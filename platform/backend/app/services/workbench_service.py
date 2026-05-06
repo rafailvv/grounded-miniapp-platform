@@ -15,8 +15,17 @@ from typing import Any
 from uuid import uuid4
 
 from app.models.domain import CreateRunRequest, RunRecord
+from app.modules.miniapp_agent_loop.lsp_tools import LspToolService
 from app.modules.miniapp_agent_loop.agent_worker_manager import AgentWorkerManager
+from app.modules.miniapp_agent_loop.product_workers import (
+    PRODUCT_WORKERS,
+    canonical_worker_id,
+    legacy_worker_id,
+    ownership_for_worker,
+    worker_refs,
+)
 from app.repositories.platform_db import PlatformDb
+from app.services.background_task_service import BackgroundTaskService
 from app.repositories.state_store import StateStore
 from app.services.exec_policy_service import ExecPolicyService
 from app.services.generation_enhancements import (
@@ -35,6 +44,8 @@ from app.services.repair_catalog import RepairCatalog
 from app.services.run_state_machine import RunStateMachine
 from app.services.tool_protocol import TOOL_PROTOCOL_VERSION, tool_envelope, tool_registry_contract
 from app.services.memory_pipeline import WorkspaceMemoryPipeline
+from app.services.run_compaction import RunCompactionService
+from app.services.run_protocol import RunProtocolConflict, RunProtocolService, diff_sha256
 from app.services.trace_bundle import TraceBundleReducer
 from app.services.workspace.run_service import RunService
 from app.services.workspace.service import WorkspaceService
@@ -61,6 +72,9 @@ class WorkbenchService:
         openai_client: OpenAIClient,
         exec_policy_service: ExecPolicyService,
         platform_db: PlatformDb | None = None,
+        run_protocol_service: RunProtocolService | None = None,
+        run_compaction_service: RunCompactionService | None = None,
+        background_task_service: BackgroundTaskService | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
@@ -69,6 +83,9 @@ class WorkbenchService:
         self.openai_client = openai_client
         self.exec_policy_service = exec_policy_service
         self.platform_db = platform_db
+        self.run_protocol_service = run_protocol_service
+        self.run_compaction_service = run_compaction_service
+        self.background_task_service = background_task_service
 
     def tool_events(self, run_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
@@ -104,14 +121,69 @@ class WorkbenchService:
         self.run_service.get_run(run_id)
         items = self.platform_db.list_run_events(run_id, after_sequence=after_sequence, limit=limit) if self.platform_db is not None else []
         snapshots = self.platform_db.list_run_state_snapshots(run_id, limit=20) if self.platform_db is not None else []
+        protocol_events = self.run_protocol_service.protocol_events(run_id).get("items", []) if self.run_protocol_service is not None else []
         return {
             "run_id": run_id,
             "schema": "grounded.run_events.v1",
             "status": "ok",
             "blocking": False,
             "items": items,
+            "protocol_events": protocol_events,
+            "compaction_events": [item for item in protocol_events if item.get("type") == "compact_boundary"],
             "state_snapshots": snapshots,
             "next_sequence": max([int(item.get("sequence") or 0) for item in items], default=int(after_sequence or 0)),
+        }
+
+    def protocol(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        if self.run_protocol_service is None:
+            return {"schema": "grounded.run_protocol.v1", "run_id": run_id, "workspace_id": run.workspace_id, "status": "unavailable", "items": []}
+        payload = self.run_protocol_service.protocol_events(run_id)
+        bookmarks = self.run_protocol_service.bookmarks(run_id)
+        payload["workspace_id"] = run.workspace_id
+        payload["bookmarks"] = bookmarks.get("items") or []
+        payload["latest_bookmark"] = (bookmarks.get("items") or [None])[0]
+        return payload
+
+    def bookmarks(self, run_id: str) -> dict[str, Any]:
+        self.run_service.get_run(run_id)
+        if self.run_protocol_service is None:
+            return {"schema": "grounded.run_bookmarks.v1", "run_id": run_id, "status": "unavailable", "items": []}
+        return self.run_protocol_service.bookmarks(run_id)
+
+    def resume_from_bookmark(self, run_id: str, bookmark_id: str, *, prompt: str | None = None, fork: bool = False) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        if self.run_protocol_service is None:
+            raise RunProtocolConflict({"reason": "protocol_unavailable", "message": "Run protocol service is unavailable.", "run_id": run_id})
+        bookmark = self.run_protocol_service.get_bookmark(run_id, bookmark_id)
+        try:
+            current_diff = self.workspace_service.diff(run.workspace_id, run_id=run.run_id)
+        except Exception:
+            current_diff = ""
+        self.run_protocol_service.validate_bookmark(run, bookmark, current_diff_sha256=diff_sha256(current_diff))
+        request = CreateRunRequest(
+            prompt=str(prompt or run.prompt),
+            mode="fix" if not fork else run.mode,
+            intent="edit" if not fork else run.intent,
+            apply_strategy="staged_auto_apply",
+            target_role_scope=list(run.target_role_scope),
+            model_profile=run.model_profile,
+            target_platform="telegram_mini_app",
+            preview_profile="telegram_mock",
+            generation_mode=str(getattr(run.generation_mode, "value", run.generation_mode) or "balanced"),
+            resume_from_run_id=run.run_id,
+            session_id=run.session_id,
+            resume_bookmark_id=bookmark_id,
+            forked_from_run_id=run.run_id if fork else None,
+        )
+        created = self.run_service.create_run(run.workspace_id, request)
+        return {
+            "schema": "grounded.run_bookmark_action.v1",
+            "status": "started",
+            "action": "fork" if fork else "resume",
+            "source_run_id": run.run_id,
+            "bookmark_id": bookmark_id,
+            "run": created.model_dump(mode="json"),
         }
 
     def trace_view(self, run_id: str) -> dict[str, Any]:
@@ -351,35 +423,89 @@ class WorkbenchService:
             )
             mailbox = {"mailbox": synthesized_mailbox}
             mailbox_workers = synthesized_mailbox.get("workers") or []
-        worker_ids = ["planner", "backend_api", "client_ui", "specialist_ui", "manager_ui", "generated_tests", "verifier"]
+        artifact_run_id = self._worker_artifact_run_id(run)
+        merge_decision_ref = f"worker_manager_merge_decision:{run.workspace_id}:{artifact_run_id}"
+        merge_decision = self.store.get("reports", merge_decision_ref) or {}
+        real_task_items = (
+            self.background_task_service.real_tasks_for_run(run.run_id)
+            if self.background_task_service is not None
+            else []
+        )
+        real_tasks = {
+            canonical_worker_id(str((item.get("input") or {}).get("worker_id") or item.get("owner") or "")): item
+            for item in real_task_items
+            if isinstance(item, dict) and item.get("type") == "worker_branch"
+        }
+        worker_ids = [role.worker_id for role in PRODUCT_WORKERS if role.worker_id != "repair_worker"]
+        if any((item.get("repair_worker") if isinstance(item, dict) else None) for item in [merge_decision]):
+            worker_ids.append("repair_worker")
         lanes = []
         for worker_id in worker_ids:
+            canonical = canonical_worker_id(worker_id)
+            aliases = [legacy_worker_id(canonical), *[alias for role in PRODUCT_WORKERS if role.worker_id == canonical for alias in role.aliases]]
             summaries = [
                 item
                 for item in run.worker_summaries
-                if isinstance(item, dict) and (item.get("worker") == worker_id or item.get("worker_id") == worker_id)
+                if isinstance(item, dict) and canonical_worker_id(str(item.get("worker") or item.get("worker_id") or "")) == canonical
             ]
-            merge_reports = [item for item in (merge.get("merge_reports") or []) if isinstance(item, dict) and item.get("worker_id") == worker_id]
+            merge_reports = [
+                item
+                for item in (merge.get("merge_reports") or [])
+                if isinstance(item, dict) and canonical_worker_id(str(item.get("worker_id") or "")) == canonical
+            ]
+            refs = worker_refs(run.workspace_id, artifact_run_id, canonical)
+            output = self.store.get("reports", refs["output_ref"]) or {}
+            context = self.store.get("reports", refs["context_ref"]) or {}
+            memory = self.store.get("reports", refs["memory_snapshot_ref"]) or {}
+            decision = next(
+                (
+                    item
+                    for item in (merge_decision.get("decisions") or [])
+                    if isinstance(item, dict) and canonical_worker_id(str(item.get("worker_id") or "")) == canonical
+                ),
+                {},
+            )
+            task = real_tasks.get(canonical) or real_tasks.get(legacy_worker_id(canonical)) or {}
+            status = self._worker_status(canonical, run, summaries, merge_reports, mailbox_workers)
+            if isinstance(output, dict) and output.get("status"):
+                status = str(output.get("status"))
+            if isinstance(decision, dict) and decision.get("decision") in {"accepted", "rejected", "needs_repair"}:
+                status = {"accepted": "merged", "rejected": "rejected", "needs_repair": "blocked"}[str(decision.get("decision"))]
             lanes.append(
                 {
-                    "worker_id": worker_id,
-                    "status": self._worker_status(worker_id, run, summaries, merge_reports, mailbox_workers),
-                    "owner_scope": self._worker_scope(worker_id),
-                    "changed_files": [path for path in run.touched_files if self._path_owned_by_worker(worker_id, path)],
+                    "worker_id": canonical,
+                    "worker_type": canonical,
+                    "alias_ids": sorted({alias for alias in aliases if alias and alias != canonical}),
+                    "status": status,
+                    "badge": str(output.get("badge") or status) if isinstance(output, dict) else status,
+                    "owner_scope": self._worker_scope(canonical),
+                    "ownership": ownership_for_worker(canonical),
+                    "changed_files": list(output.get("changed_files") or [path for path in run.touched_files if self._path_owned_by_worker(canonical, path)]),
                     "summaries": summaries,
                     "merge_reports": merge_reports,
-                    "disabled_reason": self._worker_disabled_reason(worker_id, mailbox_workers),
+                    "disabled_reason": self._worker_disabled_reason(canonical, mailbox_workers),
+                    "context_ref": refs["context_ref"] if context else None,
+                    "memory_snapshot_ref": refs["memory_snapshot_ref"] if memory else None,
+                    "output_ref": refs["output_ref"] if output else None,
+                    "task_id": task.get("task_id") if isinstance(task, dict) else None,
+                    "proof_refs": list(output.get("proof_refs") or []) if isinstance(output, dict) else [],
+                    "merge_decision_ref": merge_decision_ref if merge_decision else None,
+                    "merge_decision": decision or None,
                 }
             )
         return {
+            "schema": "grounded.product_workers.v1",
             "run_id": run_id,
+            "workspace_id": run.workspace_id,
             "workers": lanes,
             "worker_branch_refs": run.worker_branch_refs,
+            "merge_decision_ref": merge_decision_ref if merge_decision else None,
             "mailbox": (mailbox or {}).get("mailbox") if isinstance(mailbox, dict) else {},
         }
 
     def tasks(self, run_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
+        background_items = self._background_tasks_for_run(run)
         scratchpad = self.store.get("reports", run.scratchpad_ref) if run.scratchpad_ref else None
         raw_todos = []
         if isinstance(scratchpad, dict):
@@ -404,41 +530,176 @@ class WorkbenchService:
                     "updated_at": item.get("updated_at"),
                 }
             )
+        if background_items:
+            items = [*background_items, *items]
         if not items:
             items = self._tasks_from_activity(run)
         return {"schema": "grounded.run_tasks.v1", "run_id": run_id, "workspace_id": run.workspace_id, "status": run.status, "items": items}
+
+    def create_background_task(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.background_task_service is None:
+            raise KeyError("Background task service is unavailable.")
+        task = self.background_task_service.create_task(
+            workspace_id=str(payload.get("workspace_id") or ""),
+            run_id=str(payload.get("run_id") or "").strip() or None,
+            parent_task_id=str(payload.get("parent_task_id") or "").strip() or None,
+            task_type=str(payload.get("type") or payload.get("task_type") or ""),
+            title=str(payload.get("title") or "").strip() or None,
+            input_payload=payload.get("input") if isinstance(payload.get("input"), dict) else {},
+            owner=str(payload.get("owner") or "agent"),
+            max_attempts=int(payload.get("max_attempts") or 1),
+            auto_start=bool(payload.get("auto_start", True)),
+        )
+        return task.model_dump(mode="json")
+
+    def list_background_tasks(self, *, workspace_id: str | None = None, run_id: str | None = None, status: str | None = None) -> dict[str, Any]:
+        if self.background_task_service is None:
+            return {"schema": "grounded.background_tasks.v1", "status": "unavailable", "items": []}
+        return self.background_task_service.list_tasks(workspace_id=workspace_id, run_id=run_id, status=status)
+
+    def get_background_task(self, task_id: str) -> dict[str, Any]:
+        if self.background_task_service is None:
+            raise KeyError("Background task service is unavailable.")
+        return self.background_task_service.get_task(task_id).model_dump(mode="json")
+
+    def update_background_task(self, task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.background_task_service is None:
+            raise KeyError("Background task service is unavailable.")
+        return self.background_task_service.update_task(task_id, payload).model_dump(mode="json")
+
+    def stop_background_task(self, task_id: str) -> dict[str, Any]:
+        if self.background_task_service is None:
+            raise KeyError("Background task service is unavailable.")
+        return self.background_task_service.stop_task(task_id).model_dump(mode="json")
+
+    def retry_background_task(self, task_id: str) -> dict[str, Any]:
+        if self.background_task_service is None:
+            raise KeyError("Background task service is unavailable.")
+        return self.background_task_service.retry_task(task_id).model_dump(mode="json")
+
+    def requeue_background_task(self, task_id: str) -> dict[str, Any]:
+        if self.background_task_service is None:
+            raise KeyError("Background task service is unavailable.")
+        return self.background_task_service.requeue_task(task_id).model_dump(mode="json")
+
+    def background_task_output(self, task_id: str, *, cursor: int = 0, limit: int = 100) -> dict[str, Any]:
+        if self.background_task_service is None:
+            raise KeyError("Background task service is unavailable.")
+        return self.background_task_service.output(task_id, cursor=cursor, limit=limit)
 
     def worker_roles(self) -> dict[str, Any]:
         return WorkerRoleCatalog.roles()
 
     def worker_artifacts(self, run_id: str, worker_id: str) -> dict[str, Any]:
         workers = self.workers(run_id)["workers"]
-        lane = next((item for item in workers if item["worker_id"] == worker_id), None)
+        canonical = canonical_worker_id(worker_id)
+        lane = next((item for item in workers if canonical_worker_id(item["worker_id"]) == canonical), None)
         if lane is None:
             raise KeyError(f"Worker not found: {worker_id}")
         return {"run_id": run_id, "worker_id": worker_id, "artifacts": lane}
 
+    def worker_context(self, run_id: str, worker_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        ref = worker_refs(run.workspace_id, self._worker_artifact_run_id(run), worker_id)["context_ref"]
+        payload = self.store.get("reports", ref)
+        if not isinstance(payload, dict):
+            raise KeyError(f"Worker context not found: {worker_id}")
+        return payload
+
+    def worker_memory(self, run_id: str, worker_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        ref = worker_refs(run.workspace_id, self._worker_artifact_run_id(run), worker_id)["memory_snapshot_ref"]
+        payload = self.store.get("reports", ref)
+        if not isinstance(payload, dict):
+            raise KeyError(f"Worker memory snapshot not found: {worker_id}")
+        return payload
+
+    def worker_output(self, run_id: str, worker_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        ref = worker_refs(run.workspace_id, self._worker_artifact_run_id(run), worker_id)["output_ref"]
+        payload = self.store.get("reports", ref)
+        if not isinstance(payload, dict):
+            raise KeyError(f"Worker output not found: {worker_id}")
+        return payload
+
+    def worker_merge_decision(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        ref = f"worker_manager_merge_decision:{run.workspace_id}:{self._worker_artifact_run_id(run)}"
+        payload = self.store.get("reports", ref)
+        if not isinstance(payload, dict):
+            return {"schema": "grounded.worker_manager_merge_decision.v1", "run_id": run_id, "workspace_id": run.workspace_id, "status": "empty", "decisions": []}
+        return payload
+
     def worker_diff(self, run_id: str, worker_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
         diff = self._run_artifacts_or_empty(run_id).get("diff") or ""
-        owned_files = [path for path in run.touched_files if self._path_owned_by_worker(worker_id, path)]
-        return {"run_id": run_id, "worker_id": worker_id, "owned_files": owned_files, "diff": self._filter_diff(diff, owned_files)}
+        canonical = canonical_worker_id(worker_id)
+        owned_files = [path for path in run.touched_files if self._path_owned_by_worker(canonical, path)]
+        return {"run_id": run_id, "worker_id": canonical, "owned_files": owned_files, "diff": self._filter_diff(diff, owned_files)}
 
     def review(self, run_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
         artifacts = self._run_artifacts_or_empty(run_id)
-        findings = []
+        findings: list[dict[str, Any]] = []
         for issue in run.checks_summary.issues:
-            findings.append({"severity": issue.get("severity") or "medium", "code": issue.get("code"), "message": issue.get("message")})
+            findings.append(
+                self._review_finding(
+                    code=str(issue.get("code") or issue.get("kind") or "check_summary_issue"),
+                    message=str(issue.get("message") or issue.get("details") or "Run check summary contains an unresolved issue."),
+                    severity=str(issue.get("severity") or "medium"),
+                    category="check",
+                    source="checks_summary",
+                    file_path=issue.get("file_path") or issue.get("file") or issue.get("path") or issue.get("location"),
+                    line=issue.get("line"),
+                    evidence=issue,
+                    blocker=bool(issue.get("blocking") or issue.get("blocker") or run.checks_summary.gate_status in {"failed", "blocked"}),
+                )
+            )
         diff_text = str(artifacts.get("diff") or "")
         changed_files = run.touched_files or self._paths_from_diff(diff_text)
-        if diff_text and not (artifacts.get("browser_proof_steps") or run.browser_flow_proof):
+        check_results = [item for item in artifacts.get("check_results") or [] if isinstance(item, dict)]
+        check_by_name = {str(item.get("name") or ""): item for item in check_results}
+        acceptance_required = bool((run.acceptance_contract or {}).get("required")) or run.intent == "create"
+        browser_check = check_by_name.get("browser_flow_smoke")
+        api_check = check_by_name.get("api_workflow_smoke")
+        browser_passed = browser_check and browser_check.get("status") == "passed"
+        api_passed = api_check and api_check.get("status") == "passed"
+        browser_proof_present = bool(artifacts.get("browser_proof_steps") or run.browser_flow_proof or run.browser_proof_ref or browser_passed)
+        if diff_text and not browser_proof_present:
             findings.append(
-                {
-                    "severity": "medium",
-                    "code": "missing_browser_proof",
-                    "message": "Changed draft has no recorded browser proof.",
-                }
+                self._review_finding(
+                    code="browser_proof_gap",
+                    message="Changed product draft has no recorded browser workflow proof.",
+                    severity="high" if acceptance_required else "medium",
+                    category="browser_proof",
+                    source="review_gate",
+                    blocker=acceptance_required,
+                    evidence={"browser_proof_ref": run.browser_proof_ref, "browser_flow_smoke": browser_check},
+                )
+            )
+        if acceptance_required and not api_passed:
+            findings.append(
+                self._review_finding(
+                    code="product_contract_missing_api_smoke",
+                    message="Required product contract is missing a passing API workflow smoke proof.",
+                    severity="high",
+                    category="product_contract",
+                    source="acceptance_contract",
+                    blocker=True,
+                    evidence={"api_workflow_smoke": api_check, "acceptance_contract_required": True},
+                )
+            )
+        if acceptance_required and not browser_passed:
+            findings.append(
+                self._review_finding(
+                    code="product_contract_missing_browser_smoke",
+                    message="Required product contract is missing a passing browser workflow proof.",
+                    severity="high",
+                    category="product_contract",
+                    source="acceptance_contract",
+                    blocker=True,
+                    evidence={"browser_flow_smoke": browser_check, "acceptance_contract_required": True},
+                )
             )
         risky_paths = [
             path
@@ -447,34 +708,265 @@ class WorkbenchService:
         ]
         if risky_paths:
             findings.append(
-                {
-                    "severity": "high",
-                    "code": "risky_generated_or_runtime_change",
-                    "message": f"Review risky generated/runtime paths before apply: {', '.join(risky_paths[:8])}.",
-                    "paths": risky_paths,
-                }
+                self._review_finding(
+                    code="risky_generated_or_runtime_change",
+                    message=f"Review risky generated/runtime paths before apply: {', '.join(risky_paths[:8])}.",
+                    severity="high",
+                    category="product_contract",
+                    source="diff",
+                    file_path=risky_paths[0],
+                    evidence={"paths": risky_paths},
+                    blocker=True,
+                )
             )
-        if len(changed_files) >= 12 and not artifacts.get("check_results"):
+        if len(changed_files) >= 12 and not check_results:
             findings.append(
-                {
-                    "severity": "medium",
-                    "code": "large_untested_change",
-                    "message": "Large draft has no recorded check results.",
-                    "changed_file_count": len(changed_files),
-                }
+                self._review_finding(
+                    code="large_untested_change",
+                    message="Large draft has no recorded check results.",
+                    severity="high",
+                    category="missing_tests",
+                    source="diff",
+                    blocker=acceptance_required,
+                    evidence={"changed_file_count": len(changed_files)},
+                )
             )
+        findings.extend(self._review_findings_from_check_results(check_results, acceptance_required=acceptance_required))
+        findings.extend(self._review_test_findings(run=run, changed_files=changed_files, check_by_name=check_by_name, acceptance_required=acceptance_required))
+        findings.extend(self._review_contract_findings(run=run, check_by_name=check_by_name, acceptance_required=acceptance_required))
+        findings = self._dedupe_review_findings(findings)
+        findings.sort(key=self._review_finding_sort_key)
+        blocker_count = sum(1 for item in findings if item.get("is_blocker_for_product_acceptance"))
+        severity_counts: dict[str, int] = {}
+        for item in findings:
+            severity = str(item.get("severity") or "medium")
+            severity_counts[severity] = severity_counts.get(severity, 0) + 1
         payload = {
+            "schema": "grounded.review_report.v2",
             "run_id": run_id,
+            "workspace_id": run.workspace_id,
             "status": "failed" if findings else "passed",
+            "summary": {
+                "finding_count": len(findings),
+                "blocker_count": blocker_count,
+                "severity_counts": severity_counts,
+                "missing_tests": sum(1 for item in findings if item.get("category") == "missing_tests"),
+                "stale_test_risks": sum(1 for item in findings if item.get("category") == "stale_test_risk"),
+                "browser_proof_gaps": sum(1 for item in findings if item.get("category") == "browser_proof"),
+                "contract_mismatches": sum(1 for item in findings if item.get("category") == "product_contract"),
+            },
             "findings": findings,
             "evidence": {
                 "diff_available": bool(artifacts.get("diff")),
-                "checks": artifacts.get("check_results") or [],
+                "changed_files": changed_files,
+                "checks": check_results,
                 "browser_proof_ref": run.browser_proof_ref,
+                "verifier_review_ref": run.verifier_review_ref,
+                "acceptance_contract_required": acceptance_required,
             },
+            "created_at": datetime.now(timezone.utc).isoformat(),
         }
         self.store.upsert("reports", f"review:{run_id}", payload)
         return payload
+
+    @staticmethod
+    def _review_finding(
+        *,
+        code: str,
+        message: str,
+        severity: str,
+        category: str,
+        source: str,
+        blocker: bool,
+        file_path: object = None,
+        line: object = None,
+        evidence: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        normalized_path = str(file_path or "").strip()
+        normalized_line: int | None = None
+        try:
+            normalized_line = int(line) if line is not None and str(line).strip() else None
+        except (TypeError, ValueError):
+            normalized_line = None
+        payload: dict[str, Any] = {
+            "code": code,
+            "severity": severity if severity in {"critical", "high", "medium", "low", "info"} else "medium",
+            "category": category,
+            "source": source,
+            "message": message,
+            "is_blocker_for_product_acceptance": blocker,
+            "evidence": evidence or {},
+        }
+        if normalized_path:
+            payload["file_path"] = normalized_path
+            payload["path"] = normalized_path
+            payload["location"] = {"path": normalized_path, "line": normalized_line or 1}
+        if normalized_line:
+            payload["line"] = normalized_line
+        return payload
+
+    def _review_findings_from_check_results(self, check_results: list[dict[str, Any]], *, acceptance_required: bool) -> list[dict[str, Any]]:
+        findings: list[dict[str, Any]] = []
+        for result in check_results:
+            status = str(result.get("status") or "")
+            if status not in {"failed", "blocked"}:
+                continue
+            diagnostics = result.get("diagnostics") if isinstance(result.get("diagnostics"), dict) else {}
+            location = self._review_location_from_diagnostics(diagnostics)
+            check_name = str(result.get("name") or "check")
+            category = (
+                "browser_proof"
+                if check_name == "browser_flow_smoke"
+                else "product_contract"
+                if check_name in {"api_workflow_smoke", "platform_invariants", "frontend_interaction_static_smoke"}
+                else "missing_tests"
+                if "test" in check_name
+                else "check"
+            )
+            findings.append(
+                self._review_finding(
+                    code=f"check_failed.{check_name}",
+                    message=str(result.get("details") or f"{check_name} did not pass."),
+                    severity="high" if category in {"browser_proof", "product_contract"} or acceptance_required else "medium",
+                    category=category,
+                    source="check_results",
+                    file_path=location.get("path"),
+                    line=location.get("line"),
+                    blocker=acceptance_required and category in {"browser_proof", "product_contract", "missing_tests"},
+                    evidence={"check": check_name, "status": status, "logs": list(result.get("logs") or [])[-6:], "diagnostics": diagnostics},
+                )
+            )
+        return findings
+
+    def _review_test_findings(
+        self,
+        *,
+        run: RunRecord,
+        changed_files: list[str],
+        check_by_name: dict[str, dict[str, Any]],
+        acceptance_required: bool,
+    ) -> list[dict[str, Any]]:
+        findings: list[dict[str, Any]] = []
+        app_changed = [path for path in changed_files if path.startswith("miniapp/app/")]
+        tests_changed = [path for path in changed_files if path.startswith("miniapp/tests/")]
+        generated_test_checks = [name for name in check_by_name if name in {"generated_app_python_tests", "generated_app_js_tests"}]
+        if acceptance_required and app_changed and not generated_test_checks and not run.generated_tests:
+            findings.append(
+                self._review_finding(
+                    code="missing_generated_acceptance_tests",
+                    message="Product-changing run changed app files but has no generated acceptance test evidence.",
+                    severity="high",
+                    category="missing_tests",
+                    source="generated_tests",
+                    blocker=True,
+                    evidence={"app_changed": app_changed[:12], "tests_changed": tests_changed[:12]},
+                )
+            )
+        if app_changed and not tests_changed and run.intent in {"create", "edit"}:
+            findings.append(
+                self._review_finding(
+                    code="stale_test_risk",
+                    message="App files changed without generated test files changing; tests may be stale against the current workflow.",
+                    severity="medium",
+                    category="stale_test_risk",
+                    source="diff",
+                    blocker=False,
+                    evidence={"app_changed": app_changed[:12], "tests_changed": tests_changed},
+                )
+            )
+        for check_name in ("generated_app_python_tests", "generated_app_js_tests"):
+            check = check_by_name.get(check_name)
+            if check and check.get("status") in {"failed", "blocked"}:
+                diagnostics = check.get("diagnostics") if isinstance(check.get("diagnostics"), dict) else {}
+                location = self._review_location_from_diagnostics(diagnostics)
+                findings.append(
+                    self._review_finding(
+                        code=f"stale_or_failing_test.{check_name}",
+                        message=str(check.get("details") or "Generated acceptance tests are failing or stale."),
+                        severity="high" if acceptance_required else "medium",
+                        category="stale_test_risk",
+                        source="generated_tests",
+                        file_path=location.get("path"),
+                        line=location.get("line"),
+                        blocker=acceptance_required,
+                        evidence={"check": check_name, "diagnostics": diagnostics, "logs": list(check.get("logs") or [])[-6:]},
+                    )
+                )
+        return findings
+
+    def _review_contract_findings(self, *, run: RunRecord, check_by_name: dict[str, dict[str, Any]], acceptance_required: bool) -> list[dict[str, Any]]:
+        findings: list[dict[str, Any]] = []
+        contract = run.acceptance_contract if isinstance(run.acceptance_contract, dict) else {}
+        if acceptance_required and not contract:
+            findings.append(
+                self._review_finding(
+                    code="missing_product_acceptance_contract",
+                    message="Product-changing run has no stored acceptance contract.",
+                    severity="high",
+                    category="product_contract",
+                    source="acceptance_contract",
+                    blocker=True,
+                )
+            )
+        required_roles = set(str(role) for role in (run.target_role_scope or ["client", "specialist", "manager"]))
+        browser = check_by_name.get("browser_flow_smoke") or {}
+        diagnostics = browser.get("diagnostics") if isinstance(browser.get("diagnostics"), dict) else {}
+        checked_roles = set(str(role) for role in diagnostics.get("roles_checked") or [])
+        if acceptance_required and checked_roles and not required_roles.issubset(checked_roles):
+            findings.append(
+                self._review_finding(
+                    code="product_contract_role_proof_mismatch",
+                    message="Browser proof did not cover all required role surfaces from the product contract.",
+                    severity="high",
+                    category="product_contract",
+                    source="browser_flow_smoke",
+                    blocker=True,
+                    evidence={"required_roles": sorted(required_roles), "checked_roles": sorted(checked_roles)},
+                )
+            )
+        return findings
+
+    @staticmethod
+    def _review_location_from_diagnostics(diagnostics: dict[str, Any]) -> dict[str, Any]:
+        for key in ("file_path", "file", "path", "location"):
+            value = diagnostics.get(key)
+            if isinstance(value, str) and value.strip():
+                return {"path": value.strip(), "line": diagnostics.get("line")}
+            if isinstance(value, dict):
+                path = value.get("path") or value.get("file_path") or value.get("file")
+                if path:
+                    return {"path": str(path), "line": value.get("line") or diagnostics.get("line")}
+        for nested_key in ("items", "issues", "diagnostics"):
+            nested = diagnostics.get(nested_key)
+            if isinstance(nested, list):
+                for item in nested:
+                    if isinstance(item, dict):
+                        location = WorkbenchService._review_location_from_diagnostics(item)
+                        if location:
+                            return location
+            elif isinstance(nested, dict):
+                location = WorkbenchService._review_location_from_diagnostics(nested)
+                if location:
+                    return location
+        return {}
+
+    @staticmethod
+    def _dedupe_review_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        deduped: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for finding in findings:
+            key = (str(finding.get("code") or ""), str(finding.get("file_path") or ""), str(finding.get("line") or ""))
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(finding)
+        return deduped
+
+    @staticmethod
+    def _review_finding_sort_key(finding: dict[str, Any]) -> tuple[int, int, str]:
+        severity_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+        blocker_rank = 0 if finding.get("is_blocker_for_product_acceptance") else 1
+        return (blocker_rank, severity_rank.get(str(finding.get("severity") or "medium"), 2), str(finding.get("code") or ""))
 
     def start_review_fix(self, run_id: str) -> RunRecord:
         run = self.run_service.get_run(run_id)
@@ -558,7 +1050,7 @@ class WorkbenchService:
         payload = self.store.get("reports", ref) or {}
         state = payload.get("state") if isinstance(payload, dict) else None
         if isinstance(state, dict) and state:
-            return state
+            return self._augment_trace_state_with_protocol(run_id, state)
         bundle_dir_value = str((payload or {}).get("bundle_dir") or "").strip()
         bundle_dir = Path(bundle_dir_value) if bundle_dir_value else None
         if bundle_dir is not None and bundle_dir.exists():
@@ -574,7 +1066,63 @@ class WorkbenchService:
                 "next_action": {"action": "none", "reason": "Trace bundle is missing."},
             }
         self.store.upsert("reports", f"trace_reducer:{run.workspace_id}:{run_id}", state)
-        return state
+        return self._augment_trace_state_with_protocol(run_id, state)
+
+    def _augment_trace_state_with_protocol(self, run_id: str, state: dict[str, Any]) -> dict[str, Any]:
+        if self.run_protocol_service is None:
+            return state
+        protocol = self.run_protocol_service.protocol_events(run_id).get("items") or []
+        if not protocol:
+            return state
+        turns = list(state.get("turns") or [])
+        tool_calls = list(state.get("tool_calls") or [])
+        proof_edges = list(state.get("proof_edges") or [])
+        blockers = list(state.get("blockers") or [])
+        compact_boundaries: list[dict[str, Any]] = []
+        terminal = None
+        for event in protocol:
+            event_type = str(event.get("type") or "")
+            compact = {
+                "seq": event.get("sequence"),
+                "event_type": f"protocol.{event_type}",
+                "status": event.get("status"),
+                "summary": event.get("message"),
+                "turn_id": event.get("turn_id"),
+                "bookmark_id": event.get("bookmark_id"),
+            }
+            if event_type in {"turn_started", "model_delta", "turn_completed"}:
+                turns.append(compact)
+            if event_type in {"tool_requested", "tool_completed"}:
+                tool_calls.append(compact)
+            if event_type in {"check_started", "run_completed"}:
+                proof_edges.append(compact)
+            if event_type == "compact_boundary":
+                compact_boundaries.append({**compact, "refs": event.get("refs") or {}})
+            if str(event.get("status") or "") in {"failed", "blocked"}:
+                blockers.append(compact)
+            if event_type == "run_completed":
+                terminal = compact
+        bookmarks = self.run_protocol_service.bookmarks(run_id).get("items") or []
+        next_target = bookmarks[0] if bookmarks else None
+        next_action = state.get("next_action") if isinstance(state.get("next_action"), dict) else {}
+        if next_target and next_action.get("action") == "none":
+            next_action = {
+                "action": "resume_from_bookmark",
+                "reason": "Latest model response bookmark is available.",
+                "bookmark_id": next_target.get("bookmark_id"),
+            }
+        return {
+            **state,
+            "turns": turns[-80:],
+            "tool_calls": tool_calls[-160:],
+            "proof_edges": proof_edges[-80:],
+            "blockers": blockers[-80:],
+            "protocol_events": protocol[-300:],
+            "compact_boundaries": compact_boundaries[-80:],
+            "model_response_bookmarks": bookmarks[:80],
+            "final_terminal_event": terminal,
+            "next_action": next_action or {"action": "none", "reason": "No blocking trace event."},
+        }
 
     def gate(self, run_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
@@ -609,11 +1157,9 @@ class WorkbenchService:
                 add_issue("unresolved_repair_signature", str(signature.get("check") or "repair"), str(signature.get("signature") or "Unresolved repair signature."), evidence=signature)
         if run.outcome_kind == "blocked_preview_infra":
             add_issue("preview_infra", "browser_flow_smoke", run.failure_reason or "Browser/preview infrastructure blocked product proof.", evidence=artifacts.get("preview_infra_diagnostics") or {})
-        apply_ok = run.apply_status == "applied" or (
-            run.apply_strategy == "manual_approve" and run.status == "awaiting_approval" and run.apply_status == "awaiting_approval"
-        )
-        if run.status in {"completed", "awaiting_approval", "blocked", "failed"} and not apply_ok:
-            add_issue("apply_gate", "apply_status", "Run must be applied or awaiting manual approval after green checks.", evidence={"apply_status": run.apply_status, "status": run.status})
+        apply_ok = run.apply_status == "applied"
+        if run.status in {"completed", "blocked", "failed"} and not apply_ok:
+            add_issue("apply_gate", "apply_status", "Run must be applied after green checks.", evidence={"apply_status": run.apply_status, "status": run.status})
 
         checkpoint = self.store.get("reports", run.resume_checkpoint_ref) if run.resume_checkpoint_ref else None
         checkpoint_packets = list((checkpoint or {}).get("repair_packets") or []) if isinstance(checkpoint, dict) else []
@@ -646,7 +1192,7 @@ class WorkbenchService:
                 "api_workflow_smoke": acceptance_required,
                 "browser_flow_smoke": acceptance_required,
                 "mobile_layout_non_blocking": True,
-                "apply_status": "applied_or_awaiting_approval",
+                "apply_status": "applied",
             },
             "artifact_refs": {
                 "run_artifacts": f"run_artifacts:{run_id}",
@@ -941,7 +1487,7 @@ class WorkbenchService:
                 prompt=prompt,
                 mode="fix",
                 intent="edit",
-                apply_strategy=run.apply_strategy,
+                apply_strategy="staged_auto_apply",
                 target_role_scope=list(run.target_role_scope or []),
                 model_profile=run.model_profile,
                 generation_mode=run.generation_mode,
@@ -1056,7 +1602,8 @@ class WorkbenchService:
 
     def skills(self) -> dict[str, Any]:
         skills = dict(self._builtin_skills())
-        for item in SkillPackCatalog.load_from_runtime(self.settings.runtime_dir, self.settings.repo_root):
+        prefetch = SkillPackCatalog.prefetch(self.settings.runtime_dir, self.settings.repo_root)
+        for item in prefetch.get("items") or []:
             skills.setdefault(item["id"], item)
         for item in self._document_skills():
             skills.setdefault(item["id"], item)
@@ -1064,6 +1611,7 @@ class WorkbenchService:
             item.setdefault("activation_reason", "available_metadata")
         return {
             "schema": "grounded.skills.v1",
+            "prefetch": {key: value for key, value in prefetch.items() if key != "items"},
             "items": sorted(skills.values(), key=lambda item: str(item.get("id") or "")),
         }
 
@@ -1159,9 +1707,11 @@ class WorkbenchService:
             self._playwright_browsers_check(),
             self._preview_container_check(),
             self._test_command_check(),
+            self.exec_policy_service.doctor_check(),
         ]
         status = "passed" if all(item["status"] == "passed" for item in checks if item["required"]) else "failed"
         payload = {"status": status, "checks": checks, "created_at": datetime.now(timezone.utc).isoformat()}
+        self.store.upsert("reports", "doctor:exec_policy", self.exec_policy_service.doctor_check())
         self.store.upsert("reports", "doctor:last", payload)
         return payload
 
@@ -1469,18 +2019,43 @@ class WorkbenchService:
 
     def compact_run(self, run_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
-        payload = {
-            "run_id": run_id,
-            "short_summary": run.summary or run.failure_reason or run.prompt[:240],
-            "active_constraints": list((run.acceptance_contract or {}).get("constraints") or []),
-            "accepted_decisions": list((run.implementation_plan or {}).get("decisions") or []),
-            "known_failures": [run.failure_reason] if run.failure_reason else [],
-            "current_file_focus": run.touched_files[:12],
-            "unresolved_approvals": [],
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
-        self.store.upsert("reports", f"run_compaction:{run_id}", payload)
-        return payload
+        if self.run_compaction_service is None:
+            raise KeyError("Run compaction service is unavailable.")
+        artifacts = self._run_artifacts_or_empty(run_id)
+        checkpoint = self.store.get("reports", run.resume_checkpoint_ref) if run.resume_checkpoint_ref else {}
+        context_pressure = self.store.get("reports", run.context_pressure_ref) if run.context_pressure_ref else {}
+        return self.run_compaction_service.compact_run(
+            run=run,
+            artifacts=artifacts,
+            checkpoint=checkpoint if isinstance(checkpoint, dict) else {},
+            context_pressure=context_pressure if isinstance(context_pressure, dict) else {},
+            reason="manual",
+            source="manual",
+        )
+
+    def compaction(self, run_id: str) -> dict[str, Any]:
+        self.run_service.get_run(run_id)
+        if self.run_compaction_service is None:
+            return {"schema": "grounded.run_compaction.v1", "run_id": run_id, "status": "unavailable", "sections": {}, "refs": {}}
+        return self.run_compaction_service.get_compaction(run_id)
+
+    def compaction_boundaries(self, run_id: str) -> dict[str, Any]:
+        self.run_service.get_run(run_id)
+        if self.run_compaction_service is None:
+            return {"schema": "grounded.run_compaction_boundaries.v1", "run_id": run_id, "status": "unavailable", "items": []}
+        return self.run_compaction_service.boundaries(run_id)
+
+    def microcompact(self, run_id: str, digest: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        if self.run_compaction_service is None:
+            raise KeyError("Run compaction service is unavailable.")
+        return self.run_compaction_service.microcompact(run.workspace_id, run_id, digest)
+
+    def post_compact_message(self, run_id: str, boundary_id: str) -> dict[str, Any]:
+        self.run_service.get_run(run_id)
+        if self.run_compaction_service is None:
+            raise KeyError("Run compaction service is unavailable.")
+        return self.run_compaction_service.post_compact_message(run_id, boundary_id)
 
     def stage_files(self, run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
@@ -1610,66 +2185,40 @@ class WorkbenchService:
             "symbols": self._symbol_overview(root, normalized_query),
         }
 
-    def lsp_diagnostics(self, workspace_id: str, *, run_id: str | None = None) -> dict[str, Any]:
+    def lsp_diagnostics(self, workspace_id: str, *, run_id: str | None = None, changed_only: bool = False, files: list[str] | None = None) -> dict[str, Any]:
         self.workspace_service.get_workspace(workspace_id)
         root = self.workspace_service.draft_source_dir(workspace_id, run_id) if run_id else self.workspace_service.source_dir(workspace_id)
-        items: list[dict[str, Any]] = []
-        tool_status: dict[str, str] = {}
-        py_files = [path for path in root.rglob("*.py") if not self.workspace_service._is_ignored_workspace_path(path.relative_to(root))]
-        for path in py_files[:120]:
-            try:
-                result = subprocess.run([sys.executable, "-m", "py_compile", str(path)], text=True, capture_output=True, timeout=4)
-            except Exception as exc:
-                items.append({"path": path.relative_to(root).as_posix(), "severity": "error", "message": str(exc), "source": "python_compile"})
-                continue
-            if result.returncode != 0:
-                items.append({"path": path.relative_to(root).as_posix(), "severity": "error", "message": (result.stderr or result.stdout).strip()[:1200], "source": "python_compile"})
-        tool_status["python_compile"] = "completed"
-        if shutil.which("ruff") and (root / "miniapp/app").exists():
-            try:
-                result = subprocess.run(["ruff", "check", str(root / "miniapp/app")], text=True, capture_output=True, timeout=8)
-                tool_status["ruff"] = "passed" if result.returncode == 0 else "failed"
-                if result.returncode != 0:
-                    items.append({"path": "miniapp/app", "severity": "warning", "message": (result.stdout or result.stderr).strip()[:2000], "source": "ruff"})
-            except Exception as exc:
-                tool_status["ruff"] = "error"
-                items.append({"path": "miniapp/app", "severity": "warning", "message": str(exc), "source": "ruff"})
-        else:
-            tool_status["ruff"] = "skipped_unavailable"
-        if shutil.which("pyright") and (root / "miniapp/app").exists():
-            try:
-                result = subprocess.run(["pyright", str(root / "miniapp/app")], text=True, capture_output=True, timeout=10)
-                tool_status["pyright"] = "passed" if result.returncode == 0 else "failed"
-                if result.returncode != 0:
-                    items.append({"path": "miniapp/app", "severity": "warning", "message": (result.stdout or result.stderr).strip()[:2000], "source": "pyright"})
-            except Exception as exc:
-                tool_status["pyright"] = "error"
-                items.append({"path": "miniapp/app", "severity": "warning", "message": str(exc), "source": "pyright"})
-        else:
-            tool_status["pyright"] = "skipped_unavailable"
-        if shutil.which("node"):
-            tool_status["node_check"] = "completed"
-            for path in list(root.rglob("*.js"))[:80]:
-                if self.workspace_service._is_ignored_workspace_path(path.relative_to(root)):
-                    continue
-                try:
-                    result = subprocess.run(["node", "--check", str(path)], text=True, capture_output=True, timeout=4)
-                except Exception as exc:
-                    items.append({"path": path.relative_to(root).as_posix(), "severity": "error", "message": str(exc), "source": "node --check"})
-                    continue
-                if result.returncode != 0:
-                    items.append({"path": path.relative_to(root).as_posix(), "severity": "error", "message": (result.stderr or result.stdout).strip()[:1200], "source": "node --check"})
-        else:
-            tool_status["node_check"] = "skipped_unavailable"
+        changed_files: list[str] = []
+        if run_id:
+            changed_files = self._paths_from_diff(self.workspace_service.diff(workspace_id, run_id=run_id))
+        report = LspToolService.diagnostics(
+            root=root,
+            targets=files,
+            changed_files=changed_files,
+            changed_only=changed_only,
+        )
         return {
+            **report,
             "workspace_id": workspace_id,
             "run_id": run_id,
-            "status": "passed" if not items else "failed",
-            "items": items[:100],
-            "tool_status": tool_status,
-            "sources": sorted({str(item.get("source") or "unknown") for item in items} or {"none"}),
-            "symbols": self._symbol_overview(root, ""),
+            "sources": sorted({str(item.get("source") or "unknown") for item in report.get("items") or []} or {"none"}),
+            "symbols": LspToolService.symbol_context(root=root, query="", targets=files).get("items", []),
         }
+
+    def lsp_symbol_context(self, workspace_id: str, *, run_id: str | None = None, query: str = "", targets: list[str] | None = None) -> dict[str, Any]:
+        self.workspace_service.get_workspace(workspace_id)
+        root = self.workspace_service.draft_source_dir(workspace_id, run_id) if run_id else self.workspace_service.source_dir(workspace_id)
+        return {**LspToolService.symbol_context(root=root, query=query, targets=targets), "workspace_id": workspace_id, "run_id": run_id}
+
+    def lsp_find_references(self, workspace_id: str, *, run_id: str | None = None, symbol: str = "", targets: list[str] | None = None) -> dict[str, Any]:
+        self.workspace_service.get_workspace(workspace_id)
+        root = self.workspace_service.draft_source_dir(workspace_id, run_id) if run_id else self.workspace_service.source_dir(workspace_id)
+        return {**LspToolService.find_references(root=root, symbol=symbol, targets=targets), "workspace_id": workspace_id, "run_id": run_id}
+
+    def lsp_route_static_context(self, workspace_id: str, *, run_id: str | None = None, targets: list[str] | None = None) -> dict[str, Any]:
+        self.workspace_service.get_workspace(workspace_id)
+        root = self.workspace_service.draft_source_dir(workspace_id, run_id) if run_id else self.workspace_service.source_dir(workspace_id)
+        return {**LspToolService.route_static_context(root=root, targets=targets), "workspace_id": workspace_id, "run_id": run_id}
 
     def patch_preflight(self, workspace_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         raw_ops = payload.get("ops") or payload.get("patch_actions") or []
@@ -1904,6 +2453,21 @@ class WorkbenchService:
             items.append(item)
         payload["items"] = items
         self.store.upsert("reports", key, payload)
+        if self.run_protocol_service is not None and not replaced and str(item.get("status") or "") == "pending":
+            try:
+                run = self.run_service.get_run(run_id)
+                self.run_protocol_service.append_event(
+                    run_id=run_id,
+                    workspace_id=run.workspace_id,
+                    session_id=run.session_id,
+                    event_type="approval_requested",
+                    status="blocked",
+                    message=str(item.get("summary") or item.get("kind") or "Approval requested."),
+                    payload={"approval": item},
+                    source_event_type="approval_requested",
+                )
+            except Exception:
+                pass
 
     def _approval_by_id(self, run_id: str, approval_id: str) -> dict[str, Any] | None:
         for item in self.approvals(run_id).get("items") or []:
@@ -1967,18 +2531,20 @@ class WorkbenchService:
 
     @staticmethod
     def _worker_scope(worker_id: str) -> str:
+        canonical = canonical_worker_id(worker_id)
         return {
-            "planner": "Prompt contract, acceptance scenarios, and ownership plan",
-            "backend_api": "Backend API and shared persistence",
-            "client_ui": "Client role UI",
-            "specialist_ui": "Specialist role UI",
-            "manager_ui": "Manager role UI",
-            "generated_tests": "Generated test coverage",
-            "verifier": "Fresh verification and review",
-        }.get(worker_id, worker_id)
+            "backend_api_worker": "Backend API and shared persistence",
+            "client_surface_worker": "Client role UI",
+            "specialist_surface_worker": "Specialist role UI",
+            "manager_surface_worker": "Manager role UI",
+            "test_verifier_worker": "Generated tests and verification",
+            "mobile_polish_worker": "Mobile polish and visual QA",
+            "repair_worker": "Focused owned repair",
+        }.get(canonical, canonical)
 
     @staticmethod
     def _path_owned_by_worker(worker_id: str, path: str) -> bool:
+        worker_id = legacy_worker_id(worker_id)
         normalized = str(path or "").replace("\\", "/")
         if worker_id == "planner":
             return normalized.startswith("docs/") or normalized.endswith("README.md")
@@ -1993,6 +2559,7 @@ class WorkbenchService:
 
     @staticmethod
     def _worker_status(worker_id: str, run: Any, summaries: list[dict[str, Any]], merge_reports: list[dict[str, Any]], mailbox_workers: Any = None) -> str:
+        canonical = canonical_worker_id(worker_id)
         if summaries or merge_reports:
             if any(str(item.get("status") or "") == "failed" for item in [*summaries, *merge_reports]):
                 return "failed"
@@ -2000,18 +2567,35 @@ class WorkbenchService:
                 return "merged"
             return "completed"
         for worker in mailbox_workers if isinstance(mailbox_workers, list) else []:
-            if isinstance(worker, dict) and str(worker.get("worker") or worker.get("worker_id") or "") == worker_id:
+            if isinstance(worker, dict) and canonical_worker_id(str(worker.get("worker") or worker.get("worker_id") or "")) == canonical:
                 status = str(worker.get("status") or "")
                 if status == "available_disabled":
                     return status
-        return "not_started" if run.status == "completed" else "pending"
+                if status:
+                    return status
+        return "not_started" if run.status == "completed" else "planned"
 
     @staticmethod
     def _worker_disabled_reason(worker_id: str, mailbox_workers: Any = None) -> str:
+        canonical = canonical_worker_id(worker_id)
         for worker in mailbox_workers if isinstance(mailbox_workers, list) else []:
-            if isinstance(worker, dict) and str(worker.get("worker") or worker.get("worker_id") or "") == worker_id:
+            if isinstance(worker, dict) and canonical_worker_id(str(worker.get("worker") or worker.get("worker_id") or "")) == canonical:
                 return str(worker.get("disabled_reason") or "")
         return ""
+
+    @staticmethod
+    def _worker_artifact_run_id(run: Any) -> str:
+        ref = str(getattr(run, "worker_mailbox_ref", "") or "")
+        if ref.startswith("worker_mailbox:"):
+            parts = ref.split(":")
+            if len(parts) >= 3 and parts[-1]:
+                return parts[-1]
+        refs = list(getattr(run, "worker_branch_refs", []) or [])
+        for item in refs:
+            parts = str(item).split(":")
+            if len(parts) >= 4 and parts[2]:
+                return parts[2]
+        return str(getattr(run, "run_id", "") or "")
 
     @staticmethod
     def _task_status(value: str) -> str:
@@ -2057,6 +2641,38 @@ class WorkbenchService:
                 }
             )
         return items[-80:]
+
+    def _background_tasks_for_run(self, run: Any) -> list[dict[str, Any]]:
+        if self.background_task_service is None:
+            return []
+        tasks = self.background_task_service.real_tasks_for_run(run.run_id)
+        items: list[dict[str, Any]] = []
+        for task in tasks:
+            status = str(task.get("status") or "queued")
+            items.append(
+                {
+                    "task_id": str(task.get("task_id") or ""),
+                    "title": str(task.get("title") or task.get("type") or "Background task"),
+                    "phase": str(task.get("type") or "background_task"),
+                    "status": self._task_status(status),
+                    "owner": str(task.get("owner") or "agent"),
+                    "files": [],
+                    "proof": task.get("linked_refs") or {},
+                    "blocker": task.get("error") if status in {"failed", "blocked"} else None,
+                    "artifact_refs": {
+                        "background_task": str(task.get("task_id") or ""),
+                        "run": str(task.get("run_id") or ""),
+                    },
+                    "updated_at": task.get("updated_at"),
+                    "source": "background",
+                    "background_status": status,
+                    "attempt": task.get("attempt"),
+                    "max_attempts": task.get("max_attempts"),
+                    "output_summary": task.get("output_summary"),
+                    "linked_refs": task.get("linked_refs") or {},
+                }
+            )
+        return items
 
     @staticmethod
     def _filter_diff(diff: str, paths: list[str]) -> str:

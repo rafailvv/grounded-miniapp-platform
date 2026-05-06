@@ -27,6 +27,7 @@ from app.modules.miniapp_agent_loop.agent_worker_tasks import AgentWorkerTaskPla
 from app.models.artifacts import ApplyPatchResult
 from app.modules.miniapp_agent_loop.context_pressure import AgentContextPressureAnalyzer
 from app.modules.miniapp_agent_loop.edit_validator import AgentEditValidator
+from app.modules.miniapp_agent_loop.lsp_tools import LspToolService
 from app.modules.miniapp_agent_loop.repair_packets import RepairTransitionPolicy
 from app.modules.miniapp_agent_loop.rollout_trace import RolloutTraceRecorder
 from app.modules.miniapp_agent_loop.semantic_tools import semantic_scan
@@ -143,6 +144,60 @@ def test_lsp_static_diagnostics_reports_structured_python_issue(tmp_path: Path) 
     assert result.status == "failed"
     assert result.diagnostics["items"][0]["source"] == "python_compile"
     assert result.diagnostics["items"][0]["file"] == "miniapp/app/main.py"
+
+
+def test_lsp_tool_service_reports_jumpable_changed_file_diagnostics(tmp_path: Path) -> None:
+    app_dir = tmp_path / "miniapp" / "app"
+    app_dir.mkdir(parents=True)
+    (app_dir / "main.py").write_text("def broken(:\n    pass\n", encoding="utf-8")
+    (app_dir / "ok.py").write_text("def ok():\n    return True\n", encoding="utf-8")
+
+    report = LspToolService.diagnostics(
+        root=tmp_path,
+        changed_only=True,
+        changed_files=["miniapp/app/main.py"],
+        include_optional_tools=False,
+    )
+
+    assert report["tool"] == "lsp.diagnostics"
+    assert report["status"] == "failed"
+    assert report["items"][0]["path"] == "miniapp/app/main.py"
+    assert report["items"][0]["jump"]["line"] >= 1
+
+
+def test_lsp_tool_service_symbol_reference_and_route_context(tmp_path: Path) -> None:
+    routes = tmp_path / "miniapp" / "app" / "routes"
+    client = tmp_path / "miniapp" / "app" / "static" / "client"
+    routes.mkdir(parents=True)
+    client.mkdir(parents=True)
+    (routes / "api.py").write_text(
+        "from fastapi import APIRouter\n"
+        "router = APIRouter(prefix='/api/items')\n"
+        "@router.get('')\n"
+        "def list_items():\n"
+        "    return []\n",
+        encoding="utf-8",
+    )
+    (client / "app.js").write_text("function loadItems() { return fetch('/api/items'); }\nloadItems();\n", encoding="utf-8")
+
+    symbols = LspToolService.symbol_context(root=tmp_path, query="list_items")
+    refs = LspToolService.find_references(root=tmp_path, symbol="loadItems")
+    route_context = LspToolService.route_static_context(root=tmp_path)
+
+    assert symbols["items"][0]["name"] == "list_items"
+    assert len(refs["items"]) == 2
+    assert "GET /api/items" in route_context["api_routes"]
+    assert route_context["frontend_api_refs"][0]["declared"] is True
+
+
+def test_lsp_agent_tools_are_model_visible_aliases_with_canonical_protocol() -> None:
+    tool_names = {tool["name"] for tool in AgentToolRegistry.openai_tools()}
+
+    assert "lsp_diagnostics" in tool_names
+    assert "lsp_symbol_context" in tool_names
+    assert "lsp_find_references" in tool_names
+    assert "lsp_route_static_context" in tool_names
+    assert AgentToolRegistry.kind("lsp.diagnostics") == "read_only"
 
 
 def test_prompt_planning_hints_extract_role_fields_from_colon_and_action_sentences() -> None:
@@ -1562,16 +1617,32 @@ def test_worker_manager_rejects_conflicting_owned_edits() -> None:
     assert report["conflicts"][0]["path"] == "miniapp/app/static/client/app.js"  # type: ignore[index]
 
 
+def test_worker_manager_rejects_forbidden_worker_paths() -> None:
+    report = AgentWorkerManager.validate_non_conflicting(
+        [
+            DraftAction(
+                file_path="miniapp/app/static/manager/app.js",
+                operation="replace",
+                content="console.log('manager');\n",
+                reason="[client_surface_worker] wrong role",
+            ),
+        ]
+    )
+
+    assert report["ok"] is False
+    assert report["forbidden"][0]["path"] == "miniapp/app/static/manager/app.js"  # type: ignore[index]
+
+
 def test_generation_modes_use_serial_contract_runtime_writes(monkeypatch) -> None:
     monkeypatch.delenv("GROUNDED_ENABLE_WORKER_BRANCHES", raising=False)
     for mode in (GenerationMode.FAST, GenerationMode.BALANCED, GenerationMode.QUALITY):
         mailbox = AgentWorkerManager.mailbox_for_plan(
             generation_mode=mode,
-            implementation_plan={"prompt_contract_v1": {"enabled": True, "metadata_only": True}},
+            implementation_plan={"prompt_contract_v1": {"required": True, "entities": ["entity"], "flows": [{"roles": ["client"]}]}},
         )
         prompt_payload = WorkspaceCodeAgentRuntime._worker_branching_prompt_payload(
             generation_mode=mode,
-            implementation_plan={"prompt_contract_v1": {"enabled": True, "metadata_only": True}},
+            implementation_plan={"prompt_contract_v1": {"required": True, "entities": ["entity"], "flows": [{"roles": ["client"]}]}},
         )
 
         assert mailbox["enabled"] is False
@@ -1583,14 +1654,21 @@ def test_generation_modes_use_serial_contract_runtime_writes(monkeypatch) -> Non
     monkeypatch.setenv("GROUNDED_ENABLE_WORKER_BRANCHES", "1")
     quality_mailbox = AgentWorkerManager.mailbox_for_plan(
         generation_mode=GenerationMode.QUALITY,
-        implementation_plan={"primary_entities": ["entity"]},
+        implementation_plan={"prompt_contract_v1": {"required": True, "entities": ["entity"], "flows": [{"roles": ["client"]}]}},
     )
     fast_mailbox = AgentWorkerManager.mailbox_for_plan(
         generation_mode=GenerationMode.FAST,
-        implementation_plan={"primary_entities": ["entity"]},
+        implementation_plan={"prompt_contract_v1": {"required": True, "entities": ["entity"], "flows": [{"roles": ["client"]}]}},
+    )
+    no_contract_mailbox = AgentWorkerManager.mailbox_for_plan(
+        generation_mode=GenerationMode.QUALITY,
+        implementation_plan={},
     )
     assert quality_mailbox["enabled"] is True
     assert fast_mailbox["enabled"] is False
+    assert no_contract_mailbox["enabled"] is False
+    assert any(worker["worker_id"] == "backend_api_worker" for worker in quality_mailbox["workers"])  # type: ignore[index]
+    assert any("backend_api" in worker["alias_ids"] for worker in quality_mailbox["workers"])  # type: ignore[index]
 
 
 def test_hook_manager_records_context_and_blocks_forbidden_tool() -> None:
@@ -1615,12 +1693,14 @@ def test_worker_task_planner_builds_self_contained_owner_prompts() -> None:
 
     by_id = {task["worker_id"]: task for task in tasks}
 
-    assert "client_ui" in by_id
-    assert "Own only these paths" in by_id["client_ui"]["prompt"]
-    assert "miniapp/app/generated/miniapp_contract.json" in by_id["client_ui"]["prompt"]
-    assert "keep them consistent across backend, JS payloads, renderers, and tests" in by_id["client_ui"]["prompt"]
-    assert by_id["client_ui"]["mode_contract"]["depth"] == "deep"
-    assert "mobile layout works" in by_id["client_ui"]["self_check"][3]
+    assert "client_surface_worker" in by_id
+    assert by_id["client_surface_worker"]["legacy_worker_id"] == "client_ui"
+    assert "Own only these paths" in by_id["client_surface_worker"]["prompt"]
+    assert "Forbidden paths" in by_id["client_surface_worker"]["prompt"]
+    assert "miniapp/app/generated/miniapp_contract.json" in by_id["client_surface_worker"]["prompt"]
+    assert "keep them consistent across backend, JS payloads, renderers, and tests" in by_id["client_surface_worker"]["prompt"]
+    assert by_id["client_surface_worker"]["mode_contract"]["depth"] == "deep"
+    assert "mobile layout works" in by_id["client_surface_worker"]["self_check"][3]
 
 
 def test_worker_runtime_prepares_isolated_drafts_and_merge_reports(tmp_path: Path) -> None:

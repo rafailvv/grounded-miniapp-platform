@@ -29,6 +29,9 @@ from app.validators.suite import ValidationSuite
 from app.ai.openai_client import OpenAIClient
 from app.services.exec_policy_service import ExecPolicyService
 from app.services.exec_runtime_service import ExecRuntimeService
+from app.services.background_task_service import BackgroundTaskService
+from app.services.run_compaction import RunCompactionService
+from app.services.run_protocol import RunProtocolService
 from app.services.workbench_service import WorkbenchService
 
 
@@ -37,6 +40,8 @@ class ServiceContainer:
         self.settings = settings or get_settings()
         self.store = StateStore(self.settings.data_dir / "platform-state.json")
         self.platform_db = PlatformDb(self.settings.data_dir / "platform.db")
+        self.run_protocol_service = RunProtocolService(self.platform_db, self.store)
+        self.run_compaction_service = RunCompactionService(self.store, self.run_protocol_service)
         self.rpc_event_hub = RpcEventHub()
         self.store.shard_large_runtime_payloads()
         self.workspace_log_service = WorkspaceLogService(self.settings)
@@ -77,6 +82,8 @@ class ServiceContainer:
             agent_tool_call_loop=self.agent_tool_call_loop,
             context_pack_builder=self.context_pack_builder,
             platform_db=self.platform_db,
+            run_protocol_service=self.run_protocol_service,
+            run_compaction_service=self.run_compaction_service,
         )
         self.run_service = RunService(
             self.store,
@@ -86,6 +93,7 @@ class ServiceContainer:
             self.check_runner,
             self.openai_client,
             self.workspace_log_service,
+            run_protocol_service=self.run_protocol_service,
         )
         self.exec_policy_service = ExecPolicyService(self.settings.runtime_dir / "policies" / "agent_exec_policy.json")
         self.exec_runtime_service = ExecRuntimeService(
@@ -93,6 +101,13 @@ class ServiceContainer:
             platform_db=self.platform_db,
             event_hub=self.rpc_event_hub,
             store=self.store,
+        )
+        self.background_task_service = BackgroundTaskService(
+            store=self.store,
+            workspace_service=self.workspace_service,
+            run_service=self.run_service,
+            preview_service=self.preview_service,
+            check_runner=self.check_runner,
         )
         self.workbench_service = WorkbenchService(
             settings=self.settings,
@@ -102,6 +117,9 @@ class ServiceContainer:
             openai_client=self.openai_client,
             exec_policy_service=self.exec_policy_service,
             platform_db=self.platform_db,
+            run_protocol_service=self.run_protocol_service,
+            run_compaction_service=self.run_compaction_service,
+            background_task_service=self.background_task_service,
         )
         self.thread_service = ThreadService(
             self.platform_db,

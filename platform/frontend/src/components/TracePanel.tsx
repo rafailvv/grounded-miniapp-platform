@@ -1,11 +1,14 @@
-import type { RunTraceView, TraceBundleReport } from "../lib/api";
+import type { RunCompactionBoundaries, RunCompactionReport, RunProtocolReport, RunTraceView, TraceBundleReport } from "../lib/api";
 
 type TracePanelProps = {
   trace: RunTraceView | null;
   traceBundle: TraceBundleReport | null;
+  protocol: RunProtocolReport | null;
+  compaction: RunCompactionReport | null;
+  compactionBoundaries: RunCompactionBoundaries | null;
 };
 
-export function TracePanel({ trace, traceBundle }: TracePanelProps) {
+export function TracePanel({ trace, traceBundle, protocol, compaction, compactionBoundaries }: TracePanelProps) {
   if (!trace) {
     return (
       <div className="workbench-panel">
@@ -20,7 +23,25 @@ export function TracePanel({ trace, traceBundle }: TracePanelProps) {
   const reducer = trace.reducer || {};
   const bundleState = traceBundle?.state || {};
   const blockers = bundleState.blockers || [];
+  const promptContexts = bundleState.prompt_contexts || [];
+  const skillEdges = bundleState.skill_edges || [];
+  const memoryEdges = bundleState.memory_edges || [];
+  const diffEdges = bundleState.diff_edges || [];
+  const acceptanceGate = bundleState.acceptance_gate || [];
   const nextAction = bundleState.next_action || {};
+  const protocolEvents = protocol?.items || [];
+  const compactBoundaries = compactionBoundaries?.items || bundleState.compact_boundaries || [];
+  const compactionSections = compaction?.sections || {};
+  const microcompacts = (compactionSections.microcompacts as Array<Record<string, unknown>> | undefined) || [];
+  const postCompactRef = compaction?.post_compact_message_ref || String(compaction?.refs?.post_compact_message_ref || "");
+  const postCompactStatus = compaction?.post_compact_status || "missing";
+  const sectionCount = Object.keys(compactionSections).length;
+  const bookmarks = protocol?.bookmarks || [];
+  const latestBookmark = protocol?.latest_bookmark || bookmarks[0];
+  const protocolCounts = protocolEvents.reduce<Record<string, number>>((acc, event) => {
+    acc[event.type] = (acc[event.type] || 0) + 1;
+    return acc;
+  }, {});
   const sections = [
     ["Failed checks", reducer.failed_checks || []],
     ["Patches", reducer.patches || []],
@@ -60,7 +81,45 @@ export function TracePanel({ trace, traceBundle }: TracePanelProps) {
             <strong>{blockers.length}</strong>
             <span>blockers</span>
           </div>
+          <div>
+            <strong>{promptContexts.length}</strong>
+            <span>prompts</span>
+          </div>
+          <div>
+            <strong>{memoryEdges.length}</strong>
+            <span>memory</span>
+          </div>
+          <div>
+            <strong>{diffEdges.length}</strong>
+            <span>diffs</span>
+          </div>
+          <div>
+            <strong>{acceptanceGate.length}</strong>
+            <span>gates</span>
+          </div>
         </div>
+        {skillEdges.length || memoryEdges.length || acceptanceGate.length ? (
+          <div className="run-detail-list compact">
+            {skillEdges.slice(0, 3).map((item, index) => (
+              <div className="run-detail-item" key={`skill-edge-${index}`}>
+                <strong>{String(item.skill_id || "skill")}</strong>
+                <span>{String(item.reason || "")}</span>
+              </div>
+            ))}
+            {memoryEdges.slice(0, 3).map((item, index) => (
+              <div className="run-detail-item" key={`memory-edge-${index}`}>
+                <strong>{String(item.kind || item.source || "memory")}</strong>
+                <span>{String(item.reason || "")}</span>
+              </div>
+            ))}
+            {acceptanceGate.slice(-1).map((item, index) => (
+              <div className="run-detail-item" key={`gate-${index}`}>
+                <strong>acceptance gate</strong>
+                <span>{String(item.status || "recorded")}</span>
+              </div>
+            ))}
+          </div>
+        ) : null}
         {nextAction.action ? <p className="muted">Next: {String(nextAction.action)} · {String(nextAction.reason || "")}</p> : null}
         {blockers.length ? (
           <div className="run-detail-list compact">
@@ -71,6 +130,95 @@ export function TracePanel({ trace, traceBundle }: TracePanelProps) {
               </div>
             ))}
           </div>
+        ) : null}
+      </div>
+      <div className="workbench-panel">
+        <div className="workbench-panel-header">
+          <strong>Run protocol</strong>
+          <span>{protocol?.status || "missing"}</span>
+        </div>
+        <div className="trace-bundle-grid">
+          <div>
+            <strong>{protocolEvents.length}</strong>
+            <span>events</span>
+          </div>
+          <div>
+            <strong>{protocolCounts.turn_started || 0}</strong>
+            <span>turns</span>
+          </div>
+          <div>
+            <strong>{protocolCounts.tool_requested || 0}</strong>
+            <span>tools</span>
+          </div>
+          <div>
+            <strong>{bookmarks.length}</strong>
+            <span>bookmarks</span>
+          </div>
+        </div>
+        {latestBookmark ? (
+          <p className="muted">
+            Latest bookmark: {latestBookmark.bookmark_id} · {latestBookmark.turn_id || "turn unknown"}
+          </p>
+        ) : null}
+        <div className="timeline-list">
+          {protocolEvents.slice(-8).map((event) => (
+            <div className="timeline-event" key={event.event_id}>
+              <strong>{event.type}</strong>
+              <span>{event.status} · {event.turn_id || event.source_event_type || "run"}</span>
+            </div>
+          ))}
+          {!protocolEvents.length ? <p className="muted">No protocol events.</p> : null}
+        </div>
+      </div>
+      <div className="workbench-panel">
+        <div className="workbench-panel-header">
+          <strong>Compaction</strong>
+          <span>{compaction?.status || "missing"}</span>
+        </div>
+        <div className="trace-bundle-grid">
+          <div>
+            <strong>{compactBoundaries.length}</strong>
+            <span>boundaries</span>
+          </div>
+          <div>
+            <strong>{microcompacts.length}</strong>
+            <span>micro</span>
+          </div>
+          <div>
+            <strong>{String((compactionSections.context_pressure as Record<string, unknown> | undefined)?.pressure_ratio ?? "n/a")}</strong>
+            <span>pressure</span>
+          </div>
+          <div>
+            <strong>{compaction?.boundary_id ? "yes" : "no"}</strong>
+            <span>latest</span>
+          </div>
+          <div>
+            <strong>{postCompactStatus}</strong>
+            <span>post</span>
+          </div>
+          <div>
+            <strong>{sectionCount}</strong>
+            <span>sections</span>
+          </div>
+        </div>
+        {postCompactRef ? (
+          <p className="muted">
+            Post compact: {postCompactRef}
+            {compaction?.consumed_by_turn_id ? ` · consumed by ${compaction.consumed_by_turn_id}` : ""}
+          </p>
+        ) : null}
+        {microcompacts.length ? (
+          <div className="run-detail-list compact">
+            {microcompacts.slice(0, 3).map((item, index) => (
+              <div className="run-detail-item" key={`microcompact-${index}`}>
+                <strong>{String(item.tool || item.digest || "microcompact")}</strong>
+                <span>{String(item.ref || item.digest || "")}</span>
+              </div>
+            ))}
+          </div>
+        ) : null}
+        {(compactionSections.next_repair_action as Record<string, unknown> | undefined) ? (
+          <p className="muted">Next repair: {String((compactionSections.next_repair_action as Record<string, unknown>).failure_signature || (compactionSections.next_repair_action as Record<string, unknown>).required_next_tool || "recorded")}</p>
         ) : null}
       </div>
       {sections.map(([title, items]) => (

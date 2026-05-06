@@ -4,6 +4,7 @@ from typing import Any
 
 from app.models.common import GenerationMode
 from app.modules.miniapp_agent_loop.agent_worker_manager import AgentWorkerManager
+from app.modules.miniapp_agent_loop.product_workers import canonical_worker_id, legacy_worker_id, ownership_for_worker
 
 
 class AgentWorkerTaskPlanner:
@@ -54,16 +55,26 @@ class AgentWorkerTaskPlanner:
             worker_id = str(worker.get("worker") or "")
             owner_scope = str(worker.get("owner_scope") or "")
             path_prefixes = [str(item) for item in worker.get("path_prefixes") or []]
+            canonical_id = canonical_worker_id(worker_id)
+            legacy_id = legacy_worker_id(canonical_id)
+            ownership = dict(worker.get("ownership") or ownership_for_worker(canonical_id))
             tasks.append(
                 {
-                    "worker_id": worker_id,
+                    "worker_id": canonical_id,
+                    "legacy_worker_id": legacy_id,
+                    "worker_type": str(worker.get("worker_type") or canonical_id),
+                    "alias_ids": list(worker.get("alias_ids") or [legacy_id]),
                     "owner_scope": owner_scope,
                     "path_prefixes": path_prefixes,
+                    "ownership": ownership,
+                    "expected_proof": list(worker.get("expected_proof") or ownership.get("expected_proof") or []),
+                    "badge": str(worker.get("badge") or worker.get("status") or "planned"),
                     "mode_contract": mode_contract,
                     "prompt": cls._task_prompt(
-                        worker_id=worker_id,
+                        worker_id=canonical_id,
                         owner_scope=owner_scope,
                         path_prefixes=path_prefixes,
+                        ownership=ownership,
                         implementation_plan=implementation_plan,
                         mode_contract=mode_contract,
                     ),
@@ -84,13 +95,17 @@ class AgentWorkerTaskPlanner:
         worker_id: str,
         owner_scope: str,
         path_prefixes: list[str],
+        ownership: dict[str, Any],
         implementation_plan: dict[str, Any],
         mode_contract: dict[str, Any],
     ) -> str:
         plan_summary = str(implementation_plan.get("principle") or "plan, inspect, patch, verify, repair")
+        forbidden_paths = ", ".join(str(item) for item in ownership.get("forbidden_paths") or []) or "none"
+        expected_proof = ", ".join(str(item) for item in ownership.get("expected_proof") or []) or "owned self-check"
         return (
             f"You are worker `{worker_id}` responsible for {owner_scope}. "
             f"Own only these paths unless the coordinator explicitly asks for shared files: {', '.join(path_prefixes) or 'shared workspace slice'}. "
+            f"Forbidden paths for this worker: {forbidden_paths}. Expected proof: {expected_proof}. "
             f"Use the implementation plan ({plan_summary}) and the user's prompt-derived entities/actions as source of truth. "
             f"Mode depth is {mode_contract.get('depth')}: {mode_contract.get('workflow_bar')}; page organization: {mode_contract.get('page_bar')}; design bar: {mode_contract.get('design_bar')}. "
             "Use implementation_plan.routeable_screen_plan for screen intent guidance; choose concrete route names from the prompt and keep only screens that clarify the mobile workflow. "

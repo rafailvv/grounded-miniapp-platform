@@ -13,7 +13,7 @@ class RunStateMachine:
     """Single evaluator for run/job/gate/artifact consistency.
 
     The generator can finish through different code paths: the agent job, the
-    draft apply path, preview/browser proof, or a manual approval path. This
+    draft apply path, preview/browser proof, or blocked diagnostics. This
     reducer keeps the API-facing state honest without inventing recovery or
     switching execution modes.
     """
@@ -33,12 +33,8 @@ class RunStateMachine:
         artifacts_payload = dict(artifacts or {})
         browser_payload = dict(browser_proof or {})
         terminal = run.status in TERMINAL_RUN_STATUSES
-        manual_approval_ok = (
-            run.apply_strategy == "manual_approve"
-            and run.status == "awaiting_approval"
-            and run.apply_status == "awaiting_approval"
-        )
-        apply_ok = run.apply_status == "applied" or manual_approval_ok
+        manual_approval_ok = False
+        apply_ok = run.apply_status == "applied"
         gate_status = str(gate_payload.get("status") or "pending")
         gate_blocking = bool(gate_payload.get("blocking"))
         gate_issues = [item for item in gate_payload.get("issues") or [] if isinstance(item, dict)]
@@ -66,7 +62,7 @@ class RunStateMachine:
                 cls._issue(
                     "apply_status",
                     "apply_gate",
-                    "Terminal run is neither applied nor awaiting manual approval.",
+                    "Terminal run is not applied.",
                     {"run_status": run.status, "apply_status": run.apply_status},
                 )
             )
@@ -127,12 +123,12 @@ class RunStateMachine:
                     {"run_status": run.status, "apply_status": run.apply_status},
                 )
             )
-        if run.status == "awaiting_approval" and not manual_approval_ok:
+        if run.status == "awaiting_approval":
             issues.append(
                 cls._issue(
                     "manual_approval_mismatch",
                     "run_state",
-                    "A run can await approval only in manual mode with apply_status='awaiting_approval'.",
+                    "User-facing approval states are disabled; runs should auto-apply or block with diagnostics.",
                     {"apply_strategy": run.apply_strategy, "apply_status": run.apply_status},
                 )
             )
@@ -150,7 +146,7 @@ class RunStateMachine:
                 cls._issue(
                     "gate_passed_without_apply",
                     "apply_gate",
-                    "Reliability Gate passed but the run is not applied or awaiting manual approval.",
+                    "Reliability Gate passed but the run is not applied.",
                     {"run_status": run.status, "apply_status": run.apply_status},
                 )
             )

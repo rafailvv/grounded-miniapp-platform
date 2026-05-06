@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shutil
 import time
 from typing import Any
 
@@ -9,6 +10,8 @@ from fastapi.testclient import TestClient
 
 from app.main import create_app
 from app.models.domain import JobRecord, PreviewRecord, RunRecord
+from app.modules.miniapp_agent_loop.agent_command_policy import AgentCommandPolicy
+from app.modules.miniapp_agent_loop.agent_transcript import AgentTranscriptStore
 from app.services.repair_catalog import RepairCatalog
 from app.services.exec_policy_service import ExecPolicyService
 from app.services.tool_protocol import TOOL_PROTOCOL_VERSION, canonical_tool_name, tool_envelope
@@ -52,9 +55,228 @@ def test_exec_policy_loads_json_policy_and_validates_not_match_examples() -> Non
     snapshot = service.snapshot()
 
     assert snapshot["policy_file"]["status"] == "loaded"
+    assert str(snapshot["policy_file"]["source"]).endswith("agent_exec_policy.codexpolicy")
     assert any("not_match" in item for item in snapshot["rules"])
     assert service.evaluate_command("python3 -m py_compile miniapp/app/main.py")["decision"]["action"] == "allow"
     assert service.evaluate_command("python3 -m pip install requests")["decision"]["action"] == "forbidden"
+
+
+def test_exec_policy_dsl_severity_merge_and_matched_rules() -> None:
+    policy = AgentCommandPolicy.from_dsl_text(
+        """
+prefix_rule(
+    pattern = ["rg"],
+    decision = "allow",
+    justification = "read-only search",
+    match = ["rg api miniapp/app"],
+)
+prefix_rule(
+    pattern = ["rg", "secret"],
+    decision = "forbidden",
+    justification = "secret scans are blocked in this test policy",
+    match = ["rg secret miniapp/app"],
+    not_match = ["rg api miniapp/app"],
+)
+""",
+        source="test.codexpolicy",
+    )
+    decision = policy.decide("rg secret miniapp/app")
+
+    assert decision.action == "forbidden"
+    assert len(decision.matched_rules) == 2
+    assert decision.matched_rules[-1]["decision"] == "forbidden"
+    assert all(item["status"] == "passed" for item in policy.validation_examples())
+
+
+def test_exec_policy_dsl_rejects_invalid_rules_and_service_falls_back(tmp_path: Path) -> None:
+    policy_path = tmp_path / "agent_exec_policy.codexpolicy"
+    policy_path.write_text(
+        """
+prefix_rule(
+    pattern = ["rg"],
+    decision = "sometimes",
+    justification = "invalid",
+)
+""",
+        encoding="utf-8",
+    )
+
+    service = ExecPolicyService(policy_path)
+    doctor = service.doctor_check()
+
+    assert service.snapshot()["policy_file"]["status"] == "fallback_builtin"
+    assert doctor["status"] == "failed"
+    assert service.evaluate_command("rg api miniapp/app")["decision"]["action"] == "allow"
+
+
+def test_exec_policy_resolves_trusted_host_executable() -> None:
+    python_path = shutil.which("python3")
+    assert python_path
+    policy = AgentCommandPolicy.from_dsl_text(
+        """
+prefix_rule(
+    pattern = ["python3", "-m", "py_compile"],
+    decision = "allow",
+    justification = "compile diagnostics",
+    match = ["python3 -m py_compile miniapp/app/main.py"],
+)
+""",
+        source="host.codexpolicy",
+    )
+
+    trusted = policy.decide(f"{python_path} -m py_compile miniapp/app/main.py")
+    untrusted = policy.decide("/tmp/python3 -m py_compile miniapp/app/main.py")
+
+    assert trusted.action == "allow"
+    assert trusted.executable_resolution["status"] == "trusted_absolute"
+    assert untrusted.action == "forbidden"
+    assert untrusted.executable_resolution["status"] == "untrusted_absolute"
+
+
+def test_policy_simulation_endpoint_returns_matched_rules(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+
+    response = client.post("/policy/evaluate", json={"command": "python3 -m pip install requests"}).json()
+    doctor = client.get("/doctor").json()
+
+    assert response["decision"]["action"] == "forbidden"
+    assert response["matched_rules"]
+    assert response["selected_decision"] == "forbidden"
+    assert response["policy_file"]["status"] == "loaded"
+    assert any(item["name"] == "exec_policy" for item in doctor["checks"])
+
+
+def test_background_tasks_crud_output_stop_retry_and_run_lane(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Task Workspace",
+            "description": "background task test",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    run = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Build a workflow",
+        intent="edit",
+        target_role_scope=["client", "specialist", "manager"],
+        model_profile="test",
+    )
+    app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+
+    created = client.post(
+        "/tasks",
+        json={
+            "workspace_id": workspace["workspace_id"],
+            "run_id": run.run_id,
+            "type": "worker_branch",
+            "title": "Backend worker",
+            "input": {"worker_id": "backend_api"},
+            "max_attempts": 2,
+            "auto_start": False,
+        },
+    ).json()
+    listed = client.get(f"/tasks?workspace_id={workspace['workspace_id']}").json()
+    updated = client.patch(f"/tasks/{created['task_id']}", json={"status": "failed", "title": "Backend worker failed"}).json()
+    output = client.get(f"/tasks/{created['task_id']}/output?cursor=0&limit=2").json()
+    retry = client.post(f"/tasks/{created['task_id']}/retry").json()
+    lane = client.get(f"/runs/{run.run_id}/tasks").json()
+    stopped = client.post(f"/tasks/{created['task_id']}/stop").json()
+
+    assert created["status"] == "queued"
+    assert listed["items"][0]["task_id"] == created["task_id"]
+    assert updated["status"] == "failed"
+    assert output["items"][0]["event_type"] == "task_created"
+    assert output["next_cursor"] == 2
+    assert retry["parent_task_id"] == created["task_id"]
+    assert retry["attempt"] == 2
+    assert lane["items"][0]["source"] == "background"
+    assert any(item["artifact_refs"]["background_task"] == created["task_id"] for item in lane["items"])
+    assert stopped["status"] in {"cancelled", "failed", "stopping"}
+
+
+def test_background_task_memory_consolidate_completes(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Memory Task Workspace",
+            "description": "memory task test",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    app.state.container.store.upsert(
+        "reports",
+        f"memory_stage1:{workspace['workspace_id']}:run_1",
+        {
+            "workspace_id": workspace["workspace_id"],
+            "run_id": "run_1",
+            "items": [{"kind": "preference", "text": "Use compact operational UI.", "confidence": 0.9}],
+        },
+    )
+
+    created = client.post(
+        "/tasks",
+        json={
+            "workspace_id": workspace["workspace_id"],
+            "type": "memory_consolidate",
+            "title": "Consolidate memory",
+        },
+    ).json()
+    task = _wait_for_background_task(client, created["task_id"])
+    output = client.get(f"/tasks/{created['task_id']}/output").json()
+
+    assert task["status"] == "completed"
+    assert task["linked_refs"]["memory_ref"] == f"workspace_memory:{workspace['workspace_id']}"
+    assert any(item["event_type"] == "task_completed" for item in output["items"])
+
+
+def test_background_task_generate_product_links_created_run(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Generate Task Workspace",
+            "description": "generate task test",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+
+    def fake_create_run(workspace_id: str, request: Any) -> RunRecord:
+        run = RunRecord(
+            workspace_id=workspace_id,
+            prompt=request.prompt,
+            intent="edit",
+            target_role_scope=["client", "specialist", "manager"],
+            model_profile="test",
+        )
+        app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+        return run
+
+    app.state.container.run_service.create_run = fake_create_run
+
+    created = client.post(
+        "/tasks",
+        json={
+            "workspace_id": workspace["workspace_id"],
+            "type": "generate_product",
+            "title": "Generate product",
+            "input": {"prompt": "Build a simple workflow", "intent": "edit"},
+        },
+    ).json()
+    task = _wait_for_background_task(client, created["task_id"])
+
+    assert task["status"] == "completed"
+    assert task["run_id"]
+    assert task["linked_refs"]["run_id"] == task["run_id"]
 
 
 def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
@@ -78,7 +300,50 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
         model_profile="test",
         linked_job_id=None,
     )
+    run.worker_mailbox_ref = f"worker_mailbox:{workspace['workspace_id']}:{run.run_id}"
     app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+    app.state.container.store.upsert(
+        "reports",
+        run.worker_mailbox_ref,
+        {
+            "workspace_id": workspace["workspace_id"],
+            "run_id": run.run_id,
+            "mailbox": {
+                "enabled": False,
+                "workers": [
+                    {
+                        "worker_id": "backend_api_worker",
+                        "worker": "backend_api_worker",
+                        "worker_type": "backend_api_worker",
+                        "alias_ids": ["backend_api"],
+                        "status": "available_disabled",
+                        "disabled_reason": "test gate disabled",
+                    }
+                ],
+            },
+            "worker_tasks": [],
+        },
+    )
+    app.state.container.store.upsert(
+        "reports",
+        f"worker_context:{workspace['workspace_id']}:{run.run_id}:backend_api_worker",
+        {"schema": "grounded.worker_context.v1", "worker_id": "backend_api_worker", "contract_slice": {}},
+    )
+    app.state.container.store.upsert(
+        "reports",
+        f"worker_memory_snapshot:{workspace['workspace_id']}:{run.run_id}:backend_api_worker",
+        {"schema": "grounded.worker_memory_snapshot.v1", "worker_id": "backend_api_worker", "items": []},
+    )
+    app.state.container.store.upsert(
+        "reports",
+        f"worker_output:{workspace['workspace_id']}:{run.run_id}:backend_api_worker",
+        {"schema": "grounded.worker_output.v1", "worker_id": "backend_api_worker", "status": "available_disabled", "changed_files": []},
+    )
+    app.state.container.store.upsert(
+        "reports",
+        f"worker_manager_merge_decision:{workspace['workspace_id']}:{run.run_id}",
+        {"schema": "grounded.worker_manager_merge_decision.v1", "status": "empty", "decisions": []},
+    )
 
     policy = client.get("/system/policies/exec").json()
     evaluation = client.post(
@@ -89,6 +354,10 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
     trace = client.get(f"/runs/{run.run_id}/trace-view").json()
     trace_bundle = client.get(f"/runs/{run.run_id}/trace-bundle").json()
     trace_bundle_state = client.get(f"/runs/{run.run_id}/trace-bundle/state").json()
+    protocol = client.get(f"/runs/{run.run_id}/protocol").json()
+    bookmarks = client.get(f"/runs/{run.run_id}/bookmarks").json()
+    compaction = client.get(f"/runs/{run.run_id}/compaction").json()
+    compaction_boundaries = client.get(f"/runs/{run.run_id}/compaction/boundaries").json()
     tasks = client.get(f"/runs/{run.run_id}/tasks").json()
     run_events = client.get(f"/runs/{run.run_id}/events").json()
     doctor = client.get("/doctor").json()
@@ -101,8 +370,15 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
     consolidated_memory = client.post(f"/workspaces/{workspace['workspace_id']}/memory/consolidate").json()
     skills = client.get("/skills").json()
     workers = client.get(f"/runs/{run.run_id}/workers").json()
+    worker_context = client.get(f"/runs/{run.run_id}/workers/backend_api_worker/context").json()
+    worker_memory = client.get(f"/runs/{run.run_id}/workers/backend_api_worker/memory").json()
+    worker_output = client.get(f"/runs/{run.run_id}/workers/backend_api_worker/output").json()
+    worker_merge_decision = client.get(f"/runs/{run.run_id}/workers/merge-decision").json()
     permissions = client.get("/system/permissions/rules").json()
     lsp = client.get(f"/workspaces/{workspace['workspace_id']}/diagnostics/lsp").json()
+    lsp_symbols = client.get(f"/workspaces/{workspace['workspace_id']}/lsp/symbol-context?q=app").json()
+    lsp_refs = client.get(f"/workspaces/{workspace['workspace_id']}/lsp/references?symbol=app").json()
+    lsp_route_context = client.get(f"/workspaces/{workspace['workspace_id']}/lsp/route-static-context").json()
     thread = client.post("/threads", json={"workspace_id": workspace["workspace_id"], "title": "Workbench Thread"}).json()
     thread_snapshot = client.get(f"/threads/{thread['thread_id']}").json()
     resumed_thread = client.post(f"/threads/{thread['thread_id']}/resume").json()
@@ -127,6 +403,10 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
     assert trace["reducer"]["why"] == "Build a workflow"
     assert trace_bundle["schema"] == "grounded.trace_bundle.v1"
     assert trace_bundle_state["schema"] == "grounded.trace_bundle_state.v1"
+    assert protocol["schema"] == "grounded.run_protocol.v1"
+    assert bookmarks["schema"] == "grounded.run_bookmarks.v1"
+    assert compaction["schema"] == "grounded.run_compaction.v1"
+    assert compaction_boundaries["schema"] == "grounded.run_compaction_boundaries.v1"
     assert tasks["schema"] == "grounded.run_tasks.v1"
     assert run_events["schema"] == "grounded.run_events.v1"
     assert doctor["checks"]
@@ -136,10 +416,20 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
     assert consolidated_memory["pipeline"]["schema"] == "grounded.memory_pipeline.v1"
     assert any(item["id"] == "state-workflow" for item in skills["items"])
     assert any(item["id"] == "role-surfaces" for item in skills["items"])
-    assert any(item["worker_id"] == "backend_api" for item in workers["workers"])
+    assert workers["schema"] == "grounded.product_workers.v1"
+    assert any(item["worker_id"] == "backend_api_worker" and "backend_api" in item["alias_ids"] for item in workers["workers"])
     assert any(item["status"] == "available_disabled" for item in workers["workers"])
+    assert worker_context["schema"] == "grounded.worker_context.v1"
+    assert worker_memory["schema"] == "grounded.worker_memory_snapshot.v1"
+    assert worker_output["schema"] == "grounded.worker_output.v1"
+    assert worker_merge_decision["schema"] == "grounded.worker_manager_merge_decision.v1"
     assert any(item["rule_id"] == "block_destructive" for item in permissions["items"])
     assert lsp["status"] in {"passed", "failed"}
+    assert lsp["schema"] == "grounded.lsp_diagnostics.v1"
+    assert "jump" in lsp["items"][0] if lsp["items"] else True
+    assert lsp_symbols["schema"] == "grounded.lsp_symbol_context.v1"
+    assert lsp_refs["schema"] == "grounded.lsp_find_references.v1"
+    assert lsp_route_context["schema"] == "grounded.lsp_route_static_context.v1"
     assert thread_snapshot["thread"]["thread_id"] == thread["thread_id"]
     assert resumed_thread["status"] == "active"
     assert patch_preflight["status"] == "passed"
@@ -185,7 +475,235 @@ def test_run_events_are_persisted_by_platform_db(tmp_path: Path) -> None:
 
     assert events["items"][0]["event_type"] == "run.started"
     assert events["items"][0]["payload"]["source_event_type"] == "job_started"
+    assert events["protocol_events"][0]["type"] == "run_started"
+    assert events["protocol_events"][0]["source_event_type"] == "job_started"
     assert events["state_snapshots"][0]["reason"] == "job_started"
+
+
+def test_run_protocol_appends_events_and_bookmarks(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Protocol Workspace",
+            "description": "Protocol persistence",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    run = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Build a workflow",
+        intent="create",
+        target_role_scope=["client", "specialist", "manager"],
+        model_profile="test",
+        session_id="thread_test",
+    )
+    app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+    app.state.container.store.upsert("reports", "resume_checkpoint:test", {"status": "pending"})
+    app.state.container.run_protocol_service.append_event(
+        run_id=run.run_id,
+        workspace_id=run.workspace_id,
+        session_id=run.session_id,
+        event_type="turn_started",
+        status="started",
+        turn_id="turn_1_1",
+        message="Turn started.",
+    )
+    bookmark = app.state.container.run_protocol_service.create_bookmark(
+        run_id=run.run_id,
+        workspace_id=run.workspace_id,
+        turn_id="turn_1_1",
+        response_id="resp_123",
+        checkpoint_ref="resume_checkpoint:test",
+        trace_bundle_ref="trace_bundle:test",
+        diff_sha256_value=None,
+        tool_result_count=2,
+    )
+
+    protocol = client.get(f"/runs/{run.run_id}/protocol").json()
+    bookmarks = client.get(f"/runs/{run.run_id}/bookmarks").json()
+
+    assert protocol["items"][0]["schema"] == "grounded.run_protocol_event.v1"
+    assert protocol["items"][0]["turn_id"] == "turn_1_1"
+    assert protocol["latest_bookmark"]["response_id"] == "resp_123"
+    assert bookmarks["items"][0]["bookmark_id"] == bookmark["bookmark_id"]
+
+
+def test_resume_from_stale_bookmark_returns_structured_conflict(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Protocol Conflict",
+            "description": "Protocol resume conflict",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    run = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Build a workflow",
+        intent="create",
+        target_role_scope=["client", "specialist", "manager"],
+        model_profile="test",
+    )
+    app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+    bookmark = app.state.container.run_protocol_service.create_bookmark(
+        run_id=run.run_id,
+        workspace_id=run.workspace_id,
+        turn_id="turn_1_1",
+        response_id=None,
+        checkpoint_ref="missing_checkpoint",
+        trace_bundle_ref=None,
+        diff_sha256_value=None,
+    )
+
+    response = client.post(
+        f"/runs/{run.run_id}/resume-from-bookmark",
+        json={"bookmark_id": bookmark["bookmark_id"], "prompt": "Continue"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["details"]["detail"]["reason"] == "missing_checkpoint"
+
+
+def test_run_compaction_endpoint_records_contract_plan_and_protocol_boundary(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Compaction Workspace",
+            "description": "Compaction endpoint test",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    run = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Build a workflow",
+        intent="create",
+        target_role_scope=["client", "specialist", "manager"],
+        model_profile="test",
+        acceptance_contract={"required": True, "flows": [{"id": "create_item"}]},
+        implementation_plan={"steps": [{"id": "backend"}]},
+        touched_files=["miniapp/app/main.py"],
+        budget_status={"status": "ok"},
+        completion_budget={"turns": 4},
+        checks_summary={"validators": "passed", "build": "failed", "preview": "pending", "gate_status": "blocked", "issues": []},
+        resume_checkpoint_ref=f"resume_checkpoint:{workspace['workspace_id']}:run_compact_test",
+    )
+    app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+    app.state.container.store.upsert(
+        "reports",
+        run.resume_checkpoint_ref,
+        {
+            "latest_diff_summary": "diff --git a/miniapp/app/main.py b/miniapp/app/main.py",
+            "repair_packets": [{"failure_signature": "build.failed", "required_next_tool": "run_checks"}],
+            "todo_plan": [{"status": "in_progress", "step": "Fix build"}],
+            "pending_tool_result_count": 1,
+        },
+    )
+    app.state.container.store.upsert(
+        "reports",
+        f"run_artifacts:{run.run_id}",
+        {"check_results": [{"name": "frontend build", "status": "failed", "details": "syntax"}]},
+    )
+
+    compaction = client.post(f"/runs/{run.run_id}/compact").json()
+    boundaries = client.get(f"/runs/{run.run_id}/compaction/boundaries").json()
+    post_message = client.get(f"/runs/{run.run_id}/compaction/post-message/{compaction['boundary_id']}").json()
+    events = client.get(f"/runs/{run.run_id}/events").json()
+
+    assert compaction["schema"] == "grounded.run_compaction.v1"
+    assert compaction["sections"]["product_contract"]["acceptance_contract"]["required"] is True
+    assert compaction["sections"]["files_changed"]["touched_files"] == ["miniapp/app/main.py"]
+    assert compaction["sections"]["failing_checks"][0]["name"] == "frontend build"
+    assert compaction["sections"]["current_plan"]["todo_plan"][0]["step"] == "Fix build"
+    assert compaction["sections"]["next_repair_action"]["failure_signature"] == "build.failed"
+    assert compaction["sections"]["budget_status"]["completion_budget"]["turns"] == "4" or compaction["sections"]["budget_status"]["completion_budget"]["turns"] == 4
+    assert compaction["post_compact_message_ref"] == f"post_compact_message:{run.run_id}:{compaction['boundary_id']}"
+    assert compaction["post_compact_status"] == "pending"
+    assert post_message["schema"] == "grounded.post_compact_message.v1"
+    assert post_message["status"] == "pending"
+    assert post_message["sections"]["current_plan"]["todo_plan"][0]["step"] == "Fix build"
+    assert boundaries["items"][0]["boundary_id"] == compaction["boundary_id"]
+    assert boundaries["items"][0]["post_compact_message_ref"] == compaction["post_compact_message_ref"]
+    assert any(item["type"] == "compact_boundary" for item in events["protocol_events"])
+
+
+def test_agent_transcript_microcompacts_large_tool_results(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    service = app.state.container.run_compaction_service
+    transcript = AgentTranscriptStore()
+    run_key = "run_microcompact"
+    transcript.configure_microcompact(
+        run_key,
+        writer=lambda result, serialized: service.microcompact_tool_result(
+            workspace_id="ws_micro",
+            run_id=run_key,
+            tool_result=result,
+            serialized=serialized,
+        ),
+    )
+    large_result = {
+        "tool_use_id": "tool_1",
+        "tool": "read_files",
+        "status": "completed",
+        "content": "x" * 9000,
+    }
+
+    transcript.append_tool_results(run_key, [large_result])
+    snapshot = transcript.snapshot(run_key)
+    pending = snapshot["tool_result_messages"][0]
+    microcompact_ref = pending["microcompact_ref"]
+    stored = app.state.container.store.get("reports", microcompact_ref)
+
+    assert pending["tool_use_id"] == "tool_1"
+    assert "microcompact_ref" in pending["output"]
+    assert len(pending["output"]) < 4000
+    assert stored["schema"] == "grounded.microcompact.v1"
+    assert stored["original_chars"] > 6000
+
+
+def test_agent_transcript_queues_and_consumes_post_compact_message() -> None:
+    transcript = AgentTranscriptStore()
+    run_key = "run_post_compact"
+    transcript.append_post_compact_message(
+        run_key,
+        {
+            "boundary_id": "compact_1",
+            "ref": "post_compact_message:run_post_compact:compact_1",
+            "status": "pending",
+            "message": "{\"sections\":{\"current_plan\":[]}}",
+            "sections": {"current_plan": []},
+            "refs": {"compaction_ref": "run_compaction:run_post_compact"},
+        },
+    )
+
+    context = transcript.next_model_context(run_key)
+    assert context["post_compact_messages"][0]["boundary_id"] == "compact_1"
+    assert context["tool_result_messages"] == []
+
+    transcript.append_model_turn(
+        run_key,
+        attempt=1,
+        tool_round=0,
+        response_id="resp_1",
+        assistant_message="continue",
+        tool_calls=[],
+        model="test",
+        consumed_post_compact_count=1,
+        consumed_post_compact_refs=["post_compact_message:run_post_compact:compact_1"],
+    )
+    snapshot = transcript.snapshot(run_key)
+
+    assert snapshot["pending_post_compact_count"] == 0
+    assert snapshot["counts"]["post_compact_message"] == 1
+    assert snapshot["counts"]["post_compact_message_consumed"] == 1
 
 
 def test_workspace_memory_rejects_secret_like_text(tmp_path: Path) -> None:
@@ -714,6 +1232,76 @@ def test_reliability_gate_blocks_missing_browser_proof(tmp_path: Path) -> None:
     assert any(item["signature"] == "preview.browser_flow_failed" for item in repair["items"])
 
 
+def test_review_report_prioritizes_acceptance_blockers_with_locations(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Review Mode Workspace",
+            "description": "Review findings shape",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    run = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Build an operations workflow",
+        intent="create",
+        target_role_scope=["client", "specialist", "manager"],
+        model_profile="test",
+        status="blocked",
+        apply_status="blocked",
+        touched_files=["miniapp/app/static/client/app.js"],
+        acceptance_contract={"required": True},
+        checks_summary={
+            "validators": "failed",
+            "build": "passed",
+            "preview": "failed",
+            "gate_status": "blocked",
+            "issues": [
+                {
+                    "severity": "high",
+                    "code": "platform.workflow_selector_matches_no_html",
+                    "message": "Missing selector",
+                    "file_path": "miniapp/app/static/client/app.js",
+                    "line": 12,
+                    "blocking": True,
+                }
+            ],
+        },
+    )
+    app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+    app.state.container.store.upsert(
+        "reports",
+        f"run_artifacts:{run.run_id}",
+        {
+            "diff": "diff --git a/miniapp/app/static/client/app.js b/miniapp/app/static/client/app.js\n",
+            "check_results": [
+                {
+                    "name": "frontend_interaction_static_smoke",
+                    "status": "failed",
+                    "details": "Selector mismatch",
+                    "logs": [],
+                    "diagnostics": {"file_path": "miniapp/app/static/client/app.js", "line": 12},
+                }
+            ],
+        },
+    )
+
+    review = client.get(f"/runs/{run.run_id}/review").json()
+
+    assert review["schema"] == "grounded.review_report.v2"
+    assert review["status"] == "failed"
+    assert review["summary"]["blocker_count"] >= 2
+    assert review["summary"]["missing_tests"] >= 1
+    assert review["summary"]["browser_proof_gaps"] >= 1
+    assert review["summary"]["contract_mismatches"] >= 1
+    assert review["findings"][0]["is_blocker_for_product_acceptance"] is True
+    assert any(item["category"] == "stale_test_risk" for item in review["findings"])
+    assert any(item.get("file_path") == "miniapp/app/static/client/app.js" and item.get("line") == 12 for item in review["findings"])
+
+
 def test_repair_catalog_extracts_nested_workflow_evidence() -> None:
     packets = RepairCatalog.classify_many(
         [
@@ -880,6 +1468,17 @@ def _workspace_with_run(tmp_path: Path) -> tuple[Any, TestClient, dict, RunRecor
     return app, client, workspace, run
 
 
+def _wait_for_background_task(client: TestClient, task_id: str, timeout: float = 5.0) -> dict[str, Any]:
+    latest: dict[str, Any] = {}
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        latest = client.get(f"/tasks/{task_id}").json()
+        if latest.get("status") in {"completed", "failed", "blocked", "cancelled"}:
+            return latest
+        time.sleep(0.05)
+    return latest
+
+
 def _wait_for_exec_output(service: Any, process_id: str) -> dict[str, Any]:
     output: dict[str, Any] = {}
     for _ in range(30):
@@ -901,24 +1500,23 @@ def _wait_for_exec_session(app: Any, process_id: str) -> dict[str, Any]:
     return session
 
 
-def test_approval_rejection_blocks_and_appears_in_timeline(tmp_path: Path) -> None:
+def test_policy_decision_auto_accepts_without_user_approval(tmp_path: Path) -> None:
     _app, client, workspace, run = _workspace_with_run(tmp_path)
 
     evaluation = client.post(
         f"/workspaces/{workspace['workspace_id']}/policy/evaluate-command",
         json={"command": "rg FastAPI miniapp/app", "preset": "strict_manual", "run_id": run.run_id},
     ).json()
-    approval_id = evaluation["approval"]["approval_id"]
 
     approvals = client.get(f"/runs/{run.run_id}/approvals").json()
-    rejected = client.post(f"/runs/{run.run_id}/approvals/{approval_id}/reject").json()
     events = client.get(f"/runs/{run.run_id}/tool-events").json()
     timeline = client.get(f"/runs/{run.run_id}/timeline").json()
 
-    assert approvals["items"][0]["status"] == "pending"
-    assert rejected["status"] == "rejected"
+    assert evaluation["approval"]["required"] is False
+    assert evaluation["approval"]["approval_id"] is None
+    assert approvals["items"] == []
     assert any(item["tool"] == "policy.evaluate" for item in events["events"])
-    assert any(item["kind"] == "approval" and item["status"] == "rejected" for item in timeline["items"])
+    assert not any(item["kind"] == "approval" for item in timeline["items"])
 
 
 def test_staged_apply_commits_only_selected_files_and_discard_restores_draft(tmp_path: Path) -> None:

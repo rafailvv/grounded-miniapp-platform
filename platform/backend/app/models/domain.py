@@ -262,6 +262,39 @@ class JobRecord(StrictModel):
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
+
+BackgroundTaskType = Literal[
+    "generate_product",
+    "repair_failed_run",
+    "browser_verify",
+    "memory_consolidate",
+    "worker_branch",
+    "preview_rebuild",
+]
+BackgroundTaskStatus = Literal["queued", "running", "stopping", "completed", "failed", "blocked", "cancelled"]
+
+
+class BackgroundTaskRecord(StrictModel):
+    task_id: str = Field(default_factory=lambda: new_id("task"))
+    workspace_id: str
+    run_id: str | None = None
+    parent_task_id: str | None = None
+    type: BackgroundTaskType
+    status: BackgroundTaskStatus = "queued"
+    title: str
+    owner: str = "agent"
+    input: dict[str, Any] = Field(default_factory=dict)
+    output_summary: str | None = None
+    error: str | None = None
+    attempt: int = 1
+    max_attempts: int = 1
+    linked_refs: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=utc_now)
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
 class PreviewRecord(StrictModel):
     preview_id: str = Field(default_factory=lambda: new_id("preview"))
     workspace_id: str
@@ -336,6 +369,9 @@ class GenerateRequest(StrictModel):
     model_profile: str = ""
     linked_run_id: str | None = None
     resume_from_run_id: str | None = None
+    session_id: str | None = None
+    resume_bookmark_id: str | None = None
+    forked_from_run_id: str | None = None
     error_context: ErrorContext | None = None
 
 
@@ -520,6 +556,9 @@ class RunRecord(StrictModel):
     outcome_kind: Literal["applied", "warnings", "blocked_generation", "blocked_preview_infra", "noop_generation_failure"] | None = None
     linked_job_id: str | None = None
     resume_from_run_id: str | None = None
+    session_id: str | None = None
+    resume_bookmark_id: str | None = None
+    forked_from_run_id: str | None = None
     source_revision_id: str | None = None
     result_revision_id: str | None = None
     candidate_revision_id: str | None = None
@@ -627,4 +666,7 @@ class CreateRunRequest(StrictModel):
     preview_profile: PreviewProfile = PreviewProfile.TELEGRAM_MOCK
     generation_mode: GenerationMode = GenerationMode.BALANCED
     resume_from_run_id: str | None = None
+    session_id: str | None = None
+    resume_bookmark_id: str | None = None
+    forked_from_run_id: str | None = None
     error_context: ErrorContext | None = None

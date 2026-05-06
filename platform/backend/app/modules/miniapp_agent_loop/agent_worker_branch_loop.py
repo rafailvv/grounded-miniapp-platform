@@ -21,6 +21,7 @@ from app.modules.miniapp_agent_loop.agent_tool_changes import (
 from app.modules.miniapp_agent_loop.agent_tool_registry import AgentToolRegistry
 from app.modules.miniapp_agent_loop.agent_transcript import AgentTranscriptStore
 from app.modules.miniapp_agent_loop.agent_worker_manager import AgentWorkerManager
+from app.modules.miniapp_agent_loop.product_workers import canonical_worker_id, legacy_worker_id, path_is_allowed
 from app.modules.miniapp_agent_loop.edit_validator import AgentEditValidator
 from app.modules.miniapp_agent_loop.semantic_tools import semantic_scan
 from app.modules.miniapp_agent_loop.agent_tool_runtime import normalize_tool_calls
@@ -515,7 +516,7 @@ class AgentWorkerBranchLoop:
             )
 
     def _owned_completion_missing(self, worker_id: str, branch_source: Path) -> list[str]:
-        worker = str(worker_id or "").strip()
+        worker = legacy_worker_id(worker_id)
         missing: list[str] = []
         if worker in {"client_ui", "specialist_ui", "manager_ui"}:
             role = worker.removesuffix("_ui")
@@ -618,12 +619,13 @@ class AgentWorkerBranchLoop:
 
     @staticmethod
     def _role_surface_isolation_errors(worker_id: str, item: DraftAction) -> list[str]:
-        if worker_id not in {"client_ui", "specialist_ui", "manager_ui"}:
+        legacy_worker = legacy_worker_id(worker_id)
+        if legacy_worker not in {"client_ui", "specialist_ui", "manager_ui"}:
             return []
         normalized = str(item.file_path or "").strip().replace("\\", "/")
         if not normalized.endswith((".html", ".js")):
             return []
-        role = worker_id.removesuffix("_ui")
+        role = legacy_worker.removesuffix("_ui")
         if f"miniapp/app/static/{role}/" not in normalized:
             return []
         text = f"{item.content or ''}\n{item.diff or ''}".lower()
@@ -658,6 +660,10 @@ class AgentWorkerBranchLoop:
 
     @staticmethod
     def _worker_can_write(worker_id: str, path: str) -> bool:
+        canonical = canonical_worker_id(worker_id)
+        if path_is_allowed(canonical, path):
+            return True
+        worker_id = legacy_worker_id(worker_id)
         owner = AgentWorkerManager.owner_for_path(path)
         if owner == worker_id:
             return True

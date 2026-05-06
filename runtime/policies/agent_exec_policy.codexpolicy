@@ -1,0 +1,194 @@
+# Grounded agent command execution policy.
+# This DSL is intentionally small and startup-validated through match/not_match examples.
+
+prefix_rule(
+    pattern = ["python", "-m", "unittest"],
+    decision = "allow",
+    justification = "Python unit diagnostics are allowed inside the draft workspace.",
+    match = [
+        "python -m unittest discover",
+    ],
+    not_match = [
+        "python -m pip install fastapi",
+    ],
+)
+
+prefix_rule(
+    pattern = ["python3", "-m", "unittest"],
+    decision = "allow",
+    justification = "Python 3 unit diagnostics are allowed inside the draft workspace.",
+    match = [
+        "python3 -m unittest discover",
+    ],
+    not_match = [
+        "python3 -m pip install fastapi",
+    ],
+)
+
+prefix_rule(
+    pattern = ["python", "-m", "py_compile"],
+    decision = "allow",
+    justification = "Python compile diagnostics are allowed inside the draft workspace.",
+    match = [
+        "python -m py_compile miniapp/app/main.py",
+    ],
+    not_match = [
+        "python -m pip install requests",
+    ],
+)
+
+prefix_rule(
+    pattern = ["python3", "-m", "py_compile"],
+    decision = "allow",
+    justification = "Python 3 compile diagnostics are allowed inside the draft workspace.",
+    match = [
+        "python3 -m py_compile miniapp/app/main.py",
+    ],
+    not_match = [
+        "python3 -m pip install requests",
+    ],
+)
+
+prefix_rule(
+    pattern = ["node", "--check"],
+    decision = "allow",
+    justification = "Node syntax diagnostics are allowed inside the draft workspace.",
+    match = [
+        "node --check miniapp/app/static/client/app.js",
+    ],
+    not_match = [
+        "node server.js",
+    ],
+)
+
+prefix_rule(
+    pattern = ["node", "--test"],
+    decision = "allow",
+    justification = "Node test diagnostics are allowed inside the draft workspace.",
+    match = [
+        "node --test tests/generated_app.test.mjs",
+    ],
+    not_match = [
+        "node server.js",
+    ],
+)
+
+prefix_rule(
+    pattern = ["rg"],
+    decision = "allow",
+    justification = "Ripgrep workspace inspection is read-only.",
+    match = [
+        ["rg", "api", "miniapp/app"],
+    ],
+    not_match = [
+        "rm -rf miniapp",
+    ],
+)
+
+prefix_rule(
+    pattern = ["sed"],
+    decision = "allow",
+    justification = "Read-only sed workspace inspection is allowed.",
+    match = [
+        "sed -n 1,40p miniapp/app/main.py",
+    ],
+    not_match = [
+        "rm -rf miniapp",
+    ],
+)
+
+prefix_rule(
+    pattern = ["ls"],
+    decision = "allow",
+    justification = "Directory listing is read-only.",
+    match = [
+        "ls miniapp/app",
+    ],
+    not_match = [
+        "rm -rf miniapp",
+    ],
+)
+
+prefix_rule(
+    pattern = ["python", "-m", "pip", "install"],
+    decision = "forbidden",
+    justification = "Package installation is not an agent diagnostic command.",
+    match = [
+        "python -m pip install requests",
+    ],
+    not_match = [
+        "python -m py_compile miniapp/app/main.py",
+    ],
+)
+
+prefix_rule(
+    pattern = ["python3", "-m", "pip", "install"],
+    decision = "forbidden",
+    justification = "Package installation is not an agent diagnostic command.",
+    match = [
+        "python3 -m pip install requests",
+    ],
+    not_match = [
+        "python3 -m py_compile miniapp/app/main.py",
+    ],
+)
+
+prefix_rule(
+    pattern = ["npm", "install"],
+    decision = "forbidden",
+    justification = "Package installation is not an agent diagnostic command.",
+    match = [
+        "npm install",
+    ],
+    not_match = [
+        "node --check miniapp/app/static/client/app.js",
+    ],
+)
+
+prefix_rule(
+    pattern = ["npm", "i"],
+    decision = "forbidden",
+    justification = "Package installation is not an agent diagnostic command.",
+    match = [
+        "npm i",
+    ],
+    not_match = [
+        "node --test tests/generated_app.test.mjs",
+    ],
+)
+
+prefix_rule(
+    pattern = ["rm"],
+    decision = "forbidden",
+    justification = "Destructive filesystem commands are blocked.",
+    match = [
+        "rm -rf miniapp",
+    ],
+    not_match = [
+        "rg api miniapp/app",
+    ],
+)
+
+prefix_rule(
+    pattern = ["curl"],
+    decision = "forbidden",
+    justification = "Direct network commands are blocked in agent diagnostics.",
+    match = [
+        "curl https://example.com",
+    ],
+    not_match = [
+        "git status",
+    ],
+)
+
+prefix_rule(
+    pattern = ["wget"],
+    decision = "forbidden",
+    justification = "Direct network commands are blocked in agent diagnostics.",
+    match = [
+        "wget https://example.com",
+    ],
+    not_match = [
+        "git status",
+    ],
+)

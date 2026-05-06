@@ -4,7 +4,6 @@ import re
 from pathlib import PurePosixPath
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
 from app.modules.miniapp_agent_loop.agent_command_policy import (
     DEFAULT_COMMAND_POLICY,
@@ -21,8 +20,8 @@ APPROVAL_PRESETS: dict[str, dict[str, Any]] = {
         "auto_approve_risks": [],
     },
     "safe_auto": {
-        "description": "Auto-approve safe read-only diagnostics; require approval for mutations and network.",
-        "auto_approve_risks": ["safe", "read_only"],
+        "description": "Auto-accept permitted local diagnostics and draft mutations; forbidden commands remain blocked.",
+        "auto_approve_risks": ["safe", "read_only", "mutating"],
     },
     "workspace_trusted": {
         "description": "Trust workspace-scoped diagnostics and draft writes; still block destructive and external network operations.",
@@ -71,11 +70,15 @@ class ExecPolicyService:
         self.policy_source = str(policy_path) if policy_path else "builtin"
         self.policy_status = "builtin"
         self.policy_errors: list[str] = []
+        self.policy_validation: list[dict[str, Any]] = []
         self.policy = DEFAULT_COMMAND_POLICY
-        if policy_path is not None and policy_path.exists():
+        selected_path = self._select_policy_path(policy_path)
+        if selected_path is not None and selected_path.exists():
+            self.policy_source = str(selected_path)
             try:
-                loaded = AgentCommandPolicy.from_rule_file(policy_path)
+                loaded = AgentCommandPolicy.from_dsl_file(selected_path) if selected_path.suffix == ".codexpolicy" else AgentCommandPolicy.from_rule_file(selected_path)
                 examples = loaded.validation_examples()
+                self.policy_validation = examples
                 failed = [item for item in examples if item.get("status") != "passed"]
                 if failed:
                     raise ValueError(f"Policy examples failed: {failed[:3]}")
@@ -86,6 +89,17 @@ class ExecPolicyService:
                 self.policy_status = "fallback_builtin"
                 self.policy = DEFAULT_COMMAND_POLICY
         configure_default_command_policy(self.policy)
+
+    @staticmethod
+    def _select_policy_path(policy_path: Path | None) -> Path | None:
+        if policy_path is None:
+            return None
+        if policy_path.suffix == ".codexpolicy":
+            return policy_path if policy_path.exists() else None
+        dsl_path = policy_path.with_suffix(".codexpolicy")
+        if dsl_path.exists():
+            return dsl_path
+        return policy_path if policy_path.exists() else None
 
     def snapshot(self) -> dict[str, Any]:
         payload = self.policy.snapshot()
@@ -106,6 +120,7 @@ class ExecPolicyService:
                     "source": self.policy_source,
                     "status": self.policy_status,
                     "errors": list(self.policy_errors),
+                    "validation": list(self.policy_validation),
                 },
             }
         )
@@ -118,9 +133,36 @@ class ExecPolicyService:
         return {
             "tool_protocol_version": TOOL_PROTOCOL_VERSION,
             "command": self.redact(command),
+            "argv": [self.redact(item) for item in decision.argv],
+            "resolved_executable": decision.executable_resolution,
+            "matched_rules": [self._redact_rule(item) for item in decision.matched_rules],
+            "selected_decision": decision.action,
             "decision": self._decision_payload(decision, risk=risk),
             "approval": approval,
             "sandbox_summary": self.sandbox_summary(decision, risk=risk, preset=preset),
+            "policy_file": {
+                "source": self.policy_source,
+                "status": self.policy_status,
+                "errors": list(self.policy_errors),
+            },
+        }
+
+    def doctor_check(self) -> dict[str, Any]:
+        snapshot = self.snapshot()
+        examples = [item for item in snapshot.get("examples") or [] if isinstance(item, dict)]
+        failed = [item for item in examples if item.get("status") != "passed"]
+        policy_file = snapshot.get("policy_file") if isinstance(snapshot.get("policy_file"), dict) else {}
+        status = "failed" if policy_file.get("status") == "fallback_builtin" or failed else "passed"
+        if policy_file.get("status") == "builtin":
+            status = "warning"
+        return {
+            "name": "exec_policy",
+            "status": status,
+            "details": str(policy_file.get("source") or "builtin"),
+            "required": True,
+            "policy_file": policy_file,
+            "failed_examples": failed[:12],
+            "matched_rule_count": len(snapshot.get("rules") or []),
         }
 
     def validate_workspace_path(self, path: str, *, operation: str) -> dict[str, Any]:
@@ -187,13 +229,13 @@ class ExecPolicyService:
         resolved_preset = preset if preset in APPROVAL_PRESETS else "safe_auto"
         if decision.action == "forbidden" or risk == "forbidden":
             return {"required": False, "status": "blocked", "preset": resolved_preset, "approval_id": None}
-        required = risk not in APPROVAL_PRESETS[resolved_preset]["auto_approve_risks"] or decision.action == "prompt"
+        required = False
         return {
             "required": required,
-            "status": "pending" if required else "not_required",
+            "status": "not_required",
             "preset": resolved_preset,
-            "approval_id": f"approval_{uuid4().hex}" if required else None,
-            "actions": ["approve_once", "approve_prefix", "reject"] if required else [],
+            "approval_id": None,
+            "actions": [],
         }
 
     def _decision_payload(self, decision: CommandPolicyDecision, *, risk: ToolRisk) -> dict[str, Any]:
@@ -205,6 +247,14 @@ class ExecPolicyService:
             "argv": [self.redact(item) for item in decision.argv],
             "matched_prefix": list(decision.matched_prefix),
             "cwd_policy": decision.cwd_policy,
+            "matched_rules": [self._redact_rule(item) for item in decision.matched_rules],
+            "executable_resolution": decision.executable_resolution,
+        }
+
+    def _redact_rule(self, item: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: self.redact(value) if isinstance(value, str) else value
+            for key, value in item.items()
         }
 
     @staticmethod

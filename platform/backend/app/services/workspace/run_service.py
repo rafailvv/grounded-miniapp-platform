@@ -34,6 +34,7 @@ from app.repositories.state_store import StateStore
 from app.services.check_runner import CheckRunner
 from app.services.memory_pipeline import WorkspaceMemoryPipeline
 from app.services.miniapp_contract import MiniAppContractCompiler
+from app.services.run_protocol import RunProtocolService
 from app.services.run_state_machine import RunStateMachine
 from app.services.workflow_acceptance import build_acceptance_contract, build_implementation_plan, orchestration_metadata_for_contract
 from app.services.workspace.log_service import WorkspaceLogService
@@ -111,6 +112,7 @@ class RunService:
         check_runner: CheckRunner,
         openai_client: OpenAIClient,
         workspace_log_service: WorkspaceLogService,
+        run_protocol_service: RunProtocolService | None = None,
     ) -> None:
         self.store = store
         self.workspace_service = workspace_service
@@ -119,6 +121,7 @@ class RunService:
         self.check_runner = check_runner
         self.openai_client = openai_client
         self.workspace_log_service = workspace_log_service
+        self.run_protocol_service = run_protocol_service
         self._active_workers: dict[str, threading.Thread] = {}
         self._startup_started_at = datetime.now(timezone.utc)
         self._recover_orphaned_active_runs()
@@ -170,6 +173,9 @@ class RunService:
             model_profile=effective_model_profile,
             linked_run_id=None,
             resume_from_run_id=request.resume_from_run_id,
+            session_id=request.session_id,
+            resume_bookmark_id=request.resume_bookmark_id,
+            forked_from_run_id=request.forked_from_run_id,
             error_context=request.error_context,
         )
         focused_edit_kind = WorkspaceCodeAgentRuntime._focused_edit_kind(contract_probe)
@@ -220,14 +226,17 @@ class RunService:
             prompt=request.prompt,
             mode=request.mode,
             intent=resolved_intent,
-            apply_strategy=request.apply_strategy,
-            approval_required=request.apply_strategy == "manual_approve",
+            apply_strategy="staged_auto_apply",
+            approval_required=False,
             target_role_scope=resolved_role_scope,
             model_profile=effective_model_profile,
             generation_mode=effective_generation_mode,
             llm_provider=(self.openai_client.configuration().get("routing") or {}).get("provider") if self.openai_client.enabled else None,
             llm_model=prompt_analysis_model,
             resume_from_run_id=request.resume_from_run_id,
+            session_id=request.session_id or workspace_id,
+            resume_bookmark_id=request.resume_bookmark_id,
+            forked_from_run_id=request.forked_from_run_id,
             source_revision_id=workspace.current_revision_id,
             error_context=request.error_context,
             implementation_plan=implementation_plan,
@@ -291,6 +300,37 @@ class RunService:
                 },
             )
         self._save_run(run)
+        if self.run_protocol_service is not None:
+            self.run_protocol_service.append_event(
+                run_id=run.run_id,
+                workspace_id=run.workspace_id,
+                session_id=run.session_id,
+                event_type="session_configured",
+                status="completed",
+                message="Run session context configured.",
+                payload={
+                    "workspace_id": workspace_id,
+                    "session_id": run.session_id,
+                    "resume_from_run_id": run.resume_from_run_id,
+                    "resume_bookmark_id": run.resume_bookmark_id,
+                    "forked_from_run_id": run.forked_from_run_id,
+                },
+            )
+            self.run_protocol_service.append_event(
+                run_id=run.run_id,
+                workspace_id=run.workspace_id,
+                session_id=run.session_id,
+                event_type="run_started",
+                status="started",
+                message="Run record created.",
+                payload={
+                    "mode": run.mode,
+                    "intent": run.intent,
+                    "generation_mode": str(getattr(run.generation_mode, "value", run.generation_mode)),
+                    "model_profile": run.model_profile,
+                    "apply_strategy": run.apply_strategy,
+                },
+            )
         self.store.delete("reports", f"run_stop_request:{run.run_id}")
         if wait:
             self._active_workers[run.run_id] = threading.current_thread()
@@ -1151,17 +1191,11 @@ class RunService:
         if job.status == "completed":
             applied_by_job = str(job.outcome_kind or "") == "applied" or bool((job.apply_result or {}).get("revision_id"))
             applied_by_run = run.apply_status == "applied"
-            awaiting_review = run.apply_strategy == "manual_approve" and run.apply_status == "awaiting_approval"
             if applied_by_job or applied_by_run:
                 snapshot.status = "completed"
                 snapshot.apply_status = "applied"
                 snapshot.current_stage = "completed"
                 snapshot.progress_percent = 100
-            elif awaiting_review:
-                snapshot.status = "awaiting_approval"
-                snapshot.apply_status = "awaiting_approval"
-                snapshot.current_stage = "awaiting review"
-                snapshot.progress_percent = 99
             else:
                 return None
         elif job.status == "blocked":
@@ -1339,6 +1373,9 @@ class RunService:
                 model_profile=effective_model_profile,
                 linked_run_id=run.run_id,
                 resume_from_run_id=request.resume_from_run_id,
+                session_id=run.session_id,
+                resume_bookmark_id=request.resume_bookmark_id,
+                forked_from_run_id=request.forked_from_run_id,
                 error_context=request.error_context,
             )
             with self.openai_client.workspace_logging(run.workspace_id):
@@ -1471,13 +1508,6 @@ class RunService:
                     )
                     if not meaningful_paths:
                         self._mark_run_without_meaningful_diff(run, job)
-                    elif run.apply_strategy == "manual_approve":
-                        run.status = "awaiting_approval"
-                        run.apply_status = "awaiting_approval"
-                        run.draft_status = "ready"
-                        run.draft_ready = True
-                        run.current_stage = "awaiting review"
-                        run.progress_percent = 99
                     else:
                         self._apply_completed_draft(run, message="Applying generated draft to the source workspace.")
                         self._clear_successful_completion_metadata(run=run, job=job)
@@ -1572,6 +1602,8 @@ class RunService:
                 message="Run finished.",
                 payload={"run_id": run.run_id, "status": run.status, "apply_status": run.apply_status},
             )
+            if self.run_protocol_service is not None:
+                self.run_protocol_service.append_once_terminal(run, source_event_type="run_service_finished")
             if run.status == "completed" and run.apply_status == "applied":
                 self._queue_resume_generation_from_checkpoint_if_needed(run, request)
         except Exception as exc:
@@ -1622,6 +1654,8 @@ class RunService:
                     "traceback": traceback.format_exc(),
                 },
             )
+            if self.run_protocol_service is not None:
+                self.run_protocol_service.append_once_terminal(run, source_event_type="run_service_exception")
             logger.exception("run_failed run_id=%s workspace_id=%s", run.run_id, run.workspace_id)
         finally:
             self._active_workers.pop(run_id, None)
@@ -1929,6 +1963,9 @@ class RunService:
             preview_profile=str(checkpoint.get("preview_profile") or "telegram_mock"),
             generation_mode=str(checkpoint.get("generation_mode") or getattr(run.generation_mode, "value", run.generation_mode)),
             resume_from_run_id=source_run_id or None,
+            session_id=run.session_id,
+            resume_bookmark_id=run.resume_bookmark_id,
+            forked_from_run_id=run.forked_from_run_id,
         )
         resumed_run = self.create_run(run.workspace_id, resume_request)
         checkpoint["status"] = "resumed"

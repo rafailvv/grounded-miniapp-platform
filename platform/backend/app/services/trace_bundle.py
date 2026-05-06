@@ -174,6 +174,11 @@ class TraceBundleReducer:
         turns: list[dict[str, Any]] = []
         artifacts: list[dict[str, Any]] = []
         payload_refs: list[dict[str, Any]] = []
+        prompt_contexts: list[dict[str, Any]] = []
+        skill_edges: list[dict[str, Any]] = []
+        memory_edges: list[dict[str, Any]] = []
+        diff_edges: list[dict[str, Any]] = []
+        acceptance_gate: list[dict[str, Any]] = []
         for raw in raw_events:
             payload = TraceBundleReducer._read_json(bundle_dir / str(raw.get("payload_ref") or ""))
             event = {**raw, "payload": payload}
@@ -191,12 +196,44 @@ class TraceBundleReducer:
             TraceBundleReducer._collect_files(changed_files, payload)
             if event_type in {"agent_turn_started", "iteration_ready"}:
                 turns.append(TraceBundleReducer._compact_event(event))
+            if event_type in {"prompt_context_pack", "model_prompt_response"}:
+                prompt_contexts.append(TraceBundleReducer._compact_event(event))
+                if event_type == "prompt_context_pack":
+                    skills = payload.get("skills") if isinstance(payload, dict) and isinstance(payload.get("skills"), dict) else {}
+                    memory = payload.get("memory") if isinstance(payload, dict) and isinstance(payload.get("memory"), dict) else {}
+                    skill_edges.extend(
+                        {
+                            "event_seq": raw.get("seq"),
+                            "skill_id": item.get("id"),
+                            "reason": item.get("activation_reason"),
+                            "score": item.get("activation_score"),
+                        }
+                        for item in (skills.get("selected") or [])
+                        if isinstance(item, dict)
+                    )
+                    memory_edges.extend(
+                        {
+                            "event_seq": raw.get("seq"),
+                            "source": item.get("source"),
+                            "kind": item.get("kind"),
+                            "reason": item.get("reason"),
+                            "text_excerpt": item.get("text_excerpt"),
+                        }
+                        for item in [*(memory.get("injected") or []), *(memory.get("skipped") or [])]
+                        if isinstance(item, dict)
+                    )
             if "tool" in details or event_type in {"tool_use_summary", "tool_progress"}:
+                tool_calls.append(TraceBundleReducer._compact_event(event))
+            if event_type == "tool_failed_reason":
                 tool_calls.append(TraceBundleReducer._compact_event(event))
             if details.get("artifact_ref"):
                 artifacts.append({"event_seq": raw.get("seq"), "artifact_ref": details.get("artifact_ref"), "event_type": event_type})
+            if event_type in {"turn_diff_before", "turn_diff_after"}:
+                diff_edges.append(TraceBundleReducer._compact_event(event))
+            if event_type == "final_acceptance_gate_decision":
+                acceptance_gate.append(TraceBundleReducer._compact_event(event))
             status = str(details.get("status") or payload.get("status") or "").lower() if isinstance(payload, dict) else ""
-            if status in {"failed", "blocked", "conflict"} or event_type in {"job_failed", "worker_failed"}:
+            if status in {"failed", "blocked", "conflict", "forbidden", "error"} or event_type in {"job_failed", "worker_failed", "tool_failed_reason"}:
                 blockers.append(TraceBundleReducer._compact_event(event))
             if event_type in {"preview_validation_started", "verification_worker", "checks_completed"}:
                 proof_edges.append(TraceBundleReducer._compact_event(event))
@@ -215,6 +252,11 @@ class TraceBundleReducer:
             "event_count": len(events),
             "turns": turns[-80:],
             "tool_calls": tool_calls[-160:],
+            "prompt_contexts": prompt_contexts[-120:],
+            "skill_edges": skill_edges[-120:],
+            "memory_edges": memory_edges[-160:],
+            "diff_edges": diff_edges[-120:],
+            "acceptance_gate": acceptance_gate[-40:],
             "changed_files": changed_files[:200],
             "blockers": blockers[-80:],
             "proof_edges": proof_edges[-80:],
@@ -257,8 +299,14 @@ class TraceBundleReducer:
             "seq": event.get("seq"),
             "event_type": event.get("event_type"),
             "status": details.get("status") or payload.get("status"),
-            "summary": event.get("summary") or payload.get("message") or details.get("summary"),
-            "artifact_ref": details.get("artifact_ref"),
+            "summary": event.get("summary") or payload.get("message") or payload.get("summary") or details.get("summary") or payload.get("repair_focus"),
+            "tool": payload.get("tool") or details.get("tool"),
+            "tool_use_id": payload.get("tool_use_id") or details.get("tool_use_id"),
+            "artifact_ref": payload.get("artifact_ref") or details.get("artifact_ref"),
+            "turn": payload.get("turn"),
+            "attempt": payload.get("attempt"),
+            "tool_round": payload.get("tool_round"),
+            "paths": payload.get("paths"),
             "created_at": event.get("created_at"),
         }
 

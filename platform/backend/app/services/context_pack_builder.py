@@ -185,15 +185,53 @@ class ContextPackBuilder:
         settings = getattr(self.code_index_service, "settings", None)
         if settings is None:
             return ""
-        skills = SkillPackCatalog.load_from_runtime(settings.runtime_dir, settings.repo_root)
-        selected = SkillPackCatalog.select_for_context(
-            skills,
+        prefetch = SkillPackCatalog.prefetch(settings.runtime_dir, settings.repo_root)
+        search = SkillPackCatalog.search_for_context(
+            list(prefetch.get("items") or []),
             prompt=prompt,
             intent=intent,
             generation_mode=str(getattr(generation_mode, "value", generation_mode) or ""),
             paths=paths,
         )
+        selected = list(search.get("selected") or [])
+        store = getattr(self.code_index_service, "store", None)
+        if store is not None:
+            store.upsert(
+                "reports",
+                "skill_prefetch:last",
+                {
+                    "prefetch": {k: v for k, v in prefetch.items() if k != "items"},
+                    "search": {k: v for k, v in search.items() if k != "selected"},
+                    "selected_ids": [item.get("id") for item in selected],
+                },
+            )
         return SkillPackCatalog.compact_context(selected, body_limit=500)
+
+    def skill_search_for_context(
+        self,
+        *,
+        prompt: str,
+        intent: str | None,
+        generation_mode: GenerationMode | str | None,
+        paths: list[str],
+        failure_class: str | None = None,
+    ) -> dict[str, Any]:
+        settings = getattr(self.code_index_service, "settings", None)
+        if settings is None:
+            return {"schema": "grounded.skill_search.v1", "status": "settings_unavailable", "selected": [], "skipped": []}
+        prefetch = SkillPackCatalog.prefetch(settings.runtime_dir, settings.repo_root)
+        search = SkillPackCatalog.search_for_context(
+            list(prefetch.get("items") or []),
+            prompt=prompt,
+            intent=intent,
+            generation_mode=str(getattr(generation_mode, "value", generation_mode) or ""),
+            paths=paths,
+            failure_class=failure_class,
+        )
+        return {
+            **search,
+            "prefetch": {k: v for k, v in prefetch.items() if k != "items"},
+        }
 
     def _project_instruction_summary(self) -> str:
         settings = getattr(self.code_index_service, "settings", None)

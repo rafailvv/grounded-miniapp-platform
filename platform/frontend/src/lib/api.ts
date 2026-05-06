@@ -39,6 +39,9 @@ export type Run = {
   llm_model?: string | null;
   linked_job_id?: string | null;
   resume_from_run_id?: string | null;
+  session_id?: string | null;
+  resume_bookmark_id?: string | null;
+  forked_from_run_id?: string | null;
   source_revision_id?: string | null;
   result_revision_id?: string | null;
   candidate_revision_id?: string | null;
@@ -448,12 +451,86 @@ export type TraceBundleState = {
   event_count?: number;
   turns?: Array<Record<string, unknown>>;
   tool_calls?: Array<Record<string, unknown>>;
+  prompt_contexts?: Array<Record<string, unknown>>;
+  skill_edges?: Array<Record<string, unknown>>;
+  memory_edges?: Array<Record<string, unknown>>;
+  diff_edges?: Array<Record<string, unknown>>;
+  acceptance_gate?: Array<Record<string, unknown>>;
   artifacts?: Array<Record<string, unknown>>;
   changed_files?: string[];
   blockers?: Array<Record<string, unknown>>;
   proof_edges?: Array<Record<string, unknown>>;
+  compact_boundaries?: Array<Record<string, unknown>>;
   next_action?: Record<string, unknown>;
   payload_refs?: Array<Record<string, unknown>>;
+};
+
+export type RunProtocolEvent = {
+  schema?: string;
+  event_id: string;
+  run_id: string;
+  workspace_id: string;
+  session_id?: string | null;
+  task_id?: string | null;
+  turn_id?: string | null;
+  sequence: number;
+  type: string;
+  status: string;
+  message?: string;
+  payload?: Record<string, unknown>;
+  refs?: Record<string, unknown>;
+  bookmark_id?: string | null;
+  source_event_type?: string | null;
+  created_at: string;
+};
+
+export type RunBookmark = {
+  schema?: string;
+  bookmark_id: string;
+  run_id: string;
+  workspace_id: string;
+  turn_id?: string | null;
+  response_id?: string | null;
+  checkpoint_ref?: string | null;
+  trace_bundle_ref?: string | null;
+  diff_sha256?: string | null;
+  tool_result_count?: number;
+  latest_check_ref?: string | null;
+  todo_state_ref?: string | null;
+  created_at: string;
+};
+
+export type RunProtocolReport = {
+  schema: string;
+  run_id: string;
+  workspace_id?: string;
+  status: string;
+  items: RunProtocolEvent[];
+  bookmarks?: RunBookmark[];
+  latest_bookmark?: RunBookmark | null;
+};
+
+export type RunCompactionReport = {
+  schema: string;
+  status: string;
+  run_id: string;
+  workspace_id?: string;
+  boundary_id?: string;
+  compaction_ref?: string;
+  boundary_ref?: string;
+  post_compact_message_ref?: string;
+  post_compact_status?: string;
+  consumed_by_turn_id?: string | null;
+  sections?: Record<string, unknown>;
+  refs?: Record<string, string | null | undefined>;
+  created_at?: string;
+};
+
+export type RunCompactionBoundaries = {
+  schema: string;
+  status: string;
+  run_id: string;
+  items: Array<Record<string, unknown>>;
 };
 
 export type DoctorReport = {
@@ -469,17 +546,31 @@ export type DoctorReport = {
 };
 
 export type WorkerReport = {
+  schema?: string;
   run_id: string;
+  workspace_id?: string;
   workers: Array<{
     worker_id: string;
+    worker_type?: string;
+    alias_ids?: string[];
     status: string;
+    badge?: string;
     owner_scope: string;
+    ownership?: Record<string, unknown>;
     changed_files: string[];
     summaries?: Array<Record<string, unknown>>;
     merge_reports?: Array<Record<string, unknown>>;
     disabled_reason?: string | null;
+    context_ref?: string | null;
+    memory_snapshot_ref?: string | null;
+    output_ref?: string | null;
+    task_id?: string | null;
+    proof_refs?: string[];
+    merge_decision_ref?: string | null;
+    merge_decision?: Record<string, unknown> | null;
   }>;
   worker_branch_refs?: string[];
+  merge_decision_ref?: string | null;
   mailbox?: Record<string, unknown>;
 };
 
@@ -499,13 +590,76 @@ export type RunTaskReport = {
     blocker?: Record<string, unknown> | string | null;
     artifact_refs?: Record<string, string | null | undefined>;
     updated_at?: string | null;
+    source?: string;
+    background_status?: string;
+    attempt?: number;
+    max_attempts?: number;
+    output_summary?: string | null;
+    linked_refs?: Record<string, unknown>;
   }>;
 };
 
-export type ReviewReport = {
-  run_id: string;
+export type BackgroundTask = {
+  task_id: string;
+  workspace_id: string;
+  run_id?: string | null;
+  parent_task_id?: string | null;
+  type: string;
   status: string;
-  findings: Array<Record<string, unknown>>;
+  title: string;
+  owner?: string;
+  input?: Record<string, unknown>;
+  output_summary?: string | null;
+  error?: string | null;
+  attempt?: number;
+  max_attempts?: number;
+  linked_refs?: Record<string, unknown>;
+  created_at?: string;
+  started_at?: string | null;
+  completed_at?: string | null;
+  updated_at?: string;
+};
+
+export type BackgroundTaskOutput = {
+  schema: string;
+  task_id: string;
+  items: Array<{
+    sequence: number;
+    event_type: string;
+    message: string;
+    payload?: Record<string, unknown>;
+    created_at: string;
+  }>;
+  next_cursor: number;
+  has_more: boolean;
+};
+
+export type ReviewReport = {
+  schema?: string;
+  run_id: string;
+  workspace_id?: string;
+  status: string;
+  summary?: {
+    finding_count?: number;
+    blocker_count?: number;
+    severity_counts?: Record<string, number>;
+    missing_tests?: number;
+    stale_test_risks?: number;
+    browser_proof_gaps?: number;
+    contract_mismatches?: number;
+  };
+  findings: Array<{
+    code?: string;
+    severity?: string;
+    category?: string;
+    source?: string;
+    message?: string;
+    file_path?: string;
+    path?: string;
+    line?: number;
+    is_blocker_for_product_acceptance?: boolean;
+    evidence?: Record<string, unknown>;
+  } & Record<string, unknown>>;
   evidence?: Record<string, unknown>;
 };
 
@@ -690,11 +844,17 @@ export type FileSearchResult = {
 };
 
 export type LspDiagnosticsReport = {
+  schema?: string;
   workspace_id: string;
   run_id?: string | null;
   status: string;
-  items: Array<{ path: string; severity: string; message: string; source: string }>;
-  symbols?: Array<{ path: string; kind: string; name: string; line: number }>;
+  items: Array<{ path: string; file?: string; severity: string; message: string; source: string; line?: number; column?: number; code?: string; jump?: { path: string; line: number; column?: number; label?: string } }>;
+  symbols?: Array<{ path: string; kind: string; name: string; line: number; column?: number; jump?: { path: string; line: number; column?: number; label?: string } }>;
+  tool_status?: Record<string, unknown>;
+  error_count?: number;
+  warning_count?: number;
+  changed_only?: boolean;
+  changed_files?: string[];
 };
 
 export type CommandPaletteAction = {
@@ -942,8 +1102,63 @@ export async function getRunTraceBundleState(runId: string): Promise<TraceBundle
   return request<TraceBundleState>(`/runs/${runId}/trace-bundle/state`);
 }
 
+export async function getRunProtocol(runId: string): Promise<RunProtocolReport> {
+  return request<RunProtocolReport>(`/runs/${runId}/protocol`);
+}
+
+export async function getRunBookmarks(runId: string): Promise<{ schema: string; run_id: string; status: string; items: RunBookmark[] }> {
+  return request(`/runs/${runId}/bookmarks`);
+}
+
 export async function getRunTasks(runId: string): Promise<RunTaskReport> {
   return request<RunTaskReport>(`/runs/${runId}/tasks`);
+}
+
+export async function listBackgroundTasks(params: { workspace_id?: string; run_id?: string; status?: string } = {}): Promise<{ schema: string; status: string; items: BackgroundTask[] }> {
+  const search = new URLSearchParams();
+  if (params.workspace_id) search.set("workspace_id", params.workspace_id);
+  if (params.run_id) search.set("run_id", params.run_id);
+  if (params.status) search.set("status", params.status);
+  const suffix = search.toString() ? `?${search.toString()}` : "";
+  return request(`/tasks${suffix}`);
+}
+
+export async function getBackgroundTask(taskId: string): Promise<BackgroundTask> {
+  return request<BackgroundTask>(`/tasks/${taskId}`);
+}
+
+export async function createBackgroundTask(payload: {
+  workspace_id: string;
+  type: string;
+  title?: string;
+  run_id?: string | null;
+  parent_task_id?: string | null;
+  input?: Record<string, unknown>;
+  owner?: string;
+  max_attempts?: number;
+  auto_start?: boolean;
+}): Promise<BackgroundTask> {
+  return request<BackgroundTask>("/tasks", { method: "POST", body: JSON.stringify(payload) });
+}
+
+export async function updateBackgroundTask(taskId: string, payload: { title?: string; status?: string; metadata?: Record<string, unknown> }): Promise<BackgroundTask> {
+  return request<BackgroundTask>(`/tasks/${taskId}`, { method: "PATCH", body: JSON.stringify(payload) });
+}
+
+export async function stopBackgroundTask(taskId: string): Promise<BackgroundTask> {
+  return request<BackgroundTask>(`/tasks/${taskId}/stop`, { method: "POST" });
+}
+
+export async function retryBackgroundTask(taskId: string): Promise<BackgroundTask> {
+  return request<BackgroundTask>(`/tasks/${taskId}/retry`, { method: "POST" });
+}
+
+export async function requeueBackgroundTask(taskId: string): Promise<BackgroundTask> {
+  return request<BackgroundTask>(`/tasks/${taskId}/requeue`, { method: "POST" });
+}
+
+export async function getBackgroundTaskOutput(taskId: string, cursor = 0, limit = 100): Promise<BackgroundTaskOutput> {
+  return request<BackgroundTaskOutput>(`/tasks/${taskId}/output?cursor=${cursor}&limit=${limit}`);
 }
 
 export async function getRunGate(runId: string): Promise<RunGateReport> {
@@ -996,6 +1211,22 @@ export async function compactRun(runId: string): Promise<Record<string, unknown>
   return request<Record<string, unknown>>(`/runs/${runId}/compact`, { method: "POST" });
 }
 
+export async function getRunCompaction(runId: string): Promise<RunCompactionReport> {
+  return request<RunCompactionReport>(`/runs/${runId}/compaction`);
+}
+
+export async function getRunCompactionBoundaries(runId: string): Promise<RunCompactionBoundaries> {
+  return request<RunCompactionBoundaries>(`/runs/${runId}/compaction/boundaries`);
+}
+
+export async function getRunMicrocompact(runId: string, digest: string): Promise<Record<string, unknown>> {
+  return request<Record<string, unknown>>(`/runs/${runId}/microcompact/${digest}`);
+}
+
+export async function getRunPostCompactMessage(runId: string, boundaryId: string): Promise<Record<string, unknown>> {
+  return request<Record<string, unknown>>(`/runs/${runId}/compaction/post-message/${boundaryId}`);
+}
+
 export async function startReviewFix(runId: string): Promise<Run> {
   return request<Run>(`/runs/${runId}/review/fix`, { method: "POST" });
 }
@@ -1006,6 +1237,22 @@ export async function getDoctorReport(): Promise<DoctorReport> {
 
 export async function getRunWorkers(runId: string): Promise<WorkerReport> {
   return request<WorkerReport>(`/runs/${runId}/workers`);
+}
+
+export async function getRunWorkerContext(runId: string, workerId: string): Promise<Record<string, unknown>> {
+  return request<Record<string, unknown>>(`/runs/${runId}/workers/${encodeURIComponent(workerId)}/context`);
+}
+
+export async function getRunWorkerMemory(runId: string, workerId: string): Promise<Record<string, unknown>> {
+  return request<Record<string, unknown>>(`/runs/${runId}/workers/${encodeURIComponent(workerId)}/memory`);
+}
+
+export async function getRunWorkerOutput(runId: string, workerId: string): Promise<Record<string, unknown>> {
+  return request<Record<string, unknown>>(`/runs/${runId}/workers/${encodeURIComponent(workerId)}/output`);
+}
+
+export async function getRunWorkerMergeDecision(runId: string): Promise<Record<string, unknown>> {
+  return request<Record<string, unknown>>(`/runs/${runId}/workers/merge-decision`);
 }
 
 export async function getRunReview(runId: string): Promise<ReviewReport> {
@@ -1091,10 +1338,16 @@ export async function searchWorkspaceFiles(workspaceId: string, query: string, r
   return request<FileSearchResult>(`/workspaces/${workspaceId}/files/search?${params.toString()}`);
 }
 
-export async function getLspDiagnostics(workspaceId: string, runId?: string): Promise<LspDiagnosticsReport> {
+export async function getLspDiagnostics(workspaceId: string, runId?: string, options?: { changedOnly?: boolean; files?: string[] }): Promise<LspDiagnosticsReport> {
   const params = new URLSearchParams();
   if (runId) {
     params.set("run_id", runId);
+  }
+  if (options?.changedOnly) {
+    params.set("changed_only", "true");
+  }
+  if (options?.files?.length) {
+    params.set("files", options.files.join(","));
   }
   const suffix = params.toString() ? `?${params.toString()}` : "";
   return request<LspDiagnosticsReport>(`/workspaces/${workspaceId}/diagnostics/lsp${suffix}`);

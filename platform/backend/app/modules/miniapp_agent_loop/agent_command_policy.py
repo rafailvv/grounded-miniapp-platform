@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass, field
 from pathlib import Path
 import re
 import shlex
+import shutil
 from typing import Any, Literal
 
 
@@ -21,6 +23,8 @@ class CommandPolicyRule:
     prefixes: tuple[tuple[str, ...], ...]
     action: CommandPolicyAction
     reason: str
+    rule_id: str = ""
+    source: str = "builtin"
     examples: tuple[CommandPolicyExample, ...] = field(default_factory=tuple)
     not_match_examples: tuple[str, ...] = field(default_factory=tuple)
 
@@ -30,6 +34,22 @@ class CommandPolicyRule:
             if len(lowered) >= len(prefix) and tuple(lowered[: len(prefix)]) == prefix:
                 return True
         return False
+
+    def matched_prefix(self, args: list[str]) -> tuple[str, ...]:
+        lowered = [item.lower() for item in args]
+        for prefix in self.prefixes:
+            if len(lowered) >= len(prefix) and tuple(lowered[: len(prefix)]) == prefix:
+                return prefix
+        return ()
+
+    def match_payload(self, args: list[str]) -> dict[str, Any]:
+        return {
+            "rule_id": self.rule_id,
+            "source": self.source,
+            "pattern": list(self.matched_prefix(args)),
+            "decision": self.action,
+            "justification": self.reason,
+        }
 
 
 @dataclass(frozen=True)
@@ -41,6 +61,8 @@ class CommandPolicyDecision:
     argv: tuple[str, ...] = ()
     matched_prefix: tuple[str, ...] = ()
     cwd_policy: str = "draft_workspace"
+    matched_rules: tuple[dict[str, Any], ...] = ()
+    executable_resolution: dict[str, Any] = field(default_factory=dict)
 
     @property
     def allowed(self) -> bool:
@@ -71,13 +93,39 @@ class AgentCommandPolicy:
     _UNSAFE_RG_OPTIONS = {"--pre", "--pre-glob", "--hostname-bin", "-z", "--search-zip"}
     _UNSAFE_FIND_ACTIONS = {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fls", "-fprint", "-fprint0", "-fprintf"}
 
-    def __init__(self, rules: list[CommandPolicyRule] | None = None) -> None:
+    _DEFAULT_HOST_EXECUTABLES = {
+        "python",
+        "python3",
+        "node",
+        "npm",
+        "pnpm",
+        "yarn",
+        "rg",
+        "sed",
+        "ls",
+        "find",
+        "git",
+        "bash",
+        "sh",
+        "zsh",
+    }
+
+    def __init__(
+        self,
+        rules: list[CommandPolicyRule] | None = None,
+        *,
+        host_executables_by_name: dict[str, list[str]] | None = None,
+        source: str = "builtin",
+    ) -> None:
         self.rules = list(rules or self.default_rules())
+        self.source = source
+        self.host_executables_by_name = host_executables_by_name or self._discover_host_executables()
 
     @classmethod
     def from_rule_payload(cls, payload: dict[str, Any]) -> "AgentCommandPolicy":
         rules: list[CommandPolicyRule] = []
-        for raw_rule in payload.get("rules", []) if isinstance(payload, dict) else []:
+        source = str(payload.get("source") or "json") if isinstance(payload, dict) else "json"
+        for index, raw_rule in enumerate(payload.get("rules", []) if isinstance(payload, dict) else []):
             if not isinstance(raw_rule, dict):
                 continue
             prefixes: list[tuple[str, ...]] = []
@@ -113,17 +161,103 @@ class AgentCommandPolicy:
                         prefixes=tuple(prefixes),
                         action=action,  # type: ignore[arg-type]
                         reason=str(raw_rule.get("reason") or "Rule-file command policy decision."),
+                        rule_id=str(raw_rule.get("rule_id") or f"json_rule_{index + 1}"),
+                        source=source,
                         examples=tuple(examples),
                         not_match_examples=tuple(not_match_examples),
                     )
                 )
-        return cls(rules or None)
+        return cls(rules or None, source=source)
 
     @classmethod
     def from_rule_file(cls, path: Path) -> "AgentCommandPolicy":
         import json
 
-        return cls.from_rule_payload(json.loads(path.read_text(encoding="utf-8")))
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            payload = {**payload, "source": str(path)}
+        return cls.from_rule_payload(payload)
+
+    @classmethod
+    def from_dsl_file(cls, path: Path) -> "AgentCommandPolicy":
+        return cls.from_dsl_text(path.read_text(encoding="utf-8"), source=str(path))
+
+    @classmethod
+    def from_dsl_text(cls, text: str, *, source: str = "dsl") -> "AgentCommandPolicy":
+        module = ast.parse(text, filename=source, mode="exec")
+        rules: list[CommandPolicyRule] = []
+        for index, node in enumerate(module.body):
+            if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+                call = node.value
+            elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and node.value.value is None:
+                continue
+            else:
+                raise ValueError(f"{source}:{getattr(node, 'lineno', '?')}: only prefix_rule(...) calls are allowed")
+            if not isinstance(call.func, ast.Name) or call.func.id != "prefix_rule":
+                raise ValueError(f"{source}:{getattr(call, 'lineno', '?')}: only prefix_rule(...) calls are allowed")
+            if call.args:
+                raise ValueError(f"{source}:{getattr(call, 'lineno', '?')}: positional arguments are not allowed")
+            raw = cls._dsl_keywords(call, source=source)
+            unknown = set(raw) - {"pattern", "decision", "justification", "match", "not_match"}
+            if unknown:
+                raise ValueError(f"{source}:{getattr(call, 'lineno', '?')}: unknown fields: {', '.join(sorted(unknown))}")
+            pattern = cls._dsl_string_list(raw.get("pattern"), field="pattern", source=source, lineno=getattr(call, "lineno", 0))
+            if not pattern:
+                raise ValueError(f"{source}:{getattr(call, 'lineno', '?')}: pattern cannot be empty")
+            decision = str(raw.get("decision") or "allow")
+            if decision not in {"allow", "prompt", "forbidden"}:
+                raise ValueError(f"{source}:{getattr(call, 'lineno', '?')}: invalid decision {decision!r}")
+            justification = str(raw.get("justification") or raw.get("reason") or "Rule-file command policy decision.")
+            if not justification.strip():
+                raise ValueError(f"{source}:{getattr(call, 'lineno', '?')}: justification cannot be empty")
+            examples = [
+                CommandPolicyExample(command, decision)  # type: ignore[arg-type]
+                for command in cls._dsl_command_examples(raw.get("match"), source=source, lineno=getattr(call, "lineno", 0))
+            ]
+            not_match = cls._dsl_command_examples(raw.get("not_match"), source=source, lineno=getattr(call, "lineno", 0))
+            rules.append(
+                CommandPolicyRule(
+                    prefixes=(tuple(item.lower() for item in pattern),),
+                    action=decision,  # type: ignore[arg-type]
+                    reason=justification,
+                    rule_id=f"dsl_rule_{index + 1}",
+                    source=source,
+                    examples=tuple(examples),
+                    not_match_examples=tuple(not_match),
+                )
+            )
+        return cls(rules or None, source=source)
+
+    @staticmethod
+    def _dsl_keywords(call: ast.Call, *, source: str) -> dict[str, Any]:
+        values: dict[str, Any] = {}
+        for keyword in call.keywords:
+            if keyword.arg is None:
+                raise ValueError(f"{source}:{getattr(call, 'lineno', '?')}: **kwargs are not allowed")
+            values[keyword.arg] = ast.literal_eval(keyword.value)
+        return values
+
+    @staticmethod
+    def _dsl_string_list(value: Any, *, field: str, source: str, lineno: int) -> list[str]:
+        if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
+            raise ValueError(f"{source}:{lineno}: {field} must be a non-empty list of strings")
+        return [item.strip() for item in value]
+
+    @classmethod
+    def _dsl_command_examples(cls, value: Any, *, source: str, lineno: int) -> list[str]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ValueError(f"{source}:{lineno}: match/not_match must be a list")
+        commands: list[str] = []
+        for item in value:
+            if isinstance(item, str) and item.strip():
+                commands.append(item.strip())
+            elif isinstance(item, list) and all(isinstance(part, str) and part.strip() for part in item):
+                commands.append(" ".join(part.strip() for part in item))
+            else:
+                raise ValueError(f"{source}:{lineno}: examples must be command strings or string arrays")
+        return commands
 
     @staticmethod
     def default_rules() -> list[CommandPolicyRule]:
@@ -132,24 +266,28 @@ class AgentCommandPolicy:
                 prefixes=(("python", "-m", "unittest"), ("python3", "-m", "unittest")),
                 action="allow",
                 reason="Python unit diagnostics are allowed inside the draft workspace.",
+                rule_id="builtin_python_unittest",
                 examples=(CommandPolicyExample("python -m unittest discover", "allow"),),
             ),
             CommandPolicyRule(
                 prefixes=(("python", "-m", "py_compile"), ("python3", "-m", "py_compile")),
                 action="allow",
                 reason="Python compile diagnostics are allowed inside the draft workspace.",
+                rule_id="builtin_python_compile",
                 examples=(CommandPolicyExample("python -m py_compile miniapp/app/main.py", "allow"),),
             ),
             CommandPolicyRule(
                 prefixes=(("node", "--test"), ("node", "--check")),
                 action="allow",
                 reason="Node diagnostics are allowed inside the draft workspace.",
+                rule_id="builtin_node_diagnostics",
                 examples=(CommandPolicyExample("node --check miniapp/app/static/client/app.js", "allow"),),
             ),
             CommandPolicyRule(
                 prefixes=(("rg",), ("sed",), ("ls",)),
                 action="allow",
                 reason="Read-only workspace inspection commands are allowed.",
+                rule_id="builtin_read_only_inspection",
                 examples=(CommandPolicyExample("rg api miniapp/app", "allow"),),
             ),
             CommandPolicyRule(
@@ -167,6 +305,7 @@ class AgentCommandPolicy:
                 ),
                 action="forbidden",
                 reason="Package installation is not an agent diagnostic command.",
+                rule_id="builtin_package_install_block",
                 examples=(CommandPolicyExample("npm install", "forbidden"),),
             ),
             CommandPolicyRule(
@@ -186,9 +325,21 @@ class AgentCommandPolicy:
                 ),
                 action="forbidden",
                 reason="The command can mutate or fetch outside the draft diagnostic boundary.",
+                rule_id="builtin_dangerous_block",
                 examples=(CommandPolicyExample("rm -rf miniapp", "forbidden"),),
             ),
         ]
+
+    @classmethod
+    def _discover_host_executables(cls) -> dict[str, list[str]]:
+        resolved: dict[str, list[str]] = {}
+        for name in sorted(cls._DEFAULT_HOST_EXECUTABLES):
+            paths = []
+            first = shutil.which(name)
+            if first:
+                paths.append(str(Path(first).resolve()))
+            resolved[name] = paths
+        return resolved
 
     def decide(self, command: str) -> CommandPolicyDecision:
         stripped = str(command or "").strip()
@@ -234,13 +385,24 @@ class AgentCommandPolicy:
             return wrapper_decision
         if any(arg == ".." or arg.startswith("../") or "/../" in arg for arg in args):
             return CommandPolicyDecision("forbidden", "Parent-directory paths are blocked.", command, normalized, tuple(args))
-        if any(str(arg).startswith(("/", "~")) for arg in args):
-            return CommandPolicyDecision("forbidden", "Absolute and home-relative paths are blocked.", command, normalized, tuple(args))
+        executable_resolution = self._resolve_executable(args[0])
+        if executable_resolution.get("status") == "untrusted_absolute":
+            return CommandPolicyDecision(
+                "forbidden",
+                "Absolute executable path is not in the trusted host executable map.",
+                command,
+                normalized,
+                tuple(args),
+                executable_resolution=executable_resolution,
+            )
+        if any(str(arg).startswith(("/", "~")) for arg in args[1:]) or str(args[0]).startswith("~"):
+            return CommandPolicyDecision("forbidden", "Absolute and home-relative paths are blocked.", command, normalized, tuple(args), executable_resolution=executable_resolution)
         if any(re.search(r"[*?\\[]", str(arg)) for arg in args[1:]):
             return CommandPolicyDecision("forbidden", "Shell glob patterns are blocked; use explicit paths from list_files/search results.", command, normalized, tuple(args))
         if any(arg == ".git" or arg.startswith(".git/") or "/.git/" in arg for arg in args[1:]):
             return CommandPolicyDecision("forbidden", "Git internals are blocked.", command, normalized, tuple(args))
-        normalized_args = [Path(args[0]).name.lower(), *[str(arg).lower() for arg in args[1:]]]
+        executable_name = str(executable_resolution.get("name") or Path(args[0]).name).lower()
+        normalized_args = [executable_name, *[str(arg).lower() for arg in args[1:]]]
         if normalized_args[0] in {"python3.10", "python3.11", "python3.12"}:
             normalized_args[0] = "python3"
         structured_decision = self._structured_command_decision(command, normalized, args, normalized_args, cwd_policy=cwd_policy)
@@ -261,7 +423,17 @@ class AgentCommandPolicy:
                 (prefix for prefix in selected.prefixes if tuple(normalized_args[: len(prefix)]) == prefix),
                 (),
             )
-            return CommandPolicyDecision(selected.action, selected.reason, command, normalized, tuple(args), matched, cwd_policy)
+            return CommandPolicyDecision(
+                selected.action,
+                selected.reason,
+                command,
+                normalized,
+                tuple(args),
+                matched,
+                cwd_policy,
+                tuple(rule.match_payload(normalized_args) for rule in matched_rules),
+                executable_resolution,
+            )
         return CommandPolicyDecision(
             "forbidden",
             "Only diagnostic commands are allowed: python -m unittest, python -m py_compile, node --test, node --check, rg, sed, and ls.",
@@ -269,7 +441,22 @@ class AgentCommandPolicy:
             normalized,
             tuple(args),
             cwd_policy=cwd_policy,
+            executable_resolution=executable_resolution,
         )
+
+    def _resolve_executable(self, raw: str) -> dict[str, Any]:
+        raw_text = str(raw or "")
+        path = Path(raw_text)
+        basename = path.name.lower()
+        if basename in {"python3.10", "python3.11", "python3.12"}:
+            basename = "python3"
+        if not path.is_absolute():
+            return {"input": raw_text, "name": basename, "resolved_path": None, "status": "basename"}
+        resolved = str(path.resolve())
+        trusted = [str(Path(item).resolve()) for item in self.host_executables_by_name.get(basename, [])]
+        if resolved in trusted:
+            return {"input": raw_text, "name": basename, "resolved_path": resolved, "status": "trusted_absolute"}
+        return {"input": raw_text, "name": basename, "resolved_path": resolved, "status": "untrusted_absolute", "trusted_paths": trusted}
 
     def _shell_wrapper_decision(
         self,
@@ -430,6 +617,7 @@ class AgentCommandPolicy:
                 decision = self.decide(example.command)
                 examples.append(
                     {
+                        "rule_id": rule.rule_id,
                         "command": example.command,
                         "expected": example.action,
                         "actual": decision.action,
@@ -444,6 +632,7 @@ class AgentCommandPolicy:
                 matched_this_rule = bool(args and rule.matches(args))
                 examples.append(
                     {
+                        "rule_id": rule.rule_id,
                         "command": command,
                         "expected": "not_match",
                         "actual": "matched" if matched_this_rule else "not_match",
@@ -460,12 +649,15 @@ class AgentCommandPolicy:
                     "prefixes": [" ".join(prefix) for prefix in rule.prefixes],
                     "action": rule.action,
                     "reason": rule.reason,
+                    "rule_id": rule.rule_id,
+                    "source": rule.source,
                     "match": [example.command for example in rule.examples],
                     "not_match": list(rule.not_match_examples),
                 }
                 for rule in self.rules
             ],
             "examples": self.validation_examples(),
+            "host_executables": self.host_executables_by_name,
         }
 
 

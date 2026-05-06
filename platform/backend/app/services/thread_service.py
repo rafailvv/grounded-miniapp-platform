@@ -167,6 +167,7 @@ class ThreadService:
             generation_mode=params.get("generation_mode") or "balanced",
             target_platform=params.get("target_platform") or "telegram_mini_app",
             preview_profile=params.get("preview_profile") or "telegram_mock",
+            session_id=thread.thread_id,
             error_context=params.get("error_context"),
         )
         run = self.run_service.create_run(thread.workspace_id, run_request)

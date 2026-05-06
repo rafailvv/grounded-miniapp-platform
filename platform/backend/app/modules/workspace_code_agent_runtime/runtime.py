@@ -18,6 +18,7 @@ from app.ai.openai_client import OpenAIClient
 from app.models.artifacts import ValidationIssue
 from app.models.common import GenerationMode
 from app.models.domain import (
+    BackgroundTaskRecord,
     CheckExecutionRecord,
     DraftAction,
     GenerateRequest,
@@ -25,6 +26,7 @@ from app.models.domain import (
     JobRecord,
     RepairIterationRecord,
     RunCheckResult,
+    RunRecord,
     ValidationSnapshot,
 )
 from app.modules.miniapp_agent_loop.agent_file_state import AgentFileStateCache
@@ -42,6 +44,16 @@ from app.modules.miniapp_agent_loop.agent_worker_manager import AgentWorkerManag
 from app.modules.miniapp_agent_loop.agent_worker_branch_loop import AgentWorkerBranchLoop, WorkerBranchResult
 from app.modules.miniapp_agent_loop.agent_worker_runtime import AgentWorkerRuntime
 from app.modules.miniapp_agent_loop.agent_worker_tasks import AgentWorkerTaskPlanner
+from app.modules.miniapp_agent_loop.product_workers import (
+    SECRET_RE,
+    canonical_worker_id,
+    legacy_worker_id,
+    ownership_for_worker,
+    path_is_allowed,
+    select_memory_items,
+    stale_path_checks,
+    worker_refs,
+)
 from app.modules.miniapp_agent_loop.agent_kernel import compact_agent_memory
 from app.modules.miniapp_agent_loop.agent_memory_store import AgentMemoryStore
 from app.modules.miniapp_agent_loop.agent_scratchpad import AgentScratchpad
@@ -76,7 +88,10 @@ from app.repositories.state_store import StateStore
 from app.services.check_runner import CheckRunner
 from app.services.miniapp_contract import MiniAppContractCompiler, MiniAppContractMaterializer, MiniAppRouteRegistry
 from app.services.platform_shell import BASE_STYLESHEET_HREF, BASE_STYLESHEET_PATH, PAGE_SHELL_INLINE_STYLE
+from app.services.run_compaction import RunCompactionService
+from app.services.run_protocol import RunProtocolService, diff_sha256
 from app.services.trace_bundle import TraceBundleWriter
+from app.services.generation_enhancements import SkillPackCatalog
 from app.services.workflow_acceptance import (
     build_acceptance_contract,
     build_implementation_plan,
@@ -145,6 +160,8 @@ class WorkspaceCodeAgentRuntime:
         agent_tool_call_loop: AgentToolCallLoop,
         context_pack_builder: Any | None = None,
         platform_db: PlatformDb | None = None,
+        run_protocol_service: RunProtocolService | None = None,
+        run_compaction_service: RunCompactionService | None = None,
     ) -> None:
         self.store = store
         self.workspace_service = workspace_service
@@ -189,6 +206,8 @@ class WorkspaceCodeAgentRuntime:
         )
         self.context_pack_builder = context_pack_builder
         self.platform_db = platform_db
+        self.run_protocol_service = run_protocol_service
+        self.run_compaction_service = run_compaction_service
 
     def get_job(self, job_id: str) -> JobRecord:
         payload = self.store.get("jobs", job_id)
@@ -967,10 +986,28 @@ class WorkspaceCodeAgentRuntime:
             job.worker_mailbox_ref,
             {"workspace_id": workspace_id, "run_id": run_id, "mailbox": worker_mailbox, "worker_tasks": worker_tasks},
         )
+        worker_tasks = self._prepare_product_worker_artifacts(
+            workspace_id=workspace_id,
+            run_id=run_id,
+            artifact_run_id=artifact_run_id,
+            job=job,
+            generation_mode=generation_mode,
+            worker_tasks=worker_tasks,
+            implementation_plan=implementation_plan,
+            acceptance_contract=acceptance_contract,
+            semantic_graph=semantic_graph,
+            worker_prefix=worker_prefix,
+            draft_source=draft_source,
+            enabled=bool(worker_mailbox.get("enabled")),
+        )
+        self._store_report(
+            job.worker_mailbox_ref,
+            {"workspace_id": workspace_id, "run_id": run_id, "mailbox": worker_mailbox, "worker_tasks": worker_tasks},
+        )
         writer_worker_tasks = [
             task
             for task in worker_tasks
-            if str(task.get("worker_id") or "").strip() not in {"design_verifier", "fresh_verifier"}
+            if canonical_worker_id(str(task.get("worker_id") or "")).strip() not in {"mobile_polish_worker"}
         ]
         worker_drafts = self.worker_runtime.prepare_workspace_branches(
             workspace_id=workspace_id,
@@ -1658,6 +1695,16 @@ class WorkspaceCodeAgentRuntime:
                 turn=turn,
                 paths=paths,
             )
+            self._record_rollout_trace(
+                job,
+                artifact_run_id=artifact_run_id,
+                event_type="turn_diff_before",
+                payload={
+                    "turn": turn,
+                    "paths": paths,
+                    "file_hashes": self._file_content_hashes(workspace_id=workspace_id, run_id=run_id, paths=paths),
+                },
+            )
             self.transcript_store.append_file_changes(artifact_run_id, turn=turn, file_changes=file_changes)
             self._store_transcript_snapshot(job, artifact_run_id)
             self.rollout_trace.append(artifact_run_id, "patch_apply_started", {"turn": turn, "paths": paths})
@@ -1690,6 +1737,19 @@ class WorkspaceCodeAgentRuntime:
                 payload={"turn": turn, "paths": paths, "turn_diff_ref": job.turn_diff_ref},
             )
             self.rollout_trace.append(artifact_run_id, "patch_apply_completed", record.summary())
+            self._record_rollout_trace(
+                job,
+                artifact_run_id=artifact_run_id,
+                event_type="turn_diff_after",
+                payload={
+                    "turn": turn,
+                    "paths": paths,
+                    "apply_status": getattr(apply_result, "status", None),
+                    "turn_diff_ref": job.turn_diff_ref,
+                    "diff_summary": record.summary(),
+                    "file_hashes": self._file_content_hashes(workspace_id=workspace_id, run_id=run_id, paths=paths),
+                },
+            )
             self._record_hook(
                 job=job,
                 hook="post_apply_patch",
@@ -1879,17 +1939,44 @@ class WorkspaceCodeAgentRuntime:
                 save=False,
             )
 
-        callbacks = AgentLoopCallbacks(
-            execute_checks=_execute_checks,
-            build_validation_snapshot=self._validation_snapshot_from_execution,
-            completion_state=lambda results, preview_details, validation_snapshot=None: self._completion_state(
+        def _completion_state_with_trace(results: list[RunCheckResult], preview_details: dict[str, Any], validation_snapshot: ValidationSnapshot | None = None) -> dict[str, object]:
+            state = self._completion_state(
                 workspace_id=workspace_id,
                 run_id=run_id,
                 request=request,
                 results=results,
                 preview_details=preview_details,
                 validation_snapshot=validation_snapshot,
-            ),
+            )
+            self._record_rollout_trace(
+                job,
+                artifact_run_id=artifact_run_id,
+                event_type="final_acceptance_gate_decision",
+                payload={
+                    "status": state.get("status") or ("blocked" if state.get("blocking") else "passed"),
+                    "blocking": state.get("blocking"),
+                    "reasons": state.get("reasons") or state.get("issues") or [],
+                    "result_names": [result.name for result in results],
+                    "failed_checks": [result.name for result in results if result.status == "failed"],
+                    "acceptance_required": bool((acceptance_contract or {}).get("required") or request.mode == "generate"),
+                    "validation_snapshot": validation_snapshot.model_dump(mode="json") if validation_snapshot is not None else None,
+                },
+            )
+            self._record_skill_usage_telemetry(
+                job=job,
+                artifact_run_id=artifact_run_id,
+                workspace_id=workspace_id,
+                run_id=run_id,
+                request=request,
+                results=results,
+                run_status="blocked" if state.get("blocking") else "completed",
+            )
+            return state
+
+        callbacks = AgentLoopCallbacks(
+            execute_checks=_execute_checks,
+            build_validation_snapshot=self._validation_snapshot_from_execution,
+            completion_state=_completion_state_with_trace,
             has_tooling_failure=CheckRunner.has_tooling_failure,
             plan_turn=_plan_turn,
             apply_change_sync=_apply_change_sync,
@@ -1926,6 +2013,342 @@ class WorkspaceCodeAgentRuntime:
             callbacks=callbacks,
         )
 
+    def _prepare_product_worker_artifacts(
+        self,
+        *,
+        workspace_id: str,
+        run_id: str,
+        artifact_run_id: str,
+        job: JobRecord,
+        generation_mode: GenerationMode,
+        worker_tasks: list[dict[str, Any]],
+        implementation_plan: dict[str, Any],
+        acceptance_contract: dict[str, Any],
+        semantic_graph: dict[str, Any],
+        worker_prefix: dict[str, Any],
+        draft_source: Path,
+        enabled: bool,
+    ) -> list[dict[str, Any]]:
+        enriched: list[dict[str, Any]] = []
+        workspace_memory = self.store.get("reports", f"workspace_memory:{workspace_id}") or {"items": []}
+        run_memory = self.store.get("reports", f"memory_stage1:{workspace_id}:{run_id}") or {"items": []}
+        latest_repair_packet = (job.repair_iterations[-1].model_dump(mode="json") if job.repair_iterations else {})
+        for task in worker_tasks:
+            if not isinstance(task, dict):
+                continue
+            worker_id = canonical_worker_id(str(task.get("worker_id") or ""))
+            if not worker_id:
+                continue
+            refs = worker_refs(workspace_id, artifact_run_id, worker_id)
+            ownership = dict(task.get("ownership") or ownership_for_worker(worker_id))
+            selected_memory, rejected_memory = select_memory_items(
+                {"items": [*(workspace_memory.get("items") or []), *(run_memory.get("items") or [])]},
+                worker_id=worker_id,
+            )
+            memory_snapshot = {
+                "schema": "grounded.worker_memory_snapshot.v1",
+                "workspace_id": workspace_id,
+                "run_id": run_id,
+                "artifact_run_id": artifact_run_id,
+                "worker_id": worker_id,
+                "worker_type": worker_id,
+                "items": selected_memory,
+                "rejected": rejected_memory,
+                "source_refs": {
+                    "workspace_memory": f"workspace_memory:{workspace_id}",
+                    "run_memory": f"memory_stage1:{workspace_id}:{run_id}",
+                },
+                "stale_check": stale_path_checks(draft_source, {"items": selected_memory}),
+                "created_at": utc_now().isoformat(),
+            }
+            context_payload = {
+                "schema": "grounded.worker_context.v1",
+                "workspace_id": workspace_id,
+                "run_id": run_id,
+                "artifact_run_id": artifact_run_id,
+                "worker_id": worker_id,
+                "worker_type": worker_id,
+                "generation_mode": str(generation_mode.value),
+                "ownership": ownership,
+                "contract_slice": self._worker_contract_slice(
+                    worker_id=worker_id,
+                    implementation_plan=implementation_plan,
+                    acceptance_contract=acceptance_contract,
+                ),
+                "shared_state_contract": (implementation_plan.get("role_state_contract") or implementation_plan.get("prompt_hints", {}).get("role_state_contract") or {}),
+                "semantic_slice": self._worker_semantic_slice(worker_id=worker_id, semantic_graph=semantic_graph),
+                "memory_snapshot_ref": refs["memory_snapshot_ref"],
+                "latest_repair_packet": latest_repair_packet,
+                "backend_contract": worker_prefix.get("backend_contract") or {},
+                "created_at": utc_now().isoformat(),
+            }
+            output_payload = {
+                "schema": "grounded.worker_output.v1",
+                "workspace_id": workspace_id,
+                "run_id": run_id,
+                "artifact_run_id": artifact_run_id,
+                "worker_id": worker_id,
+                "worker_type": worker_id,
+                "status": "context_ready" if enabled else "available_disabled",
+                "badge": "context_ready" if enabled else "available_disabled",
+                "ownership": ownership,
+                "changed_files": [],
+                "diff_ref": None,
+                "proof_refs": [],
+                "issues": [],
+                "self_check": {"status": "pending" if enabled else "skipped"},
+                "token_usage": {},
+                "summary": "Worker context prepared." if enabled else "Worker available but disabled by gate.",
+                "merge_recommendation": "pending" if enabled else "deferred",
+                "context_ref": refs["context_ref"],
+                "memory_snapshot_ref": refs["memory_snapshot_ref"],
+                "created_at": utc_now().isoformat(),
+            }
+            task_id = ""
+            if enabled:
+                task_id = self._record_worker_background_task(
+                    workspace_id=workspace_id,
+                    run_id=run_id,
+                    worker_id=worker_id,
+                    context_ref=refs["context_ref"],
+                    output_ref=refs["output_ref"],
+                )
+                output_payload["task_id"] = task_id
+            self._store_report(refs["memory_snapshot_ref"], memory_snapshot)
+            self._store_report(refs["context_ref"], context_payload)
+            self._store_report(refs["output_ref"], output_payload)
+            enriched_task = dict(task)
+            enriched_task.update(
+                {
+                    "worker_id": worker_id,
+                    "worker_type": worker_id,
+                    "legacy_worker_id": legacy_worker_id(worker_id),
+                    "ownership": ownership,
+                    "context_ref": refs["context_ref"],
+                    "memory_snapshot_ref": refs["memory_snapshot_ref"],
+                    "output_ref": refs["output_ref"],
+                    "merge_decision_ref": refs["merge_decision_ref"],
+                    "task_id": task_id or None,
+                }
+            )
+            enriched.append(enriched_task)
+        return enriched
+
+    def _record_worker_background_task(
+        self,
+        *,
+        workspace_id: str,
+        run_id: str,
+        worker_id: str,
+        context_ref: str,
+        output_ref: str,
+    ) -> str:
+        task = BackgroundTaskRecord(
+            workspace_id=workspace_id,
+            run_id=run_id,
+            type="worker_branch",
+            title=f"{worker_id} branch",
+            owner=worker_id,
+            input={"worker_id": worker_id, "context_ref": context_ref, "output_ref": output_ref},
+            linked_refs={"context_ref": context_ref, "output_ref": output_ref},
+        )
+        task.status = "running"
+        task.started_at = utc_now()
+        task.updated_at = utc_now()
+        self.store.upsert("background_tasks", task.task_id, task.model_dump(mode="json"))
+        self._append_worker_task_output(task.task_id, "task_created", "Worker branch task created.", {"worker_id": worker_id})
+        self._append_worker_task_output(task.task_id, "context_ready", "Worker isolated context is ready.", {"context_ref": context_ref, "output_ref": output_ref})
+        return task.task_id
+
+    def _append_worker_task_output(self, task_id: str, event_type: str, message: str, payload: dict[str, Any] | None = None) -> None:
+        key = f"background_task_output:{task_id}"
+        output = self.store.get("reports", key) or {"schema": "grounded.background_task_output.v1", "task_id": task_id, "items": []}
+        items = [item for item in output.get("items") or [] if isinstance(item, dict)]
+        items.append(
+            {
+                "sequence": len(items) + 1,
+                "event_type": event_type,
+                "message": message,
+                "payload": payload or {},
+                "created_at": utc_now().isoformat(),
+            }
+        )
+        output["items"] = items[-1000:]
+        output["updated_at"] = utc_now().isoformat()
+        self.store.upsert("reports", key, output)
+
+    @staticmethod
+    def _worker_contract_slice(
+        *,
+        worker_id: str,
+        implementation_plan: dict[str, Any],
+        acceptance_contract: dict[str, Any],
+    ) -> dict[str, Any]:
+        role = ownership_for_worker(worker_id).get("role")
+        flows = [
+            flow
+            for flow in (acceptance_contract.get("flows") or [])
+            if isinstance(flow, dict) and (not role or role in [str(item) for item in flow.get("roles") or []])
+        ]
+        return {
+            "primary_entities": list(implementation_plan.get("primary_entities") or [])[:8],
+            "role": role,
+            "flows": flows[:6],
+            "role_actions": (acceptance_contract.get("role_actions") or {}).get(role, []) if role else acceptance_contract.get("role_actions") or {},
+            "browser_steps": acceptance_contract.get("browser_steps") or [],
+            "api_smoke": acceptance_contract.get("api_smoke") or [],
+            "persisted_markers": acceptance_contract.get("persisted_markers") or [],
+        }
+
+    @staticmethod
+    def _worker_semantic_slice(*, worker_id: str, semantic_graph: dict[str, Any]) -> dict[str, Any]:
+        ownership = ownership_for_worker(worker_id)
+        allowed = [str(item) for item in ownership.get("allowed_paths") or []]
+        graph = semantic_graph.get("graph") if isinstance(semantic_graph, dict) else semantic_graph
+        files = []
+        if isinstance(graph, dict):
+            for item in graph.get("files") or graph.get("nodes") or []:
+                if not isinstance(item, dict):
+                    continue
+                path = str(item.get("path") or item.get("file") or "")
+                if any(path == prefix or path.startswith(prefix.rstrip("/") + "/") for prefix in allowed):
+                    files.append(item)
+        return {"allowed_prefixes": allowed, "files": files[:80]}
+
+    def _update_worker_output_artifact(
+        self,
+        *,
+        workspace_id: str,
+        run_id: str,
+        artifact_run_id: str,
+        worker_id: str,
+        result: WorkerBranchResult,
+        branch_ref: str,
+    ) -> None:
+        canonical = canonical_worker_id(worker_id)
+        refs = worker_refs(workspace_id, artifact_run_id, canonical)
+        current = self.store.get("reports", refs["output_ref"]) or {}
+        status = "changes_ready" if result.status == "changes_ready" else "failed" if result.status == "failed" else "completed"
+        payload = {
+            **(current if isinstance(current, dict) else {}),
+            "schema": "grounded.worker_output.v1",
+            "workspace_id": workspace_id,
+            "run_id": run_id,
+            "artifact_run_id": artifact_run_id,
+            "worker_id": canonical,
+            "worker_type": canonical,
+            "status": status,
+            "badge": status,
+            "ownership": ownership_for_worker(canonical),
+            "changed_files": list(result.changed_files),
+            "diff_ref": branch_ref,
+            "proof_refs": list((current or {}).get("proof_refs") or []),
+            "issues": ([{"message": result.error, "severity": "high"}] if result.error else []),
+            "self_check": {
+                "status": "failed" if result.status == "failed" else "ready_for_merge",
+                "owned_paths_only": all(path_is_allowed(canonical, path) for path in result.changed_files),
+                "file_count": len(result.changed_files),
+            },
+            "token_usage": dict(result.token_usage),
+            "summary": result.assistant_message[:1200] or (
+                f"{canonical} produced {len(result.changed_files)} changed file(s)."
+                if result.changed_files
+                else f"{canonical} finished without branch changes."
+            ),
+            "merge_recommendation": "needs_repair" if result.status == "failed" else "accept" if result.status == "changes_ready" else "deferred",
+            "branch_ref": branch_ref,
+            "updated_at": utc_now().isoformat(),
+        }
+        self._store_report(refs["output_ref"], payload)
+        task_id = str(payload.get("task_id") or "")
+        if task_id:
+            self._append_worker_task_output(task_id, status, payload["summary"], {"worker_id": canonical, "output_ref": refs["output_ref"], "branch_ref": branch_ref})
+            task_payload = self.store.get("background_tasks", task_id)
+            if isinstance(task_payload, dict):
+                task_payload["status"] = "failed" if result.status == "failed" else "completed"
+                task_payload["output_summary"] = payload["summary"]
+                task_payload["completed_at"] = utc_now().isoformat()
+                task_payload["updated_at"] = utc_now().isoformat()
+                task_payload["linked_refs"] = {**(task_payload.get("linked_refs") or {}), "branch_ref": branch_ref, "output_ref": refs["output_ref"]}
+                self.store.upsert("background_tasks", task_id, task_payload)
+
+    def _store_worker_merge_decision(
+        self,
+        *,
+        workspace_id: str,
+        run_id: str,
+        artifact_run_id: str,
+        merge_report: dict[str, Any],
+        results: list[WorkerBranchResult],
+        status: str,
+        apply_result: dict[str, Any] | None = None,
+    ) -> None:
+        decisions: list[dict[str, Any]] = []
+        ownership = merge_report.get("ownership") if isinstance(merge_report.get("ownership"), dict) else {}
+        conflict_paths = {
+            str(item.get("path") or "")
+            for item in ownership.get("conflicts", [])
+            if isinstance(item, dict)
+        }
+        forbidden_paths = {
+            str(item.get("path") or "")
+            for item in ownership.get("forbidden", [])
+            if isinstance(item, dict)
+        }
+        for result in results:
+            worker_id = canonical_worker_id(result.worker_id)
+            changed = list(result.changed_files)
+            blocked_paths = sorted({path for path in changed if path in conflict_paths or path in forbidden_paths})
+            if result.status == "failed":
+                decision = "needs_repair"
+            elif blocked_paths:
+                decision = "rejected"
+            elif status in {"merged", "partial"} and result.status == "changes_ready":
+                decision = "accepted"
+            elif result.status == "changes_ready":
+                decision = "deferred"
+            else:
+                decision = "deferred"
+            decisions.append(
+                {
+                    "worker_id": worker_id,
+                    "worker_type": worker_id,
+                    "decision": decision,
+                    "changed_files": changed,
+                    "blocked_paths": blocked_paths,
+                    "output_ref": worker_refs(workspace_id, artifact_run_id, worker_id)["output_ref"],
+                    "repair_worker_required": decision in {"needs_repair", "rejected"},
+                }
+            )
+        payload = {
+            "schema": "grounded.worker_manager_merge_decision.v1",
+            "workspace_id": workspace_id,
+            "run_id": run_id,
+            "artifact_run_id": artifact_run_id,
+            "status": status,
+            "decisions": decisions,
+            "merge_report": merge_report,
+            "apply_result": apply_result or {},
+            "repair_worker": self._repair_worker_packet_from_decisions(run_id=run_id, decisions=decisions),
+            "created_at": utc_now().isoformat(),
+        }
+        ref = f"worker_manager_merge_decision:{workspace_id}:{artifact_run_id}"
+        self._store_report(ref, payload)
+
+    @staticmethod
+    def _repair_worker_packet_from_decisions(*, run_id: str, decisions: list[dict[str, Any]]) -> dict[str, Any]:
+        repair_items = [item for item in decisions if item.get("repair_worker_required")]
+        if not repair_items:
+            return {}
+        return {
+            "worker_id": "repair_worker",
+            "worker_type": "repair_worker",
+            "run_id": run_id,
+            "owned_failures": repair_items,
+            "status": "planned",
+            "next_action": "Start repair_worker with the blocked owned paths and latest proof failure.",
+        }
+
     def _run_parallel_worker_branches(
         self,
         *,
@@ -1951,8 +2374,8 @@ class WorkspaceCodeAgentRuntime:
         ]
         if not tasks:
             return [], [], "Workspace code agent initialized."
-        backend_tasks = [task for task in tasks if str(task.get("worker_id") or "").strip() == "backend_api"]
-        remaining_tasks = [task for task in tasks if str(task.get("worker_id") or "").strip() != "backend_api"]
+        backend_tasks = [task for task in tasks if canonical_worker_id(str(task.get("worker_id") or "").strip()) == "backend_api_worker"]
+        remaining_tasks = [task for task in tasks if canonical_worker_id(str(task.get("worker_id") or "").strip()) != "backend_api_worker"]
         if backend_tasks and remaining_tasks:
             backend_changes, backend_changed_files, backend_message = self._run_parallel_worker_branches(
                 workspace_id=workspace_id,
@@ -2058,10 +2481,18 @@ class WorkspaceCodeAgentRuntime:
 
         def record_result(result: WorkerBranchResult) -> None:
             results.append(result)
-            worker_id = result.worker_id
+            worker_id = canonical_worker_id(result.worker_id)
             ref = f"worker_branch:{workspace_id}:{artifact_run_id}:{worker_id}"
             job.worker_branch_refs = list(dict.fromkeys([*job.worker_branch_refs, ref]))
             self._store_report(ref, {"workspace_id": workspace_id, "run_id": run_id, "branch": result.as_dict()})
+            self._update_worker_output_artifact(
+                workspace_id=workspace_id,
+                run_id=run_id,
+                artifact_run_id=artifact_run_id,
+                worker_id=worker_id,
+                result=result,
+                branch_ref=ref,
+            )
             if result.token_usage:
                 job.token_usage = self._merge_run_token_usage(
                     job.token_usage if isinstance(job.token_usage, dict) else {},
@@ -2132,7 +2563,7 @@ class WorkspaceCodeAgentRuntime:
         for worker_id in sorted(pending):
             worker = workers_by_id.get(worker_id, {})
             result = WorkerBranchResult(
-                worker_id=worker_id,
+                worker_id=canonical_worker_id(worker_id),
                 owner_scope=str(worker.get("owner_scope") or worker_id),
                 branch_run_id=str(worker.get("branch_run_id") or ""),
                 source_dir=str(worker.get("source_dir") or ""),
@@ -2142,6 +2573,14 @@ class WorkspaceCodeAgentRuntime:
             record_result(result)
         file_changes = [change for result in results if result.status == "changes_ready" for change in result.file_changes]
         if not file_changes:
+            self._store_worker_merge_decision(
+                workspace_id=workspace_id,
+                run_id=run_id,
+                artifact_run_id=artifact_run_id,
+                merge_report={"run_id": artifact_run_id, "status": "no_changes", "ownership": {"ok": True, "conflicts": [], "forbidden": []}},
+                results=results,
+                status="deferred",
+            )
             self._store_report(
                 job.worker_merge_ref or f"worker_merge:{workspace_id}:{artifact_run_id}",
                 {"workspace_id": workspace_id, "run_id": run_id, **self.worker_runtime.snapshot(artifact_run_id)},
@@ -2149,6 +2588,14 @@ class WorkspaceCodeAgentRuntime:
             return [], [], "Worker branches completed without mergeable changes; coordinator will continue."
         merge_report = self.worker_runtime.merge_report(artifact_run_id, file_changes)
         job.worker_merge_ref = job.worker_merge_ref or f"worker_merge:{workspace_id}:{artifact_run_id}"
+        self._store_worker_merge_decision(
+            workspace_id=workspace_id,
+            run_id=run_id,
+            artifact_run_id=artifact_run_id,
+            merge_report=merge_report,
+            results=results,
+            status="conflict" if not bool((merge_report.get("ownership") if isinstance(merge_report.get("ownership"), dict) else {}).get("ok")) else "ready",
+        )
         if not bool((merge_report.get("ownership") if isinstance(merge_report.get("ownership"), dict) else {}).get("ok")):
             conflict_paths = {
                 str(conflict.get("path") or "")
@@ -2173,6 +2620,15 @@ class WorkspaceCodeAgentRuntime:
                 }
                 self._store_report(job.worker_merge_ref, {"workspace_id": workspace_id, "run_id": run_id, **self.worker_runtime.snapshot(artifact_run_id), **merge_payload})
                 if apply_result.status == "applied":
+                    self._store_worker_merge_decision(
+                        workspace_id=workspace_id,
+                        run_id=run_id,
+                        artifact_run_id=artifact_run_id,
+                        merge_report=merge_report,
+                        results=results,
+                        status="partial",
+                        apply_result=apply_result.model_dump(mode="json"),
+                    )
                     branch_results = self.worker_runtime.record_branch_results(artifact_run_id, mergeable_changes)
                     for branch in branch_results:
                         ref = f"worker_branch_merge:{workspace_id}:{artifact_run_id}:{branch.get('worker_id')}"
@@ -2212,6 +2668,15 @@ class WorkspaceCodeAgentRuntime:
         }
         self._store_report(job.worker_merge_ref, {"workspace_id": workspace_id, "run_id": run_id, **self.worker_runtime.snapshot(artifact_run_id), **merge_payload})
         if apply_result.status != "applied":
+            self._store_worker_merge_decision(
+                workspace_id=workspace_id,
+                run_id=run_id,
+                artifact_run_id=artifact_run_id,
+                merge_report=merge_report,
+                results=results,
+                status="rejected",
+                apply_result=apply_result.model_dump(mode="json"),
+            )
             self._append_event(
                 job,
                 "worker_failed",
@@ -2220,6 +2685,15 @@ class WorkspaceCodeAgentRuntime:
             )
             return [], [], "Worker branches need coordinator repair after merge apply conflict."
         branch_results = self.worker_runtime.record_branch_results(artifact_run_id, file_changes)
+        self._store_worker_merge_decision(
+            workspace_id=workspace_id,
+            run_id=run_id,
+            artifact_run_id=artifact_run_id,
+            merge_report=merge_report,
+            results=results,
+            status="merged",
+            apply_result=apply_result.model_dump(mode="json"),
+        )
         for branch in branch_results:
             ref = f"worker_branch_merge:{workspace_id}:{artifact_run_id}:{branch.get('worker_id')}"
             job.worker_branch_refs = list(dict.fromkeys([*job.worker_branch_refs, ref]))
@@ -2265,6 +2739,7 @@ class WorkspaceCodeAgentRuntime:
     ) -> dict[str, Any]:
         turn_started_at = time.perf_counter()
         turn_started_iso = datetime.now(timezone.utc).isoformat()
+        protocol_turn_id = f"turn_{attempt}_{tool_round}"
         self._append_event(
             job,
             "agent_turn_started",
@@ -2276,6 +2751,27 @@ class WorkspaceCodeAgentRuntime:
                 "has_draft_diff": bool(self.workspace_service.diff(workspace_id, run_id=run_id).strip()),
             },
         )
+        if self.run_protocol_service is not None:
+            self.run_protocol_service.append_event(
+                run_id=run_id,
+                workspace_id=workspace_id,
+                session_id=request.session_id,
+                event_type="turn_started",
+                status="started",
+                turn_id=protocol_turn_id,
+                message="Workspace code agent turn started.",
+                payload={
+                    "attempt": attempt,
+                    "tool_round": tool_round,
+                    "context_mode": context_mode,
+                    "repeated_no_progress": repeated_no_progress,
+                },
+                refs={
+                    "checkpoint_ref": job.resume_checkpoint_ref,
+                    "trace_bundle_ref": job.trace_bundle_ref,
+                },
+                source_event_type="agent_turn_started",
+            )
         try:
             generation_mode = self._generation_mode(request.generation_mode)
             intent_value = str(request.intent or "").strip().lower()
@@ -2363,6 +2859,23 @@ class WorkspaceCodeAgentRuntime:
                 attempt=attempt,
                 tool_round=tool_round,
             )
+            self._record_rollout_trace(
+                job,
+                artifact_run_id=run_id or job.job_id,
+                event_type="prompt_context_pack",
+                payload=self._prompt_context_trace_payload(
+                    workspace_id=workspace_id,
+                    run_id=run_id,
+                    request=request,
+                    attempt=attempt,
+                    tool_round=tool_round,
+                    context_mode=context_mode,
+                    prompt_payload=user_prompt,
+                    agent_memory=agent_memory or {},
+                    latest_execution=latest_execution,
+                    latest_diff_summary=latest_diff_summary,
+                ),
+            )
             self._append_event(
                 job,
                 "agent_turn_started",
@@ -2396,6 +2909,7 @@ class WorkspaceCodeAgentRuntime:
             if isolate_compact_repair and (
                 transcript_context.get("previous_response_id")
                 or transcript_context.get("tool_result_messages")
+                or transcript_context.get("post_compact_messages")
             ):
                 self.transcript_store.clear_model_context(artifact_run_id)
                 self._append_event(
@@ -2410,6 +2924,9 @@ class WorkspaceCodeAgentRuntime:
                 )
                 transcript_context = self.transcript_store.next_model_context(artifact_run_id)
             pending_tool_results = list(transcript_context.get("tool_result_messages") or [])
+            pending_post_compact_messages = list(transcript_context.get("post_compact_messages") or [])
+            if pending_post_compact_messages:
+                user_prompt = self._with_post_compact_messages(user_prompt, pending_post_compact_messages)
             available_tools = AgentToolRegistry.openai_tools()
             forced_tool_names = {
                 str(item)
@@ -2473,8 +2990,47 @@ class WorkspaceCodeAgentRuntime:
                     "total_tokens": int(turn_cache_stats.get("total_tokens") or 0),
                 },
                 consumed_tool_result_count=len(pending_tool_results),
+                consumed_post_compact_count=len(pending_post_compact_messages),
+                consumed_post_compact_refs=[
+                    str(item.get("post_compact_message_ref") or item.get("ref") or "")
+                    for item in pending_post_compact_messages
+                    if isinstance(item, dict)
+                ],
             )
+            for compact_message in pending_post_compact_messages:
+                if not isinstance(compact_message, dict) or self.run_compaction_service is None:
+                    continue
+                boundary_id_value = str(compact_message.get("boundary_id") or "").strip()
+                if not boundary_id_value:
+                    continue
+                try:
+                    self.run_compaction_service.mark_post_compact_consumed(
+                        run_id=run_id,
+                        boundary_id=boundary_id_value,
+                        turn_id=protocol_turn_id,
+                    )
+                except KeyError:
+                    logger.debug("post_compact_message_missing run_id=%s boundary_id=%s", run_id, boundary_id_value)
             self.transcript_store.append_tool_calls(artifact_run_id, normalized_tool_calls)
+            self._record_rollout_trace(
+                job,
+                artifact_run_id=artifact_run_id,
+                event_type="model_prompt_response",
+                payload={
+                    "attempt": attempt,
+                    "tool_round": tool_round,
+                    "response_id": str(parsed_payload.get("response_id") or ""),
+                    "model": job.llm_model,
+                    "assistant_summary": str(parsed_payload.get("assistant_message") or "")[:1200],
+                    "tool_call_count": tool_call_count,
+                    "token_usage": {
+                        "input_tokens": int(turn_cache_stats.get("input_tokens") or 0),
+                        "output_tokens": int(turn_cache_stats.get("output_tokens") or 0),
+                        "reasoning_tokens": int(turn_cache_stats.get("reasoning_tokens") or 0),
+                        "total_tokens": int(turn_cache_stats.get("total_tokens") or 0),
+                    },
+                },
+            )
             job.active_tool_uses = [
                 {
                     "tool_use_id": str(item.get("tool_use_id") or ""),
@@ -2490,8 +3046,81 @@ class WorkspaceCodeAgentRuntime:
                 job,
                 artifact_run_id,
                 phase="model_turn",
-                extra={"attempt": attempt, "tool_round": tool_round, "pending_tool_results": len(pending_tool_results)},
+                extra={
+                    "attempt": attempt,
+                    "tool_round": tool_round,
+                    "pending_tool_results": len(pending_tool_results),
+                    "consumed_post_compact_count": len(pending_post_compact_messages),
+                },
             )
+            protocol_bookmark: dict[str, Any] | None = None
+            if self.run_protocol_service is not None:
+                try:
+                    protocol_bookmark = self.run_protocol_service.create_bookmark(
+                        run_id=run_id,
+                        workspace_id=workspace_id,
+                        turn_id=protocol_turn_id,
+                        response_id=str(parsed_payload.get("response_id") or "") or None,
+                        checkpoint_ref=job.resume_checkpoint_ref,
+                        trace_bundle_ref=job.trace_bundle_ref,
+                        diff_sha256_value=diff_sha256(self.workspace_service.diff(workspace_id, run_id=run_id)),
+                        tool_result_count=len(pending_tool_results),
+                        latest_check_ref=f"latest_check_execution:{run_id}",
+                        todo_state_ref=job.scratchpad_ref,
+                        metadata={
+                            "attempt": attempt,
+                            "tool_round": tool_round,
+                            "context_mode": context_mode,
+                            "model": job.llm_model,
+                        },
+                    )
+                    self.run_protocol_service.append_event(
+                        run_id=run_id,
+                        workspace_id=workspace_id,
+                        session_id=request.session_id,
+                        event_type="model_delta",
+                        status="completed",
+                        turn_id=protocol_turn_id,
+                        message="Workspace code agent produced a model response.",
+                        payload={
+                            "response_id": str(parsed_payload.get("response_id") or "") or None,
+                            "model": job.llm_model,
+                            "assistant_summary": str(parsed_payload.get("assistant_message") or "")[:600],
+                            "tool_call_count": tool_call_count,
+                            "token_usage": {
+                                "input_tokens": int(turn_cache_stats.get("input_tokens") or 0),
+                                "output_tokens": int(turn_cache_stats.get("output_tokens") or 0),
+                                "reasoning_tokens": int(turn_cache_stats.get("reasoning_tokens") or 0),
+                                "total_tokens": int(turn_cache_stats.get("total_tokens") or 0),
+                            },
+                        },
+                        refs={
+                            "checkpoint_ref": job.resume_checkpoint_ref,
+                            "trace_bundle_ref": job.trace_bundle_ref,
+                        },
+                        bookmark_id=str(protocol_bookmark.get("bookmark_id") or "") if protocol_bookmark else None,
+                        source_event_type="iteration_ready",
+                    )
+                    for tool_call in normalized_tool_calls:
+                        self.run_protocol_service.append_event(
+                            run_id=run_id,
+                            workspace_id=workspace_id,
+                            session_id=request.session_id,
+                            event_type="tool_requested",
+                            status="started",
+                            turn_id=protocol_turn_id,
+                            message=f"Tool requested: {tool_call.get('tool') or 'unknown'}",
+                            payload={
+                                "tool": tool_call.get("tool"),
+                                "tool_use_id": tool_call.get("tool_use_id"),
+                                "mode": tool_call.get("mode"),
+                                "targets": tool_call.get("targets") if isinstance(tool_call.get("targets"), list) else [],
+                            },
+                            bookmark_id=str(protocol_bookmark.get("bookmark_id") or "") if protocol_bookmark else None,
+                            source_event_type="tool_call",
+                        )
+                except Exception:
+                    logger.exception("run_protocol_turn_record_failed run_id=%s turn_id=%s", run_id, protocol_turn_id)
             self._append_agent_diagnostic(
                 workspace_id,
                 {
@@ -2542,6 +3171,19 @@ class WorkspaceCodeAgentRuntime:
                     "has_draft_diff": bool(self.workspace_service.diff(workspace_id, run_id=run_id).strip()),
                 },
             )
+            if self.run_protocol_service is not None:
+                self.run_protocol_service.append_event(
+                    run_id=run_id,
+                    workspace_id=workspace_id,
+                    session_id=request.session_id,
+                    event_type="turn_completed",
+                    status="completed",
+                    turn_id=protocol_turn_id,
+                    message="Workspace code agent turn completed.",
+                    payload={"attempt": attempt, "tool_round": tool_round, "tool_call_count": tool_call_count},
+                    bookmark_id=str(protocol_bookmark.get("bookmark_id") or "") if protocol_bookmark else None,
+                    source_event_type="iteration_ready",
+                )
             return parsed_payload if parsed_payload else {"error": "Agent returned no tool-step payload."}
         except Exception as exc:
             error_text = str(exc)
@@ -2580,6 +3222,18 @@ class WorkspaceCodeAgentRuntime:
                 )
             else:
                 logger.exception("workspace_code_agent_turn_failed workspace_id=%s run_id=%s", workspace_id, run_id)
+            if self.run_protocol_service is not None:
+                self.run_protocol_service.append_event(
+                    run_id=run_id,
+                    workspace_id=workspace_id,
+                    session_id=request.session_id,
+                    event_type="turn_completed",
+                    status="failed",
+                    turn_id=protocol_turn_id,
+                    message="Workspace code agent turn failed.",
+                    payload={"attempt": attempt, "tool_round": tool_round, "error": error_text, "error_class": exc.__class__.__name__},
+                    source_event_type="agent_turn_failed",
+                )
             return {"error": f"Workspace code agent turn failed: {error_text}"}
 
     @staticmethod
@@ -3674,6 +4328,23 @@ class WorkspaceCodeAgentRuntime:
         )
         if not should_spill:
             return WorkspaceCodeAgentRuntime._compact_jsonish(item, max_chars=900, max_items=7)
+        if self.run_compaction_service is not None:
+            compact = self.run_compaction_service.microcompact_tool_result(
+                workspace_id=str(workspace_id),
+                run_id=str(run_id),
+                tool_result=dict(item),
+                serialized=serialized,
+            )
+            return {
+                "tool": compact.get("tool"),
+                "status": compact.get("status"),
+                "persisted_output_ref": compact.get("microcompact_ref"),
+                "microcompact_ref": compact.get("microcompact_ref"),
+                "digest": compact.get("digest"),
+                "original_chars": compact.get("original_chars"),
+                "preview": compact.get("output"),
+                "has_more": True,
+            }
         report_key = self._store_large_tool_result(
             workspace_id=str(workspace_id),
             run_id=str(run_id),
@@ -3784,6 +4455,16 @@ class WorkspaceCodeAgentRuntime:
                 "rule": "Use cached file_contexts/current diff for these paths unless they were mutated after the last read or a precise missing line range is required.",
             }
         if pressure.get("compact_recommended"):
+            self._record_compact_boundary(
+                job=job,
+                workspace_id=workspace_id,
+                run_id=run_id,
+                artifact_run_id=artifact_run_id,
+                pressure=pressure,
+                attempt=attempt,
+                tool_round=tool_round,
+                reason="context_pressure",
+            )
             self._append_activity(
                 job,
                 "context_suggestion",
@@ -3800,6 +4481,137 @@ class WorkspaceCodeAgentRuntime:
             )
             self.rollout_trace.append(artifact_run_id, "context_suggestion", pressure)
         return json.dumps(payload, ensure_ascii=False)
+
+    @staticmethod
+    def _with_post_compact_messages(user_prompt: str, messages: list[dict[str, Any]]) -> str:
+        compact_messages: list[dict[str, Any]] = []
+        for item in messages[-3:]:
+            if not isinstance(item, dict):
+                continue
+            compact_messages.append(
+                {
+                    "boundary_id": item.get("boundary_id"),
+                    "post_compact_message_ref": item.get("post_compact_message_ref") or item.get("ref"),
+                    "status": item.get("status"),
+                    "message": str(item.get("message") or "")[:12000],
+                    "refs": item.get("refs") if isinstance(item.get("refs"), dict) else {},
+                }
+            )
+        if not compact_messages:
+            return user_prompt
+        try:
+            payload = json.loads(user_prompt)
+            if isinstance(payload, dict):
+                payload["post_compact_messages"] = compact_messages
+                payload["post_compact_instruction"] = (
+                    "Use post_compact_messages as the active continuity context for this turn. "
+                    "They replace omitted prior tool results at compact boundaries."
+                )
+                return json.dumps(payload, ensure_ascii=False)
+        except (TypeError, ValueError):
+            pass
+        return (
+            f"{user_prompt}\n\n"
+            "POST-COMPACT CONTEXT:\n"
+            f"{json.dumps(compact_messages, ensure_ascii=False, default=str)}"
+        )
+
+    def _record_compact_boundary(
+        self,
+        *,
+        job: JobRecord,
+        workspace_id: str,
+        run_id: str,
+        artifact_run_id: str,
+        pressure: dict[str, Any],
+        attempt: int,
+        tool_round: int,
+        reason: str,
+    ) -> None:
+        if self.run_compaction_service is None or not run_id:
+            return
+        boundary_id = f"compact_{attempt}_{tool_round}_{hashlib.sha256(json.dumps(pressure, ensure_ascii=False, default=str).encode('utf-8')).hexdigest()[:8]}"
+        boundary_ref = f"run_compaction_boundary:{run_id}:{boundary_id}"
+        if isinstance(self.store.get("reports", boundary_ref), dict):
+            return
+        run_payload = self.store.get("runs", run_id)
+        if not isinstance(run_payload, dict):
+            return
+        try:
+            run = RunRecord.model_validate(run_payload)
+            checkpoint = self.store.get("reports", job.resume_checkpoint_ref) if job.resume_checkpoint_ref else {}
+            artifacts = self.store.get("reports", f"run_artifacts:{run_id}") or {}
+            compact_payload = self.run_compaction_service.compact_run(
+                run=run,
+                artifacts=artifacts if isinstance(artifacts, dict) else {},
+                checkpoint=checkpoint if isinstance(checkpoint, dict) else {},
+                context_pressure=pressure,
+                reason=reason,
+                source="autocompact",
+                boundary_id=boundary_id,
+            )
+            reset = self.transcript_store.compact_model_context(
+                artifact_run_id,
+                reason=reason,
+                preserve_response_id=True,
+            )
+            post_compact_message_ref = compact_payload.get("post_compact_message_ref")
+            post_compact_message: dict[str, Any] | None = None
+            if post_compact_message_ref:
+                post_compact_message = self.store.get("reports", str(post_compact_message_ref))
+                if isinstance(post_compact_message, dict):
+                    self.transcript_store.append_post_compact_message(artifact_run_id, post_compact_message)
+            job.compaction_summaries = [
+                *list(job.compaction_summaries or []),
+                {
+                    "schema": "grounded.run_compaction_summary.v1",
+                    "boundary_id": boundary_id,
+                    "compaction_ref": compact_payload.get("compaction_ref"),
+                    "post_compact_message_ref": post_compact_message_ref,
+                    "reason": reason,
+                    "pressure_ratio": pressure.get("pressure_ratio"),
+                    "pending_tool_result_count": reset.get("pending_tool_result_count"),
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                },
+            ][-20:]
+            self._store_transcript_snapshot(job, artifact_run_id)
+            self._append_event(
+                job,
+                "compact_boundary",
+                "Run context compacted at context-pressure boundary.",
+                {
+                    "boundary_id": boundary_id,
+                    "artifact_ref": compact_payload.get("compaction_ref"),
+                    "boundary_ref": compact_payload.get("boundary_ref"),
+                    "post_compact_message_ref": post_compact_message_ref,
+                    "reason": reason,
+                    "attempt": attempt,
+                    "tool_round": tool_round,
+                    "pressure_ratio": pressure.get("pressure_ratio"),
+                    "pending_tool_result_count": reset.get("pending_tool_result_count"),
+                    "previous_response_id": reset.get("previous_response_id"),
+                },
+            )
+            self._store_resume_checkpoint(
+                job,
+                artifact_run_id,
+                phase="compact_boundary",
+                extra={
+                    "compaction_ref": compact_payload.get("compaction_ref"),
+                    "compact_boundary_ref": compact_payload.get("boundary_ref"),
+                    "compact_boundary_id": boundary_id,
+                    "post_compact_message_ref": post_compact_message_ref,
+                    "context_pressure": pressure,
+                    "pending_tool_result_count": reset.get("pending_tool_result_count"),
+                    "pending_post_compact_count": 1 if post_compact_message else 0,
+                    "previous_response_id": reset.get("previous_response_id"),
+                    "latest_check_ref": f"latest_check_execution:{run_id}",
+                    "budget_status": job.budget_status,
+                    "completion_budget": job.completion_budget,
+                },
+            )
+        except Exception:
+            logger.exception("run_compaction_boundary_failed workspace_id=%s run_id=%s", workspace_id, run_id)
 
     def _record_hook(
         self,
@@ -4123,6 +4935,29 @@ class WorkspaceCodeAgentRuntime:
         if job is not None:
             artifact_run_id = run_id or job.job_id
             self.transcript_store.append_tool_results(artifact_run_id, tool_results)
+            for item in tool_results:
+                if not isinstance(item, dict):
+                    continue
+                success = item.get("success")
+                status = str(item.get("status") or item.get("semantic_status") or "").lower()
+                exit_code = item.get("exit_code")
+                failed = success is False or status in {"failed", "blocked", "forbidden", "error"} or (isinstance(exit_code, int) and exit_code != 0)
+                if failed:
+                    self._record_rollout_trace(
+                        job,
+                        artifact_run_id=artifact_run_id,
+                        event_type="tool_failed_reason",
+                        payload={
+                            "tool": item.get("tool"),
+                            "tool_use_id": item.get("tool_use_id"),
+                            "status": status or item.get("status"),
+                            "semantic_status": item.get("semantic_status"),
+                            "exit_code": exit_code,
+                            "policy_decision": item.get("policy_decision"),
+                            "error": item.get("error") or item.get("stderr_tail") or item.get("details"),
+                            "command": item.get("command"),
+                        },
+                    )
             completed_ids = {str(item.get("tool_use_id") or "") for item in tool_results if isinstance(item, dict)}
             if completed_ids and job.active_tool_uses:
                 job.active_tool_uses = [
@@ -4202,6 +5037,13 @@ class WorkspaceCodeAgentRuntime:
             "diagnostics_delta_ref": diagnostics_delta_ref,
             "diagnostics_delta": self.store.get("reports", diagnostics_delta_ref),
             "file_state_cache_ref": job.file_state_cache_ref,
+            "compaction_ref": f"run_compaction:{artifact_run_id}",
+            "compact_boundaries_ref": f"run_compaction_boundaries:{artifact_run_id}",
+            "latest_check_ref": f"latest_check_execution:{artifact_run_id}",
+            "budget_status": job.budget_status,
+            "completion_budget": job.completion_budget,
+            "previous_response_id": self.transcript_store.snapshot(artifact_run_id).get("last_response_id"),
+            "pending_tool_result_count": self.transcript_store.snapshot(artifact_run_id).get("pending_tool_result_count"),
             "stored_at": datetime.now(timezone.utc).isoformat(),
         }
         checkpoint.update(extra or {})
@@ -4241,6 +5083,16 @@ class WorkspaceCodeAgentRuntime:
             writer=write,
             existing=existing if isinstance(existing, dict) else None,
         )
+        if self.run_compaction_service is not None:
+            self.transcript_store.configure_microcompact(
+                artifact_run_id,
+                writer=lambda result, serialized: self.run_compaction_service.microcompact_tool_result(
+                    workspace_id=job.workspace_id,
+                    run_id=artifact_run_id,
+                    tool_result=result,
+                    serialized=serialized,
+                ),
+            )
 
     def _store_transcript_snapshot(self, job: JobRecord, artifact_run_id: str) -> None:
         self._configure_transcript_persistence(job, artifact_run_id)
@@ -4822,12 +5674,13 @@ class WorkspaceCodeAgentRuntime:
             for operation in loop_result.all_file_changes
         ]
         job.compaction_summaries = [
+            *list(job.compaction_summaries or []),
             compact_agent_memory(
                 turn_history=loop_result.turn_history,
                 file_change_count=len(loop_result.all_file_changes),
                 last_assistant_message=truncate_tool_text(loop_result.last_assistant_message, max_chars=1200),
             )
-        ]
+        ][-20:]
         job.agent_transcript_ref = job.agent_transcript_ref or f"agent_transcript:{job.workspace_id}:{artifact_run_id}"
         job.tool_trace_ref = f"tool_trace:{job.workspace_id}:{artifact_run_id}"
         job.file_change_history_ref = f"file_change_history:{job.workspace_id}:{artifact_run_id}"
@@ -5639,6 +6492,20 @@ class WorkspaceCodeAgentRuntime:
         }
         try:
             event = self.platform_db.append_run_event(job.linked_run_id, sdk_event_type, payload)
+            if self.run_protocol_service is not None:
+                session_id = None
+                run_payload = self.store.get("runs", job.linked_run_id)
+                if isinstance(run_payload, dict):
+                    session_id = str(run_payload.get("session_id") or "") or None
+                self.run_protocol_service.record_from_source_event(
+                    run_id=job.linked_run_id,
+                    workspace_id=job.workspace_id,
+                    session_id=session_id,
+                    source_event_type=event_type,
+                    message=message,
+                    details=payload["details"] if isinstance(payload.get("details"), dict) else {},
+                    job_status=job.status,
+                )
             if event_type in self._RUN_STATE_SNAPSHOT_EVENTS:
                 self.platform_db.insert_run_state_snapshot(
                     run_id=job.linked_run_id,
@@ -5874,6 +6741,236 @@ class WorkspaceCodeAgentRuntime:
             )
         except Exception:
             logger.exception("Failed to append trace bundle event %s for job %s.", event_type, job.job_id)
+
+    def _record_rollout_trace(self, job: JobRecord, *, artifact_run_id: str, event_type: str, payload: dict[str, Any]) -> None:
+        try:
+            self.rollout_trace.append(artifact_run_id, event_type, payload)
+            self._append_trace_bundle_event(job, event_type, payload)
+        except Exception:
+            logger.exception("Failed to record rollout trace event %s for job %s.", event_type, job.job_id)
+
+    def _prompt_context_trace_payload(
+        self,
+        *,
+        workspace_id: str,
+        run_id: str,
+        request: GenerateRequest,
+        attempt: int,
+        tool_round: int,
+        context_mode: str,
+        prompt_payload: str,
+        agent_memory: dict[str, Any],
+        latest_execution: CheckExecutionRecord,
+        latest_diff_summary: str | None,
+    ) -> dict[str, Any]:
+        parsed: dict[str, Any] = {}
+        try:
+            value = json.loads(prompt_payload)
+            parsed = value if isinstance(value, dict) else {}
+        except json.JSONDecodeError:
+            parsed = {"raw_prompt_excerpt": prompt_payload[:2000]}
+        context_pack = parsed.get("context_pack") if isinstance(parsed.get("context_pack"), dict) else {}
+        memory_trace = self._memory_injection_trace(workspace_id=workspace_id, run_id=run_id, agent_memory=agent_memory)
+        active_paths = self._target_files_from_execution(latest_execution)
+        if not active_paths and latest_diff_summary:
+            active_paths = self._paths_from_diff(str(latest_diff_summary or ""))[:8]
+        return {
+            "schema": "grounded.rollout_memory_trace.v1",
+            "attempt": attempt,
+            "tool_round": tool_round,
+            "context_mode": context_mode,
+            "prompt_sha256": hashlib.sha256(prompt_payload.encode("utf-8")).hexdigest(),
+            "prompt_chars": len(prompt_payload),
+            "prompt_keys": sorted(str(key) for key in parsed.keys())[:80],
+            "prompt_excerpt": prompt_payload[:4000],
+            "context_pack": {
+                "present": bool(context_pack),
+                "workspace_summary_chars": len(str(context_pack.get("workspace_summary") or "")) if context_pack else 0,
+                "selected_code_paths": [
+                    str(item.get("path") or "")
+                    for item in (context_pack.get("selected_code") or [])
+                    if isinstance(item, dict)
+                ][:20],
+                "targeted_file_paths": [
+                    str(item.get("path") or "")
+                    for item in (context_pack.get("targeted_files") or [])
+                    if isinstance(item, dict)
+                ][:20],
+                "retrieval_stats": context_pack.get("retrieval_stats") or {},
+            },
+            "skills": self._selected_skill_trace(
+                workspace_id=workspace_id,
+                prompt=request.prompt,
+                intent=str(request.intent or ""),
+                generation_mode=str(getattr(request.generation_mode, "value", request.generation_mode)),
+                paths=active_paths,
+                failure_class=str(getattr(request, "failure_class", "") or ""),
+            ),
+            "memory": memory_trace,
+            "rules_count": len(parsed.get("rules") or []) if isinstance(parsed.get("rules"), list) else 0,
+            "tool_registry_count": len(parsed.get("tool_registry") or {}) if isinstance(parsed.get("tool_registry"), dict) else 0,
+            "repair_focus": parsed.get("repair_focus") or "",
+        }
+
+    def _selected_skill_trace(
+        self,
+        *,
+        workspace_id: str,
+        prompt: str,
+        intent: str,
+        generation_mode: str,
+        paths: list[str],
+        failure_class: str,
+    ) -> dict[str, Any]:
+        del workspace_id
+        builder = getattr(self, "context_pack_builder", None)
+        if builder is not None and hasattr(builder, "skill_search_for_context"):
+            search = builder.skill_search_for_context(
+                prompt=prompt,
+                intent=intent,
+                generation_mode=generation_mode,
+                paths=paths,
+                failure_class=failure_class,
+            )
+        else:
+            search = {"selected": [], "skipped": [], "reason": "settings_unavailable"}
+        selected = list(search.get("selected") or [])
+        skipped = list(search.get("skipped") or [])[:20]
+        return {
+            "schema": search.get("schema") or "grounded.skill_search.v1",
+            "budget": search.get("budget") or {},
+            "explicit_mentions": search.get("explicit_mentions") or [],
+            "prefetch": search.get("prefetch") or {},
+            "selected": [
+                {
+                    "id": item.get("id"),
+                    "source": item.get("source"),
+                    "activation_reason": item.get("activation_reason"),
+                    "activation_score": item.get("activation_score"),
+                    "allowedTools": item.get("allowedTools") or [],
+                    "validation": item.get("validation") or item.get("validation_hints") or [],
+                }
+                for item in selected
+            ],
+            "skipped": skipped,
+        }
+
+    def _memory_injection_trace(self, *, workspace_id: str, run_id: str, agent_memory: dict[str, Any]) -> dict[str, Any]:
+        workspace_payload = self.store.get("reports", f"workspace_memory:{workspace_id}") or {}
+        stage1_payload = self.store.get("reports", f"memory_stage1:{workspace_id}:{run_id}") or {}
+        injected: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        for source, payload in (
+            ("workspace_memory", workspace_payload),
+            ("memory_stage1", stage1_payload),
+            ("agent_memory", agent_memory or {}),
+        ):
+            items = payload.get("items") or payload.get("memories") or []
+            if isinstance(payload.get("recent_failures"), list):
+                items = [*list(items if isinstance(items, list) else []), *payload.get("recent_failures")]
+            for index, item in enumerate(items if isinstance(items, list) else []):
+                if not isinstance(item, dict):
+                    continue
+                text = str(item.get("text") or item.get("summary") or item.get("signature") or "")
+                entry = {
+                    "source": source,
+                    "index": index,
+                    "kind": item.get("kind") or item.get("type") or "memory",
+                    "text_excerpt": text[:240],
+                    "citation": item.get("citation") or item.get("citations") or item.get("source_ref"),
+                }
+                if SECRET_RE.search(text) or SECRET_RE.search(str(item)):
+                    skipped.append({**entry, "reason": "secret_like_material"})
+                elif item.get("status") == "superseded":
+                    skipped.append({**entry, "reason": "superseded"})
+                elif (item.get("stale_check") or {}).get("status") == "stale":
+                    skipped.append({**entry, "reason": "stale_reference"})
+                else:
+                    injected.append({**entry, "reason": "active_context"})
+        return {
+            "injected": injected[:30],
+            "skipped": skipped[:30],
+            "source_refs": {
+                "workspace_memory": f"workspace_memory:{workspace_id}",
+                "memory_stage1": f"memory_stage1:{workspace_id}:{run_id}",
+                "agent_memory": f"agent_memory_store:{workspace_id}:{run_id}",
+            },
+        }
+
+    def _record_skill_usage_telemetry(
+        self,
+        *,
+        job: JobRecord,
+        artifact_run_id: str,
+        workspace_id: str,
+        run_id: str,
+        request: GenerateRequest,
+        results: list[RunCheckResult],
+        run_status: str,
+    ) -> None:
+        builder = getattr(self, "context_pack_builder", None)
+        paths = [path for result in results for path in self._target_files_from_result_payload(result)][:16]
+        if builder is not None and hasattr(builder, "skill_search_for_context"):
+            search = builder.skill_search_for_context(
+                prompt=request.prompt,
+                intent=str(request.intent or ""),
+                generation_mode=str(getattr(request.generation_mode, "value", request.generation_mode)),
+                paths=paths,
+                failure_class=str(job.failure_class or ""),
+            )
+            selected = list(search.get("selected") or [])
+        else:
+            selected = []
+        telemetry = SkillPackCatalog.usage_telemetry(
+            selected=selected,
+            check_results=[result.model_dump(mode="json") for result in results],
+            run_status=run_status,
+        )
+        telemetry_ref = f"skill_usage:{workspace_id}:{artifact_run_id}"
+        telemetry["workspace_id"] = workspace_id
+        telemetry["run_id"] = run_id
+        telemetry["search_selected_ids"] = [item.get("id") for item in selected]
+        self._store_report(telemetry_ref, telemetry)
+        self._record_rollout_trace(
+            job,
+            artifact_run_id=artifact_run_id,
+            event_type="skill_usage_telemetry",
+            payload={"telemetry_ref": telemetry_ref, "items": telemetry.get("items", [])},
+        )
+
+    def _file_content_hashes(self, *, workspace_id: str, run_id: str, paths: list[str]) -> dict[str, dict[str, Any]]:
+        hashes: dict[str, dict[str, Any]] = {}
+        for path in paths:
+            normalized = str(path or "").strip().replace("\\", "/")
+            if not normalized:
+                continue
+            text = self.workspace_service.try_read_text_file(workspace_id, normalized, run_id=run_id)
+            hashes[normalized] = {
+                "exists": text is not None,
+                "sha256": hashlib.sha256(str(text or "").encode("utf-8")).hexdigest() if text is not None else None,
+                "chars": len(str(text or "")) if text is not None else 0,
+            }
+        return hashes
+
+    @staticmethod
+    def _target_files_from_result_payload(result: RunCheckResult) -> list[str]:
+        paths: list[str] = []
+        diagnostics = result.diagnostics if isinstance(result.diagnostics, dict) else {}
+        for key in ("target_files", "changed_files", "files", "paths"):
+            value = diagnostics.get(key)
+            if isinstance(value, list):
+                paths.extend(str(item) for item in value if isinstance(item, str))
+            elif isinstance(value, str):
+                paths.append(value)
+        for line in [result.details, result.command, *list(result.logs or [])]:
+            for match in re.finditer(r"miniapp/[A-Za-z0-9_./-]+\\.(?:py|js|mjs|html|css|json)", str(line or "")):
+                paths.append(match.group(0))
+        normalized: list[str] = []
+        for path in paths:
+            value = WorkspaceCodeAgentRuntime._strip_leading_dot_slash(path)
+            if value and value not in normalized:
+                normalized.append(value)
+        return normalized[:12]
 
     def _finalize_trace_bundle(self, job: JobRecord) -> None:
         try:

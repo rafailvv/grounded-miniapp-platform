@@ -13,6 +13,7 @@ from app.modules.miniapp_agent_loop.agent_process_manager import AgentProcessMan
 from app.modules.miniapp_agent_loop.agent_kernel import plan_agent_tool_batches
 from app.modules.miniapp_agent_loop.agent_tool_registry import AgentToolRegistry
 from app.modules.miniapp_agent_loop.edit_validator import AgentEditValidator
+from app.modules.miniapp_agent_loop.lsp_tools import LspToolService
 from app.modules.miniapp_agent_loop.semantic_tools import semantic_scan
 from app.modules.miniapp_agent_loop.agent_tool_runtime import (
     list_workspace_files,
@@ -191,6 +192,60 @@ class AgentToolExecutor:
                 )
                 emit_activity(activity, label, {"tool_use_id": use_id, "tool": tool_name, "targets": request_targets, "status": "completed", "item_count": total_items})
                 emit_activity("hook_completed", "Post-tool hook", {"hook": "post_tool_use", "tool_use_id": use_id, "tool": tool_name, "status": "completed"})
+                return local_context, result
+            if tool_name in {"lsp.diagnostics", "lsp_diagnostics"}:
+                changed_files = self._paths_from_diff(self.workspace_service.diff(workspace_id, run_id=run_id))
+                files = [
+                    self._strip_leading_dot_slash(item)
+                    for item in request_item.get("files") or []
+                    if str(item or "").strip() and self._is_model_visible_path(self._strip_leading_dot_slash(item))
+                ]
+                effective_targets = files or request_targets
+                result = {
+                    **LspToolService.diagnostics(
+                        root=draft_source,
+                        targets=effective_targets,
+                        changed_files=changed_files,
+                        changed_only=bool(request_item.get("changed_only")),
+                    ),
+                    "reason": reason,
+                    "tool_use_id": use_id,
+                    "blocked_targets": blocked_read_targets,
+                }
+                emit_activity(activity, label, {"tool_use_id": use_id, "tool": "lsp.diagnostics", "targets": effective_targets, "status": "completed", "issue_count": len(result.get("items") or [])})
+                emit_activity("hook_completed", "Post-tool hook", {"hook": "post_tool_use", "tool_use_id": use_id, "tool": "lsp.diagnostics", "status": "completed"})
+                return local_context, result
+            if tool_name in {"lsp.symbol_context", "lsp_symbol_context"}:
+                query = str(request_item.get("query") or request_item.get("pattern") or "").strip()
+                result = {
+                    **LspToolService.symbol_context(root=draft_source, query=query, targets=request_targets),
+                    "reason": reason,
+                    "tool_use_id": use_id,
+                    "blocked_targets": blocked_read_targets,
+                }
+                emit_activity(activity, label, {"tool_use_id": use_id, "tool": "lsp.symbol_context", "targets": request_targets, "status": "completed", "symbol_count": len(result.get("items") or [])})
+                emit_activity("hook_completed", "Post-tool hook", {"hook": "post_tool_use", "tool_use_id": use_id, "tool": "lsp.symbol_context", "status": "completed"})
+                return local_context, result
+            if tool_name in {"lsp.find_references", "lsp_find_references"}:
+                symbol = str(request_item.get("symbol") or request_item.get("query") or request_item.get("pattern") or "").strip()
+                result = {
+                    **LspToolService.find_references(root=draft_source, symbol=symbol, targets=request_targets),
+                    "reason": reason,
+                    "tool_use_id": use_id,
+                    "blocked_targets": blocked_read_targets,
+                }
+                emit_activity(activity, label, {"tool_use_id": use_id, "tool": "lsp.find_references", "targets": request_targets, "status": "completed", "reference_count": len(result.get("items") or [])})
+                emit_activity("hook_completed", "Post-tool hook", {"hook": "post_tool_use", "tool_use_id": use_id, "tool": "lsp.find_references", "status": "completed"})
+                return local_context, result
+            if tool_name in {"lsp.route_static_context", "lsp_route_static_context"}:
+                result = {
+                    **LspToolService.route_static_context(root=draft_source, targets=request_targets),
+                    "reason": reason,
+                    "tool_use_id": use_id,
+                    "blocked_targets": blocked_read_targets,
+                }
+                emit_activity(activity, label, {"tool_use_id": use_id, "tool": "lsp.route_static_context", "targets": request_targets, "status": "completed", "route_count": len(result.get("routes") or [])})
+                emit_activity("hook_completed", "Post-tool hook", {"hook": "post_tool_use", "tool_use_id": use_id, "tool": "lsp.route_static_context", "status": "completed"})
                 return local_context, result
             if tool_name == "inspect_diff":
                 result = {**self._inspect_diff(workspace_id=workspace_id, run_id=run_id, targets=request_targets), "reason": reason, "tool_use_id": use_id}

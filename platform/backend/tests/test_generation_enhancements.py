@@ -46,14 +46,31 @@ def test_project_instructions_skills_slash_commands_and_worker_roles(tmp_path: P
     assert any(item["name"] == "/visual-qa" for item in slash["items"])
     assert resolved["ui_action"]["type"] == "submit_composer_with_prompt"
     assert "Polish the current app visually" in resolved["prompt_template"]
-    assert any(item["worker_id"] == "planner" for item in workers["items"])
-    assert any(item["worker_id"] == "verifier" for item in workers["items"])
+    assert any(item["worker_id"] == "backend_api_worker" and "backend_api" in item["alias_ids"] for item in workers["items"])
+    assert any(item["worker_id"] == "mobile_polish_worker" and "fresh_verifier" in item["alias_ids"] for item in workers["items"])
 
 
 def test_trace_bundle_writes_payloads_and_reduces_state(tmp_path: Path) -> None:
     writer = TraceBundleWriter(root=tmp_path, workspace_id="ws_1", run_id="run_1")
 
     writer.record("planning", {"message": "Plan ready", "files": ["miniapp/app/main.py"]})
+    writer.record(
+        "prompt_context_pack",
+        {
+            "attempt": 1,
+            "tool_round": 1,
+            "prompt_sha256": "abc",
+            "skills": {"selected": [{"id": "mobile-ui-polish", "activation_reason": "quality", "activation_score": 2}]},
+            "memory": {
+                "injected": [{"source": "workspace_memory", "kind": "preference", "reason": "active_context", "text_excerpt": "Use dense UI."}],
+                "skipped": [{"source": "workspace_memory", "kind": "avoidance", "reason": "secret_like_material", "text_excerpt": "api key"}],
+            },
+        },
+    )
+    writer.record("turn_diff_before", {"turn": 1, "paths": ["miniapp/app/main.py"], "file_hashes": {"miniapp/app/main.py": {"sha256": "old"}}})
+    writer.record("turn_diff_after", {"turn": 1, "paths": ["miniapp/app/main.py"], "file_hashes": {"miniapp/app/main.py": {"sha256": "new"}}})
+    writer.record("tool_failed_reason", {"tool": "run_command", "tool_use_id": "tool_1", "status": "failed", "error": "exit 1"})
+    writer.record("final_acceptance_gate_decision", {"status": "blocked", "blocking": True, "failed_checks": ["browser_flow_smoke"]})
     writer.record(
         "checks_completed",
         {
@@ -70,10 +87,15 @@ def test_trace_bundle_writes_payloads_and_reduces_state(tmp_path: Path) -> None:
     assert writer.manifest_path.exists()
     assert writer.trace_path.exists()
     assert writer.state_path.exists()
-    assert len(list(writer.payload_dir.glob("*.json"))) == 2
-    assert state["event_count"] == 2
+    assert len(list(writer.payload_dir.glob("*.json"))) == 7
+    assert state["event_count"] == 7
     assert "miniapp/app/main.py" in state["changed_files"]
     assert state["blockers"]
+    assert state["prompt_contexts"]
+    assert state["skill_edges"][0]["skill_id"] == "mobile-ui-polish"
+    assert any(item["reason"] == "secret_like_material" for item in state["memory_edges"])
+    assert len(state["diff_edges"]) == 2
+    assert state["acceptance_gate"][0]["status"] == "blocked"
     assert state["next_action"]["action"] == "repair"
 
 
@@ -136,8 +158,26 @@ validation:
     old_dir = runtime_dir / "skills" / "old-skill"
     old_dir.mkdir(parents=True)
     (old_dir / "SKILL.md").write_text("# Old Skill\n\n## Rules\n- Read first.\n", encoding="utf-8")
+    mobile_dir = runtime_dir / "skills" / "mobile-skill"
+    mobile_dir.mkdir(parents=True)
+    (mobile_dir / "SKILL.md").write_text(
+        """---
+description: Mobile polish skill
+whenToUse:
+  - mobile polish
+paths:
+  - miniapp/app/static/**/styles.css
+validation:
+  - mobile_layout
+---
+# Mobile Skill
+""",
+        encoding="utf-8",
+    )
 
     skills = SkillPackCatalog.load_from_runtime(runtime_dir, tmp_path)
+    prefetch = SkillPackCatalog.prefetch(runtime_dir, tmp_path)
+    cached = SkillPackCatalog.prefetch(runtime_dir, tmp_path)
     selected = SkillPackCatalog.select_for_context(
         skills,
         prompt="Fix api workflow smoke failure",
@@ -146,12 +186,32 @@ validation:
         paths=["miniapp/app/routes/items.py"],
         failure_class="api_workflow_smoke",
     )
+    search = SkillPackCatalog.search_for_context(
+        skills,
+        prompt="Use $api-skill to fix api workflow smoke failure and mobile polish",
+        intent="edit",
+        generation_mode="fast",
+        paths=["miniapp/app/routes/items.py", "miniapp/app/static/client/styles.css"],
+        failure_class="api_workflow_smoke",
+        max_skills=1,
+    )
+    telemetry = SkillPackCatalog.usage_telemetry(
+        selected=list(search["selected"]),
+        check_results=[{"name": "api_workflow_smoke", "status": "passed"}],
+        run_status="completed",
+    )
 
     parsed = {item["id"]: item for item in skills}
     assert parsed["api-skill"]["paths"] == ["miniapp/app/routes/**"]
     assert parsed["old-skill"]["constraints"] == ["Read first."]
+    assert prefetch["status"] == "ready"
+    assert cached["cache"]["status"] == "hit"
     assert selected[0]["id"] == "api-skill"
     assert "paths" in selected[0]["activation_reason"]
+    assert search["selected"][0]["id"] == "api-skill"
+    assert "explicit_mention" in search["selected"][0]["activation_reason"]
+    assert any(item["reason"] == "activation_budget_exceeded" for item in search["skipped"])
+    assert telemetry["items"][0]["outcome"] == "helped"
 
 
 def test_acceptance_visual_trace_and_magic_docs_reports(tmp_path: Path) -> None:

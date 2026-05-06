@@ -17,7 +17,7 @@ class StateStore:
     DEFAULT_SHARD_THRESHOLD_BYTES = 16 * 1024
     JOB_EVENT_TAIL_LIMIT = 40
     JOB_EVENT_SHARD_MIN_COUNT = 20
-    _SHARDABLE_COLLECTIONS = {"jobs", "runs", "reports", "code_chunks"}
+    _SHARDABLE_COLLECTIONS = {"jobs", "runs", "reports", "code_chunks", "background_tasks"}
     _HEAVY_REPORT_PREFIXES = (
         "run_artifacts:",
         "check_results:",
@@ -55,6 +55,12 @@ class StateStore:
         "exec_trace:",
         "process_outputs:",
         "context_pressure:",
+        "run_compaction:",
+        "run_compaction_boundary:",
+        "run_compaction_boundaries:",
+        "microcompact:",
+        "microcompacts:",
+        "post_compact_message:",
         "hook_trace:",
         "semantic_graph:",
         "worker_prefix:",
@@ -69,6 +75,7 @@ class StateStore:
         "acceptance_scenarios:",
         "visual_qa:",
         "magic_doc:",
+        "background_task_output:",
     )
 
     def __init__(self, path: Path) -> None:
@@ -99,6 +106,7 @@ class StateStore:
             "code_chunks": {},
             "code_indexes": {},
             "patch_applies": {},
+            "background_tasks": {},
         }
 
     @contextlib.contextmanager

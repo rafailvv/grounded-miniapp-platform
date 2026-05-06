@@ -16,8 +16,10 @@ import {
   getRunTimeline,
   getRunTraceView,
   getRunTraceBundle,
+  getRunProtocol,
+  getRunCompaction,
+  getRunCompactionBoundaries,
   getRunTasks,
-  getRunApprovals,
   getDoctorReport,
   getRunWorkers,
   getRunReview,
@@ -25,6 +27,7 @@ import {
   getRunPromptContract,
   getRunMiniAppContract,
   getWorkspaceMemory,
+  getLspDiagnostics,
   getWorkspaceLogs,
   listRuns,
   listWorkspaces,
@@ -33,9 +36,6 @@ import {
   rollbackRun,
   ensurePreview,
   stopRun,
-  approveRunApproval,
-  rejectRunApproval,
-  applyStagedRun,
   compactRun,
   searchWorkspaceFiles,
   subscribeRpcNotifications,
@@ -45,9 +45,12 @@ import {
   RunTimeline,
   RunTraceView,
   TraceBundleReport,
+  RunProtocolReport,
+  RunCompactionReport,
+  RunCompactionBoundaries,
   RunTaskReport,
-  ApprovalRecord,
   FileSearchResult,
+  LspDiagnosticsReport,
   CommandPaletteAction,
   TestMatrixReport,
   PromptContractReport,
@@ -60,11 +63,11 @@ import {
   WorkspaceLogs,
   Workspace,
 } from "./lib/api";
-import { ApprovalCenter } from "./components/ApprovalCenter";
 import { CommandPalette } from "./components/CommandPalette";
 import { ChecksPanel } from "./components/ChecksPanel";
 import { DoctorPanel } from "./components/DoctorPanel";
 import { FileSearchPanel } from "./components/FileSearchPanel";
+import { LspDiagnosticsPanel } from "./components/LspDiagnosticsPanel";
 import { MemoryPanel } from "./components/MemoryPanel";
 import { ReviewPanel } from "./components/ReviewPanel";
 import { TaskLanePanel } from "./components/TaskLanePanel";
@@ -106,7 +109,7 @@ type PreviewHistoryState = {
 
 type RunComposerMode = "generate" | "fix";
 type UserGenerationMode = "fast" | "balanced" | "quality";
-type WorkbenchTab = "preview" | "timeline" | "tasks" | "trace" | "code" | "diff" | "logs" | "workers" | "review" | "checks" | "doctor" | "memory" | "search";
+type WorkbenchTab = "preview" | "timeline" | "tasks" | "trace" | "code" | "diff" | "logs" | "workers" | "review" | "checks" | "doctor" | "memory" | "search" | "lsp";
 
 type FixErrorContext = {
   raw_error: string;
@@ -540,7 +543,7 @@ function displayRunStatus(run: Run | null): string {
     return "blocked";
   }
   if (run.status === "awaiting_approval") {
-    return "awaiting_approval";
+    return "blocked";
   }
   if (run.status === "completed") {
     return "completed";
@@ -1164,8 +1167,10 @@ export default function App() {
   const [runTimeline, setRunTimeline] = useState<RunTimeline | null>(null);
   const [runTraceView, setRunTraceView] = useState<RunTraceView | null>(null);
   const [runTraceBundle, setRunTraceBundle] = useState<TraceBundleReport | null>(null);
+  const [runProtocol, setRunProtocol] = useState<RunProtocolReport | null>(null);
+  const [runCompaction, setRunCompaction] = useState<RunCompactionReport | null>(null);
+  const [runCompactionBoundaries, setRunCompactionBoundaries] = useState<RunCompactionBoundaries | null>(null);
   const [runTaskReport, setRunTaskReport] = useState<RunTaskReport | null>(null);
-  const [runApprovals, setRunApprovals] = useState<ApprovalRecord[]>([]);
   const [doctorReport, setDoctorReport] = useState<DoctorReport | null>(null);
   const [workerReport, setWorkerReport] = useState<WorkerReport | null>(null);
   const [reviewReport, setReviewReport] = useState<ReviewReport | null>(null);
@@ -1176,6 +1181,8 @@ export default function App() {
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const [fileSearchQuery, setFileSearchQuery] = useState("");
   const [fileSearchResult, setFileSearchResult] = useState<FileSearchResult | null>(null);
+  const [lspDiagnosticsReport, setLspDiagnosticsReport] = useState<LspDiagnosticsReport | null>(null);
+  const [selectedJumpLine, setSelectedJumpLine] = useState<number | null>(null);
   const [files, setFiles] = useState<FileEntry[]>([]);
   const [selectedPath, setSelectedPath] = useState("");
   const [fileContent, setFileContent] = useState("");
@@ -1455,8 +1462,10 @@ export default function App() {
       setRunTimeline(null);
       setRunTraceView(null);
       setRunTraceBundle(null);
+      setRunProtocol(null);
+      setRunCompaction(null);
+      setRunCompactionBoundaries(null);
       setRunTaskReport(null);
-      setRunApprovals([]);
       setWorkerReport(null);
       setReviewReport(null);
       setTestMatrixReport(null);
@@ -1467,12 +1476,14 @@ export default function App() {
     let cancelled = false;
     void (async () => {
       try {
-        const [timeline, traceView, traceBundle, tasks, approvals, workers, review, matrix, contract, miniappContract] = await Promise.all([
+        const [timeline, traceView, traceBundle, protocol, compaction, compactionBoundaries, tasks, workers, review, matrix, contract, miniappContract] = await Promise.all([
           getRunTimeline(activeRunId),
           getRunTraceView(activeRunId),
           getRunTraceBundle(activeRunId),
+          getRunProtocol(activeRunId),
+          getRunCompaction(activeRunId),
+          getRunCompactionBoundaries(activeRunId),
           getRunTasks(activeRunId),
-          getRunApprovals(activeRunId),
           getRunWorkers(activeRunId),
           getRunReview(activeRunId),
           getRunTestMatrix(activeRunId),
@@ -1483,8 +1494,10 @@ export default function App() {
           setRunTimeline(timeline);
           setRunTraceView(traceView);
           setRunTraceBundle(traceBundle);
+          setRunProtocol(protocol);
+          setRunCompaction(compaction);
+          setRunCompactionBoundaries(compactionBoundaries);
           setRunTaskReport(tasks);
-          setRunApprovals(approvals.items);
           setWorkerReport(workers);
           setReviewReport(review);
           setTestMatrixReport(matrix);
@@ -1497,7 +1510,6 @@ export default function App() {
           setRunTraceView(null);
           setRunTraceBundle(null);
           setRunTaskReport(null);
-          setRunApprovals([]);
           setWorkerReport(null);
           setReviewReport(null);
           setTestMatrixReport(null);
@@ -1539,10 +1551,25 @@ export default function App() {
           }
         });
     }
+    if (activeTab === "lsp" && workspace?.workspace_id) {
+      const activeRun = runs.find((item) => item.run_id === selectedRunId);
+      const runId = activeRun?.draft_ready || activeRun?.status === "awaiting_approval" ? activeRun.run_id : "";
+      void getLspDiagnostics(workspace.workspace_id, runId || undefined, { changedOnly: Boolean(runId) })
+        .then((report) => {
+          if (!cancelled) {
+            setLspDiagnosticsReport(report);
+          }
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setLspDiagnosticsReport(null);
+          }
+        });
+    }
     return () => {
       cancelled = true;
     };
-  }, [activeTab, workspace?.workspace_id]);
+  }, [activeTab, runs, selectedRunId, workspace?.workspace_id]);
 
   useEffect(() => {
     if (activeTab !== "search" || !workspace?.workspace_id || !fileSearchQuery.trim()) {
@@ -2235,7 +2262,7 @@ export default function App() {
     }
   }
 
-  async function handleSelectFile(path: string) {
+  async function handleSelectFile(path: string, line?: number) {
     if (!workspace) {
       return;
     }
@@ -2243,6 +2270,7 @@ export default function App() {
       setSelectedPath(path);
       setFileContent("");
       setOriginalFileContent("");
+      setSelectedJumpLine(line || null);
       setActiveTab("code");
       return;
     }
@@ -2255,10 +2283,12 @@ export default function App() {
       setSelectedPath(path);
       setFileContent(payload.content);
       setOriginalFileContent(payload.content);
+      setSelectedJumpLine(line || null);
     } catch {
       setSelectedPath(path);
       setFileContent("");
       setOriginalFileContent("");
+      setSelectedJumpLine(line || null);
     }
     setActiveTab("code");
   }
@@ -2335,20 +2365,24 @@ export default function App() {
 
   async function refreshWorkbenchPanels(runId: string) {
     try {
-      const [timeline, traceView, traceBundle, tasks, approvals, workers, review] = await Promise.all([
+      const [timeline, traceView, traceBundle, protocol, compaction, compactionBoundaries, tasks, workers, review] = await Promise.all([
         getRunTimeline(runId),
         getRunTraceView(runId),
         getRunTraceBundle(runId),
+        getRunProtocol(runId),
+        getRunCompaction(runId),
+        getRunCompactionBoundaries(runId),
         getRunTasks(runId),
-        getRunApprovals(runId),
         getRunWorkers(runId),
         getRunReview(runId),
       ]);
       setRunTimeline(timeline);
       setRunTraceView(traceView);
       setRunTraceBundle(traceBundle);
+      setRunProtocol(protocol);
+      setRunCompaction(compaction);
+      setRunCompactionBoundaries(compactionBoundaries);
       setRunTaskReport(tasks);
-      setRunApprovals(approvals.items);
       setWorkerReport(workers);
       setReviewReport(review);
       setTestMatrixReport(await getRunTestMatrix(runId));
@@ -2356,34 +2390,6 @@ export default function App() {
       setMiniAppContractReport(await getRunMiniAppContract(runId));
     } catch {
       // Keep the current panel data if one derived endpoint is temporarily unavailable.
-    }
-  }
-
-  async function handleApprovalDecision(approvalId: string, approved: boolean) {
-    const runId = selectedRun?.run_id || selectedRunId;
-    if (!runId) {
-      return;
-    }
-    try {
-      const next = approved ? await approveRunApproval(runId, approvalId) : await rejectRunApproval(runId, approvalId);
-      setRunApprovals((current) => current.map((item) => (item.approval_id === approvalId ? next : item)));
-      await refreshWorkbenchPanels(runId);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to update approval.");
-    }
-  }
-
-  async function handleApplyStagedRun() {
-    if (!workspace || !selectedRun) {
-      return;
-    }
-    try {
-      const updatedRun = await applyStagedRun(selectedRun.run_id);
-      setRuns((current) => current.map((item) => (item.run_id === updatedRun.run_id ? updatedRun : item)));
-      await refreshWorkspaceState(workspace.workspace_id, updatedRun.run_id);
-      await refreshWorkbenchPanels(updatedRun.run_id);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to apply staged files.");
     }
   }
 
@@ -3383,7 +3389,7 @@ export default function App() {
                 </p>
               </header>
               <WorkbenchTabs
-                tabs={["preview", "timeline", "tasks", "trace", "code", "diff", "logs", "workers", "review", "checks", "doctor", "memory", "search"] as const}
+                tabs={["preview", "timeline", "tasks", "trace", "code", "diff", "logs", "workers", "review", "checks", "doctor", "memory", "search", "lsp"] as const}
                 activeTab={activeTab}
                 onChange={setActiveTab}
               />
@@ -3419,6 +3425,7 @@ export default function App() {
                   </div>
                   {selectedPath && editorSupportsFile ? (
                     <div className="editor-actions">
+                      {selectedJumpLine ? <span className="editor-jump-ref">Line {selectedJumpLine}</span> : null}
                       <button type="button" onClick={handleSaveFile} disabled={!editorIsDirty}>
                         Save
                       </button>
@@ -3458,28 +3465,11 @@ export default function App() {
           {activeTab === "timeline" ? (
             <div className="workbench-stack">
               <TimelinePanel timeline={runTimeline} />
-              <ApprovalCenter
-                approvals={runApprovals}
-                onApprove={(approvalId) => void handleApprovalDecision(approvalId, true)}
-                onReject={(approvalId) => void handleApprovalDecision(approvalId, false)}
-              />
-              {selectedRun?.status === "awaiting_approval" ? (
-                <div className="workbench-panel staged-apply-panel">
-                  <div className="workbench-panel-header">
-                    <strong>Staged apply</strong>
-                    <span>{selectedRun.touched_files.length} files</span>
-                  </div>
-                  <p className="muted">Apply currently staged files for this run. Whole-run approval remains available in the run card.</p>
-                  <button type="button" className="ghost-action" onClick={() => void handleApplyStagedRun()}>
-                    Apply staged
-                  </button>
-                </div>
-              ) : null}
             </div>
           ) : null}
 
           {activeTab === "trace" ? (
-            <TracePanel trace={runTraceView} traceBundle={runTraceBundle} />
+            <TracePanel trace={runTraceView} traceBundle={runTraceBundle} protocol={runProtocol} compaction={runCompaction} compactionBoundaries={runCompactionBoundaries} />
           ) : null}
 
           {activeTab === "tasks" ? (
@@ -3708,6 +3698,21 @@ export default function App() {
               result={fileSearchResult}
               onQueryChange={setFileSearchQuery}
               onSelectFile={(path) => void handleSelectFile(path)}
+            />
+          ) : null}
+
+          {activeTab === "lsp" ? (
+            <LspDiagnosticsPanel
+              report={lspDiagnosticsReport}
+              onJumpToLine={(path, line) => void handleSelectFile(path, line)}
+              onRefresh={() => {
+                if (!workspace?.workspace_id) {
+                  return;
+                }
+                void getLspDiagnostics(workspace.workspace_id, draftContextRunId || undefined, { changedOnly: Boolean(draftContextRunId) })
+                  .then(setLspDiagnosticsReport)
+                  .catch(() => setLspDiagnosticsReport(null));
+              }}
             />
           ) : null}
         </section>

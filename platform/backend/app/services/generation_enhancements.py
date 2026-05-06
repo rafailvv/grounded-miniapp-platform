@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import fnmatch
 import json
 from pathlib import Path
 import re
@@ -81,6 +82,8 @@ class ProjectInstructionBundle:
 class SkillPackCatalog:
     """Skill discovery layer inspired by Codex/Claude, scoped to this generator."""
 
+    _runtime_cache: dict[str, dict[str, Any]] = {}
+
     @staticmethod
     def builtin() -> dict[str, dict[str, Any]]:
         items = [
@@ -122,11 +125,30 @@ class SkillPackCatalog:
         ]
         return {str(item["id"]): item for item in items}
 
-    @staticmethod
-    def load_from_runtime(runtime_dir: Path, repo_root: Path) -> list[dict[str, Any]]:
+    @classmethod
+    def load_from_runtime(cls, runtime_dir: Path, repo_root: Path) -> list[dict[str, Any]]:
+        return list(cls.prefetch(runtime_dir, repo_root).get("items") or [])
+
+    @classmethod
+    def prefetch(cls, runtime_dir: Path, repo_root: Path, *, force: bool = False) -> dict[str, Any]:
         root = runtime_dir / "skills"
         if not root.exists():
-            return []
+            return {
+                "schema": "grounded.skill_prefetch.v1",
+                "status": "missing",
+                "items": [],
+                "cache": {"status": "miss", "reason": "runtime_skills_missing"},
+                "created_at": _now(),
+            }
+        signature = cls._runtime_signature(root)
+        cache_key = str(root.resolve())
+        cached = cls._runtime_cache.get(cache_key)
+        if cached and not force and cached.get("signature") == signature:
+            return {
+                **cached,
+                "cache": {"status": "hit", "signature": signature},
+                "created_at": _now(),
+            }
         items: list[dict[str, Any]] = []
         for path in sorted(root.glob("*/SKILL.md")):
             text = _read_text(path)
@@ -151,12 +173,23 @@ class SkillPackCatalog:
                     "constraints": rules[:8],
                     "validation_hints": acceptance[:8],
                     "body": body or text,
+                    "mtime_ns": path.stat().st_mtime_ns if path.exists() else 0,
                 }
             )
-        return items
+        payload = {
+            "schema": "grounded.skill_prefetch.v1",
+            "status": "ready",
+            "signature": signature,
+            "items": items,
+            "cache": {"status": "loaded", "signature": signature},
+            "created_at": _now(),
+        }
+        cls._runtime_cache[cache_key] = payload
+        return payload
 
-    @staticmethod
-    def select_for_context(
+    @classmethod
+    def search_for_context(
+        cls,
         skills: list[dict[str, Any]],
         *,
         prompt: str = "",
@@ -164,8 +197,17 @@ class SkillPackCatalog:
         generation_mode: str | None = None,
         paths: list[str] | None = None,
         failure_class: str | None = None,
-        limit: int = 5,
-    ) -> list[dict[str, Any]]:
+        max_skills: int | None = None,
+        max_body_chars: int | None = None,
+        max_total_body_chars: int | None = None,
+    ) -> dict[str, Any]:
+        budget = cls._activation_budget(
+            generation_mode=generation_mode,
+            max_skills=max_skills,
+            max_body_chars=max_body_chars,
+            max_total_body_chars=max_total_body_chars,
+        )
+        explicit_mentions = cls.explicit_mentions(prompt, skills)
         haystack = " ".join(
             [
                 str(prompt or ""),
@@ -175,20 +217,32 @@ class SkillPackCatalog:
                 " ".join(paths or []),
             ]
         ).lower()
-        selected: list[dict[str, Any]] = []
+        candidates: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
         for skill in skills:
             score = 0
             reasons: list[str] = []
-            when_to_use = str(skill.get("whenToUse") or skill.get("activation") or "").lower()
-            if when_to_use and any(token for token in re.split(r"[^a-z0-9_-]+", when_to_use) if token and token in haystack):
-                score += 2
-                reasons.append("whenToUse")
-            for path_pattern in skill.get("paths") or []:
-                prefix = str(path_pattern).rstrip("*")
-                if prefix and any(str(path).startswith(prefix) for path in paths or []):
-                    score += 2
-                    reasons.append("paths")
             skill_id = str(skill.get("id") or "")
+            if skill_id in explicit_mentions:
+                score += 100
+                reasons.append("explicit_mention")
+            when_to_use_items = [str(item).lower() for item in SkillPackCatalog._frontmatter_list(skill.get("whenToUse") or skill.get("activation"))]
+            for phrase in when_to_use_items:
+                if cls._phrase_matches(phrase, haystack):
+                    score += 3
+                    reasons.append("whenToUse")
+                    break
+            for path_pattern in skill.get("paths") or []:
+                if any(cls._path_matches(str(path_pattern), str(path)) for path in paths or []):
+                    score += 3
+                    reasons.append("paths")
+                    break
+            if failure_class and cls._failure_matches(skill, failure_class):
+                score += 4
+                reasons.append("failure_class")
+            if any(validation and validation.lower() in haystack for validation in [str(item) for item in skill.get("validation") or skill.get("validation_hints") or []]):
+                score += 2
+                reasons.append("validation")
             if skill_id in {"telegram-miniapp-product"} and ("telegram" in haystack or str(intent or "") == "create"):
                 score += 2
                 reasons.append("platform")
@@ -198,16 +252,77 @@ class SkillPackCatalog:
             if skill_id in {"repair-failed-generation"} and failure_class:
                 score += 3
                 reasons.append("failure")
-            if skill_id in {"mobile-ui-polish"} and str(generation_mode or "").lower() == "quality":
+            if skill_id in {"mobile-ui-polish"} and (str(generation_mode or "").lower() == "quality" or "layout" in haystack or "overflow" in haystack):
                 score += 2
                 reasons.append("quality")
-            if skill_id in {"browser-acceptance-proof"} and str(intent or "").lower() == "create":
+            if skill_id in {"browser-acceptance-proof"} and (str(intent or "").lower() == "create" or "browser" in haystack or "final gate" in haystack):
                 score += 2
                 reasons.append("proof")
             if score:
-                selected.append({**skill, "activation_reason": ", ".join(dict.fromkeys(reasons)), "activation_score": score})
-        selected.sort(key=lambda item: (-int(item.get("activation_score") or 0), str(item.get("id") or "")))
-        return selected[:limit]
+                candidates.append(
+                    {
+                        **skill,
+                        "activation_reason": ", ".join(dict.fromkeys(reasons)),
+                        "activation_score": score,
+                        "explicit": skill_id in explicit_mentions,
+                    }
+                )
+            else:
+                skipped.append({"id": skill_id, "reason": "no intent/path/failure match", "source": skill.get("source")})
+        candidates.sort(key=lambda item: (-int(item.get("activation_score") or 0), str(item.get("id") or "")))
+        selected: list[dict[str, Any]] = []
+        used_body_chars = 0
+        conflict_groups: set[str] = set()
+        for item in candidates:
+            group = cls._conflict_group(item)
+            body_chars = min(len(str(item.get("body") or "")), int(budget["max_body_chars"]))
+            if len(selected) >= int(budget["max_skills"]):
+                skipped.append({"id": item.get("id"), "reason": "activation_budget_exceeded", "activation_score": item.get("activation_score")})
+                continue
+            if used_body_chars + body_chars > int(budget["max_total_body_chars"]) and not item.get("explicit"):
+                skipped.append({"id": item.get("id"), "reason": "body_budget_exceeded", "activation_score": item.get("activation_score")})
+                continue
+            if group and group in conflict_groups and not item.get("explicit"):
+                skipped.append({"id": item.get("id"), "reason": f"conflict_group:{group}", "activation_score": item.get("activation_score")})
+                continue
+            selected.append({**item, "body_budget_chars": int(budget["max_body_chars"])})
+            used_body_chars += body_chars
+            if group:
+                conflict_groups.add(group)
+        return {
+            "schema": "grounded.skill_search.v1",
+            "status": "ready",
+            "selected": selected,
+            "skipped": skipped[:80],
+            "explicit_mentions": sorted(explicit_mentions),
+            "budget": {**budget, "used_body_chars": used_body_chars},
+            "created_at": _now(),
+        }
+
+    @classmethod
+    def select_for_context(
+        cls,
+        skills: list[dict[str, Any]],
+        *,
+        prompt: str = "",
+        intent: str | None = None,
+        generation_mode: str | None = None,
+        paths: list[str] | None = None,
+        failure_class: str | None = None,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        return list(
+            cls.search_for_context(
+                skills,
+                prompt=prompt,
+                intent=intent,
+                generation_mode=generation_mode,
+                paths=paths,
+                failure_class=failure_class,
+                max_skills=limit,
+            ).get("selected")
+            or []
+        )
 
     @staticmethod
     def compact_context(skills: list[dict[str, Any]], *, body_limit: int = 800) -> str:
@@ -224,8 +339,125 @@ class SkillPackCatalog:
                 lines.append(f"  Validation: {validation}")
             body = str(skill.get("body") or "").strip()
             if body:
-                lines.append(f"  Body excerpt: {body[:body_limit]}")
+                limit = min(int(skill.get("body_budget_chars") or body_limit), body_limit)
+                lines.append(f"  Body excerpt: {body[:limit]}")
         return "\n".join(lines)
+
+    @staticmethod
+    def explicit_mentions(prompt: str, skills: list[dict[str, Any]]) -> set[str]:
+        text = str(prompt or "")
+        mentions = set(re.findall(r"[@$]([A-Za-z0-9_-]+)", text))
+        normalized = {item.lower() for item in mentions}
+        result: set[str] = set()
+        for skill in skills:
+            skill_id = str(skill.get("id") or "")
+            names = {skill_id.lower(), str(skill.get("name") or "").lower().replace(" ", "-")}
+            if normalized & names:
+                result.add(skill_id)
+        return result
+
+    @staticmethod
+    def usage_telemetry(
+        *,
+        selected: list[dict[str, Any]],
+        check_results: list[dict[str, Any]],
+        run_status: str,
+    ) -> dict[str, Any]:
+        by_name = {str(item.get("name") or ""): str(item.get("status") or "") for item in check_results if isinstance(item, dict)}
+        items: list[dict[str, Any]] = []
+        for skill in selected:
+            validation = [str(item) for item in skill.get("validation") or skill.get("validation_hints") or []]
+            passed = [name for name in validation if by_name.get(name) == "passed"]
+            failed = [name for name in validation if by_name.get(name) == "failed"]
+            if passed and not failed:
+                outcome = "helped"
+            elif failed:
+                outcome = "not_helped"
+            elif run_status == "completed":
+                outcome = "neutral_completed"
+            else:
+                outcome = "unknown"
+            items.append(
+                {
+                    "skill_id": skill.get("id"),
+                    "activation_reason": skill.get("activation_reason"),
+                    "activation_score": skill.get("activation_score"),
+                    "validation": validation,
+                    "passed": passed,
+                    "failed": failed,
+                    "outcome": outcome,
+                }
+            )
+        return {"schema": "grounded.skill_usage_telemetry.v1", "status": run_status, "items": items, "created_at": _now()}
+
+    @staticmethod
+    def _runtime_signature(root: Path) -> str:
+        parts = []
+        for path in sorted(root.glob("*/SKILL.md")):
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            parts.append(f"{path}:{stat.st_mtime_ns}:{stat.st_size}")
+        return str(hash(tuple(parts)))
+
+    @staticmethod
+    def _activation_budget(
+        *,
+        generation_mode: str | None,
+        max_skills: int | None,
+        max_body_chars: int | None,
+        max_total_body_chars: int | None,
+    ) -> dict[str, int]:
+        mode = str(generation_mode or "").lower()
+        defaults = {
+            "fast": {"max_skills": 2, "max_body_chars": 350, "max_total_body_chars": 900},
+            "balanced": {"max_skills": 4, "max_body_chars": 550, "max_total_body_chars": 1800},
+            "quality": {"max_skills": 5, "max_body_chars": 800, "max_total_body_chars": 2800},
+        }.get(mode, {"max_skills": 4, "max_body_chars": 550, "max_total_body_chars": 1800})
+        return {
+            "max_skills": max(1, int(max_skills or defaults["max_skills"])),
+            "max_body_chars": max(120, int(max_body_chars or defaults["max_body_chars"])),
+            "max_total_body_chars": max(240, int(max_total_body_chars or defaults["max_total_body_chars"])),
+        }
+
+    @staticmethod
+    def _phrase_matches(phrase: str, haystack: str) -> bool:
+        phrase = str(phrase or "").strip().lower()
+        if not phrase:
+            return False
+        if phrase in haystack:
+            return True
+        tokens = [token for token in re.split(r"[^a-z0-9_-]+", phrase) if len(token) >= 3]
+        return bool(tokens and all(token in haystack for token in tokens[:4]))
+
+    @staticmethod
+    def _path_matches(pattern: str, path: str) -> bool:
+        pattern = str(pattern or "").strip().replace("\\", "/")
+        path = str(path or "").strip().replace("\\", "/")
+        if not pattern or not path:
+            return False
+        return fnmatch.fnmatch(path, pattern) or path.startswith(pattern.rstrip("*").rstrip("/"))
+
+    @staticmethod
+    def _failure_matches(skill: dict[str, Any], failure_class: str) -> bool:
+        failure = str(failure_class or "").lower()
+        if not failure:
+            return False
+        return any(str(item).lower() in failure or failure in str(item).lower() for item in [*(skill.get("whenToUse") or []), *(skill.get("validation") or [])])
+
+    @staticmethod
+    def _conflict_group(skill: dict[str, Any]) -> str:
+        skill_id = str(skill.get("id") or "")
+        validation = " ".join(str(item).lower() for item in skill.get("validation") or skill.get("validation_hints") or [])
+        paths = " ".join(str(item).lower() for item in skill.get("paths") or [])
+        if "mobile" in validation or "static/**/styles" in paths or skill_id == "mobile-ui-polish":
+            return "mobile_polish"
+        if "api" in validation or "routes" in paths or skill_id == "fastapi-persistence":
+            return "persistence"
+        if "repair" in skill_id or "failing_check" in validation:
+            return "repair"
+        return ""
 
     @staticmethod
     def _sections(text: str) -> tuple[list[str], list[str]]:
@@ -358,46 +590,53 @@ class WorkerRoleCatalog:
     def roles() -> dict[str, Any]:
         items = [
             {
-                "worker_id": "planner",
-                "purpose": "Prompt contract, acceptance scenarios, file ownership plan.",
-                "allowed_paths": ["README.md", "docs/**", "miniapp/tests/**"],
-                "handoff": "Produces implementation plan and scenario list before edits.",
-            },
-            {
-                "worker_id": "backend_api",
+                "worker_id": "backend_api_worker",
+                "alias_ids": ["backend_api"],
                 "purpose": "FastAPI routes, schemas, persistence, shared state.",
                 "allowed_paths": ["miniapp/app/**/*.py", "miniapp/requirements.txt"],
                 "handoff": "Owns API/persistence failures.",
             },
             {
-                "worker_id": "client_ui",
+                "worker_id": "client_surface_worker",
+                "alias_ids": ["client_ui"],
                 "purpose": "Client role HTML/CSS/JS and client child pages.",
                 "allowed_paths": ["miniapp/app/static/client/**"],
                 "handoff": "Owns client selector and layout failures.",
             },
             {
-                "worker_id": "specialist_ui",
+                "worker_id": "specialist_surface_worker",
+                "alias_ids": ["specialist_ui"],
                 "purpose": "Specialist role HTML/CSS/JS and child pages.",
                 "allowed_paths": ["miniapp/app/static/specialist/**"],
                 "handoff": "Owns specialist selector and layout failures.",
             },
             {
-                "worker_id": "manager_ui",
+                "worker_id": "manager_surface_worker",
+                "alias_ids": ["manager_ui"],
                 "purpose": "Manager role HTML/CSS/JS and child pages.",
                 "allowed_paths": ["miniapp/app/static/manager/**"],
                 "handoff": "Owns manager selector and layout failures.",
             },
             {
-                "worker_id": "generated_tests",
+                "worker_id": "test_verifier_worker",
+                "alias_ids": ["generated_tests", "verifier"],
                 "purpose": "Generated Python and JS acceptance tests.",
                 "allowed_paths": ["miniapp/tests/**"],
                 "handoff": "Owns stale or brittle generated tests.",
             },
             {
-                "worker_id": "verifier",
-                "purpose": "Independent final review, checks, browser proof, visual QA.",
-                "allowed_paths": [],
-                "handoff": "Read-only unless a repair run is started from findings.",
+                "worker_id": "mobile_polish_worker",
+                "alias_ids": ["design_verifier", "fresh_verifier"],
+                "purpose": "Independent mobile polish and visual QA after green workflow.",
+                "allowed_paths": ["miniapp/app/static/**"],
+                "handoff": "Owns mobile overflow, spacing, and role-surface polish failures.",
+            },
+            {
+                "worker_id": "repair_worker",
+                "alias_ids": ["repair"],
+                "purpose": "Focused owned repair from failure signature or merge decision.",
+                "allowed_paths": ["miniapp/app/**", "miniapp/tests/**"],
+                "handoff": "Runs only from an explicit repair packet.",
             },
         ]
         return {"schema": "grounded.worker_roles.v1", "items": items}
