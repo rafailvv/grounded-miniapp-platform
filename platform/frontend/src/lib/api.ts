@@ -924,6 +924,21 @@ type RpcEnvelope = {
 
 type RpcNotificationHandler = (message: RpcEnvelope) => void;
 
+class RpcConnectionError extends Error {
+  constructor(message = "RPC socket connection failed.") {
+    super(message);
+    this.name = "RpcConnectionError";
+  }
+}
+
+function isRpcConnectionError(error: unknown): boolean {
+  return (
+    error instanceof RpcConnectionError ||
+    (error instanceof Error &&
+      (error.message === "RPC socket connection failed." || error.message === "RPC socket is not open."))
+  );
+}
+
 class JsonRpcClient {
   private socket: WebSocket | null = null;
   private nextId = 1;
@@ -963,12 +978,40 @@ class JsonRpcClient {
     this.connected = new Promise<void>((resolve, reject) => {
       const socket = new WebSocket(this.rpcUrl());
       this.socket = socket;
+      let settled = false;
+      const fail = (error: Error) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        this.connected = null;
+        if (this.socket === socket) {
+          this.socket = null;
+        }
+        if (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN) {
+          socket.close();
+        }
+        this.rejectPending(error);
+        reject(error);
+      };
+      const succeed = () => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        resolve();
+      };
+      const timeout = window.setTimeout(() => {
+        fail(new RpcConnectionError("RPC socket connection failed."));
+      }, 5000);
       socket.addEventListener("open", async () => {
         try {
           await this.callRaw("initialize", { clientInfo: { name: "grounded-miniapp-frontend" } });
-          resolve();
+          window.clearTimeout(timeout);
+          succeed();
         } catch (error) {
-          reject(error);
+          window.clearTimeout(timeout);
+          fail(error instanceof Error ? error : new RpcConnectionError("RPC socket connection failed."));
         }
       });
       socket.addEventListener("message", (event) => {
@@ -991,9 +1034,14 @@ class JsonRpcClient {
       socket.addEventListener("close", () => {
         this.socket = null;
         this.connected = null;
+        window.clearTimeout(timeout);
+        if (!settled) {
+          fail(new RpcConnectionError("RPC socket connection failed."));
+        }
       });
       socket.addEventListener("error", () => {
-        reject(new Error("RPC socket connection failed."));
+        window.clearTimeout(timeout);
+        fail(new RpcConnectionError("RPC socket connection failed."));
       });
     });
     return this.connected;
@@ -1015,6 +1063,13 @@ class JsonRpcClient {
   private rpcUrl(): string {
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     return `${protocol}//${window.location.host}/rpc`;
+  }
+
+  private rejectPending(error: Error): void {
+    for (const pending of this.pending.values()) {
+      pending.reject(error);
+    }
+    this.pending.clear();
   }
 }
 
@@ -1086,9 +1141,7 @@ export async function createRun(
     };
   },
 ): Promise<Run> {
-  const threadId = await getOrCreateWorkspaceThread(workspaceId);
-  const turn = await rpcClient.call<AgentTurn>("turn/start", {
-    thread_id: threadId,
+  const runPayload = {
     mode: "generate",
     intent: "auto",
     apply_strategy: "staged_auto_apply",
@@ -1097,13 +1150,28 @@ export async function createRun(
     target_platform: "telegram_mini_app",
     preview_profile: "telegram_mock",
     ...payload,
-  });
-  const run = turn.metadata?.run as Run | undefined;
-  if (!run?.run_id) {
-    throw new Error("RPC turn did not return a linked run.");
+  };
+  try {
+    const threadId = await getOrCreateWorkspaceThread(workspaceId);
+    const turn = await rpcClient.call<AgentTurn>("turn/start", {
+      thread_id: threadId,
+      ...runPayload,
+    });
+    const run = turn.metadata?.run as Run | undefined;
+    if (!run?.run_id) {
+      throw new Error("RPC turn did not return a linked run.");
+    }
+    runTurnRefs.set(run.run_id, { threadId, turnId: turn.turn_id });
+    return run;
+  } catch (error) {
+    if (!isRpcConnectionError(error)) {
+      throw error;
+    }
+    return request<Run>(`/workspaces/${workspaceId}/runs`, {
+      method: "POST",
+      body: JSON.stringify(runPayload),
+    });
   }
-  runTurnRefs.set(run.run_id, { threadId, turnId: turn.turn_id });
-  return run;
 }
 
 export async function getRunArtifacts(runId: string): Promise<RunArtifacts> {
@@ -1396,7 +1464,13 @@ export async function getLspDiagnostics(workspaceId: string, runId?: string, opt
 export async function stopRun(runId: string): Promise<Run> {
   const ref = runTurnRefs.get(runId);
   if (ref) {
-    await rpcClient.call("turn/interrupt", { thread_id: ref.threadId, turn_id: ref.turnId });
+    try {
+      await rpcClient.call("turn/interrupt", { thread_id: ref.threadId, turn_id: ref.turnId });
+    } catch (error) {
+      if (!isRpcConnectionError(error)) {
+        throw error;
+      }
+    }
   }
   return request<Run>(`/runs/${runId}/stop`, {
     method: "POST",

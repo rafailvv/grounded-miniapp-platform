@@ -202,6 +202,28 @@ REPAIR_CATALOG: tuple[RepairCatalogEntry, ...] = (
         ),
     ),
     RepairCatalogEntry(
+        signature="tests.python_protected_shell_import",
+        issue_code="generated_python_test_imports_platform_shell_helper",
+        severity="high",
+        likely_root_cause="Generated Python tests imported product/reset behavior from a platform-owned shell module instead of the app-owned route module or DB reset path.",
+        target_files=("miniapp/tests/test_generated_app.py", "miniapp/app/routes/**", "miniapp/app/db.py"),
+        verification_check="generated_app_python_tests",
+        instruction=(
+            "Patch generated Python tests so product/reset helpers do not come from platform shell modules "
+            "app.routes.health, app.routes.role_pages, or app.routes.role_routes. Import from the app-owned route module that defines the resource, "
+            "or reset the generated DB after importing app-owned route models. Do not add product helpers to platform shell files."
+        ),
+        required_next_tool="read_files",
+        suggested_tool_after_read="apply_patch_to_draft_or_write_file",
+        verification_command="run_checks generated_app_python_tests",
+        patterns=(
+            _rx(r"protected_platform_shell_import"),
+            _rx(r"generated_python_test_imports_platform_shell_helper"),
+            _rx(r"cannot import name .+ from 'app\.routes\.(?:health|role_pages|role_routes)'"),
+            _rx(r"app\.routes\.(?:health|role_pages|role_routes)"),
+        ),
+    ),
+    RepairCatalogEntry(
         signature="tests.js_brittle_route_manifest_root",
         issue_code="generated_js_brittle_route_manifest_root",
         severity="high",
@@ -252,6 +274,27 @@ REPAIR_CATALOG: tuple[RepairCatalogEntry, ...] = (
             _rx(r"js_test_imports_browser_app_without_dom"),
             _rx(r"ReferenceError:\s*(?:document|window)\s+is not defined"),
             _rx(r"generated_app\.test\.mjs.*import.*app/static/(?:client|specialist|manager)/app\.js"),
+        ),
+    ),
+    RepairCatalogEntry(
+        signature="tests.js_stale_selector_assertion",
+        issue_code="generated_js_stale_selector_assertion",
+        severity="high",
+        likely_root_cause="Generated JS tests assert an exact selector literal that the current generated role UI does not use.",
+        target_files=("miniapp/tests/generated_app.test.mjs", "miniapp/app/static/**/index.html", "miniapp/app/static/**/app.js"),
+        verification_check="generated_app_js_tests",
+        instruction=(
+            "Read generated_app.test.mjs and the relevant role HTML/JS. If the app already has a working prompt-derived form or handler, "
+            "patch the JS test to assert those actual selectors/handlers instead of editing app code or route metadata to satisfy a stale selector literal."
+        ),
+        required_next_tool="read_files",
+        suggested_tool_after_read="write_file",
+        verification_command="run_checks generated_app_js_tests",
+        patterns=(
+            _rx(r"stale_selector_assertion"),
+            _rx(r"generated_js_test_requires_exact_selector_literal"),
+            _rx(r"assert\.match\(.*?/data-[A-Za-z0-9_-]+/"),
+            _rx(r"unused selector literal"),
         ),
     ),
     RepairCatalogEntry(

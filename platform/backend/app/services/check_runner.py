@@ -109,6 +109,20 @@ PRELOADED_PRODUCT_DATA_MARKERS = (
     "демо-данн",
     "тестовые данные",
 )
+RUNTIME_DATABASE_ARTIFACT_SUFFIXES = (
+    ".db",
+    ".db-journal",
+    ".db-shm",
+    ".db-wal",
+    ".sqlite",
+    ".sqlite-journal",
+    ".sqlite-shm",
+    ".sqlite-wal",
+    ".sqlite3",
+    ".sqlite3-journal",
+    ".sqlite3-shm",
+    ".sqlite3-wal",
+)
 CSS_PLACEHOLDER_MARKERS = (
     "generated client page styles can replace this file",
     "generated specialist page styles can replace this file",
@@ -150,6 +164,15 @@ class CheckRunner:
         r"AttributeError:\s+'(?P<object>[A-Za-z0-9_]+)'\s+object\s+has\s+no\s+attribute\s+'(?P<attribute>[A-Za-z0-9_]+)'",
         re.IGNORECASE,
     )
+    _PY_IMPORT_ERROR_RE = re.compile(
+        r"ImportError:\s+cannot\s+import\s+name\s+'(?P<name>[A-Za-z0-9_]+)'\s+from\s+'(?P<module>app\.routes\.(?:health|role_pages|role_routes))'",
+        re.IGNORECASE,
+    )
+    _GENERATED_TEST_PROTECTED_ROUTE_MODULES = {
+        "app.routes.health": {"health"},
+        "app.routes.role_pages": set(),
+        "app.routes.role_routes": set(),
+    }
     _SHARED_STATE_UPDATE_RE = re.compile(
         r"Updated (?:state|entity|item|record)\s+(?P<entity_id>[A-Za-z0-9_-]+)\s+did not reflect\s+(?P<actor>[A-Za-z0-9_-]+)\s+changes in shared state\.\s+Payload:\s*(?P<payload>.*)$",
         re.IGNORECASE,
@@ -417,6 +440,7 @@ class CheckRunner:
                 ]
             )
             completed_at = utc_now()
+            self._cleanup_runtime_database_artifacts(source_dir)
             return CheckExecutionRecord(
                 workspace_id=workspace_id,
                 run_id=run_id,
@@ -429,6 +453,7 @@ class CheckRunner:
 
         require_generated_tests = scope_mode == "agentic"
         skip_preview_only = check_profile == "fast_gate" and must_run_generated_tests
+        generated_tests_failed = False
 
         def _run_python_tests() -> RunCheckResult:
             python_tests_started = time.perf_counter()
@@ -479,6 +504,20 @@ class CheckRunner:
 
         def _run_preview_checks() -> tuple[RunCheckResult, RunCheckResult, RunCheckResult, RunCheckResult]:
             preview_started = time.perf_counter()
+            if generated_tests_failed:
+                api_started = time.perf_counter()
+                api_workflow_result = self._api_workflow_smoke(
+                    source_dir=source_dir,
+                    generation_mode=generation_mode,
+                    acceptance_contract=acceptance_contract,
+                )
+                api_workflow_result.duration_ms = int((time.perf_counter() - api_started) * 1000)
+                duration_ms = int((time.perf_counter() - preview_started) * 1000)
+                preview_boot_result, connectivity_result, _, browser_result = _skipped_preview_results(
+                    "Browser/preview proof skipped until generated app tests pass.",
+                    duration_ms=duration_ms,
+                )
+                return preview_boot_result, connectivity_result, api_workflow_result, browser_result
             if should_skip_preview or skip_preview_only:
                 duration_ms = int((time.perf_counter() - preview_started) * 1000)
                 reason = (
@@ -534,6 +573,8 @@ class CheckRunner:
             js_future = executor.submit(_run_js_tests)
             python_tests_result = python_future.result()
             js_tests_result = js_future.result()
+
+        generated_tests_failed = self._generated_tests_failed(python_tests_result, js_tests_result)
 
         for result in (python_tests_result, js_tests_result):
             self._emit_check_progress(
@@ -603,6 +644,7 @@ class CheckRunner:
             )
 
         completed_at = utc_now()
+        self._cleanup_runtime_database_artifacts(source_dir)
         return CheckExecutionRecord(
             workspace_id=workspace_id,
             run_id=run_id,
@@ -611,6 +653,14 @@ class CheckRunner:
             started_at=utc_now(),
             completed_at=completed_at,
             duration_ms=int((time.perf_counter() - started) * 1000),
+        )
+
+    @staticmethod
+    def _generated_tests_failed(*results: RunCheckResult) -> bool:
+        return any(
+            result.name in {"generated_app_python_tests", "generated_app_js_tests"}
+            and result.status in {"failed", "blocked"}
+            for result in results
         )
 
     @staticmethod
@@ -812,7 +862,11 @@ class CheckRunner:
         issues: list[ValidationIssue] = []
         for role in sorted(visibility_roles):
             role_identifiers = set(re.findall(r"\b[A-Za-z_$][\w$]*\b", role_text.get(role, "")))
-            missing = sorted(field for field in update_fields if field not in role_identifiers)
+            missing = sorted(
+                field
+                for field in update_fields
+                if not cls._update_field_rendered_by_role(field, role_identifiers, update_fields)
+            )
             if not missing:
                 continue
             issues.append(
@@ -851,6 +905,20 @@ class CheckRunner:
             )
         return issues
 
+    @staticmethod
+    def _update_field_rendered_by_role(field: str, role_identifiers: set[str], update_fields: set[str]) -> bool:
+        if field in role_identifiers:
+            return True
+        label_field = f"{field}_label"
+        if not field.endswith("_label") and label_field in update_fields and label_field in role_identifiers:
+            return True
+        if field.endswith("_id"):
+            stem = field[: -len("_id")]
+            for candidate in (stem, f"{stem}_label", f"{stem}_name", f"{stem}_title"):
+                if candidate in role_identifiers:
+                    return True
+        return False
+
     @classmethod
     def _frontend_role_wiring_issues(cls, static_root: Path, *, backend_text: str = "") -> list[ValidationIssue]:
         issues: list[ValidationIssue] = []
@@ -881,6 +949,20 @@ class CheckRunner:
             issues.extend(cls._js_obvious_undefined_workflow_issues(role, js_path, js_source))
             issues.extend(cls._late_domcontentloaded_init_issues(role, js_path, js_source, combined_html))
             issues.extend(cls._selector_wiring_issues(role, js_path, js_source, combined_html))
+            generated_markup = cls._js_generated_markup_text(js_source)
+            if generated_markup:
+                generated_relative = f"{js_path.relative_to(static_root.parents[2]).as_posix()}#generated_markup"
+                issues.extend(
+                    cls._form_wiring_issues(
+                        generated_relative,
+                        js_path,
+                        generated_markup,
+                        js_source,
+                        backend_create_fields=backend_create_fields,
+                        backend_create_schemas=backend_create_schemas,
+                    )
+                )
+                issues.extend(cls._button_wiring_issues(generated_relative, js_path, generated_markup, js_source))
             for relative_path, html_source in html_by_path.items():
                 issues.extend(
                     cls._form_wiring_issues(
@@ -912,7 +994,9 @@ class CheckRunner:
             return []
         if not re.search(r"document\s*\.\s*addEventListener\(\s*([\"'])DOMContentLoaded\1", text):
             return []
-        if not re.search(r"<(?:form|button|select|textarea|input)\b", str(html_source or ""), re.IGNORECASE):
+        generated_markup = cls._js_generated_markup_text(js_source)
+        available_markup = "\n".join(part for part in (str(html_source or ""), generated_markup) if part)
+        if not re.search(r"<(?:form|button|select|textarea|input)\b", available_markup, re.IGNORECASE):
             return []
         return [
             ValidationIssue(
@@ -1005,10 +1089,12 @@ class CheckRunner:
     @classmethod
     def _selector_wiring_issues(cls, role: str, js_path: Path, js_source: str, combined_html: str) -> list[ValidationIssue]:
         issues: list[ValidationIssue] = []
+        generated_markup = cls._js_generated_markup_text(js_source)
+        available_markup = "\n".join(part for part in (combined_html, generated_markup) if part)
         for selector in cls._literal_query_selectors(js_source):
             if cls._selector_is_dynamic_or_broad(selector):
                 continue
-            if cls._html_has_simple_selector(combined_html, selector):
+            if cls._html_has_simple_selector(available_markup, selector):
                 continue
             if cls._selector_is_optional_feedback_target(js_source, selector):
                 continue
@@ -1020,7 +1106,8 @@ class CheckRunner:
                     code="platform.workflow_selector_matches_no_html",
                     message=(
                         f"{js_path.relative_to(js_path.parents[4]).as_posix()} queries selector `{selector}`, "
-                        f"but no {role} HTML page contains that selector. Required workflows must not be guarded behind selectors that never match."
+                        f"but no {role} HTML page or generated role markup contains that selector. "
+                        "Required workflows must not be guarded behind selectors that never match."
                     ),
                     severity="high" if blocking else "medium",
                     location=js_path.relative_to(js_path.parents[4]).as_posix(),
@@ -1049,6 +1136,20 @@ class CheckRunner:
                 )
             )
         return issues
+
+    @staticmethod
+    def _js_generated_markup_text(js_source: str) -> str:
+        text = str(js_source or "")
+        fragments: list[str] = []
+        for match in re.finditer(r"`(?P<body>(?:\\`|[^`])*)`", text, re.DOTALL):
+            body = match.group("body") or ""
+            if re.search(r"<[A-Za-z][^>]*>", body):
+                fragments.append(body)
+        for match in re.finditer(r"""(?P<quote>["'])(?P<body>(?:\\.|[^"'])*?)(?P=quote)""", text):
+            body = match.group("body") or ""
+            if re.search(r"<[A-Za-z][^>]*>", body):
+                fragments.append(body)
+        return "\n".join(fragments)
 
     @classmethod
     def _selector_is_optional_feedback_target(cls, js_source: str, selector: str) -> bool:
@@ -1267,6 +1368,34 @@ class CheckRunner:
                             location=relative_path,
                             blocking=False,
                         )
+                )
+            unread_named_controls = sorted(
+                name
+                for name, dom_id in field_ids_by_name.items()
+                if not cls._is_path_id_field(name)
+                and not cls._js_reads_dom_field_id(js_source, dom_id)
+                and not cls._js_reads_named_form_control(js_source, name)
+            )
+            if unread_named_controls:
+                issues.append(
+                    ValidationIssue(
+                        code="platform.workflow_form_field_value_not_used",
+                        message=(
+                            f"{relative_path} form {form_label} has visible named controls whose actual DOM values are not read before submit: "
+                            f"{', '.join(unread_named_controls[:6])}. Do not keep a user-editable field whose value is ignored by the API payload."
+                        ),
+                        severity="high",
+                        location=relative_path,
+                        blocking=True,
+                        repair_recipe=cls._form_wiring_repair_recipe(
+                            signature="frontend.form_field_value_not_used",
+                            relative_path=relative_path,
+                            js_path=js_path,
+                            form_label=form_label,
+                            field_names=set(unread_named_controls),
+                            evidence_code="workflow_form_field_value_not_used",
+                        ),
+                    )
                 )
             if (
                 backend_create_fields
@@ -1625,6 +1754,14 @@ class CheckRunner:
     @staticmethod
     def _js_payload_uses_dynamic_formdata_entries(js_source: str) -> bool:
         text = str(js_source or "")
+        if re.search(r"\bObject\.fromEntries\(\s*new\s+FormData\b", text):
+            return True
+        formdata_vars = {
+            match.group("var")
+            for match in re.finditer(r"\b(?:const|let|var)\s+(?P<var>[A-Za-z_$][\w$]*)\s*=\s*new\s+FormData\b", text)
+        }
+        if any(re.search(rf"\bObject\.fromEntries\(\s*{re.escape(var_name)}(?:\.entries\(\))?\s*\)", text) for var_name in formdata_vars):
+            return True
         return bool(
             re.search(r"\bnew\s+FormData\s*\(", text)
             and re.search(r"\.entries\s*\(\s*\)", text)
@@ -1966,6 +2103,23 @@ class CheckRunner:
             or re.search(rf"\[\s*name\s*=\s*([\"']){escaped}\1\s*\]", text)
             or re.search(rf"\bname\s*=\s*([\"']){escaped}\1", text)
             or re.search(rf"\bcollectFormData\([^)]*\[[^\]]*([\"']){escaped}\1", text, re.DOTALL)
+            or CheckRunner._js_payload_uses_dynamic_formdata_entries(text)
+            or re.search(
+                rf"\bfor\s*\([^)]*\bkey\b[^)]*\bof\b\s*\[[^\]]*([\"']){escaped}\1[^\]]*\][\s\S]{{0,500}}\.get\(\s*key\s*\)",
+                text,
+            )
+        )
+
+    @staticmethod
+    def _js_reads_named_form_control(js_source: str, field_name: str) -> bool:
+        escaped = re.escape(str(field_name or ""))
+        text = str(js_source or "")
+        return bool(
+            re.search(rf"\.get\(\s*([\"']){escaped}\1\s*\)", text)
+            or re.search(rf"\bdata\.{escaped}\b", text)
+            or re.search(rf"\b[A-Za-z_$][\w$]*\.elements\.{escaped}\b", text)
+            or re.search(rf"\b[A-Za-z_$][\w$]*\.elements\[\s*([\"']){escaped}\1\s*\]", text)
+            or re.search(rf"\[\s*name\s*=\s*([\"']){escaped}\1\s*\]", text)
             or CheckRunner._js_payload_uses_dynamic_formdata_entries(text)
             or re.search(
                 rf"\bfor\s*\([^)]*\bkey\b[^)]*\bof\b\s*\[[^\]]*([\"']){escaped}\1[^\]]*\][\s\S]{{0,500}}\.get\(\s*key\s*\)",
@@ -2723,6 +2877,35 @@ def goto(page, route):
 
 
 def body_text(page):
+    try:
+        text = page.evaluate(
+            """() => {
+                const bodyText = document.body ? (document.body.innerText || "") : "";
+                const controlValues = Array.from(document.querySelectorAll("input, textarea, select"))
+                    .filter((el) => {
+                        const type = (el.getAttribute("type") || "").toLowerCase();
+                        if (type === "hidden") return false;
+                        const style = window.getComputedStyle(el);
+                        if (style.display === "none" || style.visibility === "hidden") return false;
+                        const rect = el.getBoundingClientRect();
+                        return rect.width > 0 && rect.height > 0;
+                    })
+                    .map((el) => {
+                        const tag = el.tagName.toLowerCase();
+                        if (tag === "select") {
+                            const option = el.options && el.selectedIndex >= 0 ? el.options[el.selectedIndex] : null;
+                            return [el.value, option ? option.textContent : ""].filter(Boolean).join(" ");
+                        }
+                        return el.value || el.getAttribute("value") || "";
+                    })
+                    .filter((value) => String(value || "").trim().length > 0);
+                return [bodyText, ...controlValues].join("\\n");
+            }"""
+        )
+        if isinstance(text, str):
+            return text
+    except Exception:
+        pass
     try:
         return page.locator("body").inner_text(timeout=3000)
     except Exception:
@@ -3669,8 +3852,15 @@ except Exception as exc:
                     diagnostics.get("js_test_brittle_api_constant_assertion") if isinstance(diagnostics, dict) else None
                 )
                 missing_generated_js_token = diagnostics.get("js_test_missing_generated_source_token") if isinstance(diagnostics, dict) else None
+                stale_selector_assertion = diagnostics.get("stale_selector_assertion") if isinstance(diagnostics, dict) else None
+                protected_shell_import = diagnostics.get("protected_platform_shell_import") if isinstance(diagnostics, dict) else None
                 path_id_duplicate = diagnostics.get("path_id_payload_duplicate") if isinstance(diagnostics, dict) else None
-                if isinstance(js_path_root, dict):
+                if isinstance(protected_shell_import, dict):
+                    message = (
+                        str(protected_shell_import.get("expected_fix") or "").strip()
+                        or "Generated Python tests imported product behavior from a platform-owned shell module."
+                    )
+                elif isinstance(js_path_root, dict):
                     expected_root = str(js_path_root.get("expected_root") or "").strip()
                     message = expected_root or "Generated JS tests used an invalid miniapp path root."
                 elif isinstance(js_url_path_api, dict):
@@ -3689,6 +3879,11 @@ except Exception as exc:
                     message = (
                         str(brittle_api_constant_assertion.get("expected_fix") or "").strip()
                         or "Generated JS test required a brittle API constant name."
+                    )
+                elif isinstance(stale_selector_assertion, dict):
+                    message = (
+                        str(stale_selector_assertion.get("expected_fix") or "").strip()
+                        or "Generated JS test required a selector literal that the generated app does not use."
                     )
                 elif isinstance(missing_generated_js_token, dict):
                     message = (
@@ -4021,6 +4216,7 @@ except Exception as exc:
             issues.extend(api_issues)
             data_issues, preloaded_data_findings = self._preloaded_product_data_issues(source_dir)
             issues.extend(data_issues)
+            issues.extend(self._runtime_database_artifact_issues(source_dir))
         if not css_only_focused_edit:
             dom_contract_files = list(relevant_changed)
             if agentic_scope and str(intent or "").strip().lower() == "create":
@@ -4957,6 +5153,55 @@ except Exception as exc:
         if python_marker:
             return python_marker.group(0).strip()
         return None
+
+    @classmethod
+    def _runtime_database_artifact_issues(cls, source_dir: Path) -> list[ValidationIssue]:
+        return [
+            ValidationIssue(
+                code="platform.runtime_database_artifact",
+                message=(
+                    f"{relative_path} is a runtime database artifact inside generated source. "
+                    "Create apps must ship with empty persistent state; checks and preview proof must not leave SQLite data files in the source tree."
+                ),
+                severity="high",
+                location=relative_path,
+                blocking=True,
+            )
+            for relative_path in cls._runtime_database_artifact_paths(source_dir)
+        ]
+
+    @classmethod
+    def _cleanup_runtime_database_artifacts(cls, source_dir: Path) -> list[str]:
+        removed: list[str] = []
+        for relative_path in cls._runtime_database_artifact_paths(source_dir):
+            path = source_dir / relative_path
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                continue
+            removed.append(relative_path)
+        return removed
+
+    @classmethod
+    def _runtime_database_artifact_paths(cls, source_dir: Path) -> list[str]:
+        app_root = source_dir / "miniapp/app"
+        if not app_root.exists():
+            return []
+        paths: list[str] = []
+        for path in app_root.rglob("*"):
+            if not path.is_file():
+                continue
+            name = path.name.lower()
+            if not any(name.endswith(suffix) for suffix in RUNTIME_DATABASE_ARTIFACT_SUFFIXES):
+                continue
+            try:
+                relative_path = path.relative_to(source_dir).as_posix()
+            except ValueError:
+                continue
+            paths.append(relative_path)
+        return sorted(paths)
 
     @staticmethod
     def _multipage_coverage_from_roles(role_coverage: dict[str, object]) -> dict[str, object]:
@@ -6154,6 +6399,17 @@ except Exception as exc:
             test_source = test_file.read_text(encoding="utf-8")
         except OSError:
             test_source = ""
+        protected_import = self._protected_platform_shell_import_diagnostic(test_source)
+        if protected_import:
+            return RunCheckResult(
+                name="generated_app_python_tests",
+                status="failed",
+                details="Generated Python app tests import product behavior from a platform-owned shell module.",
+                command=f"{sys.executable} -m unittest discover -s tests -p test_generated_app.py",
+                exit_code=5,
+                logs=[json.dumps({"code": "generated_python_test_imports_platform_shell_helper", **protected_import}, ensure_ascii=False)],
+                diagnostics={"protected_platform_shell_import": protected_import},
+            )
         if (
             re.search(r"^\s*def\s+test_[A-Za-z0-9_]*\s*\(", test_source, flags=re.MULTILINE)
             and "unittest.TestCase" not in test_source
@@ -6219,6 +6475,44 @@ except Exception as exc:
             exit_code=result.returncode,
             logs=["Generated Python app tests passed."],
         )
+
+    @classmethod
+    def _protected_platform_shell_import_diagnostic(cls, test_source: str) -> dict[str, object] | None:
+        for line_no, line in enumerate(str(test_source or "").splitlines(), start=1):
+            match = re.match(r"\s*from\s+(?P<module>app\.routes\.(?:health|role_pages|role_routes))\s+import\s+(?P<names>[^#]+)", line)
+            if not match:
+                continue
+            module = str(match.group("module") or "").strip()
+            imported = [
+                part.strip().split(" as ", 1)[0].strip()
+                for part in str(match.group("names") or "").split(",")
+                if part.strip()
+            ]
+            allowed = cls._GENERATED_TEST_PROTECTED_ROUTE_MODULES.get(module, set())
+            blocked = [name for name in imported if name not in allowed]
+            if not blocked:
+                continue
+            return cls._protected_platform_shell_import_payload(module=module, imported=blocked, line=line_no)
+        return None
+
+    @staticmethod
+    def _protected_platform_shell_import_payload(*, module: str, imported: list[str], line: int | None = None) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "problem": "generated_python_test_imports_platform_shell_helper",
+            "module": module,
+            "imported": imported,
+            "file_path": "miniapp/tests/test_generated_app.py",
+            "expected_fix": (
+                "Generated product tests must not import product/reset helpers from platform-owned shell modules "
+                "such as app.routes.health, app.routes.role_pages, or app.routes.role_routes. Patch the generated test "
+                "to import the helper from the app-owned route module that defines the resource, or reset the generated DB "
+                "after importing the app-owned route models. Do not add product helpers to platform shell files."
+            ),
+            "target_files": ["miniapp/tests/test_generated_app.py", "miniapp/app/routes/**", "miniapp/app/db.py"],
+        }
+        if line is not None:
+            payload["line"] = line
+        return payload
 
     def _install_python_requirements(
         self,
@@ -6696,6 +6990,17 @@ except Exception as exc:
         )
         if failing_test:
             diagnostics["failing_test_name"] = failing_test
+        for line in reversed(logs):
+            import_error_match = cls._PY_IMPORT_ERROR_RE.search(str(line or ""))
+            if not import_error_match:
+                continue
+            module = str(import_error_match.group("module") or "").strip()
+            imported = [str(import_error_match.group("name") or "").strip()]
+            diagnostics["protected_platform_shell_import"] = cls._protected_platform_shell_import_payload(
+                module=module,
+                imported=[name for name in imported if name],
+            )
+            break
         generated_js_locations = [
             {
                 "line": int(match.group("line")),
@@ -6826,13 +7131,15 @@ except Exception as exc:
                                     "the resource path/name, the required HTTP method, a submit/click handler, and fetch(...) somewhere in the source."
                                 ),
                             }
-                        diagnostics["stale_selector_assertion"] = {
-                            "problem": "generated_js_test_requires_exact_selector_literal",
-                            "expected_fix": (
-                                "Patch generated_app.test.mjs to assert selectors/handlers that actually exist in the generated HTML/JS. "
-                                "If the app binds a form/data-selector handler, do not require an unused button id literal in the script or page."
-                            ),
-                        }
+                        if re.search(r"(?:data-[A-Za-z0-9_-]+|#[A-Za-z][A-Za-z0-9_-]*|\\\.[A-Za-z][A-Za-z0-9_-]*)", expected_literal):
+                            diagnostics["stale_selector_assertion"] = {
+                                "problem": "generated_js_test_requires_exact_selector_literal",
+                                "expected_literal": expected_literal,
+                                "expected_fix": (
+                                    "Patch generated_app.test.mjs to assert selectors/handlers that actually exist in the generated HTML/JS. "
+                                    "If the app already binds a form/data-selector handler, do not edit app code or route metadata just to satisfy an unused selector literal."
+                                ),
+                            }
                     start = max(0, line_no - 4)
                     end = min(len(source_lines), line_no + 3)
                     diagnostics["assertion_context"] = [

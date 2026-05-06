@@ -30,7 +30,7 @@ class AgentWorkerManager:
     """Product-aware worker ownership and merge guard for role-separated draft work."""
 
     SCOPES: tuple[AgentWorkerScope, ...] = (
-        AgentWorkerScope("backend_api_worker", "backend/API", ("miniapp/app/routes", "miniapp/app/schemas.py", "miniapp/app/db.py", "miniapp/app/main.py")),
+        AgentWorkerScope("backend_api_worker", "backend/API", ("miniapp/app/routes", "miniapp/app/schemas.py", "miniapp/app/db.py")),
         AgentWorkerScope("client_surface_worker", "client UI", ("miniapp/app/static/client",)),
         AgentWorkerScope("specialist_surface_worker", "specialist UI", ("miniapp/app/static/specialist",)),
         AgentWorkerScope("manager_surface_worker", "manager UI", ("miniapp/app/static/manager",)),

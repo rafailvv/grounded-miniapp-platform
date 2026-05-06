@@ -6,6 +6,8 @@ from pathlib import Path
 
 from app.services.agent_runtime_config import TimeoutProfile
 
+_DOTENV_LOADED_VALUES: dict[str, str] = {}
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -41,6 +43,11 @@ def _load_repo_env(dotenv_path: Path) -> None:
         if parsed and parsed[0] == parsed[-1] and parsed[0] in {'"', "'"}:
             parsed = parsed[1:-1]
         os.environ[key] = parsed
+        _DOTENV_LOADED_VALUES[key] = parsed
+
+
+def _env_was_loaded_from_dotenv(key: str) -> bool:
+    return key in _DOTENV_LOADED_VALUES and os.environ.get(key) == _DOTENV_LOADED_VALUES[key]
 
 
 def get_settings(
@@ -51,10 +58,15 @@ def get_settings(
 ) -> Settings:
     root = repo_root or Path(__file__).resolve().parents[4]
     _load_repo_env(root / ".env")
+    explicit_host_data_dir = os.environ.get("PLATFORM_HOST_DATA_DIR")
+    host_data_dir_from_process_env = explicit_host_data_dir is not None and not _env_was_loaded_from_dotenv("PLATFORM_HOST_DATA_DIR")
     timeout_profile = TimeoutProfile.from_env()
     preview_base_url = os.getenv("PREVIEW_BASE_URL", preview_base_url)
     resolved_data_dir = data_dir or Path(os.getenv("PLATFORM_DATA_DIR", str(root / "data")))
-    resolved_host_data_dir = Path(os.getenv("PLATFORM_HOST_DATA_DIR", str(resolved_data_dir)))
+    if data_dir is not None and not host_data_dir_from_process_env:
+        resolved_host_data_dir = resolved_data_dir
+    else:
+        resolved_host_data_dir = Path(os.getenv("PLATFORM_HOST_DATA_DIR", str(resolved_data_dir)))
     settings = Settings(
         repo_root=root,
         data_dir=resolved_data_dir,

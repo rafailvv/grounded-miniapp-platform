@@ -105,6 +105,12 @@ from app.validators.static_analysis import extract_declared_routes
 logger = logging.getLogger(__name__)
 
 ROLE_ORDER = ("client", "specialist", "manager")
+PLATFORM_SHELL_TEMPLATE_PATHS = (
+    "miniapp/app/main.py",
+    "miniapp/app/routes/health.py",
+    "miniapp/app/routes/role_pages.py",
+    "miniapp/app/routes/role_routes.py",
+)
 QUALITY_FIDELITY = {
     GenerationMode.FAST: "fast_app",
     GenerationMode.QUALITY: "quality_app",
@@ -133,15 +139,11 @@ INITIAL_CONTEXT_PATHS = (
     "miniapp/tests/generated_app.test.mjs",
     "README.md",
     "docs/agent-guidelines.md",
-    "miniapp/app/main.py",
     "miniapp/app/db.py",
     "miniapp/app/schemas.py",
-    "miniapp/app/routes/role_routes.py",
-    "miniapp/app/routes/role_pages.py",
     "miniapp/app/static/shared/base.css",
     "miniapp/app/static/client/index.html",
     "miniapp/app/static/client/app.js",
-    "miniapp/app/generated/route_manifest.json",
 )
 class WorkspaceCodeAgentRuntime:
     """Single agentic code path for create, edit, fix, refine, and visual changes."""
@@ -519,6 +521,24 @@ class WorkspaceCodeAgentRuntime:
         del workspace_id, run_id, changed_files
         source_dir = Path(draft_source)
         stabilized: list[str] = []
+        template_dir = getattr(getattr(self.workspace_service, "settings", None), "template_dir", None)
+        template_root = Path(template_dir) if template_dir else None
+        if template_root is not None:
+            for relative in PLATFORM_SHELL_TEMPLATE_PATHS:
+                template_path = template_root / relative
+                target_path = source_dir / relative
+                if not template_path.exists():
+                    continue
+                try:
+                    template_text = template_path.read_text(encoding="utf-8")
+                    current_text = target_path.read_text(encoding="utf-8") if target_path.exists() else ""
+                except OSError:
+                    continue
+                if current_text != template_text:
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    target_path.write_text(template_text, encoding="utf-8")
+                    stabilized.append(relative)
+
         base_path = source_dir / BASE_STYLESHEET_PATH
         if base_path.exists():
             try:
@@ -3746,6 +3766,7 @@ class WorkspaceCodeAgentRuntime:
                     "Mobile-first: target Telegram widths around 360-430px, use one consistent light neutral product visual system across all roles unless the user explicitly asks for a dark theme, preserve safe top spacing/preview bridge, and avoid horizontal scroll or overlapping cards/forms/actions.",
                     "Generated source must start empty: no mock, seed, demo, sample, fixture, preloaded, or hard-coded product records. Empty states and validation test payloads are allowed.",
                     "Generated tests must verify the actual app contract: persisted API behavior, real role HTML/JS selectors, prompt-assigned actions, and no stale UI-only controls. Python generated tests must be unittest-discoverable: import unittest, define a unittest.TestCase subclass, and put assertions inside test_* methods. FastAPI generated tests should use `with TestClient(app) as client:` so lifespan/table setup runs, or explicitly create tables after generated ORM models are imported. JS generated tests run from cwd=miniapp, so read app/static/... and app/generated/... paths, not miniapp/app/... paths. Node has no browser DOM: do not import browser-only role app.js files unless the test creates explicit window/document mocks first; prefer source-text assertions for selectors, API calls, routes, and handlers. Do not write pytest-only top-level test functions. Patch tests only when they are stale with the app contract.",
+                    "Generated Python tests must not import product/reset helpers from platform shell modules such as app.routes.health, app.routes.role_pages, or app.routes.role_routes; import from the app-owned route module or reset the generated DB after importing app-owned route models.",
                     "For edit/refine/fix/repair, patch existing files with small unified diffs. Use full-file replace only for new files, tiny files, create-mode work, or a file that repeatedly conflicts.",
                     "If checks/browser proof fail, repair the concrete failing slice from latest_checks/tool_results: align selectors, payload fields, API routes, rendered state, and tests together. Do not rewrite unrelated files.",
                     "Read-only tools never write files. Mutating tools are serialized through the draft edit validator. run_command is limited to safe diagnostics such as unittest, py_compile, node tests/checks, rg, sed, and ls.",
@@ -3921,10 +3942,11 @@ class WorkspaceCodeAgentRuntime:
             for path in diff_paths
             if path.startswith("miniapp/app/routes/")
             and path.endswith(".py")
+            and path not in {"miniapp/app/routes/app_api.py", "miniapp/app/routes/role_pages.py", "miniapp/app/routes/role_routes.py"}
         ]
         supporting_paths: list[str] = []
         if any(path.endswith("miniapp/tests/test_generated_app.py") or path == "miniapp/tests/test_generated_app.py" for path in context_paths):
-            supporting_paths.extend([*route_paths, "miniapp/app/routes/app_api.py", "miniapp/app/schemas.py", "miniapp/app/main.py", "miniapp/app/db.py"])
+            supporting_paths.extend([*route_paths, "miniapp/app/routes/api.py", "miniapp/app/schemas.py", "miniapp/app/db.py"])
             supporting_paths.extend(
                 [
                     path
@@ -3936,7 +3958,7 @@ class WorkspaceCodeAgentRuntime:
         if any(path.endswith("miniapp/tests/generated_app.test.mjs") or path == "miniapp/tests/generated_app.test.mjs" for path in context_paths):
             supporting_paths.extend([path for path in diff_paths if path.startswith("miniapp/app/static/") and path.endswith((".html", ".js"))][:4])
         if any("/routes/" in path for path in context_paths):
-            supporting_paths.extend([*route_paths, "miniapp/app/schemas.py", "miniapp/app/main.py", "miniapp/app/db.py", "miniapp/tests/test_generated_app.py"])
+            supporting_paths.extend([*route_paths, "miniapp/app/schemas.py", "miniapp/app/db.py", "miniapp/tests/test_generated_app.py"])
         for role in ROLE_ORDER:
             role_prefix = f"miniapp/app/static/{role}/"
             if any(path.startswith(role_prefix) and path.endswith((".html", "app.js", "styles.css")) for path in context_paths):
@@ -3952,7 +3974,7 @@ class WorkspaceCodeAgentRuntime:
                         f"{role_prefix}app.js",
                         f"{role_prefix}styles.css",
                         *route_paths,
-                        "miniapp/app/routes/app_api.py",
+                        "miniapp/app/routes/api.py",
                         "miniapp/app/schemas.py",
                         "miniapp/tests/test_generated_app.py",
                         "miniapp/tests/generated_app.test.mjs",
@@ -4156,9 +4178,10 @@ class WorkspaceCodeAgentRuntime:
                     path
                     for path in diff_paths
                     if path.startswith("miniapp/app/routes/") and path.endswith(".py")
+                    and path not in {"miniapp/app/routes/app_api.py", "miniapp/app/routes/role_pages.py", "miniapp/app/routes/role_routes.py"}
                 ]
             )
-            ordered.extend(["miniapp/app/routes/app_api.py", "miniapp/app/schemas.py"])
+            ordered.extend(["miniapp/app/routes/api.py", "miniapp/app/schemas.py"])
         if "generated_app_js_tests" in failed_names:
             ordered.append("miniapp/tests/generated_app.test.mjs")
         if "generated_app_python_tests" in failed_names or api_failed:
@@ -4202,8 +4225,12 @@ class WorkspaceCodeAgentRuntime:
             diagnostics = result.diagnostics if isinstance(result.diagnostics, dict) else {}
             if diagnostics.get("assertion_failures") or diagnostics.get("failing_test_location") or diagnostics.get("assertion_source"):
                 return True
+            if diagnostics.get("protected_platform_shell_import"):
+                return True
             stale_markers = (
                 "assertionerror",
+                "cannot import name",
+                "app.routes.health",
                 "expected:",
                 "actual:",
                 "operator:",
@@ -4251,13 +4278,15 @@ class WorkspaceCodeAgentRuntime:
         if missing:
             return (
                 "Generated-test repair: create the missing generated Python and JS acceptance tests from the actual current routes, schemas, "
-                "role HTML, and role JS. Do not invent a separate test-only contract."
+                "role HTML, and role JS. Do not invent a separate test-only contract. Python tests must not import product/reset helpers from "
+                "platform shell modules such as app.routes.health, app.routes.role_pages, or app.routes.role_routes."
             )
         return (
             "Generated-test repair: fix stale generated acceptance tests before returning to browser proof. "
             f"Failed checks: {', '.join(failed_names) or 'generated tests'}. "
             "Compare the test expectations with the current app files in file_contexts. Prefer patching only miniapp/tests/* when tests assert old selectors, old class names, old labels, or old routes. "
-            "Patch app code only if the assertion proves the actual workflow contract is broken. Keep browser-flow repair for the next validation round."
+            "Patch app code only if the assertion proves the actual workflow contract is broken. Python tests must not import product/reset helpers from platform shell modules; "
+            "import from the app-owned route module that defines the resource or reset the generated DB after importing app-owned route models. Keep browser-flow repair for the next validation round."
         )
 
     @staticmethod
@@ -4280,12 +4309,12 @@ class WorkspaceCodeAgentRuntime:
             for path in diff_paths
             if path.startswith("miniapp/app/routes/")
             and path.endswith(".py")
+            and path not in {"miniapp/app/routes/app_api.py", "miniapp/app/routes/role_pages.py", "miniapp/app/routes/role_routes.py"}
         ]
         ordered.extend(static_paths[:9])
         ordered.extend(route_paths[:6])
         if "generated_app_python_tests" in failed_names or route_paths:
-            ordered.extend(["miniapp/app/schemas.py", "miniapp/app/main.py", "miniapp/app/db.py"])
-        ordered.append("miniapp/app/generated/route_manifest.json")
+            ordered.extend(["miniapp/app/schemas.py", "miniapp/app/db.py"])
 
         compact: list[str] = []
         for path in ordered:
@@ -4854,6 +4883,7 @@ class WorkspaceCodeAgentRuntime:
             "Browser-flow failures are product failures: make the UI action change persisted state, make other roles observe it, and make reload preserve it.",
             "A role that creates shared state must render the persisted fields relevant to its contract. If the contract assigns later changes to another role, those changes must become visible to the relevant roles after refresh.",
             "Generated tests should verify the actual app contract. Python generated tests must be unittest-discoverable: import unittest, define a unittest.TestCase subclass, and put assertions inside test_* methods; use FastAPI TestClient as a context manager when app lifespan creates tables; never replace tests with pytest-only top-level functions. JS generated tests run from cwd=miniapp, so path reads should be app/static/... and app/generated/.... Node has no browser DOM: do not import browser-only role app.js files unless the test creates explicit window/document mocks first; prefer source-text assertions for selectors, API calls, routes, and handlers. Patch stale/brittle test expectations only when the app behavior is already correct.",
+            "Generated Python tests must not import product/reset helpers from platform shell modules such as app.routes.health, app.routes.role_pages, or app.routes.role_routes; import from the app-owned route module or reset the generated DB after importing app-owned route models.",
             "Mobile layout fixes must target 360-430px width: no horizontal scroll, no overlapping critical cards/forms/actions, and readable wrapping.",
             "For multi-page role apps, a shared static/<role>/app.js must be view-aware: branch by body[data-view] or route, guard optional DOM nodes that exist only on other pages, and bind every visible form/button/control on root and child pages.",
         ]
@@ -4962,10 +4992,8 @@ class WorkspaceCodeAgentRuntime:
                 candidates.append("miniapp/tests/test_generated_app.py")
                 candidates.extend(
                     [
-                        "miniapp/app/routes/app_api.py",
                         "miniapp/app/routes/api.py",
                         "miniapp/app/schemas.py",
-                        "miniapp/app/main.py",
                         "miniapp/app/db.py",
                     ]
                 )
@@ -4974,10 +5002,8 @@ class WorkspaceCodeAgentRuntime:
             if result.name == "browser_flow_smoke":
                 candidates.extend(
                     [
-                        "miniapp/app/routes/app_api.py",
                         "miniapp/app/routes/api.py",
                         "miniapp/app/schemas.py",
-                        "miniapp/app/main.py",
                         "miniapp/app/db.py",
                         "miniapp/tests/test_generated_app.py",
                         "miniapp/tests/generated_app.test.mjs",
@@ -5016,7 +5042,6 @@ class WorkspaceCodeAgentRuntime:
                             )
                         candidates.extend(
                             [
-                                "miniapp/app/routes/app_api.py",
                                 "miniapp/app/routes/api.py",
                                 "miniapp/app/schemas.py",
                                 "miniapp/tests/test_generated_app.py",
@@ -5030,7 +5055,6 @@ class WorkspaceCodeAgentRuntime:
                             [
                                 f"miniapp/app/static/{role}/app.js",
                                 "miniapp/app/schemas.py",
-                                "miniapp/app/routes/app_api.py",
                                 "miniapp/app/routes/api.py",
                             ]
                         )
@@ -6092,12 +6116,15 @@ class WorkspaceCodeAgentRuntime:
         if normalized.startswith("miniapp/tests/"):
             return "test_verifier_worker"
         if normalized.startswith("miniapp/app/routes/") or normalized in {
-            "miniapp/app/main.py",
             "miniapp/app/db.py",
             "miniapp/app/schemas.py",
         }:
             return "backend_api_worker"
-        if normalized.startswith("miniapp/app/generated/") or normalized.startswith("miniapp/app/static/shared/"):
+        if (
+            normalized == "miniapp/app/main.py"
+            or normalized.startswith("miniapp/app/generated/")
+            or normalized.startswith("miniapp/app/static/shared/")
+        ):
             return "shared_runtime"
         return "shared"
 
@@ -6391,7 +6418,7 @@ class WorkspaceCodeAgentRuntime:
                 if suggested:
                     target_paths.append(suggested)
             target_paths.append(str(issue.get("location") or ""))
-        for path in ["miniapp/app/routes/api.py", "miniapp/app/main.py", "miniapp/app/schemas.py", *target_paths]:
+        for path in ["miniapp/app/routes/api.py", "miniapp/app/schemas.py", *target_paths]:
             if not path or path in extra_file_context:
                 continue
             content = self.workspace_service.try_read_text_file(workspace_id, path, run_id=run_id)
@@ -6792,11 +6819,12 @@ class WorkspaceCodeAgentRuntime:
             elif path.startswith("miniapp/app/static/manager/"):
                 groups["manager"] += 1
             elif path.startswith("miniapp/app/routes/") or path in {
-                "miniapp/app/main.py",
                 "miniapp/app/db.py",
                 "miniapp/app/schemas.py",
             }:
                 groups["backend"] += 1
+            elif path == "miniapp/app/main.py":
+                groups["other"] += 1
             else:
                 groups["other"] += 1
         return {key: value for key, value in groups.items() if value}
@@ -7667,8 +7695,11 @@ class WorkspaceCodeAgentRuntime:
             except OSError:
                 continue
             if "/api" in text or "@router." in text:
-                route_relatives.append(str(path.relative_to(source_dir)).replace("\\", "/"))
-        for relative in [*route_relatives, "miniapp/app/routes/api.py", "miniapp/app/routes/app_api.py", "miniapp/app/schemas.py"]:
+                relative = str(path.relative_to(source_dir)).replace("\\", "/")
+                if relative == "miniapp/app/routes/app_api.py":
+                    continue
+                route_relatives.append(relative)
+        for relative in [*route_relatives, "miniapp/app/routes/api.py", "miniapp/app/schemas.py"]:
             path = source_dir / relative
             if not path.exists():
                 continue

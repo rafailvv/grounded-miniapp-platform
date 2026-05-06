@@ -8,6 +8,7 @@ from typing import Any
 
 from fastapi.testclient import TestClient
 
+from app.core.config import get_settings
 from app.main import create_app
 from app.models.domain import CreateRunRequest, GenerateRequest, JobRecord, PreviewRecord, RunCheckResult, RunRecord
 from app.modules.miniapp_agent_loop.agent_command_policy import AgentCommandPolicy
@@ -16,6 +17,26 @@ from app.services.repair_catalog import RepairCatalog
 from app.services.exec_policy_service import ExecPolicyService
 from app.services.tool_protocol import TOOL_PROTOCOL_VERSION, canonical_tool_name, tool_envelope
 from app.services.workspace.runtime_manager import PreviewRuntimeManager
+
+
+def test_explicit_data_dir_uses_matching_host_dir_despite_dotenv(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("PLATFORM_DATA_DIR", raising=False)
+    monkeypatch.delenv("PLATFORM_HOST_DATA_DIR", raising=False)
+
+    settings = get_settings(repo_root=Path.cwd(), data_dir=tmp_path)
+
+    assert settings.data_dir == tmp_path
+    assert settings.host_data_dir == tmp_path
+
+
+def test_explicit_host_data_dir_env_still_overrides_data_dir(tmp_path: Path, monkeypatch) -> None:
+    host_dir = tmp_path / "host"
+    monkeypatch.setenv("PLATFORM_HOST_DATA_DIR", str(host_dir))
+
+    settings = get_settings(repo_root=Path.cwd(), data_dir=tmp_path / "data")
+
+    assert settings.data_dir == tmp_path / "data"
+    assert settings.host_data_dir == host_dir
 
 
 def test_tool_protocol_normalizes_aliases() -> None:

@@ -47,6 +47,8 @@ def test_fast_contract_compiler_creates_deterministic_resource_and_routes() -> N
     assert contract.resources[0].slug == "ledgers"
     assert "miniapp/app/generated/route_manifest.json" in contract.allowed_file_graph.contract_owned_paths
     assert all("miniapp/app/routes/" not in path for path in contract.allowed_file_graph.contract_owned_paths)
+    assert "miniapp/app/main.py" in contract.allowed_file_graph.readonly_paths
+    assert "miniapp/app/main.py" not in contract.allowed_file_graph.writable_globs
     assert "miniapp/tests/test_generated_app.py" not in contract.allowed_file_graph.blocked_globs
 
 
@@ -226,3 +228,19 @@ def test_contract_owned_files_are_blocked_from_llm_writes() -> None:
 
     assert invalid is not None
     assert "protected" in invalid[1] or "relative path" in invalid[1]
+
+
+def test_platform_shell_entrypoint_is_blocked_from_llm_writes() -> None:
+    invalid = AgentEditValidator._first_invalid_file_change(
+        [
+            DraftAction(
+                file_path="miniapp/app/main.py",
+                operation="replace",
+                content="from fastapi import FastAPI\napp = FastAPI()\n",
+                reason="model tried to rewrite the platform entrypoint",
+            )
+        ]
+    )
+
+    assert invalid is not None
+    assert invalid[0] == "protected_path"

@@ -400,7 +400,7 @@ class AgentToolRegistry:
                 properties = {
                     "file_path": {
                         "type": "string",
-                        "description": "One app-owned miniapp/... file. Do not target generated/platform-owned files such as app/routes/role_pages.py, app/routes/role_routes.py, or app/generated/*.json.",
+                        "description": "One app-owned miniapp/... file. Do not target generated/platform-owned files such as app/main.py, app/routes/role_pages.py, app/routes/role_routes.py, or app/generated/*.json.",
                     },
                     "diff": {
                         "type": "string",
@@ -415,7 +415,7 @@ class AgentToolRegistry:
                 properties = {
                     "file_path": {
                         "type": "string",
-                        "description": "One app-owned miniapp/... file. Do not target generated/platform-owned files such as app/routes/role_pages.py, app/routes/role_routes.py, or app/generated/*.json.",
+                        "description": "One app-owned miniapp/... file. Do not target generated/platform-owned files such as app/main.py, app/routes/role_pages.py, app/routes/role_routes.py, or app/generated/*.json.",
                     },
                     "content": {
                         "type": "string",
@@ -430,7 +430,7 @@ class AgentToolRegistry:
                 properties = {
                     "file_path": {
                         "type": "string",
-                        "description": "One app-owned miniapp/... file. Do not target generated/platform-owned files such as app/routes/role_pages.py, app/routes/role_routes.py, or app/generated/*.json.",
+                        "description": "One app-owned miniapp/... file. Do not target generated/platform-owned files such as app/main.py, app/routes/role_pages.py, app/routes/role_routes.py, or app/generated/*.json.",
                     },
                     "old_string": {
                         "type": "string",

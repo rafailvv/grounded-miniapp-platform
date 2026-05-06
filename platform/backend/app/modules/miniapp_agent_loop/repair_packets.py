@@ -18,6 +18,7 @@ def _is_protected_target(path: str) -> bool:
     normalized = _clean_path(path)
     protected_exact = {
         "platform-state.json",
+        "miniapp/app/main.py",
         "miniapp/app/routes/role_pages.py",
         "miniapp/app/routes/role_routes.py",
         "miniapp/app/generated/miniapp_contract.json",

@@ -19,6 +19,7 @@ class AgentEditValidator:
         ".venv/",
         "venv/",
         "platform-state.json",
+        "miniapp/app/main.py",
         "miniapp/app/routes/role_pages.py",
         "miniapp/app/routes/role_routes.py",
         "miniapp/app/generated/miniapp_contract.json",
@@ -26,7 +27,6 @@ class AgentEditValidator:
         "miniapp/app/generated/contract_validator.json",
     )
     PROTECTED_PATH_REPAIR_TARGETS = (
-        "miniapp/app/main.py",
         "miniapp/app/schemas.py",
         "miniapp/app/db.py",
         "miniapp/app/static/client/index.html",
@@ -311,7 +311,6 @@ class AgentEditValidator:
             ]
         if any(path.startswith("miniapp/app/generated/") for path in blocked):
             return [
-                "miniapp/app/main.py",
                 "miniapp/app/schemas.py",
                 "miniapp/app/static/client/app.js",
                 "miniapp/app/static/specialist/app.js",

@@ -189,9 +189,9 @@ class MiniAppContractCompiler:
                 "miniapp/app/routes/**",
                 "miniapp/app/schemas.py",
                 "miniapp/app/db.py",
-                "miniapp/app/main.py",
             ],
             readonly_paths=[
+                "miniapp/app/main.py",
                 "miniapp/app/routes/role_pages.py",
                 "miniapp/app/routes/role_routes.py",
             ],

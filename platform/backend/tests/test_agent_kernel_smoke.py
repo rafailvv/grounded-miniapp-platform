@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 
 from app.ai.openai_client import OpenAIClient
 from app.ai.model_registry import CODEX_MINI_MODEL, models_for_role
@@ -16,6 +17,7 @@ from app.modules.miniapp_agent_loop.agent_kernel import agent_tool_kind, plan_ag
 from app.modules.miniapp_agent_loop.agent_memory_store import AgentMemoryStore
 from app.modules.miniapp_agent_loop.agent_process_manager import AgentProcessManager, HeadTailOutputBuffer
 from app.modules.miniapp_agent_loop.agent_scratchpad import AgentScratchpad
+from app.modules.miniapp_agent_loop.agent_tool_call_loop import AgentToolCallLoop
 from app.modules.miniapp_agent_loop.agent_transcript import AgentTranscriptStore
 from app.modules.miniapp_agent_loop.agent_tool_registry import AgentToolRegistry
 from app.modules.miniapp_agent_loop.agent_tool_changes import file_changes_from_mutating_tool_calls
@@ -74,6 +76,50 @@ def _prompt_analysis(
         },
         "routeable_screen_plan": screen_plan or {},
     }
+
+
+def test_browser_infra_failure_does_not_mask_repairable_app_failures() -> None:
+    results = [
+        RunCheckResult(
+            name="generated_app_python_tests",
+            status="failed",
+            details="Generated tests failed.",
+            logs=["AssertionError"],
+        ),
+        RunCheckResult(
+            name="browser_flow_smoke",
+            status="failed",
+            details="Browser proof failed.",
+            diagnostics={"infra_unavailable": True},
+        ),
+    ]
+
+    assert AgentToolCallLoop._has_browser_infra_failure(results) is False
+
+
+def test_browser_infra_failure_blocks_when_no_repairable_failures_remain() -> None:
+    results = [
+        RunCheckResult(name="api_workflow_smoke", status="passed", details="API proof passed."),
+        RunCheckResult(
+            name="browser_flow_smoke",
+            status="failed",
+            details="Browser proof failed.",
+            diagnostics={"infra_unavailable": True},
+        ),
+    ]
+
+    assert AgentToolCallLoop._has_browser_infra_failure(results) is True
+
+
+def test_generated_test_failures_gate_browser_preview_proof() -> None:
+    assert CheckRunner._generated_tests_failed(
+        RunCheckResult(name="generated_app_python_tests", status="failed", details="Python tests failed."),
+        RunCheckResult(name="generated_app_js_tests", status="passed", details="JS tests passed."),
+    )
+    assert not CheckRunner._generated_tests_failed(
+        RunCheckResult(name="generated_app_python_tests", status="passed", details="Python tests passed."),
+        RunCheckResult(name="generated_app_js_tests", status="skipped", details="JS tests skipped."),
+    )
 
 
 def _contract_with_analysis(
@@ -231,6 +277,143 @@ document.getElementById("manager-update-form")?.addEventListener("submit", () =>
     ]
 
 
+def test_frontend_selector_wiring_accepts_role_markup_rendered_from_js(tmp_path: Path) -> None:
+    js_path = tmp_path / "source" / "miniapp" / "app" / "static" / "manager" / "app.js"
+    js_path.parent.mkdir(parents=True)
+    js_source = """
+function render() {
+  const app = document.getElementById("app");
+  app.innerHTML = `<section><div id="manager-list" class="items"></div></section>`;
+  app.querySelector("#manager-list")?.addEventListener("click", () => {});
+}
+"""
+
+    issues = CheckRunner._selector_wiring_issues(
+        "manager",
+        js_path,
+        js_source,
+        "<main id='app'></main>",
+    )
+
+    assert issues == []
+
+
+def test_frontend_selector_wiring_flags_selector_missing_from_static_and_generated_markup(tmp_path: Path) -> None:
+    js_path = tmp_path / "source" / "miniapp" / "app" / "static" / "manager" / "app.js"
+    js_path.parent.mkdir(parents=True)
+    js_source = """
+function render() {
+  const app = document.getElementById("app");
+  app.innerHTML = `<section><div id="manager-list" class="items"></div></section>`;
+  app.querySelector("#missing-manager-list")?.addEventListener("click", () => {});
+}
+"""
+
+    issues = CheckRunner._selector_wiring_issues(
+        "manager",
+        js_path,
+        js_source,
+        "<main id='app'></main>",
+    )
+
+    assert [issue.code for issue in issues] == ["platform.workflow_selector_matches_no_html"]
+    assert issues[0].blocking is True
+
+
+def test_late_domcontentloaded_init_detects_js_rendered_controls(tmp_path: Path) -> None:
+    js_path = tmp_path / "source" / "miniapp" / "app" / "static" / "specialist" / "app.js"
+    js_path.parent.mkdir(parents=True)
+    js_source = """
+document.addEventListener("DOMContentLoaded", () => {
+  document.getElementById("app").innerHTML = `<form id="specialist-form"><button type="submit">Save</button></form>`;
+  document.getElementById("specialist-form")?.addEventListener("submit", () => {});
+});
+"""
+
+    issues = CheckRunner._late_domcontentloaded_init_issues(
+        "specialist",
+        js_path,
+        js_source,
+        "<main id='app'></main>",
+    )
+
+    assert [issue.code for issue in issues] == ["platform.workflow_late_domcontentloaded_init"]
+    assert issues[0].blocking is True
+
+
+def test_runtime_database_artifacts_are_blocking_and_cleaned(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    app_dir = source_dir / "miniapp" / "app" / "generated"
+    app_dir.mkdir(parents=True)
+    db_path = app_dir / "app.db"
+    wal_path = app_dir / "app.db-wal"
+    db_path.write_bytes(b"sqlite-runtime-data")
+    wal_path.write_bytes(b"sqlite-runtime-wal")
+
+    issues = CheckRunner._runtime_database_artifact_issues(source_dir)
+    removed = CheckRunner._cleanup_runtime_database_artifacts(source_dir)
+
+    assert [issue.code for issue in issues] == [
+        "platform.runtime_database_artifact",
+        "platform.runtime_database_artifact",
+    ]
+    assert removed == ["miniapp/app/generated/app.db", "miniapp/app/generated/app.db-wal"]
+    assert not db_path.exists()
+    assert not wal_path.exists()
+
+
+def test_js_rendered_form_blocks_visible_control_value_not_used(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    role_dir = source_dir / "miniapp" / "app" / "static" / "manager"
+    role_dir.mkdir(parents=True)
+    (role_dir / "index.html").write_text("<main id='app'></main>", encoding="utf-8")
+    (role_dir / "app.js").write_text(
+        """
+const root = document.getElementById("app");
+root.innerHTML = `<form id="manager-form">
+  <input id="manager-selected" name="selected_note" required />
+  <textarea id="manager-note"></textarea>
+  <button type="submit">Save</button>
+</form>`;
+document.getElementById("manager-form")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  await fetch("/api/items/1", { method: "PATCH", body: JSON.stringify({ selected_note: document.getElementById("manager-note").value }) });
+});
+""",
+        encoding="utf-8",
+    )
+
+    issues = CheckRunner._frontend_role_wiring_issues(source_dir / "miniapp/app/static")
+
+    assert "platform.workflow_form_field_value_not_used" in [issue.code for issue in issues]
+
+
+def test_js_rendered_form_accepts_formdata_value_use(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    role_dir = source_dir / "miniapp" / "app" / "static" / "client"
+    role_dir.mkdir(parents=True)
+    (role_dir / "index.html").write_text("<main id='app'></main>", encoding="utf-8")
+    (role_dir / "app.js").write_text(
+        """
+const root = document.getElementById("app");
+root.innerHTML = `<form id="client-form">
+  <input id="client-title" name="title" required />
+  <button type="submit">Save</button>
+</form>`;
+document.getElementById("client-form")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const payload = Object.fromEntries(new FormData(event.currentTarget).entries());
+  await fetch("/api/items", { method: "POST", body: JSON.stringify(payload) });
+});
+""",
+        encoding="utf-8",
+    )
+
+    issues = CheckRunner._frontend_role_wiring_issues(source_dir / "miniapp/app/static")
+
+    assert "platform.workflow_form_field_value_not_used" not in [issue.code for issue in issues]
+
+
 def test_lsp_tool_service_reports_jumpable_changed_file_diagnostics(tmp_path: Path) -> None:
     app_dir = tmp_path / "miniapp" / "app"
     app_dir.mkdir(parents=True)
@@ -248,6 +431,35 @@ def test_lsp_tool_service_reports_jumpable_changed_file_diagnostics(tmp_path: Pa
     assert report["status"] == "failed"
     assert report["items"][0]["path"] == "miniapp/app/main.py"
     assert report["items"][0]["jump"]["line"] >= 1
+
+
+def test_lsp_tool_service_accepts_role_ids_rendered_from_js(tmp_path: Path) -> None:
+    static_dir = tmp_path / "miniapp" / "app" / "static" / "specialist"
+    static_dir.mkdir(parents=True)
+    (static_dir / "index.html").write_text("<main id='app'></main>\n", encoding="utf-8")
+    (static_dir / "app.js").write_text(
+        """
+function render() {
+  document.getElementById("app").innerHTML = `<form id="specialist-form"><select id="specialist-item-id"></select></form>`;
+}
+document.getElementById("specialist-form")?.addEventListener("submit", () => {});
+document.getElementById("specialist-item-id")?.addEventListener("change", () => {});
+""",
+        encoding="utf-8",
+    )
+
+    report = LspToolService.diagnostics(
+        root=tmp_path,
+        targets=["miniapp/app/static/specialist/app.js"],
+        include_optional_tools=False,
+    )
+
+    assert report["status"] == "passed"
+    assert not [
+        item
+        for item in report["items"]
+        if item.get("source") == "selector_static" and item.get("code") == "missing_dom_id"
+    ]
 
 
 def test_lsp_tool_service_symbol_reference_and_route_context(tmp_path: Path) -> None:
@@ -515,6 +727,25 @@ def test_cross_role_update_visibility_requires_client_renderer(tmp_path: Path) -
     }
 
 
+def test_cross_role_update_visibility_accepts_prompt_owned_label_fields(tmp_path: Path) -> None:
+    static_root = tmp_path / "miniapp/app/static"
+    (static_root / "client").mkdir(parents=True)
+    role_text = {
+        "client": "function itemDetails(item) { return item.prep_status_label + item.manager_choice_label; }",
+        "specialist": 'fetch("/api/items/1", { method: "PATCH", body: JSON.stringify({ prep_status: "ready", prep_status_label: "Готово" }) });',
+        "manager": 'fetch("/api/items/1", { method: "PATCH", body: JSON.stringify({ manager_choice: "book", manager_choice_label: "Выбрано" }) });',
+    }
+
+    issues = CheckRunner._cross_role_update_visibility_issues(
+        static_root=static_root,
+        role_text=role_text,
+        source_roles=["client"],
+        update_roles=["specialist", "manager"],
+    )
+
+    assert issues == []
+
+
 def test_contract_compiler_preserves_prompt_metadata_without_product_shell() -> None:
     prompt = (
         "Клиент указывает название, бюджет и комментарий. "
@@ -620,6 +851,15 @@ def test_html_control_contract_blocks_duplicate_ids_and_form_names() -> None:
     codes = {issue.code for issue in issues}
     assert "platform.duplicate_dom_id" in codes
     assert "platform.duplicate_form_control_name" in codes
+
+
+def test_browser_flow_visibility_reads_visible_form_control_values() -> None:
+    script = CheckRunner._real_browser_ui_flow_python_script()
+
+    assert 'querySelectorAll("input, textarea, select")' in script
+    assert 'type === "hidden"' in script
+    assert "selectedIndex" in script
+    assert 'page.locator("body").inner_text' in script
 
 
 def test_role_surface_blocks_visible_http_api_copy_without_blocking_js_methods() -> None:
@@ -762,6 +1002,44 @@ def test_platform_shell_stabilizer_adds_shell_assets_to_plain_html() -> None:
     assert '/static/preview_bridge.js' in updated
     assert 'class="page-shell"' in updated
     assert "telegram-top-safe-offset" in updated
+
+
+def test_platform_shell_stabilizer_restores_entrypoint_from_template(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    source = tmp_path / "source"
+    shutil.copytree(repo_root / "runtime/templates/base-miniapp", source)
+    broken_main = source / "miniapp/app/main.py"
+    broken_main.write_text(
+        "from fastapi import FastAPI\nfrom .routes.role_pages import router as role_pages_router\napp = FastAPI()\napp.include_router(role_pages_router)\n",
+        encoding="utf-8",
+    )
+    runtime = object.__new__(WorkspaceCodeAgentRuntime)
+    runtime.workspace_service = SimpleNamespace(settings=SimpleNamespace(template_dir=repo_root / "runtime/templates/base-miniapp"))
+
+    stabilized = runtime._stabilize_platform_shell("ws_1", "run_1", source, ["miniapp/app/main.py"])
+
+    assert "miniapp/app/main.py" in stabilized
+    assert broken_main.read_text(encoding="utf-8") == (repo_root / "runtime/templates/base-miniapp/miniapp/app/main.py").read_text(encoding="utf-8")
+
+
+def test_repair_context_paths_exclude_platform_shell_and_legacy_api_alias() -> None:
+    paths = WorkspaceCodeAgentRuntime._repair_context_paths(
+        failed_paths=["miniapp/tests/test_generated_app.py"],
+        diff_paths=[
+            "miniapp/app/main.py",
+            "miniapp/app/routes/api.py",
+            "miniapp/app/routes/app_api.py",
+            "miniapp/app/routes/role_routes.py",
+            "miniapp/app/generated/route_manifest.json",
+            "miniapp/app/static/client/app.js",
+        ],
+    )
+
+    assert "miniapp/app/main.py" not in paths
+    assert "miniapp/app/routes/app_api.py" not in paths
+    assert "miniapp/app/routes/role_routes.py" not in paths
+    assert "miniapp/app/generated/route_manifest.json" not in paths
+    assert "miniapp/app/routes/api.py" in paths
 
 
 def test_tool_round_limits_allow_real_agent_inspection_cycles(monkeypatch) -> None:
@@ -1366,6 +1644,33 @@ def test_generated_js_browser_global_failure_gets_operational_packet(tmp_path: P
     assert packet["target_files"] == ["miniapp/tests/generated_app.test.mjs"]
 
 
+def test_generated_js_stale_selector_assertion_gets_operational_packet(tmp_path: Path) -> None:
+    test_file = tmp_path / "generated_app.test.mjs"
+    test_file.write_text(
+        "import assert from 'node:assert/strict';\n"
+        "assert.match(managerJs, /data-choose-id/);\n",
+        encoding="utf-8",
+    )
+
+    diagnostics = CheckRunner._extract_generated_app_test_diagnostics(
+        ["file:///workspace/miniapp/tests/generated_app.test.mjs:2:8"],
+        test_file=test_file,
+    )
+    packet = RepairCatalog.classify_issue(
+        {
+            "check": "generated_app_js_tests",
+            "details": "Generated JS app tests failed for the draft miniapp.",
+            "diagnostics": diagnostics,
+            "paths": ["miniapp/tests/generated_app.test.mjs"],
+        }
+    )
+
+    assert diagnostics["stale_selector_assertion"]["problem"] == "generated_js_test_requires_exact_selector_literal"
+    assert "do not edit app code or route metadata" in diagnostics["stale_selector_assertion"]["expected_fix"]
+    assert packet["signature"] == "tests.js_stale_selector_assertion"
+    assert packet["target_files"][0] == "miniapp/tests/generated_app.test.mjs"
+
+
 def test_generated_python_assertion_failure_targets_api_contract_slice() -> None:
     packet = RepairCatalog.classify_issue(
         {
@@ -1388,6 +1693,55 @@ def test_generated_python_assertion_failure_targets_api_contract_slice() -> None
     assert packet["signature"] == "tests.python_api_contract_mismatch"
     assert "miniapp/app/routes/**" in packet["target_files"]
     assert "miniapp/tests/test_generated_app.py" in packet["target_files"]
+
+
+def test_generated_python_test_blocks_platform_shell_reset_import(tmp_path: Path) -> None:
+    backend_dir = tmp_path / "miniapp"
+    tests_dir = backend_dir / "tests"
+    tests_dir.mkdir(parents=True)
+    (tests_dir / "test_generated_app.py").write_text(
+        "import unittest\n"
+        "from app.routes.health import reset_items\n\n"
+        "class GeneratedAppTestCase(unittest.TestCase):\n"
+        "    def test_contract(self):\n"
+        "        self.assertTrue(True)\n",
+        encoding="utf-8",
+    )
+    runner = object.__new__(CheckRunner)
+
+    result = runner._run_python_app_tests(backend_dir, require_present=True)
+    packet = RepairCatalog.classify_issue(
+        {
+            "check": result.name,
+            "details": result.details,
+            "diagnostics": result.diagnostics,
+            "logs": result.logs,
+            "paths": ["miniapp/tests/test_generated_app.py"],
+        }
+    )
+
+    assert result.status == "failed"
+    assert result.diagnostics["protected_platform_shell_import"]["module"] == "app.routes.health"
+    assert packet["signature"] == "tests.python_protected_shell_import"
+    assert "miniapp/tests/test_generated_app.py" in packet["target_files"]
+
+
+def test_generated_python_import_error_from_platform_shell_is_stale_test_repair_signal() -> None:
+    diagnostics = CheckRunner._extract_generated_app_test_diagnostics(
+        ["ImportError: cannot import name 'reset_items' from 'app.routes.health' (/tmp/source/miniapp/app/routes/health.py)"]
+    )
+    packet = RepairCatalog.classify_issue(
+        {
+            "check": "generated_app_python_tests",
+            "details": "Generated Python app tests failed for the draft miniapp.",
+            "diagnostics": diagnostics,
+            "logs": ["ImportError: cannot import name 'reset_items' from 'app.routes.health'"],
+            "paths": ["miniapp/tests/test_generated_app.py"],
+        }
+    )
+
+    assert diagnostics["protected_platform_shell_import"]["imported"] == ["reset_items"]
+    assert packet["signature"] == "tests.python_protected_shell_import"
 
 
 def test_backend_import_name_error_targets_traceback_file() -> None:
@@ -1715,7 +2069,7 @@ def test_semantic_scan_extracts_generic_routes_forms_and_handlers(tmp_path: Path
     root = tmp_path
     (root / "miniapp/app/routes").mkdir(parents=True)
     (root / "miniapp/app/static/client").mkdir(parents=True)
-    (root / "miniapp/app/routes/app_api.py").write_text(
+    (root / "miniapp/app/routes/api.py").write_text(
         "from fastapi import APIRouter\nrouter = APIRouter()\n@router.post('/api/entities')\ndef create_entity():\n    return {}\n",
         encoding="utf-8",
     )

@@ -13,7 +13,7 @@ from app.validators.static_analysis import (
     extract_frontend_api_refs,
     extract_js_dom_ids,
     normalize_api_path,
-    role_html_ids,
+    role_surface_dom_ids,
 )
 
 
@@ -243,7 +243,7 @@ class LspToolService:
                 js_content = js_file.read_text(encoding="utf-8", errors="ignore")
             except OSError:
                 continue
-            html_ids = role_html_ids(root, relative)
+            html_ids = role_surface_dom_ids(root, relative)
             if not html_ids:
                 continue
             for dom_id in sorted(extract_js_dom_ids(js_content) - html_ids)[:20]:

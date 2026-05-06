@@ -1051,6 +1051,21 @@ class AgentToolCallLoop:
 
     @staticmethod
     def _has_browser_infra_failure(results: list[RunCheckResult]) -> bool:
+        repairable_failures = {
+            "schema_validators",
+            "connectivity_validators",
+            "changed_files_static",
+            "lsp_static_diagnostics",
+            "platform_invariants",
+            "frontend_interaction_static_smoke",
+            "generated_app_python_tests",
+            "generated_app_js_tests",
+            "api_workflow_smoke",
+            "preview_boot_smoke",
+            "preview_connectivity_smoke",
+        }
+        if any(result.status in {"failed", "blocked"} and result.name in repairable_failures for result in results):
+            return False
         for result in results:
             if result.name != "browser_flow_smoke" or result.status != "failed":
                 continue
