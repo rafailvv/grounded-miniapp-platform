@@ -20,6 +20,6 @@ runtime/templates/base-miniapp/frontend/vite.config.d.ts
 data/
 !data/.gitkeep
 scripts/
-current_product_research_insert.md
+platform_architecture_overview.md
 application_architecture.svg
 research_diagrams/
