@@ -5,7 +5,7 @@ import hashlib
 import http.client
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shutil
 import socket
@@ -1165,6 +1165,13 @@ class WorkbenchService:
 
         if run.mode in {"generate", "fix"} and not diff_text.strip() and not run.touched_files:
             add_issue("meaningful_diff", "meaningful_diff", "Run has no meaningful draft/source diff.")
+        if acceptance_required and (diff_text.strip() or run.touched_files) and not self._has_product_runtime_change(diff_text, run.touched_files):
+            add_issue(
+                "product_source_diff",
+                "meaningful_product_diff",
+                "Acceptance run changed only generated tests or contract metadata; product runtime source must change.",
+                evidence={"touched_files": run.touched_files or [], "diff_paths": self._paths_from_diff(diff_text)},
+            )
         for item in check_results:
             if str(item.get("status")) in {"failed", "blocked"}:
                 add_issue("check_failure", str(item.get("name") or "check"), str(item.get("details") or "Check failed."), evidence=item)
@@ -1272,6 +1279,27 @@ class WorkbenchService:
         self.store.upsert("reports", f"run_state:{run_id}", state)
         self.run_service.reconcile_run_with_gate(run_id, payload)
         return payload
+
+    @classmethod
+    def _has_product_runtime_change(cls, diff_text: str, touched_files: list[str] | None) -> bool:
+        paths = [*cls._paths_from_diff(str(diff_text or "")), *[str(path) for path in (touched_files or [])]]
+        return any(cls._is_product_runtime_source_path(path) for path in paths)
+
+    @staticmethod
+    def _is_product_runtime_source_path(file_path: str) -> bool:
+        normalized = str(file_path or "").strip().replace("\\", "/")
+        while normalized.startswith("./"):
+            normalized = normalized[2:]
+        if not normalized.startswith("miniapp/"):
+            return False
+        path = PurePosixPath(normalized)
+        if any(part in {"__pycache__", "node_modules", "dist", "build", ".cache"} for part in path.parts):
+            return False
+        if normalized.startswith("miniapp/tests/") or normalized.startswith("miniapp/app/generated/"):
+            return False
+        if normalized.endswith((".pyc", ".pyo", ".tsbuildinfo")):
+            return False
+        return normalized.startswith(("miniapp/app/", "miniapp/requirements.txt", "miniapp/Dockerfile"))
 
     def repair_signatures(self, run_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)

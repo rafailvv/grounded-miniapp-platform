@@ -4497,6 +4497,22 @@ except Exception as exc:
                     )
                 )
                 continue
+            view_wiring_issue = cls._routeable_view_wiring_issue(
+                role=role,
+                source_dir=source_dir,
+                pages=route_pages.get(role, []),
+                combined=combined,
+            )
+            if view_wiring_issue is not None:
+                coverage[role] = {
+                    "status": "routeable_views_not_wired",
+                    "route_count": len(role_routes),
+                    "secondary_route_count": len(secondary_routes),
+                    "routes": role_routes,
+                    "issue": view_wiring_issue.code,
+                }
+                issues.append(view_wiring_issue)
+                continue
             action_signals = cls._role_action_signals(role, combined, acceptance_contract=acceptance_contract)
             if not action_signals:
                 expectation = cls._role_action_expectation(role, acceptance_contract=acceptance_contract)
@@ -4627,6 +4643,115 @@ except Exception as exc:
                 )
             )
         return issues
+
+    @classmethod
+    def _routeable_view_wiring_issue(
+        cls,
+        *,
+        role: str,
+        source_dir: Path,
+        pages: list[dict[str, str]],
+        combined: str,
+    ) -> ValidationIssue | None:
+        role_pages = cls._dedupe_role_pages(pages)
+        routes = cls._unique_role_routes(role_pages)
+        secondary_routes = [route for route in routes if route != f"/{role}"]
+        if not secondary_routes:
+            return None
+
+        files_by_route: dict[str, str] = {}
+        routes_by_file: dict[str, list[str]] = {}
+        view_names: set[str] = set()
+        for page in role_pages:
+            route = str(page.get("route_path") or "").rstrip("/") or f"/{role}"
+            file_path = str(page.get("file_path") or "")
+            if not file_path:
+                continue
+            files_by_route[route] = file_path
+            routes_by_file.setdefault(file_path, []).append(route)
+            html_path = source_dir / file_path
+            if html_path.exists():
+                try:
+                    html_text = html_path.read_text(encoding="utf-8")
+                except OSError:
+                    html_text = ""
+                for match in re.finditer(r"\bdata-view\s*=\s*['\"]([^'\"]+)['\"]", html_text, flags=re.IGNORECASE):
+                    value = str(match.group(1) or "").strip().lower()
+                    if value and value not in {"root", "dashboard", "index"}:
+                        view_names.add(value)
+
+        reused_route_files = {
+            file_path: sorted(set(file_routes))
+            for file_path, file_routes in routes_by_file.items()
+            if len(set(file_routes)) > 1 and any(route != f"/{role}" for route in file_routes)
+        }
+        del combined
+        js_path = source_dir / "miniapp" / "app" / "static" / role / "app.js"
+        try:
+            js_text = js_path.read_text(encoding="utf-8") if js_path.exists() else ""
+        except OSError:
+            js_text = ""
+        lowered = js_text.lower()
+        has_view_switch = bool(
+            re.search(r"\bdocument\.body\.dataset\.view\b|\bdataset\.view\b|\bdata-view\b|\blocation\.pathname\b|\bwindow\.location\b", js_text)
+        )
+        referenced_views = {view for view in view_names if re.search(rf"['\"]{re.escape(view)}['\"]", lowered)}
+        if reused_route_files and not has_view_switch:
+            return cls._routeable_view_wiring_validation_issue(
+                role=role,
+                routes=secondary_routes,
+                reason="multiple routes reuse the same page file, but app.js does not branch by view or path",
+                evidence={"reused_route_files": reused_route_files},
+            )
+        if view_names and not has_view_switch and not referenced_views:
+            return cls._routeable_view_wiring_validation_issue(
+                role=role,
+                routes=secondary_routes,
+                reason="child pages declare data-view values, but role JavaScript does not read or reference those views",
+                evidence={"view_names": sorted(view_names), "files_by_route": files_by_route},
+            )
+        return None
+
+    @staticmethod
+    def _routeable_view_wiring_validation_issue(
+        *,
+        role: str,
+        routes: list[str],
+        reason: str,
+        evidence: dict[str, object],
+    ) -> ValidationIssue:
+        return ValidationIssue(
+            code="platform.routeable_role_views_not_wired",
+            message=(
+                f"{role} role declares routeable child pages but the frontend does not wire them as distinct working views: "
+                f"{reason}. Add view-aware handlers and bind each route's visible controls to persisted API state."
+            ),
+            severity="high",
+            location=f"miniapp/app/static/{role}/app.js",
+            blocking=True,
+            repair_recipe={
+                "recipe_id": "role.routeable_views_wire_controls",
+                "failure_class": "platform_invariants",
+                "failure_signature": f"role.routeable_views_not_wired.{role}",
+                "required_next_tool": "read_files",
+                "suggested_tool_after_read": "apply_patch_to_draft_or_write_file",
+                "target_files": [
+                    f"miniapp/app/static/{role}/index.html",
+                    f"miniapp/app/static/{role}/app.js",
+                    f"miniapp/app/static/{role}/styles.css",
+                ],
+                "verification_check": "platform_invariants",
+                "verification_command": "run_checks platform_invariants",
+                "retry_policy": "deterministic_repair",
+                "deterministic": True,
+                "retryable": True,
+                "instruction": (
+                    "Make the role app page-aware. Read body.dataset.view or location.pathname, render/initialize each routeable "
+                    "screen separately, and connect every visible button/form on those screens to the shared persisted API workflow."
+                ),
+                "evidence": {"role": role, "routes": routes[:8], **evidence},
+            },
+        )
 
     @staticmethod
     def _cross_role_surface_markers(role: str, content: str) -> list[str]:
@@ -4937,11 +5062,11 @@ except Exception as exc:
         text = str(content or "")
         patterns = (
             (r"\$\{\s*escape(?:Html|Text)?\s*\(\s*item\.status\b", "template escape(item.status)"),
-            (r"\$\{\s*item\.status\b", "template item.status"),
+            (r"\$\{\s*item\.status\s*(?:\}|\|\|)", "template item.status"),
             (r"\bbuildLine\s*\(\s*['\"][^'\"]*статус[^'\"]*['\"]\s*,\s*item\.status\s*\)", "buildLine status=item.status"),
             (r"\bitem\.status\s*\|\|\s*['\"](?:new|pending|done|completed)['\"]", "item.status raw enum passthrough"),
             (r"(?:Приоритет|priority)[^`]*\$\{[^}]*item\.priority", "template item.priority raw enum"),
-            (r"\bstatus-pill[^`'\"]*`[^`]*item\.status", "status pill item.status"),
+            (r"\bstatus-pill[^`'\"]*`[^`]*\$\{\s*item\.status\s*(?:\}|\|\|)", "status pill item.status"),
             (r"\bSTATUS_LABELS\s*\[\s*(?:value|key|item\.status)\s*\]\s*\|\|\s*(?:value|key|item\.status)\b", "status label raw passthrough"),
             (r"\bSTATUS_LABELS\s*\[[^\]]+\]\s*\|\|\s*(?:[A-Za-z_$][\w$]*|item\.status)\b", "status label raw passthrough"),
             (r"\bSTATUS_LABELS\s*\[[^\]]+\]\s*\|\|\s*normalize\s*\(\s*value\b", "status label normalize(value) passthrough"),

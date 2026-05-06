@@ -10,9 +10,12 @@ from fastapi.testclient import TestClient
 
 from app.core.config import get_settings
 from app.main import create_app
+from app.models.common import GenerationMode
 from app.models.domain import CreateRunRequest, GenerateRequest, JobRecord, PreviewRecord, RunCheckResult, RunRecord
 from app.modules.miniapp_agent_loop.agent_command_policy import AgentCommandPolicy
+from app.modules.miniapp_agent_loop.agent_tool_call_loop import AgentToolCallLoop
 from app.modules.miniapp_agent_loop.agent_transcript import AgentTranscriptStore
+from app.modules.workspace_code_agent_runtime.budget import completion_budget_status
 from app.services.repair_catalog import RepairCatalog
 from app.services.exec_policy_service import ExecPolicyService
 from app.services.tool_protocol import TOOL_PROTOCOL_VERSION, canonical_tool_name, tool_envelope
@@ -1249,6 +1252,48 @@ def test_reliability_gate_blocks_missing_browser_proof(tmp_path: Path) -> None:
     assert repair_cases["active_case"]["repair_prompt"]["sections"]["expected_proof"]
 
 
+def test_reliability_gate_blocks_test_only_acceptance_diff(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Test Only Gate Workspace",
+            "description": "Reliability gate test-only diff failure",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    run = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Fix the working product, not only tests",
+        mode="fix",
+        intent="edit",
+        status="completed",
+        apply_status="applied",
+        touched_files=["miniapp/tests/generated_app.test.mjs"],
+        acceptance_contract={"required": True},
+        mobile_layout_report={"status": "passed"},
+    )
+    app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+    app.state.container.store.upsert(
+        "reports",
+        f"run_artifacts:{run.run_id}",
+        {
+            "diff": "diff --git a/miniapp/tests/generated_app.test.mjs b/miniapp/tests/generated_app.test.mjs\n",
+            "check_results": [
+                {"name": "api_workflow_smoke", "status": "passed", "details": "ok", "logs": []},
+                {"name": "browser_flow_smoke", "status": "passed", "details": "ok", "logs": [], "diagnostics": {"mobile_layout": {"status": "passed"}}},
+            ],
+        },
+    )
+
+    gate = client.get(f"/runs/{run.run_id}/gate").json()
+
+    assert gate["status"] == "blocked"
+    assert any(issue["kind"] == "product_source_diff" for issue in gate["issues"])
+
+
 def test_review_report_prioritizes_acceptance_blockers_with_locations(tmp_path: Path) -> None:
     app = create_app(data_dir=tmp_path)
     client = TestClient(app)
@@ -1570,6 +1615,63 @@ def test_run_service_schedules_auto_repair_continuation_for_repeated_no_progress
     assert app.state.container.store.get("reports", f"auto_repair_continuation:{run.run_id}")["status"] == "scheduled"
 
 
+def test_deterministic_repair_case_escalates_after_one_failed_attempt() -> None:
+    should_stop = AgentToolCallLoop._should_escalate_repeated_no_progress(
+        repeated_count=2,
+        has_draft_diff=True,
+        active_case={
+            "issue_code": "platform.routeable_role_views_not_wired",
+            "failure_signature": "platform.routeable_role_views_not_wired.manager",
+            "attempts": [{"status": "applied", "changed_files": ["miniapp/app/static/manager/app.js"]}],
+            "evidence": {"packet": {"retry_policy": "deterministic_repair"}},
+            "next_action": {"action": "patch_constrained_slice", "attempt_count": 1},
+        },
+        transition={},
+    )
+
+    assert should_stop is True
+
+
+def test_completion_gate_issues_become_targeted_repair_packets() -> None:
+    packets = AgentToolCallLoop._repair_packets_from_completion_state(
+        {
+            "remaining_issues": [
+                {
+                    "kind": "product_task_ledger",
+                    "check": "product_task_ledger",
+                    "details": "manager ledger item manager.role_surface is incomplete",
+                    "role": "manager",
+                    "ledger_item_id": "manager.role_surface",
+                    "expected_min_routes": 3,
+                    "blocking": True,
+                }
+            ]
+        }
+    )
+
+    assert packets
+    assert packets[0]["issue_code"] == "product_task_ledger"
+    assert "miniapp/app/static/manager/app.js" in packets[0]["target_files"]
+    assert packets[0]["verification_check"] == "product_task_ledger"
+
+
+def test_completion_budget_status_enforces_turn_cap() -> None:
+    job = JobRecord(
+        workspace_id="ws_budget",
+        prompt="Build product",
+        status="running",
+        target_platform="telegram_mini_app",
+        preview_profile="telegram_mock",
+        generation_mode="fast",
+        completion_budget={"time_limit_ms": 9999999, "token_limit": 9999999, "turn_budget_cap": 2},
+    )
+
+    status = completion_budget_status(job=job, mode=GenerationMode.FAST, started_at=time.perf_counter(), attempt=2)
+
+    assert status["exhausted"] is True
+    assert status["reason"] == "turn_budget_exhausted"
+
+
 def test_repair_continuation_inherits_source_product_contract(tmp_path: Path, monkeypatch) -> None:
     app = create_app(data_dir=tmp_path)
     client = TestClient(app)
@@ -1800,7 +1902,100 @@ def test_runtime_repair_lineage_keeps_acceptance_gate_required(tmp_path: Path) -
     assert {issue["check"] for issue in state["remaining_issues"] if issue["kind"] == "required_product_proof"} == {
         "api_workflow_smoke",
         "browser_flow_smoke",
+        "generated_app_python_tests",
+        "generated_app_js_tests",
     }
+
+
+def test_completion_gate_blocks_test_only_acceptance_diff(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={"name": "Completion Gate Test Only", "target_platform": "telegram_mini_app", "preview_profile": "telegram_mock"},
+    ).json()
+    workspace_id = workspace["workspace_id"]
+    run_id = "run_test_only"
+    service = app.state.container.workspace_service
+    draft = service.prepare_draft(workspace_id, run_id)
+    test_path = draft / "miniapp/tests/generated_app.test.mjs"
+    test_path.parent.mkdir(parents=True, exist_ok=True)
+    test_path.write_text("import test from 'node:test';\n// stronger test only\n", encoding="utf-8")
+
+    runtime = app.state.container.workspace_code_agent_runtime
+    state = runtime._completion_state(
+        workspace_id=workspace_id,
+        run_id=run_id,
+        request=GenerateRequest(prompt="Fix the product", mode="fix", intent="edit", generation_mode="balanced"),
+        results=[
+            RunCheckResult(name="platform_invariants", status="passed"),
+            RunCheckResult(name="api_workflow_smoke", status="passed"),
+            RunCheckResult(name="browser_flow_smoke", status="passed", diagnostics={"mobile_layout": {"status": "passed"}}),
+        ],
+        preview_details={},
+        validation_snapshot=None,
+        acceptance_contract={"required": True},
+    )
+
+    assert state["strict_green"] is False
+    assert any(issue["kind"] == "product_source_diff" for issue in state["remaining_issues"])
+
+
+def test_completion_gate_blocks_incomplete_product_task_ledger(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={"name": "Ledger Gate", "target_platform": "telegram_mini_app", "preview_profile": "telegram_mock"},
+    ).json()
+    workspace_id = workspace["workspace_id"]
+    run_id = "run_ledger_gate"
+    service = app.state.container.workspace_service
+    draft = service.prepare_draft(workspace_id, run_id)
+    app_js = draft / "miniapp/app/static/manager/app.js"
+    app_js.parent.mkdir(parents=True, exist_ok=True)
+    app_js.write_text("fetch('/api/items');\n", encoding="utf-8")
+
+    runtime = app.state.container.workspace_code_agent_runtime
+    state = runtime._completion_state(
+        workspace_id=workspace_id,
+        run_id=run_id,
+        request=GenerateRequest(prompt="Build a manager-heavy workflow", mode="generate", intent="create", generation_mode="balanced"),
+        results=[
+            RunCheckResult(
+                name="platform_invariants",
+                status="passed",
+                diagnostics={
+                    "role_coverage": {
+                        "client": {"status": "present", "route_count": 1},
+                        "specialist": {"status": "present", "route_count": 1},
+                        "manager": {"status": "present", "route_count": 1},
+                    }
+                },
+            ),
+            RunCheckResult(name="api_workflow_smoke", status="passed"),
+            RunCheckResult(name="browser_flow_smoke", status="passed", diagnostics={"mobile_layout": {"status": "passed"}}),
+        ],
+        preview_details={},
+        validation_snapshot=None,
+        acceptance_contract={"required": True},
+        implementation_plan={
+            "product_task_ledger": [
+                {
+                    "id": "manager.role_surface",
+                    "role": "manager",
+                    "kind": "source",
+                    "expected_min_routes": 3,
+                    "owned_paths": ["miniapp/app/static/manager/app.js"],
+                    "proof_checks": ["platform_invariants"],
+                }
+            ]
+        },
+    )
+
+    assert state["strict_green"] is False
+    issue = next(issue for issue in state["remaining_issues"] if issue["kind"] == "product_task_ledger" and issue["role"] == "manager")
+    assert issue["target_files"] == ["miniapp/app/static/manager/app.js"]
 
 
 def test_repair_catalog_extracts_nested_workflow_evidence() -> None:

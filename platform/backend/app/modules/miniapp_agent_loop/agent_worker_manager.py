@@ -162,6 +162,8 @@ class AgentWorkerManager:
             path = str(action.file_path or "").strip()
             raw_worker = cls._worker_from_action(action)
             owner = canonical_worker_id(raw_worker or cls.owner_for_path(path))
+            if owner == "coordinator":
+                owner = cls.owner_for_path(path)
             allowed = path_is_allowed(owner, path) or owner in {"test_verifier_worker"} and cls.owner_for_path(path) == "test_verifier_worker"
             by_path.setdefault(path, []).append(
                 {

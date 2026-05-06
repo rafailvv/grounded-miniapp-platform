@@ -19,6 +19,8 @@ class AgentTurnDiffRecord:
     changed_line_counts: dict[str, dict[str, int]]
     conflict_signature: str | None = None
     diff: str = ""
+    diff_sha256: str = ""
+    product_runtime_paths: list[str] = field(default_factory=list)
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
     def summary(self) -> dict[str, object]:
@@ -29,6 +31,9 @@ class AgentTurnDiffRecord:
             "owners": self.owners,
             "changed_line_counts": self.changed_line_counts,
             "conflict_signature": self.conflict_signature,
+            "diff_sha256": self.diff_sha256,
+            "product_runtime_paths": self.product_runtime_paths,
+            "has_product_runtime_diff": bool(self.product_runtime_paths),
             "diff_excerpt": self.diff[:5000],
             "created_at": self.created_at,
         }
@@ -71,6 +76,17 @@ class AgentTurnDiffTracker:
             return None
         raw = "|".join([status, str(reason or ""), *paths])
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+    @staticmethod
+    def _is_product_runtime_path(path: str) -> bool:
+        normalized = str(path or "").strip().replace("\\", "/")
+        if not normalized.startswith("miniapp/"):
+            return False
+        if normalized.startswith("miniapp/tests/") or normalized.startswith("miniapp/app/generated/"):
+            return False
+        if "/__pycache__/" in normalized or normalized.endswith((".pyc", ".pyo")):
+            return False
+        return normalized.startswith(("miniapp/app/", "miniapp/requirements.txt", "miniapp/Dockerfile"))
 
     def capture_baseline(
         self,
@@ -123,6 +139,7 @@ class AgentTurnDiffTracker:
                 changed_line_counts[path] = {"added": 0, "removed": 0}
         status = str(getattr(apply_result, "status", None) or (apply_result.get("status") if isinstance(apply_result, dict) else "") or "")
         reason = str(getattr(apply_result, "conflict_reason", None) or (apply_result.get("conflict_reason") if isinstance(apply_result, dict) else "") or "")
+        diff_text = "\n".join(chunks)
         record = AgentTurnDiffRecord(
             run_id=run_id,
             turn=turn,
@@ -131,7 +148,9 @@ class AgentTurnDiffTracker:
             owners={path: owner_for_path(path) for path in normalized_paths},
             changed_line_counts=changed_line_counts,
             conflict_signature=self._conflict_signature(status or "unknown", reason, normalized_paths),
-            diff="\n".join(chunks),
+            diff=diff_text,
+            diff_sha256=hashlib.sha256(diff_text.encode("utf-8")).hexdigest() if diff_text else "",
+            product_runtime_paths=[path for path in normalized_paths if self._is_product_runtime_path(path)],
         )
         self._records.setdefault(run_id, []).append(record)
         return record

@@ -57,6 +57,7 @@ class AgentWorkerTaskPlanner:
             path_prefixes = [str(item) for item in worker.get("path_prefixes") or []]
             canonical_id = canonical_worker_id(worker_id)
             ownership = dict(worker.get("ownership") or ownership_for_worker(canonical_id))
+            ledger_slice = cls._ledger_slice_for_worker(canonical_id, implementation_plan)
             tasks.append(
                 {
                     "worker_id": canonical_id,
@@ -65,6 +66,7 @@ class AgentWorkerTaskPlanner:
                     "owner_scope": owner_scope,
                     "path_prefixes": path_prefixes,
                     "ownership": ownership,
+                    "product_task_ledger_slice": ledger_slice,
                     "expected_proof": list(worker.get("expected_proof") or ownership.get("expected_proof") or []),
                     "badge": str(worker.get("badge") or worker.get("status") or "planned"),
                     "mode_contract": mode_contract,
@@ -73,6 +75,7 @@ class AgentWorkerTaskPlanner:
                         owner_scope=owner_scope,
                         path_prefixes=path_prefixes,
                         ownership=ownership,
+                        ledger_slice=ledger_slice,
                         implementation_plan=implementation_plan,
                         mode_contract=mode_contract,
                     ),
@@ -94,6 +97,7 @@ class AgentWorkerTaskPlanner:
         owner_scope: str,
         path_prefixes: list[str],
         ownership: dict[str, Any],
+        ledger_slice: list[dict[str, Any]],
         implementation_plan: dict[str, Any],
         mode_contract: dict[str, Any],
     ) -> str:
@@ -105,6 +109,7 @@ class AgentWorkerTaskPlanner:
             f"Own only these paths unless the coordinator explicitly asks for shared files: {', '.join(path_prefixes) or 'shared workspace slice'}. "
             f"Forbidden paths for this worker: {forbidden_paths}. Expected proof: {expected_proof}. "
             f"Use the implementation plan ({plan_summary}) and the user's prompt-derived entities/actions as source of truth. "
+            f"Product task ledger slice for this worker: {ledger_slice or 'none'}. Complete these ledger items with product source and proof before reporting done. "
             f"Mode depth is {mode_contract.get('depth')}: {mode_contract.get('workflow_bar')}; page organization: {mode_contract.get('page_bar')}; design bar: {mode_contract.get('design_bar')}. "
             "Use implementation_plan.product_scale_contract.min_role_routes and implementation_plan.routeable_screen_plan for screen intent guidance; choose concrete route names from the prompt and satisfy the prompt-derived minimum routeable pages. "
             "miniapp/app/generated/miniapp_contract.json is prompt-analysis metadata only; do not treat it as a fixed product schema, route template, or API scaffold. "
@@ -118,3 +123,28 @@ class AgentWorkerTaskPlanner:
             "When a role has child pages, its shared app.js must be view-aware: detect body[data-view] or route, guard optional DOM from other pages, and bind every visible form/button/control on root and child pages. "
             "Do not expose raw API paths, HTTP methods, route slugs, role slugs, or enum codes in normal user-facing UI; use readable labels and keep label/value pairs visually separated."
         )
+
+    @staticmethod
+    def _ledger_slice_for_worker(worker_id: str, implementation_plan: dict[str, Any]) -> list[dict[str, Any]]:
+        ledger = implementation_plan.get("product_task_ledger") if isinstance(implementation_plan.get("product_task_ledger"), list) else []
+        if not ledger:
+            return []
+        role_by_worker = {
+            "client_surface_worker": "client",
+            "specialist_surface_worker": "specialist",
+            "manager_surface_worker": "manager",
+        }
+        role = role_by_worker.get(worker_id)
+        selected: list[dict[str, Any]] = []
+        for item in ledger:
+            if not isinstance(item, dict):
+                continue
+            item_role = str(item.get("role") or "").strip().lower()
+            item_kind = str(item.get("kind") or "").strip().lower()
+            if role and item_role == role:
+                selected.append(item)
+            elif worker_id == "backend_api_worker" and item_kind == "backend":
+                selected.append(item)
+            elif worker_id == "test_verifier_worker" and item_kind == "proof":
+                selected.append(item)
+        return selected[:4]

@@ -2778,7 +2778,11 @@ class RunService:
             fix_targets = getattr(job, "fix_targets", None)
             if isinstance(fix_targets, list):
                 paths.extend(str(path) for path in fix_targets if str(path).strip())
-        return [path for path in list(dict.fromkeys(paths)) if self._is_meaningful_source_path(path)]
+        meaningful = [path for path in list(dict.fromkeys(paths)) if self._is_meaningful_source_path(path)]
+        acceptance_required = bool((run.acceptance_contract or {}).get("required")) or run.mode in {"generate", "fix"}
+        if acceptance_required:
+            return [path for path in meaningful if self._is_product_runtime_source_path(path)]
+        return meaningful
 
     @staticmethod
     def _is_meaningful_source_path(file_path: str) -> bool:
@@ -2797,6 +2801,19 @@ class RunService:
         if normalized.startswith("miniapp/app/generated/"):
             return False
         return True
+
+    @staticmethod
+    def _is_product_runtime_source_path(file_path: str) -> bool:
+        normalized = str(file_path or "").strip().replace("\\", "/")
+        while normalized.startswith("./"):
+            normalized = normalized[2:]
+        if not normalized.startswith("miniapp/"):
+            return False
+        if normalized.startswith("miniapp/tests/") or normalized.startswith("miniapp/app/generated/"):
+            return False
+        if "/__pycache__/" in normalized or normalized.endswith(MEANINGFUL_DIFF_IGNORED_SUFFIXES):
+            return False
+        return normalized.startswith(("miniapp/app/", "miniapp/requirements.txt", "miniapp/Dockerfile"))
 
     @staticmethod
     def _paths_from_diff(diff_text: str) -> list[str]:

@@ -89,15 +89,30 @@ def compact_agent_memory(
 ) -> dict[str, Any]:
     recent_turns = turn_history[-max_recent_turns:] if max_recent_turns > 0 else []
     failed_signatures: list[str] = []
+    latest_changed_files: list[str] = []
+    recent_outcomes: list[str] = []
+    no_edit_turn_count = 0
     for turn in turn_history:
         signature = str(turn.get("failure_signature") or turn.get("failure_class") or "").strip()
         if signature and signature not in failed_signatures:
             failed_signatures.append(signature)
+        outcome = str(turn.get("outcome") or turn.get("result") or "").strip()
+        if outcome:
+            recent_outcomes.append(outcome)
+        if outcome in {"no_op", "needs_context"} or (turn.get("result") not in {"applied"} and not turn.get("files_changed")):
+            no_edit_turn_count += 1
+        for path in turn.get("files_changed") or []:
+            normalized = str(path or "").strip().replace("\\", "/")
+            if normalized and normalized not in latest_changed_files:
+                latest_changed_files.append(normalized)
     return {
         "kind": "agent_memory_summary",
         "turn_count": len(turn_history),
         "recent_turns": recent_turns,
         "file_change_count": file_change_count,
         "failed_signatures": failed_signatures[-10:],
+        "recent_outcomes": recent_outcomes[-10:],
+        "latest_changed_files": latest_changed_files[-12:],
+        "no_edit_turn_count": no_edit_turn_count,
         "last_assistant_message": str(last_assistant_message or "")[:1200],
     }

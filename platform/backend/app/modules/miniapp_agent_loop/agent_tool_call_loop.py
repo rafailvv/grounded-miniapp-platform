@@ -122,6 +122,61 @@ class AgentToolCallLoop:
         return RepairCatalog.classify_many(issues)
 
     @staticmethod
+    def _repair_packets_from_completion_state(completion_state: dict[str, Any] | None) -> list[dict[str, Any]]:
+        state = completion_state if isinstance(completion_state, dict) else {}
+        remaining = state.get("remaining_issues") if isinstance(state.get("remaining_issues"), list) else []
+        issues: list[dict[str, Any]] = []
+        for issue in remaining:
+            if not isinstance(issue, dict) or not bool(issue.get("blocking", True)):
+                continue
+            kind = str(issue.get("kind") or issue.get("check") or "").strip()
+            if kind not in {"product_task_ledger", "product_source_diff"}:
+                continue
+            role = str(issue.get("role") or "").strip().lower()
+            paths = list(issue.get("paths") or issue.get("target_files") or [])
+            if kind == "product_task_ledger" and role in {"client", "specialist", "manager"}:
+                paths = [
+                    f"miniapp/app/static/{role}/index.html",
+                    f"miniapp/app/static/{role}/app.js",
+                    f"miniapp/app/static/{role}/styles.css",
+                    *paths,
+                ]
+            elif kind == "product_source_diff":
+                paths = ["miniapp/app/**", *paths]
+            issues.append(
+                {
+                    **issue,
+                    "code": kind,
+                    "check": str(issue.get("check") or kind),
+                    "paths": list(dict.fromkeys(str(path) for path in paths if str(path).strip())),
+                    "failure_class": str(issue.get("failure_class") or "completion_gate"),
+                    "failure_signature": str(
+                        issue.get("failure_signature")
+                        or f"completion_gate:{kind}:{role or issue.get('check') or 'shared'}"
+                    ),
+                    "severity": str(issue.get("severity") or "high"),
+                    "retry_policy": str(issue.get("retry_policy") or "deterministic_repair"),
+                    "deterministic": True,
+                }
+            )
+        return RepairCatalog.classify_many(issues)
+
+    @staticmethod
+    def _merge_repair_packets(*packet_groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        merged: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for group in packet_groups:
+            for packet in group:
+                if not isinstance(packet, dict):
+                    continue
+                key = str(packet.get("failure_signature") or packet.get("signature") or packet.get("issue_code") or len(merged))
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(packet)
+        return merged
+
+    @staticmethod
     def _paths_from_check_result(result: RunCheckResult) -> list[str]:
         paths: list[str] = []
         diagnostics = result.diagnostics if isinstance(result.diagnostics, dict) else {}
@@ -177,11 +232,35 @@ class AgentToolCallLoop:
         attempt_count = max(len(attempts), int(next_action.get("attempt_count") or 0))
         forced = transition.get("next_forced_action") if isinstance(transition.get("next_forced_action"), dict) else {}
         action = str(next_action.get("action") or forced.get("action") or "").strip()
+        if AgentToolCallLoop._is_deterministic_repair_case(active_case) and attempt_count >= 1 and repeated_count >= 2:
+            return True
         if action == "fresh_context_repair" and repeated_count >= 2:
             return True
         if attempt_count >= 3 and repeated_count >= 2:
             return True
         return repeated_count >= 5
+
+    @staticmethod
+    def _is_deterministic_repair_case(active_case: dict[str, Any]) -> bool:
+        packet = {}
+        evidence = active_case.get("evidence") if isinstance(active_case.get("evidence"), dict) else {}
+        if isinstance(evidence.get("packet"), dict):
+            packet = evidence.get("packet") or {}
+        retry_policy = packet.get("retry_policy") or active_case.get("retry_policy")
+        if str(retry_policy or "").strip().lower() in {"deterministic_repair", "do_not_retry_same_patch"}:
+            return True
+        issue_code = str(active_case.get("issue_code") or packet.get("issue_code") or packet.get("code") or "").lower()
+        failure_signature = str(active_case.get("failure_signature") or packet.get("failure_signature") or "").lower()
+        deterministic_markers = (
+            "platform.",
+            "raw_status_rendered_to_user",
+            "routeable_role_views_not_wired",
+            "missing_role_workflow_actions",
+            "prompt_scale_route_pages_missing",
+            "workflow_button_without_handler",
+            "repeated_identical_patch",
+        )
+        return any(marker in issue_code or marker in failure_signature for marker in deterministic_markers)
 
     def run(
         self,
@@ -339,8 +418,10 @@ class AgentToolCallLoop:
                 latest_diagnostics_delta = AgentDiagnosticsDelta.delta(previous_diagnostics_snapshot, current_diagnostics_snapshot)
                 previous_diagnostics_snapshot = current_diagnostics_snapshot
                 check_packets = self._repair_packets_from_execution(latest_execution)
-                if check_packets:
-                    latest_repair_packets = check_packets
+                completion_packets = self._repair_packets_from_completion_state(completion_state)
+                merged_packets = self._merge_repair_packets(check_packets, completion_packets)
+                if merged_packets:
+                    latest_repair_packets = merged_packets
                     latest_repair_cases = self.repair_cases.sync_from_packets(
                         workspace_id=workspace_id,
                         run_id=run_id,

@@ -78,17 +78,21 @@ def completion_budget_status(
     elapsed_ms = int(max(0.0, time.perf_counter() - started_at) * 1000)
     token_limit = int(budget.get("token_limit") or 0)
     time_limit_ms = int(budget.get("time_limit_ms") or 0)
+    turn_budget_cap = int(budget.get("turn_budget_cap") or 0)
     total_tokens = token_usage_total(job.token_usage)
     reason: str | None = None
     if token_limit > 0 and total_tokens >= token_limit:
         reason = "token_budget_exhausted"
     elif time_limit_ms > 0 and elapsed_ms >= time_limit_ms:
         reason = "time_budget_exhausted"
+    elif turn_budget_cap > 0 and int(attempt or 0) >= turn_budget_cap:
+        reason = "turn_budget_exhausted"
     status = {
         "mode": mode.value,
         "attempt": int(attempt or 0),
         "elapsed_ms": elapsed_ms,
         "time_limit_ms": time_limit_ms,
+        "turn_budget_cap": turn_budget_cap,
         "total_tokens": total_tokens,
         "token_limit": token_limit,
         "exhausted": reason is not None,

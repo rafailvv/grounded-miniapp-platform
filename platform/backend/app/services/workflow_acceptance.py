@@ -445,6 +445,103 @@ def _product_scale_contract(
     }
 
 
+def _product_task_ledger(
+    *,
+    prompt_hints: dict[str, Any],
+    screen_plan: dict[str, Any],
+    product_scale_contract: dict[str, Any],
+    source_roles: list[str],
+    update_roles: list[str],
+    observer_roles: list[str],
+) -> list[dict[str, Any]]:
+    role_actions = prompt_hints.get("role_action_prompts") if isinstance(prompt_hints.get("role_action_prompts"), dict) else {}
+    role_fields = prompt_hints.get("role_field_hints") if isinstance(prompt_hints.get("role_field_hints"), dict) else {}
+    role_screens = screen_plan.get("roles") if isinstance(screen_plan.get("roles"), dict) else {}
+    min_routes = product_scale_contract.get("min_role_routes") if isinstance(product_scale_contract.get("min_role_routes"), dict) else {}
+    tasks: list[dict[str, Any]] = []
+    for role in ROLE_ORDER:
+        role_kind = (
+            "source"
+            if role in source_roles
+            else "update"
+            if role in update_roles
+            else "observer"
+            if role in observer_roles
+            else "participant"
+        )
+        try:
+            expected_routes = max(1, int(min_routes.get(role) or 1))
+        except (TypeError, ValueError):
+            expected_routes = 1
+        screen_intents = [
+            {
+                "intent": _sanitize_prompt_label(item.get("intent") or item.get("purpose") or "screen", limit=80),
+                "purpose": _sanitize_prompt_label(item.get("purpose") or item.get("intent") or "prompt-derived screen", limit=120),
+            }
+            for item in (role_screens.get(role) or [])
+            if isinstance(item, dict)
+        ]
+        tasks.append(
+            {
+                "id": f"{role}.role_surface",
+                "status": "pending",
+                "role": role,
+                "kind": role_kind,
+                "expected_min_routes": expected_routes,
+                "screen_intents": screen_intents[: expected_routes + 2],
+                "actions": _sanitize_prompt_list(role_actions.get(role), limit=8),
+                "fields": _sanitize_prompt_list(role_fields.get(role), limit=8),
+                "owned_paths": [
+                    f"miniapp/app/static/{role}/index.html",
+                    f"miniapp/app/static/{role}/app.js",
+                    f"miniapp/app/static/{role}/styles.css",
+                    f"miniapp/app/static/{role}/**/index.html",
+                ],
+                "proof_checks": ["platform_invariants", "frontend_interaction_static_smoke", "browser_flow_smoke"],
+                "done_when": [
+                    "role has routeable mobile pages for the prompt-derived screen intents",
+                    "visible controls are wired in role app.js",
+                    "role uses the shared persisted API state according to role_state_contract",
+                ],
+            }
+        )
+    resources = _sanitize_prompt_list(prompt_hints.get("resource_hints"), limit=8)
+    resource_hint = _sanitize_prompt_label(prompt_hints.get("resource_hint"), limit=80)
+    if resources or resource_hint:
+        tasks.append(
+            {
+                "id": "shared_state.persistence_api",
+                "status": "pending",
+                "role": "shared",
+                "kind": "backend",
+                "resources": resources or [resource_hint],
+                "owned_paths": ["miniapp/app/routes/**", "miniapp/app/db.py", "miniapp/app/schemas.py"],
+                "proof_checks": ["api_workflow_smoke", "generated_app_python_tests"],
+                "done_when": [
+                    "backend routes persist prompt-derived records without seed/demo data",
+                    "create/update/list endpoints use the same field keys consumed by role JavaScript",
+                    "generated tests prove persisted state after reload",
+                ],
+            }
+        )
+    tasks.append(
+        {
+            "id": "proof.generated_and_browser",
+            "status": "pending",
+            "role": "shared",
+            "kind": "proof",
+            "owned_paths": ["miniapp/tests/test_generated_app.py", "miniapp/tests/generated_app.test.mjs"],
+            "proof_checks": ["generated_app_python_tests", "generated_app_js_tests", "browser_flow_smoke"],
+            "done_when": [
+                "generated Python and JS tests cover prompt-derived selectors/routes/API calls",
+                "browser proof visits the routeable screens used by the workflow",
+                "completion is blocked if only tests/metadata changed",
+            ],
+        }
+    )
+    return tasks
+
+
 def _product_anchor_issues(prompt_hints: dict[str, Any]) -> list[str]:
     issues: list[str] = []
     if not str(prompt_hints.get("resource_hint") or "").strip() and not any(str(item).strip() for item in (prompt_hints.get("resource_hints") or [])):
@@ -821,6 +918,14 @@ def build_implementation_plan(
         if isinstance(item, dict)
     ]
     page_contract = dict(contract.get("page_contract") or {})
+    product_task_ledger = _product_task_ledger(
+        prompt_hints=prompt_hints,
+        screen_plan=screen_plan,
+        product_scale_contract=product_scale_contract,
+        source_roles=source_roles,
+        update_roles=update_roles,
+        observer_roles=observer_roles,
+    )
     return {
         "version": 1,
         "required": bool(contract.get("required")),
@@ -831,6 +936,18 @@ def build_implementation_plan(
         "prompt_hints": prompt_hints,
         "primary_entities": list(prompt_hints.get("resource_hints") or ([prompt_hints.get("resource_hint")] if prompt_hints.get("resource_hint") else []))[:8],
         "product_scale_contract": product_scale_contract,
+        "product_task_ledger": product_task_ledger,
+        "completion_audit_contract": {
+            "status": "required" if contract.get("required") else "optional",
+            "principle": "Do not treat proxy signals as completion unless they cover every prompt-derived requirement.",
+            "audit_steps": [
+                "map every explicit prompt role/action/resource to product_task_ledger items",
+                "verify each ledger item has product runtime source changes, not only tests or generated metadata",
+                "verify routeable role pages are reachable and page-aware",
+                "verify persisted API state is created/updated/read by the prompt-assigned roles",
+                "verify generated tests and browser proof cover the same prompt-derived workflow",
+            ],
+        },
         "role_actions": {
             role: (prompt_hints.get("role_action_prompts") or {}).get(role)
             or (
@@ -907,6 +1024,7 @@ def build_implementation_plan(
         },
         "agent_todos": [
             {"id": "plan", "status": "completed", "content": "Extract prompt-owned roles, entities, UI controls, APIs, tests, and mobile constraints."},
+            {"id": "product_task_ledger", "status": "pending", "content": "Complete every prompt-derived product_task_ledger item with product source changes and proof."},
             {"id": "inspect", "status": "pending", "content": "Read/search only the workspace files needed for the next patch."},
             {"id": "build", "status": "pending", "content": "Patch backend, role UI, frontend behavior, and generated tests through validated code-agent write tools."},
             {"id": "verify", "status": "pending", "content": "Run static/API/generated/browser/mobile proof against the actual generated workflow."},

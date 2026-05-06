@@ -529,6 +529,33 @@ REPAIR_CATALOG: tuple[RepairCatalogEntry, ...] = (
         patterns=(_rx(r"mobile_layout"), _rx(r"overflow"), _rx(r"overlap")),
     ),
     RepairCatalogEntry(
+        signature="completion.product_task_ledger_incomplete",
+        issue_code="product_task_ledger",
+        severity="high",
+        likely_root_cause="The run passed proxy checks but has not completed a prompt-derived product ledger item.",
+        target_files=("miniapp/app/static/**/index.html", "miniapp/app/static/**/app.js", "miniapp/app/static/**/styles.css"),
+        verification_check="product_task_ledger",
+        instruction=(
+            "Read the implicated role files and implementation_plan.product_task_ledger. Add the missing routeable product pages, "
+            "page-aware JavaScript handlers, and persisted API wiring needed to satisfy the exact ledger item."
+        ),
+        required_next_tool="read_files",
+        verification_command="run_checks platform_invariants",
+        patterns=(_rx(r"product_task_ledger"), _rx(r"ledger item .* incomplete"), _rx(r"expected_min_routes")),
+    ),
+    RepairCatalogEntry(
+        signature="completion.product_source_diff_missing",
+        issue_code="product_source_diff",
+        severity="high",
+        likely_root_cause="The run changed only tests or generated metadata while claiming product acceptance progress.",
+        target_files=("miniapp/app/**", "miniapp/requirements.txt", "miniapp/Dockerfile"),
+        verification_check="meaningful_product_diff",
+        instruction="Patch the product runtime source that owns the failing workflow. Do not satisfy acceptance by editing only tests or generated metadata.",
+        required_next_tool="read_files",
+        verification_command="run_checks",
+        patterns=(_rx(r"product_source_diff"), _rx(r"meaningful_product_diff"), _rx(r"not only generated tests or contract metadata")),
+    ),
+    RepairCatalogEntry(
         signature="generation.repeated_no_progress",
         issue_code="repeated_no_progress_repair",
         severity="high",

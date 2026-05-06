@@ -727,7 +727,7 @@ function nextVisualProgress(current: number, run: Run): number {
     return Math.min(actual, current + catchUpStep);
   }
   if (current >= ceiling) {
-    return current;
+    return Math.max(ceiling, current - 1.4);
   }
 
   let driftStep = 0.18;
@@ -1921,7 +1921,7 @@ export default function App() {
     setRunProgressDisplay((current) => {
       const next: RunProgressDisplayMap = {};
       runs.forEach((run) => {
-        const actual = Math.max(0, Math.min(100, run.progress_percent || 0));
+        const actual = actualProgressForRun(run);
         const existing = current[run.run_id];
         if (existing === undefined) {
           next[run.run_id] = Math.max(4, actual);
@@ -1935,7 +1935,7 @@ export default function App() {
           next[run.run_id] = actual;
           return;
         }
-        next[run.run_id] = Math.max(existing, actual);
+        next[run.run_id] = actual < existing ? Math.max(actual, existing - 2) : actual;
       });
       return next;
     });

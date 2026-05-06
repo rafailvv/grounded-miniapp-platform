@@ -13,7 +13,7 @@ from app.modules.miniapp_agent_loop.agent_file_state import AgentFileStateCache
 from app.modules.miniapp_agent_loop.agent_command_policy import DEFAULT_COMMAND_POLICY, decide_workspace_command
 from app.modules.miniapp_agent_loop.agent_coordinator import AgentCoordinator
 from app.modules.miniapp_agent_loop.agent_hooks import AgentHookManager
-from app.modules.miniapp_agent_loop.agent_kernel import agent_tool_kind, plan_agent_tool_batches
+from app.modules.miniapp_agent_loop.agent_kernel import agent_tool_kind, compact_agent_memory, plan_agent_tool_batches
 from app.modules.miniapp_agent_loop.agent_memory_store import AgentMemoryStore
 from app.modules.miniapp_agent_loop.agent_process_manager import AgentProcessManager, HeadTailOutputBuffer
 from app.modules.miniapp_agent_loop.agent_scratchpad import AgentScratchpad
@@ -95,6 +95,21 @@ def test_browser_infra_failure_does_not_mask_repairable_app_failures() -> None:
     ]
 
     assert AgentToolCallLoop._has_browser_infra_failure(results) is False
+
+
+def test_compact_agent_memory_keeps_repair_outcomes_and_changed_files() -> None:
+    memory = compact_agent_memory(
+        turn_history=[
+            {"outcome": "needs_context", "failure_signature": "platform.first"},
+            {"outcome": "changes_ready", "result": "applied", "files_changed": ["miniapp/app/static/manager/app.js"]},
+        ],
+        file_change_count=1,
+        last_assistant_message="patched manager",
+    )
+
+    assert memory["recent_outcomes"] == ["needs_context", "changes_ready"]
+    assert memory["latest_changed_files"] == ["miniapp/app/static/manager/app.js"]
+    assert memory["no_edit_turn_count"] == 1
 
 
 def test_browser_infra_failure_blocks_when_no_repairable_failures_remain() -> None:
@@ -604,6 +619,8 @@ def test_agent_prompt_is_tool_loop_contract_not_domain_template() -> None:
     assert "manifest.roles.<role>.root" in prompt
     assert "return the persisted fields at the top level" in prompt
     assert "product_scale_contract" in prompt
+    assert "product_task_ledger" in prompt
+    assert "completion_audit_contract" in prompt
     assert "normalize list-vs-envelope shape" in prompt
     assert "miniapp/app/generated/miniapp_contract.json" in prompt
     assert "keep names consistent across backend, JS payloads, renderers, and tests" in prompt
@@ -702,6 +719,8 @@ def test_ordinary_business_prompt_promotes_prompt_scale_to_role_pages() -> None:
 
     screen_plan = plan["routeable_screen_plan"]
     scale_contract = plan["product_scale_contract"]
+    ledger = plan["product_task_ledger"]
+    audit = plan["completion_audit_contract"]
 
     assert "client" in plan["role_state_contract"]["source_roles"]
     assert "specialist" in plan["role_state_contract"]["update_roles"]
@@ -712,6 +731,17 @@ def test_ordinary_business_prompt_promotes_prompt_scale_to_role_pages() -> None:
     assert scale_contract["min_role_routes"]["client"] >= 3
     assert scale_contract["min_role_routes"]["specialist"] >= 2
     assert scale_contract["min_role_routes"]["manager"] >= 3
+    assert any(item["id"] == "manager.role_surface" and item["expected_min_routes"] >= 3 for item in ledger)
+    manager_item = next(item for item in ledger if item["id"] == "manager.role_surface")
+    assert "miniapp/app/static/manager/app.js" in manager_item["owned_paths"]
+    assert "browser_flow_smoke" in manager_item["proof_checks"]
+    assert any(item["id"] == "shared_state.persistence_api" for item in ledger)
+    assert audit["status"] == "required"
+    assert "verify each ledger item has product runtime source changes, not only tests or generated metadata" in audit["audit_steps"]
+
+    execution_contract = WorkspaceCodeAgentRuntime._product_execution_contract_payload(plan)
+    assert "product_task_ledger" in execution_contract
+    assert "completion_audit_contract" in execution_contract
 
 
 def test_acceptance_contract_carries_prompt_field_hints() -> None:
@@ -899,6 +929,19 @@ def test_role_surface_blocks_generic_workflow_copy_and_raw_status_rendering() ->
         """
     )
     assert safe_status == []
+
+    conditional_status = CheckRunner._raw_status_render_markers(
+        """
+        function humanStatus(status) {
+          return status === "active" ? "Работает" : "Пауза";
+        }
+        function render(item) {
+          return `<span>${item.status === "active" ? "Работает" : "Пауза"}</span>`;
+          return `<b>${humanStatus(item.status)}</b>`;
+        }
+        """
+    )
+    assert conditional_status == []
 
 
 def test_hidden_state_class_requires_effective_css_rule() -> None:
@@ -1263,6 +1306,44 @@ def test_prompt_scale_requires_routeable_role_pages(tmp_path: Path) -> None:
 
     assert any(issue.code == "platform.prompt_scale_route_pages_missing" for issue in issues)
     assert coverage["client"]["expected_route_count"] >= 2  # type: ignore[index]
+
+
+def test_routeable_child_pages_must_be_wired_as_distinct_views(tmp_path: Path) -> None:
+    css = ".shell { display: grid; } .card { padding: 12px; } .button { min-height: 44px; }"
+    for role in ("client", "specialist", "manager"):
+        role_dir = tmp_path / "miniapp" / "app" / "static" / role
+        role_dir.mkdir(parents=True)
+        (role_dir / "index.html").write_text(
+            "<body><main class='shell'><form><input name='title' /><button class='button'>Сохранить</button></form></main></body>",
+            encoding="utf-8",
+        )
+        (role_dir / "app.js").write_text(
+            "document.querySelector('form')?.addEventListener('submit', () => fetch('/api/items', { method: 'POST' }));",
+            encoding="utf-8",
+        )
+        (role_dir / "styles.css").write_text(css, encoding="utf-8")
+
+    manager_root = tmp_path / "miniapp" / "app" / "static" / "manager"
+    services_dir = manager_root / "services"
+    services_dir.mkdir()
+    (services_dir / "index.html").write_text(
+        "<body data-view='services'><main><form><input name='price' /><button>Добавить услугу</button></form></main></body>",
+        encoding="utf-8",
+    )
+    stylists_dir = manager_root / "stylists"
+    stylists_dir.mkdir()
+    (stylists_dir / "index.html").write_text(
+        "<body data-view='stylists'><main><form><input name='name' /><button>Добавить мастера</button></form></main></body>",
+        encoding="utf-8",
+    )
+
+    issues, coverage, _neutral = CheckRunner._role_surface_issues(
+        tmp_path,
+        generation_mode=GenerationMode.FAST,
+    )
+
+    assert any(issue.code == "platform.routeable_role_views_not_wired" for issue in issues)
+    assert coverage["manager"]["status"] == "routeable_views_not_wired"  # type: ignore[index]
 
 
 def test_role_action_signals_follow_prompt_role_flow() -> None:
@@ -1650,6 +1731,52 @@ def test_repair_catalog_embedded_connectivity_recipe_has_precise_targets() -> No
     assert "miniapp/app/static/specialist/app.js" in packet["target_files"]
     assert "miniapp/app/routes/api.py" in packet["target_files"]
     assert packet["next_forced_action"]["target_files"] == packet["target_files"]
+
+
+def test_runtime_syncs_missing_api_route_from_frontend_contract(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    routes = source / "miniapp/app/routes"
+    routes.mkdir(parents=True)
+    (routes / "__init__.py").write_text("", encoding="utf-8")
+    tests = source / "miniapp/tests"
+    tests.mkdir(parents=True)
+    (tests / "test_generated_app.py").write_text(
+        "import app.routes.health as health\n\nold = health.STORE_PATH\n",
+        encoding="utf-8",
+    )
+
+    class FakeWorkspaceService:
+        def draft_source_dir(self, workspace_id: str, run_id: str) -> Path:
+            return source
+
+        def try_read_text_file(self, workspace_id: str, path: str, run_id: str) -> str | None:
+            target = source / path
+            return target.read_text(encoding="utf-8") if target.exists() else None
+
+    runtime = WorkspaceCodeAgentRuntime.__new__(WorkspaceCodeAgentRuntime)
+    runtime.workspace_service = FakeWorkspaceService()
+    changes = [
+        DraftAction(
+            file_path="miniapp/app/static/client/app.js",
+            operation="create",
+            content="await fetch('/api/zapis', { method: 'POST', body: JSON.stringify({}) });\n",
+            reason="client creates a booking",
+        )
+    ]
+
+    synced = WorkspaceCodeAgentRuntime._sync_required_api_route_file_changes(
+        runtime,
+        changes,
+        workspace_id="ws",
+        run_id="run",
+        acceptance_contract={"required_endpoints": [{"method": "GET", "path": "/api/zapis"}]},
+    )
+
+    route = next(change for change in synced if change.file_path == "miniapp/app/routes/zapis.py")
+    assert 'router = APIRouter(prefix="/api/zapis"' in str(route.content)
+    assert "STORE_PATH" in str(route.content)
+    test_change = next(change for change in synced if change.file_path == "miniapp/tests/test_generated_app.py")
+    assert "import app.routes.zapis as health" in str(test_change.content)
 
 
 def test_frontend_form_wiring_issue_emits_exact_repair_packet(tmp_path: Path) -> None:
@@ -2206,7 +2333,11 @@ def test_turn_diff_tracker_records_changed_lines(tmp_path: Path) -> None:
     )
 
     assert record.changed_line_counts["miniapp/app/main.py"]["added"] == 1
-    assert tracker.snapshot("run_1")["turn_count"] == 1
+    snapshot = tracker.snapshot("run_1")
+    assert snapshot["turn_count"] == 1
+    assert snapshot["records"][0]["has_product_runtime_diff"] is True  # type: ignore[index]
+    assert snapshot["records"][0]["product_runtime_paths"] == ["miniapp/app/main.py"]  # type: ignore[index]
+    assert isinstance(snapshot["records"][0]["diff_sha256"], str)  # type: ignore[index]
 
 
 def test_semantic_scan_extracts_generic_routes_forms_and_handlers(tmp_path: Path) -> None:
@@ -2259,6 +2390,70 @@ def test_worker_manager_rejects_forbidden_worker_paths() -> None:
 
     assert report["ok"] is False
     assert report["forbidden"][0]["path"] == "miniapp/app/static/manager/app.js"  # type: ignore[index]
+
+
+def test_worker_manager_maps_serial_coordinator_edits_to_path_owner() -> None:
+    report = AgentWorkerManager.validate_non_conflicting(
+        [
+            DraftAction(
+                file_path="miniapp/tests/generated_app.test.mjs",
+                operation="patch",
+                diff="@@\n-a\n+b\n",
+                reason="[coordinator] repair stale generated JS acceptance test",
+            ),
+            DraftAction(
+                file_path="miniapp/app/static/manager/app.js",
+                operation="patch",
+                diff="@@\n-a\n+b\n",
+                reason="[coordinator] repair manager workflow handler",
+            ),
+        ]
+    )
+
+    assert report["ok"] is True
+    assert report["owners"]["miniapp/tests/generated_app.test.mjs"] == "test_verifier_worker"  # type: ignore[index]
+    assert report["owners"]["miniapp/app/static/manager/app.js"] == "manager_surface_worker"  # type: ignore[index]
+
+
+def test_progress_does_not_jump_for_metadata_only_patch() -> None:
+    stage, progress = WorkspaceCodeAgentRuntime._run_progress_for_event(
+        "patch_apply_completed",
+        details={
+            "changed_files": [
+                "miniapp/app/generated/miniapp_contract.json",
+                "miniapp/app/generated/route_manifest.json",
+            ],
+            "has_file_edits": True,
+        },
+    )
+
+    assert stage.startswith("Patch applied")
+    assert progress <= 20
+
+
+def test_progress_reserves_ninety_percent_for_apply_not_repair() -> None:
+    _, repair_progress = WorkspaceCodeAgentRuntime._run_progress_for_event(
+        "agent_turn_started",
+        details={
+            "attempt": 4,
+            "phase": "model_request",
+            "has_draft_diff": True,
+            "changed_files": ["miniapp/tests/generated_app.test.mjs"],
+        },
+    )
+    _, final_check_progress = WorkspaceCodeAgentRuntime._run_progress_for_event(
+        "final_checks_started",
+        details={
+            "has_file_edits": True,
+            "has_draft_diff": True,
+            "changed_files": ["miniapp/app/static/client/app.js"],
+        },
+    )
+    _, apply_progress = WorkspaceCodeAgentRuntime._run_progress_for_event("apply_started", details={})
+
+    assert repair_progress < 75
+    assert final_check_progress < 75
+    assert apply_progress >= 90
 
 
 def test_generation_modes_use_serial_contract_runtime_writes(monkeypatch) -> None:
@@ -2316,7 +2511,15 @@ def test_hook_manager_records_context_and_blocks_forbidden_tool() -> None:
 def test_worker_task_planner_builds_self_contained_owner_prompts() -> None:
     tasks = AgentWorkerTaskPlanner.worker_tasks(
         generation_mode=GenerationMode.QUALITY,
-        implementation_plan={"principle": "plan_inspect_build_verify_repair_final_browser_proof", "primary_entities": ["entity"]},
+        implementation_plan={
+            "principle": "plan_inspect_build_verify_repair_final_browser_proof",
+            "primary_entities": ["entity"],
+            "product_task_ledger": [
+                {"id": "client.role_surface", "role": "client", "kind": "source", "expected_min_routes": 2},
+                {"id": "shared_state.persistence_api", "role": "shared", "kind": "backend"},
+                {"id": "proof.generated_and_browser", "role": "shared", "kind": "proof"},
+            ],
+        },
     )
 
     by_id = {task["worker_id"]: task for task in tasks}
@@ -2325,6 +2528,9 @@ def test_worker_task_planner_builds_self_contained_owner_prompts() -> None:
     assert by_id["client_surface_worker"]["alias_ids"] == []
     assert "Own only these paths" in by_id["client_surface_worker"]["prompt"]
     assert "Forbidden paths" in by_id["client_surface_worker"]["prompt"]
+    assert "Product task ledger slice" in by_id["client_surface_worker"]["prompt"]
+    assert by_id["client_surface_worker"]["product_task_ledger_slice"][0]["id"] == "client.role_surface"
+    assert by_id["backend_api_worker"]["product_task_ledger_slice"][0]["id"] == "shared_state.persistence_api"
     assert "miniapp/app/generated/miniapp_contract.json" in by_id["client_surface_worker"]["prompt"]
     assert "keep them consistent across backend, JS payloads, renderers, and tests" in by_id["client_surface_worker"]["prompt"]
     assert by_id["client_surface_worker"]["mode_contract"]["depth"] == "deep"

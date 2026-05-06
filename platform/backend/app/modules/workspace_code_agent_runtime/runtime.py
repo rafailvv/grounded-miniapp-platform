@@ -100,7 +100,7 @@ from app.services.workspace.log_service import WorkspaceLogService
 from app.services.workspace.preview_service import PreviewService
 from app.services.workspace.runtime_manager import PreviewRuntimeManager
 from app.services.workspace.service import WorkspaceService
-from app.validators.static_analysis import extract_declared_routes
+from app.validators.static_analysis import extract_declared_routes, extract_frontend_api_refs, normalize_api_path
 
 logger = logging.getLogger(__name__)
 
@@ -693,6 +693,201 @@ class WorkspaceCodeAgentRuntime:
                 )
             )
         return normalized
+
+    def _sync_required_api_route_file_changes(
+        self,
+        file_changes: list[DraftAction],
+        *,
+        workspace_id: str,
+        run_id: str,
+        acceptance_contract: dict[str, Any],
+    ) -> list[DraftAction]:
+        synced = list(file_changes)
+        resources = self._required_api_resources_from_changes_and_contract(
+            file_changes=synced,
+            workspace_id=workspace_id,
+            run_id=run_id,
+            acceptance_contract=acceptance_contract,
+        )
+        if not resources:
+            return synced
+        routes_root = self.workspace_service.draft_source_dir(workspace_id, run_id) / "miniapp/app/routes"
+        declared_routes = extract_declared_routes(routes_root, api_only=True)
+        changed_paths = {change.file_path for change in synced}
+        for resource in resources:
+            route_file = f"miniapp/app/routes/{resource}.py"
+            base_path = f"/api/{resource}"
+            has_route = any(path == base_path or path.startswith(f"{base_path}/") for _, path in declared_routes)
+            if has_route or route_file in changed_paths:
+                continue
+            synced.append(
+                DraftAction(
+                    file_path=route_file,
+                    operation="create",
+                    content=self._generic_persisted_api_route_source(resource),
+                    reason=(
+                        "Platform synchronized the required prompt-derived API route because frontend role code "
+                        f"references {base_path} and no matching backend route exists."
+                    ),
+                )
+            )
+            changed_paths.add(route_file)
+        test_change = self._sync_generated_python_test_route_import(
+            file_changes=synced,
+            workspace_id=workspace_id,
+            run_id=run_id,
+            resources=resources,
+        )
+        if test_change is not None and test_change.file_path not in changed_paths:
+            synced.append(test_change)
+        return synced
+
+    def _required_api_resources_from_changes_and_contract(
+        self,
+        *,
+        file_changes: list[DraftAction],
+        workspace_id: str,
+        run_id: str,
+        acceptance_contract: dict[str, Any],
+    ) -> list[str]:
+        resources: list[str] = []
+
+        def add_path(path: object) -> None:
+            resource = self._resource_slug_from_api_path(str(path or ""))
+            if resource and resource not in resources:
+                resources.append(resource)
+
+        for endpoint in acceptance_contract.get("required_endpoints") or []:
+            if isinstance(endpoint, dict):
+                add_path(endpoint.get("path"))
+
+        changed_js_paths = [change.file_path for change in file_changes if change.file_path.endswith(".js")]
+        for change in file_changes:
+            if not change.file_path.endswith(".js"):
+                continue
+            text = str(change.content or change.diff or "")
+            for _, path in extract_frontend_api_refs(text):
+                add_path(path)
+        for path in changed_js_paths:
+            current = self.workspace_service.try_read_text_file(workspace_id, path, run_id=run_id)
+            if current is None:
+                continue
+            for _, api_path in extract_frontend_api_refs(current):
+                add_path(api_path)
+        return resources[:4]
+
+    @staticmethod
+    def _resource_slug_from_api_path(path: str) -> str:
+        normalized = normalize_api_path(path)
+        match = re.match(r"^/api/(?P<resource>[A-Za-z0-9_-]+)(?:/|$)", normalized)
+        if not match:
+            return ""
+        resource = match.group("resource").strip("_-").lower()
+        if not re.match(r"^[a-z][a-z0-9_]{1,48}$", resource.replace("-", "_")):
+            return ""
+        return resource.replace("-", "_")
+
+    @staticmethod
+    def _generic_persisted_api_route_source(resource: str) -> str:
+        constant = re.sub(r"[^A-Z0-9_]+", "_", resource.upper()).strip("_") or "ITEMS"
+        return f'''from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from uuid import uuid4
+
+from fastapi import APIRouter, Body, HTTPException
+
+
+router = APIRouter(prefix="/api/{resource}", tags=["{resource}"])
+STORE_PATH = Path(os.getenv("MINIAPP_{constant}_STORE_PATH", Path(__file__).resolve().parents[2] / "data" / "{resource}_store.json"))
+
+
+def _read_store() -> dict:
+    if not STORE_PATH.exists():
+        return {{"items": []}}
+    try:
+        data = json.loads(STORE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {{"items": []}}
+    if isinstance(data, list):
+        return {{"items": data}}
+    if not isinstance(data, dict):
+        return {{"items": []}}
+    items = data.get("items")
+    if not isinstance(items, list):
+        data["items"] = []
+    return data
+
+
+def _write_store(data: dict) -> None:
+    STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    STORE_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _public_item(payload: dict) -> dict:
+    item = dict(payload)
+    item.setdefault("item_id", str(uuid4()))
+    item.setdefault("status", "pending")
+    item.setdefault("arrival_marked", False)
+    item.setdefault("payload", {{key: value for key, value in item.items() if key not in {{"payload"}}}})
+    return item
+
+
+@router.get("")
+def list_items() -> dict:
+    return _read_store()
+
+
+@router.post("")
+def create_item(payload: dict = Body(default_factory=dict)) -> dict:
+    store = _read_store()
+    item = _public_item(payload if isinstance(payload, dict) else {{}})
+    store["items"].append(item)
+    _write_store(store)
+    return item
+
+
+@router.patch("/{{item_id}}")
+def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dict:
+    store = _read_store()
+    for item in store["items"]:
+        if str(item.get("item_id")) == str(item_id):
+            if isinstance(payload, dict):
+                item.update(payload)
+                item["payload"] = {{key: value for key, value in item.items() if key != "payload"}}
+            _write_store(store)
+            return item
+    raise HTTPException(status_code=404, detail="Item not found")
+'''
+
+    def _sync_generated_python_test_route_import(
+        self,
+        *,
+        file_changes: list[DraftAction],
+        workspace_id: str,
+        run_id: str,
+        resources: list[str],
+    ) -> DraftAction | None:
+        if not resources:
+            return None
+        test_path = "miniapp/tests/test_generated_app.py"
+        planned = next((change for change in file_changes if change.file_path == test_path and change.content is not None), None)
+        source = str(planned.content) if planned is not None else self.workspace_service.try_read_text_file(workspace_id, test_path, run_id=run_id)
+        if not source or "app.routes.health" not in source or "STORE_PATH" not in source:
+            return None
+        resource = resources[0]
+        updated = source.replace("import app.routes.health as health", f"import app.routes.{resource} as health")
+        updated = updated.replace("from app.routes.health import", f"from app.routes.{resource} import")
+        if updated == source:
+            return None
+        return DraftAction(
+            file_path=test_path,
+            operation="replace",
+            content=updated,
+            reason=f"Point generated product tests at the generated /api/{resource} route store instead of the platform health route.",
+        )
 
     @staticmethod
     def _patch_first_allows_full_replace(operation: DraftAction, current_content: str) -> bool:
@@ -1786,6 +1981,12 @@ class WorkspaceCodeAgentRuntime:
                 workspace_id=workspace_id,
                 run_id=run_id,
             )
+            synced = self._sync_required_api_route_file_changes(
+                synced,
+                workspace_id=workspace_id,
+                run_id=run_id,
+                acceptance_contract=acceptance_contract,
+            )
             merge_report = self.worker_runtime.merge_report(artifact_run_id, synced)
             branch_results = self.worker_runtime.record_branch_results(artifact_run_id, synced)
             job.worker_merge_ref = f"worker_merge:{workspace_id}:{artifact_run_id}"
@@ -2090,6 +2291,7 @@ class WorkspaceCodeAgentRuntime:
                 preview_details=preview_details,
                 validation_snapshot=validation_snapshot,
                 acceptance_contract=acceptance_contract,
+                implementation_plan=implementation_plan,
             )
             self._record_rollout_trace(
                 job,
@@ -2098,7 +2300,7 @@ class WorkspaceCodeAgentRuntime:
                 payload={
                     "status": state.get("status") or ("blocked" if state.get("blocking") else "passed"),
                     "blocking": state.get("blocking"),
-                    "reasons": state.get("reasons") or state.get("issues") or [],
+                    "reasons": state.get("reasons") or state.get("issues") or state.get("remaining_issues") or [],
                     "result_names": [result.name for result in results],
                     "failed_checks": [result.name for result in results if result.status == "failed"],
                     "acceptance_required": bool((acceptance_contract or {}).get("required") or request.mode == "generate"),
@@ -3596,6 +3798,7 @@ class WorkspaceCodeAgentRuntime:
                 if compact_repair_prompt
                 else implementation_plan
             ),
+            "product_execution_contract": self._product_execution_contract_payload(implementation_plan),
             "worker_branching": (
                 {
                     "enabled": False,
@@ -3865,6 +4068,21 @@ class WorkspaceCodeAgentRuntime:
                     generation_mode=generation_mode,
                     implementation_plan=implementation_plan,
                 ),
+            },
+            max_chars=2600,
+            max_items=12,
+        )
+
+    @staticmethod
+    def _product_execution_contract_payload(implementation_plan: dict[str, Any]) -> dict[str, Any]:
+        plan = implementation_plan if isinstance(implementation_plan, dict) else {}
+        return WorkspaceCodeAgentRuntime._compact_jsonish(
+            {
+                "product_scale_contract": plan.get("product_scale_contract") or {},
+                "product_task_ledger": plan.get("product_task_ledger") or [],
+                "completion_audit_contract": plan.get("completion_audit_contract") or {},
+                "role_state_contract": plan.get("role_state_contract") or {},
+                "routeable_screen_plan": plan.get("routeable_screen_plan") or {},
             },
             max_chars=2600,
             max_items=12,
@@ -5699,6 +5917,7 @@ class WorkspaceCodeAgentRuntime:
         preview_details: dict[str, Any],
         validation_snapshot: ValidationSnapshot | None,
         acceptance_contract: dict[str, Any] | None = None,
+        implementation_plan: dict[str, Any] | None = None,
     ) -> dict[str, object]:
         del preview_details
         return self.completion_gate.completion_state(
@@ -5710,6 +5929,7 @@ class WorkspaceCodeAgentRuntime:
             generation_mode=str(getattr(request.generation_mode, "value", request.generation_mode)),
             intent=request.intent,
             acceptance_contract=acceptance_contract,
+            implementation_plan=implementation_plan,
             focused_visual_edit=self._focused_edit_kind(request) == "css_only_visual",
         )
 
@@ -7209,8 +7429,10 @@ class WorkspaceCodeAgentRuntime:
             payload["current_stage"] = stage
         if event_type == "job_failed":
             payload["progress_percent"] = 100
+        elif progress < existing_progress:
+            payload["progress_percent"] = max(progress, existing_progress - 4)
         else:
-            payload["progress_percent"] = max(existing_progress, progress)
+            payload["progress_percent"] = progress
         iteration_count = self._current_iteration_count(job.workspace_id)
         if iteration_count:
             payload["iteration_count"] = iteration_count
@@ -7372,33 +7594,34 @@ class WorkspaceCodeAgentRuntime:
     ) -> tuple[str, int]:
         details = details or {}
         attempt = cls._safe_int(details.get("attempt"), default=0)
-        is_after_patch = bool(details.get("has_file_edits") or details.get("has_draft_diff"))
+        has_product_edits = cls._has_product_file_edits(details)
+        is_after_patch = bool(details.get("has_file_edits") or details.get("has_draft_diff")) and has_product_edits
         if details.get("check_step"):
             return cls._check_step_stage(details), cls._check_step_progress(details)
         progress_map = {
             "job_started": ("Starting code agent", 3),
             "spec_extract_started": ("Planning workflow contract", 8),
-            "agent_build_started": ("Running code agent", 20),
-            "agent_build_completed": ("Merged agent patches", 52),
-            "agent_build_failed": ("Repairing agent patch", 38),
-            "worker_started": ("Worker draft started", 24),
-            "worker_completed": ("Worker draft completed", 48),
-            "worker_failed": ("Repairing worker draft", 39),
-            "process_started": ("Running diagnostic command", 31),
-            "command_output_delta": ("Reading command output", 33),
-            "process_completed": ("Diagnostic command completed", 35),
-            "tool_progress": ("Tool is running", 36),
-            "tool_use_summary": ("Tool batch completed", 34),
-            "context_suggestion": ("Compacting agent context", 37),
-            "hook_started": ("Preparing agent tool", 30),
-            "hook_completed": ("Agent tool lifecycle updated", 35),
-            "verifier_nudge": ("Preparing verification proof", 79),
-            "compact_boundary": ("Compacting repair context", 43),
-            "draft_prepared": ("Prepared draft patch", 52),
-            "running_checks": ("Running validation checks" if is_after_patch else "Checking workspace shell", 59 if is_after_patch else cls._pre_patch_progress(attempt, 7)),
-            "build_started": ("Checking schema and route manifest" if is_after_patch else "Validating workspace shell", 61 if is_after_patch else cls._pre_patch_progress(attempt, 9)),
-            "frontend_build_started": ("Checking generated routes and API links" if is_after_patch else "Checking frontend baseline", 64 if is_after_patch else cls._pre_patch_progress(attempt, 11)),
-            "backend_compile_started": ("Checking static files and backend imports" if is_after_patch else "Checking backend baseline", 67 if is_after_patch else cls._pre_patch_progress(attempt, 13)),
+            "agent_build_started": ("Running code agent", 14),
+            "agent_build_completed": ("Merged agent patches", 34),
+            "agent_build_failed": ("Repairing agent patch", 28),
+            "worker_started": ("Worker draft started", 16),
+            "worker_completed": ("Worker draft completed", 30),
+            "worker_failed": ("Repairing worker draft", 32),
+            "process_started": ("Running diagnostic command", 18),
+            "command_output_delta": ("Reading command output", 19),
+            "process_completed": ("Diagnostic command completed", 22),
+            "tool_progress": ("Tool is running", 21),
+            "tool_use_summary": ("Tool batch completed", 24),
+            "context_suggestion": ("Compacting agent context", 25),
+            "hook_started": ("Preparing agent tool", 12),
+            "hook_completed": ("Agent tool lifecycle updated", 16),
+            "verifier_nudge": ("Preparing verification proof", 64),
+            "compact_boundary": ("Compacting repair context", 36),
+            "draft_prepared": ("Prepared draft patch", 34 if has_product_edits else 14),
+            "running_checks": ("Running validation checks" if is_after_patch else "Checking workspace shell", 46 if is_after_patch else cls._pre_patch_progress(attempt, 7)),
+            "build_started": ("Checking schema and route manifest" if is_after_patch else "Validating workspace shell", 48 if is_after_patch else cls._pre_patch_progress(attempt, 9)),
+            "frontend_build_started": ("Checking generated routes and API links" if is_after_patch else "Checking frontend baseline", 50 if is_after_patch else cls._pre_patch_progress(attempt, 11)),
+            "backend_compile_started": ("Checking static files and backend imports" if is_after_patch else "Checking backend baseline", 52 if is_after_patch else cls._pre_patch_progress(attempt, 13)),
             "checks_completed": (cls._checks_stage(details), cls._checks_completed_progress(details) if is_after_patch else cls._pre_patch_progress(attempt, 16)),
             "agent_turn_started": (cls._agent_turn_stage(details), cls._agent_turn_progress(details)),
             "iteration_ready": (cls._iteration_ready_stage(details), cls._iteration_ready_progress(details)),
@@ -7406,7 +7629,7 @@ class WorkspaceCodeAgentRuntime:
             "patch_apply_started": (cls._files_stage("Applying patch", details, key="files"), cls._patch_apply_progress(details, completed=False)),
             "patch_apply_completed": (cls._files_stage("Patch applied", details, key="changed_files"), cls._patch_apply_progress(details, completed=True)),
             "repair_iteration": (cls._repair_stage(details), cls._repair_progress(details)),
-            "final_checks_started": ("Running final checks", 84),
+            "final_checks_started": ("Running final checks", 62 if is_after_patch else cls._pre_patch_progress(attempt, 18)),
             "apply_started": ("Applying to workspace", 92),
             "apply_completed": ("Applied to workspace", 98),
             "preview_rebuild_completed": ("Preview refreshed", 98),
@@ -7420,7 +7643,31 @@ class WorkspaceCodeAgentRuntime:
 
     @staticmethod
     def _pre_patch_progress(attempt: int, base: int) -> int:
-        return min(42, base + max(0, int(attempt or 0)) * 6)
+        return min(30, base + max(0, int(attempt or 0)) * 3)
+
+    @classmethod
+    def _has_product_file_edits(cls, details: dict[str, Any]) -> bool:
+        candidates: list[Any] = []
+        for key in ("changed_files", "files", "target_files", "focused_edit_files"):
+            value = details.get(key)
+            if isinstance(value, list):
+                candidates.extend(value)
+        file_summary = str(details.get("file_summary") or "")
+        if not candidates and file_summary:
+            candidates.extend(part.strip() for part in file_summary.split(","))
+        if not candidates:
+            return bool(details.get("has_product_edits"))
+        for raw_path in candidates:
+            path = str(raw_path or "").strip().replace("\\", "/")
+            if not path:
+                continue
+            if path.startswith("generated/"):
+                path = f"miniapp/app/{path}"
+            if path.startswith("miniapp/tests/"):
+                return True
+            if path.startswith("miniapp/app/") and not path.startswith("miniapp/app/generated/"):
+                return True
+        return False
 
     @staticmethod
     def _safe_int(value: Any, *, default: int) -> int:
@@ -7470,7 +7717,7 @@ class WorkspaceCodeAgentRuntime:
     @classmethod
     def _check_step_progress(cls, details: dict[str, Any]) -> int:
         attempt = cls._safe_int(details.get("attempt"), default=0)
-        is_after_patch = bool(details.get("has_file_edits") or details.get("has_draft_diff"))
+        is_after_patch = bool(details.get("has_file_edits") or details.get("has_draft_diff")) and cls._has_product_file_edits(details)
         step = str(details.get("check_step") or "").strip()
         status = str(details.get("check_status") or "").strip().lower()
         if not is_after_patch:
@@ -7488,21 +7735,22 @@ class WorkspaceCodeAgentRuntime:
             }
             return cls._pre_patch_progress(attempt, order.get(step, 12))
         order = {
-            "schema_validators": 61,
-            "connectivity_validators": 64,
-            "changed_files_static": 67,
-            "platform_invariants": 70,
-            "frontend_interaction_static_smoke": 73,
-            "generated_app_python_tests": 76,
-            "generated_app_js_tests": 78,
-            "preview_boot_smoke": 80,
-            "preview_connectivity_smoke": 82,
-            "browser_flow_smoke": 84,
+            "schema_validators": 48,
+            "connectivity_validators": 51,
+            "changed_files_static": 54,
+            "platform_invariants": 58,
+            "frontend_interaction_static_smoke": 62,
+            "generated_app_python_tests": 66,
+            "generated_app_js_tests": 69,
+            "preview_boot_smoke": 72,
+            "preview_connectivity_smoke": 74,
+            "api_workflow_smoke": 76,
+            "browser_flow_smoke": 78,
         }
         progress = order.get(step, 66) + (1 if status in {"passed", "failed", "skipped"} else 0)
         if attempt > 1:
-            progress += min(10, (attempt - 1) * 4)
-        return min(94, progress)
+            progress += min(8, (attempt - 1) * 3)
+        return min(84, progress)
 
     @staticmethod
     def _duration_suffix(details: dict[str, Any]) -> str:
@@ -7531,12 +7779,12 @@ class WorkspaceCodeAgentRuntime:
         attempt = max(1, cls._safe_int(details.get("attempt"), default=1))
         tool_round = cls._safe_int(details.get("tool_round"), default=0)
         phase = str(details.get("phase") or "").strip().lower()
-        if bool(details.get("has_draft_diff")):
+        if bool(details.get("has_draft_diff")) and cls._has_product_file_edits(details):
             if phase == "context_ready":
-                return min(93, 86 + max(0, attempt - 2) * 3 + tool_round)
+                return min(68, 50 + max(0, attempt - 2) * 4 + tool_round)
             if phase == "model_request":
-                return min(93, 88 + max(0, attempt - 2) * 3 + tool_round)
-            return min(93, 84 + max(0, attempt - 2) * 3 + tool_round)
+                return min(70, 54 + max(0, attempt - 2) * 4 + tool_round)
+            return min(66, 48 + max(0, attempt - 2) * 4 + tool_round)
         base = 10 + (attempt - 1) * 6 + tool_round * 3
         if phase == "context_ready":
             return min(48, base + 5)
@@ -7563,12 +7811,12 @@ class WorkspaceCodeAgentRuntime:
         tool_round = cls._safe_int(details.get("tool_round"), default=0)
         file_change_count = cls._safe_int(details.get("file_change_count", details.get("file_change_count")), default=0)
         tool_call_count = cls._safe_int(details.get("tool_call_count"), default=0)
-        if bool(details.get("has_draft_diff")):
+        if bool(details.get("has_draft_diff")) and cls._has_product_file_edits(details):
             if file_change_count > 0:
-                return min(94, 87 + max(0, attempt - 2) * 3)
+                return min(72, 56 + max(0, attempt - 2) * 4)
             if tool_call_count > 0:
-                return min(93, 85 + max(0, attempt - 2) * 3)
-            return min(92, 84 + max(0, attempt - 2) * 3)
+                return min(68, 52 + max(0, attempt - 2) * 4)
+            return min(66, 50 + max(0, attempt - 2) * 4)
         base = 38 + max(0, attempt - 1) * 5 + tool_round * 2
         if file_change_count > 0:
             return min(51, base + 7)
@@ -7590,8 +7838,8 @@ class WorkspaceCodeAgentRuntime:
     def _repair_progress(cls, details: dict[str, Any]) -> int:
         attempt = max(1, cls._safe_int(details.get("attempt"), default=1))
         outcome = str(details.get("outcome") or "").strip()
-        if bool(details.get("has_draft_diff")):
-            return min(93, 85 + max(0, attempt - 2) * 3)
+        if bool(details.get("has_draft_diff")) and cls._has_product_file_edits(details):
+            return min(72, 54 + max(0, attempt - 2) * 4)
         if outcome in {"needs_context", "no_op"}:
             return min(50, 42 + max(0, attempt - 1) * 4)
         return min(50, 44 + max(0, attempt - 1) * 4)
@@ -7599,16 +7847,18 @@ class WorkspaceCodeAgentRuntime:
     @classmethod
     def _patch_apply_progress(cls, details: dict[str, Any], *, completed: bool) -> int:
         attempt = max(1, cls._safe_int(details.get("attempt"), default=1))
+        if not cls._has_product_file_edits(details):
+            return 16 if completed else 12
         if attempt <= 1 or bool(details.get("first_patch")) or not bool(details.get("has_draft_diff")):
-            return 58 if completed else 52
-        return min(94, (89 if completed else 87) + max(0, attempt - 2) * 3)
+            return 38 if completed else 32
+        return min(72, (58 if completed else 54) + max(0, attempt - 2) * 4)
 
     @classmethod
     def _context_expanded_progress(cls, details: dict[str, Any]) -> int:
         attempt = max(1, cls._safe_int(details.get("attempt"), default=1))
         tool_round = cls._safe_int(details.get("tool_round"), default=0)
-        if bool(details.get("has_draft_diff")):
-            return min(93, 86 + max(0, attempt - 2) * 3 + tool_round)
+        if bool(details.get("has_draft_diff")) and cls._has_product_file_edits(details):
+            return min(68, 50 + max(0, attempt - 2) * 4 + tool_round)
         return min(50, 44 + max(0, attempt - 1) * 4 + tool_round)
 
     @staticmethod
