@@ -4,7 +4,7 @@ from typing import Any
 
 from app.models.common import GenerationMode
 from app.modules.miniapp_agent_loop.agent_worker_manager import AgentWorkerManager
-from app.modules.miniapp_agent_loop.product_workers import canonical_worker_id, legacy_worker_id, ownership_for_worker
+from app.modules.miniapp_agent_loop.product_workers import canonical_worker_id, ownership_for_worker
 
 
 class AgentWorkerTaskPlanner:
@@ -23,7 +23,7 @@ class AgentWorkerTaskPlanner:
         if generation_mode == GenerationMode.QUALITY:
             return {
                 "depth": "deep",
-                "passes": ["green_workflow", "role_consistency", "mobile_design_polish", "fresh_verifier"],
+                "passes": ["green_workflow", "role_consistency", "mobile_design_polish", "test_verifier_worker"],
                 "design_bar": "modern mobile product UI with polished spacing, states, responsive cards/forms/lists, no horizontal overflow, and consistent light theme across role apps unless explicitly requested otherwise",
                 "workflow_bar": "multiple prompt-derived role actions where useful, with persisted write/read/update proof only when the prompt implies it",
                 "page_bar": "well-organized prompt-derived role pages with no long dashboard-only scrolls",
@@ -56,14 +56,12 @@ class AgentWorkerTaskPlanner:
             owner_scope = str(worker.get("owner_scope") or "")
             path_prefixes = [str(item) for item in worker.get("path_prefixes") or []]
             canonical_id = canonical_worker_id(worker_id)
-            legacy_id = legacy_worker_id(canonical_id)
             ownership = dict(worker.get("ownership") or ownership_for_worker(canonical_id))
             tasks.append(
                 {
                     "worker_id": canonical_id,
-                    "legacy_worker_id": legacy_id,
                     "worker_type": str(worker.get("worker_type") or canonical_id),
-                    "alias_ids": list(worker.get("alias_ids") or [legacy_id]),
+                    "alias_ids": [],
                     "owner_scope": owner_scope,
                     "path_prefixes": path_prefixes,
                     "ownership": ownership,

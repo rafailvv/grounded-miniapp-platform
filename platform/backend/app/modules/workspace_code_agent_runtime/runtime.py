@@ -47,7 +47,6 @@ from app.modules.miniapp_agent_loop.agent_worker_tasks import AgentWorkerTaskPla
 from app.modules.miniapp_agent_loop.product_workers import (
     SECRET_RE,
     canonical_worker_id,
-    legacy_worker_id,
     ownership_for_worker,
     path_is_allowed,
     select_memory_items,
@@ -1787,7 +1786,7 @@ class WorkspaceCodeAgentRuntime:
                 job,
                 "worker_started",
                 "Fresh verifier worker started after validation checks.",
-                {"worker_id": "fresh_verifier", "phase": "browser_verifying"},
+                {"worker_id": "mobile_polish_worker", "phase": "browser_verifying"},
             )
             report = VerificationWorker.verify(
                 latest_execution=latest_execution,
@@ -1817,7 +1816,7 @@ class WorkspaceCodeAgentRuntime:
                         "repair_packet_ref": browser_replay_ref,
                     }
                 )
-            report["worker_id"] = "fresh_verifier"
+            report["worker_id"] = "mobile_polish_worker"
             report["fresh_context"] = True
             self.verification_reports[artifact_run_id] = report
             coordinator.complete_phase("checking", "Validation checks reached strict green before verifier.")
@@ -1864,14 +1863,14 @@ class WorkspaceCodeAgentRuntime:
                 job.verifier_review_ref,
                 {"workspace_id": workspace_id, "run_id": run_id, "review": report},
             )
-            browser_step_ref = f"browser_steps:{workspace_id}:{artifact_run_id}:fresh_verifier"
+            browser_step_ref = f"browser_steps:{workspace_id}:{artifact_run_id}:mobile_polish_worker"
             job.browser_step_refs = list(dict.fromkeys([*job.browser_step_refs, browser_step_ref]))
             self._store_report(
                 browser_step_ref,
                 {
                     "workspace_id": workspace_id,
                     "run_id": run_id,
-                    "worker_id": "fresh_verifier",
+                    "worker_id": "mobile_polish_worker",
                     "status": report.get("status"),
                     "issues": report.get("issues", []),
                     "proof": report,
@@ -1885,13 +1884,13 @@ class WorkspaceCodeAgentRuntime:
                 job=job,
                 hook="post_browser_verify",
                 status="completed" if report.get("status") == "passed" else "failed",
-                payload={"worker_id": "fresh_verifier", "verification_report_ref": job.verification_report_ref},
+                payload={"worker_id": "mobile_polish_worker", "verification_report_ref": job.verification_report_ref},
             )
             self._append_event(
                 job,
                 "worker_completed" if report.get("status") == "passed" else "worker_failed",
                 "Fresh verifier worker completed.",
-                {"worker_id": "fresh_verifier", "status": report.get("status"), "artifact_ref": job.verification_report_ref},
+                {"worker_id": "mobile_polish_worker", "status": report.get("status"), "artifact_ref": job.verification_report_ref},
             )
             return report
 
@@ -2122,7 +2121,6 @@ class WorkspaceCodeAgentRuntime:
                 {
                     "worker_id": worker_id,
                     "worker_type": worker_id,
-                    "legacy_worker_id": legacy_worker_id(worker_id),
                     "ownership": ownership,
                     "context_ref": refs["context_ref"],
                     "memory_snapshot_ref": refs["memory_snapshot_ref"],
@@ -3597,7 +3595,7 @@ class WorkspaceCodeAgentRuntime:
                     *focused_rules,
                     f"Keep each turn applyable: use mutating tools for a compact coherent edit, or request only the specific read-only tools needed for the next patch.",
                     "Use the implementation_plan and acceptance_contract as the product contract. Derive entities, fields, routes, labels, and role actions from the user's prompt and current code, not from platform templates.",
-                    "Do not satisfy the contract with fixed sample nouns or a platform-default workflow; implement the concrete entities, controls, and persisted state described by the LLM-derived acceptance contract and the current code.",
+                    "Do not satisfy the contract with fixed sample nouns or a platform-generic workflow; implement the concrete entities, controls, and persisted state described by the LLM-derived acceptance contract and the current code.",
                     "Each role surface must satisfy its own LLM-derived role responsibilities. Do not satisfy a role with only a generic data-refresh page when the contract assigns concrete actions.",
                     "Create/workflow completion requires real UI controls, JavaScript handlers, backend persistence, generated tests, cross-role visibility, refresh persistence, and browser/mobile proof.",
                     "Build three isolated role surfaces in the miniapp shell. Role responsibilities come only from the LLM-derived acceptance contract; do not link role roots to each other and do not force unrequested workflow semantics.",
@@ -5925,19 +5923,19 @@ class WorkspaceCodeAgentRuntime:
     def _worker_owner_for_path(path: str) -> str:
         normalized = WorkspaceCodeAgentRuntime._strip_leading_dot_slash(path)
         if normalized.startswith("miniapp/app/static/client/"):
-            return "client_ui"
+            return "client_surface_worker"
         if normalized.startswith("miniapp/app/static/specialist/"):
-            return "specialist_ui"
+            return "specialist_surface_worker"
         if normalized.startswith("miniapp/app/static/manager/"):
-            return "manager_ui"
+            return "manager_surface_worker"
         if normalized.startswith("miniapp/tests/"):
-            return "generated_tests"
+            return "test_verifier_worker"
         if normalized.startswith("miniapp/app/routes/") or normalized in {
             "miniapp/app/main.py",
             "miniapp/app/db.py",
             "miniapp/app/schemas.py",
         }:
-            return "backend_api"
+            return "backend_api_worker"
         if normalized.startswith("miniapp/app/generated/") or normalized.startswith("miniapp/app/static/shared/"):
             return "shared_runtime"
         return "shared"

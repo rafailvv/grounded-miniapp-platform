@@ -175,7 +175,7 @@ def test_background_tasks_crud_output_stop_retry_and_run_lane(tmp_path: Path) ->
             "run_id": run.run_id,
             "type": "worker_branch",
             "title": "Backend worker",
-            "input": {"worker_id": "backend_api"},
+            "input": {"worker_id": "backend_api_worker"},
             "max_attempts": 2,
             "auto_start": False,
         },
@@ -315,7 +315,7 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
                         "worker_id": "backend_api_worker",
                         "worker": "backend_api_worker",
                         "worker_type": "backend_api_worker",
-                        "alias_ids": ["backend_api"],
+                        "alias_ids": [],
                         "status": "available_disabled",
                         "disabled_reason": "test gate disabled",
                     }
@@ -417,7 +417,7 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
     assert any(item["id"] == "state-workflow" for item in skills["items"])
     assert any(item["id"] == "role-surfaces" for item in skills["items"])
     assert workers["schema"] == "grounded.product_workers.v1"
-    assert any(item["worker_id"] == "backend_api_worker" and "backend_api" in item["alias_ids"] for item in workers["workers"])
+    assert any(item["worker_id"] == "backend_api_worker" and item["alias_ids"] == [] for item in workers["workers"])
     assert any(item["status"] == "available_disabled" for item in workers["workers"])
     assert worker_context["schema"] == "grounded.worker_context.v1"
     assert worker_memory["schema"] == "grounded.worker_memory_snapshot.v1"
@@ -1226,10 +1226,14 @@ def test_reliability_gate_blocks_missing_browser_proof(tmp_path: Path) -> None:
 
     gate = client.get(f"/runs/{run.run_id}/gate").json()
     repair = client.get(f"/runs/{run.run_id}/repair-signatures").json()
+    repair_cases = client.get(f"/runs/{run.run_id}/repair-cases").json()
 
     assert gate["status"] == "blocked"
     assert any(issue["check"] == "browser_flow_smoke" for issue in gate["issues"])
     assert any(item["signature"] == "preview.browser_flow_failed" for item in repair["items"])
+    assert repair_cases["items"]
+    assert repair_cases["active_case"]["failure_class"] in {"browser_flow_smoke", "browser_proof_gap"}
+    assert repair_cases["active_case"]["repair_prompt"]["sections"]["expected_proof"]
 
 
 def test_review_report_prioritizes_acceptance_blockers_with_locations(tmp_path: Path) -> None:
@@ -1290,6 +1294,7 @@ def test_review_report_prioritizes_acceptance_blockers_with_locations(tmp_path: 
     )
 
     review = client.get(f"/runs/{run.run_id}/review").json()
+    repair_cases = client.get(f"/runs/{run.run_id}/repair-cases").json()
 
     assert review["schema"] == "grounded.review_report.v2"
     assert review["status"] == "failed"
@@ -1300,6 +1305,55 @@ def test_review_report_prioritizes_acceptance_blockers_with_locations(tmp_path: 
     assert review["findings"][0]["is_blocker_for_product_acceptance"] is True
     assert any(item["category"] == "stale_test_risk" for item in review["findings"])
     assert any(item.get("file_path") == "miniapp/app/static/client/app.js" and item.get("line") == 12 for item in review["findings"])
+    assert repair_cases["items"]
+    assert any(item["source"] == "review" for item in repair_cases["items"])
+    assert any("miniapp/app/static/client/app.js" in item["target_files"] for item in repair_cases["items"])
+
+
+def test_repair_case_service_blocks_repeated_patch_attempts(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    run = RunRecord(
+        workspace_id="ws_1",
+        prompt="Build a prompt-derived workflow",
+        intent="create",
+        target_role_scope=["client"],
+        model_profile="test",
+        status="blocked",
+    )
+    service = app.state.container.repair_case_service
+    cases = service.sync_from_packets(
+        workspace_id=run.workspace_id,
+        run_id=run.run_id,
+        packets=[
+            {
+                "signature": "preview.browser_flow_failed",
+                "failure_class": "browser_flow_smoke",
+                "check": "browser_flow_smoke",
+                "target_files": ["miniapp/app/static/client/app.js"],
+                "evidence": {"selector": "#save"},
+            }
+        ],
+        source="test",
+    )
+    case_id = cases["active_case"]["case_id"]
+    patch_hash = "same-diff"
+
+    service.record_attempt(
+        workspace_id=run.workspace_id,
+        run_id=run.run_id,
+        case_id=case_id,
+        attempt={
+            "status": "failed",
+            "changed_files": ["miniapp/app/static/client/app.js"],
+            "patch_sha256": patch_hash,
+            "failure_reason": "proof_failed",
+            "forbidden_repeat_action": {"type": "same_patch_sha256", "sha256": patch_hash},
+        },
+    )
+
+    assert service.repeated_patch(run_id=run.run_id, case_id=case_id, patch_hash=patch_hash) is True
+    attempts = service.attempts(run.run_id, case_id)
+    assert attempts["items"][0]["forbidden_repeat_action"]["type"] == "same_patch_sha256"
 
 
 def test_repair_catalog_extracts_nested_workflow_evidence() -> None:

@@ -20,6 +20,7 @@ import {
   getRunCompaction,
   getRunCompactionBoundaries,
   getRunTasks,
+  getRunRepairCases,
   getDoctorReport,
   getRunWorkers,
   getRunReview,
@@ -49,6 +50,7 @@ import {
   RunCompactionReport,
   RunCompactionBoundaries,
   RunTaskReport,
+  RunRepairCases,
   FileSearchResult,
   LspDiagnosticsReport,
   CommandPaletteAction,
@@ -1171,6 +1173,7 @@ export default function App() {
   const [runCompaction, setRunCompaction] = useState<RunCompactionReport | null>(null);
   const [runCompactionBoundaries, setRunCompactionBoundaries] = useState<RunCompactionBoundaries | null>(null);
   const [runTaskReport, setRunTaskReport] = useState<RunTaskReport | null>(null);
+  const [runRepairCases, setRunRepairCases] = useState<RunRepairCases | null>(null);
   const [doctorReport, setDoctorReport] = useState<DoctorReport | null>(null);
   const [workerReport, setWorkerReport] = useState<WorkerReport | null>(null);
   const [reviewReport, setReviewReport] = useState<ReviewReport | null>(null);
@@ -1466,6 +1469,7 @@ export default function App() {
       setRunCompaction(null);
       setRunCompactionBoundaries(null);
       setRunTaskReport(null);
+      setRunRepairCases(null);
       setWorkerReport(null);
       setReviewReport(null);
       setTestMatrixReport(null);
@@ -1476,7 +1480,7 @@ export default function App() {
     let cancelled = false;
     void (async () => {
       try {
-        const [timeline, traceView, traceBundle, protocol, compaction, compactionBoundaries, tasks, workers, review, matrix, contract, miniappContract] = await Promise.all([
+        const [timeline, traceView, traceBundle, protocol, compaction, compactionBoundaries, tasks, repairCases, workers, review, matrix, contract, miniappContract] = await Promise.all([
           getRunTimeline(activeRunId),
           getRunTraceView(activeRunId),
           getRunTraceBundle(activeRunId),
@@ -1484,6 +1488,7 @@ export default function App() {
           getRunCompaction(activeRunId),
           getRunCompactionBoundaries(activeRunId),
           getRunTasks(activeRunId),
+          getRunRepairCases(activeRunId),
           getRunWorkers(activeRunId),
           getRunReview(activeRunId),
           getRunTestMatrix(activeRunId),
@@ -1498,6 +1503,7 @@ export default function App() {
           setRunCompaction(compaction);
           setRunCompactionBoundaries(compactionBoundaries);
           setRunTaskReport(tasks);
+          setRunRepairCases(repairCases);
           setWorkerReport(workers);
           setReviewReport(review);
           setTestMatrixReport(matrix);
@@ -1510,6 +1516,7 @@ export default function App() {
           setRunTraceView(null);
           setRunTraceBundle(null);
           setRunTaskReport(null);
+          setRunRepairCases(null);
           setWorkerReport(null);
           setReviewReport(null);
           setTestMatrixReport(null);
@@ -2365,7 +2372,7 @@ export default function App() {
 
   async function refreshWorkbenchPanels(runId: string) {
     try {
-      const [timeline, traceView, traceBundle, protocol, compaction, compactionBoundaries, tasks, workers, review] = await Promise.all([
+      const [timeline, traceView, traceBundle, protocol, compaction, compactionBoundaries, tasks, repairCases, workers, review] = await Promise.all([
         getRunTimeline(runId),
         getRunTraceView(runId),
         getRunTraceBundle(runId),
@@ -2373,6 +2380,7 @@ export default function App() {
         getRunCompaction(runId),
         getRunCompactionBoundaries(runId),
         getRunTasks(runId),
+        getRunRepairCases(runId),
         getRunWorkers(runId),
         getRunReview(runId),
       ]);
@@ -2383,6 +2391,7 @@ export default function App() {
       setRunCompaction(compaction);
       setRunCompactionBoundaries(compactionBoundaries);
       setRunTaskReport(tasks);
+      setRunRepairCases(repairCases);
       setWorkerReport(workers);
       setReviewReport(review);
       setTestMatrixReport(await getRunTestMatrix(runId));
@@ -3469,7 +3478,7 @@ export default function App() {
           ) : null}
 
           {activeTab === "trace" ? (
-            <TracePanel trace={runTraceView} traceBundle={runTraceBundle} protocol={runProtocol} compaction={runCompaction} compactionBoundaries={runCompactionBoundaries} />
+            <TracePanel trace={runTraceView} traceBundle={runTraceBundle} protocol={runProtocol} compaction={runCompaction} compactionBoundaries={runCompactionBoundaries} repairCases={runRepairCases} />
           ) : null}
 
           {activeTab === "tasks" ? (

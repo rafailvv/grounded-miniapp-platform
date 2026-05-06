@@ -113,14 +113,14 @@ class AgentCoordinator:
         if self.generation_mode == GenerationMode.FAST:
             return []
         specs = [
-            {"worker_id": "backend_api", "phase": "editing", "owner_scope": "backend API and shared persistence"},
-            {"worker_id": "client_ui", "phase": "editing", "owner_scope": "client role app"},
-            {"worker_id": "specialist_ui", "phase": "editing", "owner_scope": "specialist role app"},
-            {"worker_id": "manager_ui", "phase": "editing", "owner_scope": "manager role app"},
-            {"worker_id": "tests_design", "phase": "checking", "owner_scope": "generated checks and mobile design consistency"},
+            {"worker_id": "backend_api_worker", "phase": "editing", "owner_scope": "backend API and shared persistence"},
+            {"worker_id": "client_surface_worker", "phase": "editing", "owner_scope": "client role app"},
+            {"worker_id": "specialist_surface_worker", "phase": "editing", "owner_scope": "specialist role app"},
+            {"worker_id": "manager_surface_worker", "phase": "editing", "owner_scope": "manager role app"},
+            {"worker_id": "test_verifier_worker", "phase": "checking", "owner_scope": "generated checks"},
         ]
         if self.generation_mode == GenerationMode.QUALITY:
-            specs.append({"worker_id": "fresh_verifier", "phase": "browser_verifying", "owner_scope": "independent workflow proof"})
+            specs.append({"worker_id": "mobile_polish_worker", "phase": "browser_verifying", "owner_scope": "independent workflow proof and mobile polish"})
         return specs
 
     def snapshot(self) -> dict[str, Any]:

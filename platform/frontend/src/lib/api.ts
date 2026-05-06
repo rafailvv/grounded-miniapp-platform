@@ -597,6 +597,7 @@ export type RunTaskReport = {
     output_summary?: string | null;
     linked_refs?: Record<string, unknown>;
   }>;
+  repair_cases?: RunRepairCases;
 };
 
 export type BackgroundTask = {
@@ -802,6 +803,33 @@ export type RunRepairSignatures = {
   blocking: boolean;
   items: Array<Record<string, unknown>>;
   catalog: Array<Record<string, unknown>>;
+  repair_cases?: RunRepairCases;
+};
+
+export type RunRepairCase = {
+  schema?: string;
+  case_id: string;
+  run_id: string;
+  workspace_id: string;
+  status: string;
+  failure_signature?: string;
+  failure_class?: string;
+  issue_code?: string;
+  severity?: string;
+  likely_cause?: string;
+  target_files?: string[];
+  expected_proof?: Array<Record<string, unknown>>;
+  attempts?: Array<Record<string, unknown>>;
+  evidence?: Record<string, unknown>;
+  updated_at?: string;
+};
+
+export type RunRepairCases = {
+  schema?: string;
+  run_id: string;
+  status: string;
+  items: RunRepairCase[];
+  active_case?: RunRepairCase | null;
 };
 
 export type RunFinalReport = {
@@ -1171,6 +1199,18 @@ export async function getRunFinalReport(runId: string): Promise<RunFinalReport> 
 
 export async function getRunRepairSignatures(runId: string): Promise<RunRepairSignatures> {
   return request<RunRepairSignatures>(`/runs/${runId}/repair-signatures`);
+}
+
+export async function getRunRepairCases(runId: string): Promise<RunRepairCases> {
+  return request<RunRepairCases>(`/runs/${runId}/repair-cases`);
+}
+
+export async function getRunRepairCaseAttempts(runId: string, caseId: string): Promise<{ schema?: string; status: string; items: Array<Record<string, unknown>> }> {
+  return request(`/runs/${runId}/repair-cases/${encodeURIComponent(caseId)}/attempts`);
+}
+
+export async function retryRunRepairCase(runId: string, caseId: string): Promise<Record<string, unknown>> {
+  return request(`/runs/${runId}/repair-cases/${encodeURIComponent(caseId)}/retry`, { method: "POST" });
 }
 
 export async function resumeRun(runId: string): Promise<Run> {

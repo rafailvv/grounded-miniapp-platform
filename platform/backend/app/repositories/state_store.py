@@ -69,6 +69,8 @@ class StateStore:
         "route_registry:",
         "contract_compile:",
         "repair_recipes:",
+        "repair_case:",
+        "repair_cases:",
         "project_instructions:",
         "slash_commands:",
         "slash_command:",

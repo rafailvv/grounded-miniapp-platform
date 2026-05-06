@@ -1068,6 +1068,22 @@ def test_repair_catalog_returns_operational_packets() -> None:
     assert packet["deterministic"] is True
 
 
+def test_repair_catalog_uncatalogued_failure_creates_evidence_case_packet() -> None:
+    packet = RepairCatalog.classify_issue(
+        {
+            "check": "custom_quality_check",
+            "details": "A prompt-specific invariant assertion failed.",
+            "paths": ["miniapp/app/main.py"],
+        }
+    )
+
+    assert packet["signature"] == "repair.uncatalogued_repair_case:custom_quality_check"
+    assert packet["failure_class"] == "custom_quality_check"
+    assert packet["required_next_tool"] == "read_files"
+    assert packet["retry_policy"] == "evidence_driven_repair_case"
+    assert "evidence-driven repair case" in packet["instruction"]
+
+
 def test_repair_catalog_embedded_connectivity_recipe_has_precise_targets() -> None:
     packet = RepairCatalog.classify_issue(
         {
@@ -1574,7 +1590,7 @@ def test_turn_diff_tracker_records_changed_lines(tmp_path: Path) -> None:
         turn=1,
         paths=["miniapp/app/main.py"],
         apply_result=ApplyResult(),
-        owner_for_path=lambda path: "backend_api",
+        owner_for_path=lambda path: "backend_api_worker",
     )
 
     assert record.changed_line_counts["miniapp/app/main.py"]["added"] == 1
@@ -1668,7 +1684,7 @@ def test_generation_modes_use_serial_contract_runtime_writes(monkeypatch) -> Non
     assert fast_mailbox["enabled"] is False
     assert no_contract_mailbox["enabled"] is False
     assert any(worker["worker_id"] == "backend_api_worker" for worker in quality_mailbox["workers"])  # type: ignore[index]
-    assert any("backend_api" in worker["alias_ids"] for worker in quality_mailbox["workers"])  # type: ignore[index]
+    assert all(worker["alias_ids"] == [] for worker in quality_mailbox["workers"])  # type: ignore[index]
 
 
 def test_hook_manager_records_context_and_blocks_forbidden_tool() -> None:
@@ -1694,7 +1710,7 @@ def test_worker_task_planner_builds_self_contained_owner_prompts() -> None:
     by_id = {task["worker_id"]: task for task in tasks}
 
     assert "client_surface_worker" in by_id
-    assert by_id["client_surface_worker"]["legacy_worker_id"] == "client_ui"
+    assert by_id["client_surface_worker"]["alias_ids"] == []
     assert "Own only these paths" in by_id["client_surface_worker"]["prompt"]
     assert "Forbidden paths" in by_id["client_surface_worker"]["prompt"]
     assert "miniapp/app/generated/miniapp_contract.json" in by_id["client_surface_worker"]["prompt"]
@@ -1714,8 +1730,8 @@ def test_worker_runtime_prepares_isolated_drafts_and_merge_reports(tmp_path: Pat
         generation_mode=GenerationMode.BALANCED,
         draft_source=source,
         worker_specs=[
-            {"worker_id": "client_ui", "owner_scope": "client role app"},
-            {"worker_id": "manager_ui", "owner_scope": "manager role app"},
+            {"worker_id": "client_surface_worker", "owner_scope": "client role app"},
+            {"worker_id": "manager_surface_worker", "owner_scope": "manager role app"},
         ],
     )
     report = runtime.merge_report(
@@ -1729,7 +1745,7 @@ def test_worker_runtime_prepares_isolated_drafts_and_merge_reports(tmp_path: Pat
     assert prepared["enabled"] is True
     assert len(prepared["workers"]) == 2  # type: ignore[arg-type]
     assert Path(prepared["workers"][0]["source_dir"]).exists()  # type: ignore[index]
-    assert prepared["workers"][0]["agent_loop_ref"] == "worker_agent_loop:run_1:client_ui"  # type: ignore[index]
+    assert prepared["workers"][0]["agent_loop_ref"] == "worker_agent_loop:run_1:client_surface_worker"  # type: ignore[index]
     assert report["status"] == "conflict"
 
     branch_results = runtime.record_branch_results(
@@ -1761,11 +1777,11 @@ def test_worker_runtime_prepares_workspace_branch_run_ids(tmp_path: Path) -> Non
         run_id="run_main",
         generation_mode=GenerationMode.BALANCED,
         workspace_service=WorkspaceStub(),
-        worker_specs=[{"worker_id": "client_ui", "owner_scope": "client role app"}],
+        worker_specs=[{"worker_id": "client_surface_worker", "owner_scope": "client role app"}],
     )
 
     worker = prepared["workers"][0]  # type: ignore[index]
-    assert worker["branch_run_id"] == "run_main__worker__client_ui"
+    assert worker["branch_run_id"] == "run_main__worker__client_surface_worker"
     assert Path(worker["source_dir"], "miniapp/app/static/client/app.js").exists()
 
 
@@ -1843,12 +1859,12 @@ def test_worker_branch_loop_runs_own_tool_transcript_and_patch(tmp_path: Path) -
     result = AgentWorkerBranchLoop(openai_client=OpenAIStub(), workspace_service=workspace).run(  # type: ignore[arg-type]
         workspace_id="ws",
         parent_run_id="run_main",
-        branch_run_id="run_main__worker__client_ui",
+        branch_run_id="run_main__worker__client_surface_worker",
         branch_source=branch_source,
         generation_mode=GenerationMode.FAST,
         model_profile="",
         user_prompt="Build a role-separated mobile mini-app.",
-        worker_task={"worker_id": "client_ui", "owner_scope": "client role app"},
+        worker_task={"worker_id": "client_surface_worker", "owner_scope": "client role app"},
         worker_prefix={"plan": "generic"},
         max_steps=1,
     )

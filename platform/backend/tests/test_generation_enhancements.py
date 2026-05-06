@@ -46,8 +46,8 @@ def test_project_instructions_skills_slash_commands_and_worker_roles(tmp_path: P
     assert any(item["name"] == "/visual-qa" for item in slash["items"])
     assert resolved["ui_action"]["type"] == "submit_composer_with_prompt"
     assert "Polish the current app visually" in resolved["prompt_template"]
-    assert any(item["worker_id"] == "backend_api_worker" and "backend_api" in item["alias_ids"] for item in workers["items"])
-    assert any(item["worker_id"] == "mobile_polish_worker" and "fresh_verifier" in item["alias_ids"] for item in workers["items"])
+    assert any(item["worker_id"] == "backend_api_worker" and item["alias_ids"] == [] for item in workers["items"])
+    assert any(item["worker_id"] == "mobile_polish_worker" and item["alias_ids"] == [] for item in workers["items"])
 
 
 def test_trace_bundle_writes_payloads_and_reduces_state(tmp_path: Path) -> None:
@@ -270,6 +270,30 @@ def test_acceptance_visual_trace_and_magic_docs_reports(tmp_path: Path) -> None:
     assert magic["schema"] == "grounded.magic_doc.v1"
     assert magic["write_status"] == "written"
     assert (app.state.container.workspace_service.source_dir(workspace["workspace_id"]) / "docs/product-architecture.md").exists()
+
+
+def test_acceptance_scenarios_block_when_contract_missing(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = _workspace(client)
+    run = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Build a prompt-defined role workflow",
+        intent="create",
+        target_role_scope=["client", "specialist", "manager"],
+        model_profile="test",
+        status="blocked",
+        apply_status="blocked",
+    )
+    app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+
+    scenarios = client.get(f"/runs/{run.run_id}/acceptance-scenarios").json()
+
+    assert scenarios["schema"] == "grounded.acceptance_scenarios.v1"
+    assert scenarios["status"] == "blocked_contract_missing"
+    assert scenarios["items"] == []
+    assert scenarios["blocking"] is True
+    assert "fallback" in scenarios["message"]
 
 
 def test_context_pack_includes_workspace_memory_and_instruction_summary(tmp_path: Path) -> None:

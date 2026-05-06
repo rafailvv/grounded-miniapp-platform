@@ -5,6 +5,7 @@ from typing import Any, Callable
 from app.models.domain import DraftAction
 from app.modules.miniapp_agent_loop.edit_validator import AgentEditValidator
 from app.modules.miniapp_agent_loop.agent_worker_manager import AgentWorkerManager
+from app.modules.miniapp_agent_loop.product_workers import canonical_worker_id
 
 
 MUTATING_AGENT_TOOLS = {"apply_patch_to_draft", "write_file", "edit_file_exact"}
@@ -185,15 +186,20 @@ def _normalize_agent_file_path(raw_path: object, *, worker_id: str | None = None
         path = path[len("source/") :]
     if path.startswith("miniapp/"):
         return path
-    worker = str(worker_id or "").strip()
-    if worker in {"client_ui", "specialist_ui", "manager_ui"}:
-        role = worker.removesuffix("_ui")
+    worker = canonical_worker_id(str(worker_id or "").strip())
+    role_by_worker = {
+        "client_surface_worker": "client",
+        "specialist_surface_worker": "specialist",
+        "manager_surface_worker": "manager",
+    }
+    if worker in role_by_worker:
+        role = role_by_worker[worker]
         if path in {"index.html", "app.js", "styles.css"}:
             return f"miniapp/app/static/{role}/{path}"
-    if worker == "generated_tests":
+    if worker == "test_verifier_worker":
         if path in {"test_generated_app.py", "generated_app.test.mjs"}:
             return f"miniapp/tests/{path}"
-    if worker == "backend_api":
+    if worker == "backend_api_worker":
         if path in {"main.py", "db.py", "schemas.py"}:
             return f"miniapp/app/{path}"
         if path.endswith(".py") and "/" not in path:

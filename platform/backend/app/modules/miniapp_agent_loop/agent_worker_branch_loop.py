@@ -21,7 +21,7 @@ from app.modules.miniapp_agent_loop.agent_tool_changes import (
 from app.modules.miniapp_agent_loop.agent_tool_registry import AgentToolRegistry
 from app.modules.miniapp_agent_loop.agent_transcript import AgentTranscriptStore
 from app.modules.miniapp_agent_loop.agent_worker_manager import AgentWorkerManager
-from app.modules.miniapp_agent_loop.product_workers import canonical_worker_id, legacy_worker_id, path_is_allowed
+from app.modules.miniapp_agent_loop.product_workers import canonical_worker_id, path_is_allowed
 from app.modules.miniapp_agent_loop.edit_validator import AgentEditValidator
 from app.modules.miniapp_agent_loop.semantic_tools import semantic_scan
 from app.modules.miniapp_agent_loop.agent_tool_runtime import normalize_tool_calls
@@ -516,10 +516,15 @@ class AgentWorkerBranchLoop:
             )
 
     def _owned_completion_missing(self, worker_id: str, branch_source: Path) -> list[str]:
-        worker = legacy_worker_id(worker_id)
+        worker = canonical_worker_id(worker_id)
         missing: list[str] = []
-        if worker in {"client_ui", "specialist_ui", "manager_ui"}:
-            role = worker.removesuffix("_ui")
+        role_by_worker = {
+            "client_surface_worker": "client",
+            "specialist_surface_worker": "specialist",
+            "manager_surface_worker": "manager",
+        }
+        if worker in role_by_worker:
+            role = role_by_worker[worker]
             role_dir = branch_source / "miniapp/app/static" / role
             html = self._read_text(role_dir / "index.html")
             js = self._read_text(role_dir / "app.js")
@@ -530,7 +535,7 @@ class AgentWorkerBranchLoop:
                 missing.append(f"{role}/app.js API fetch handlers")
             if self._looks_like_placeholder_css(css):
                 missing.append(f"{role}/styles.css non-placeholder mobile styling")
-        elif worker == "backend_api":
+        elif worker == "backend_api_worker":
             main = self._read_text(branch_source / "miniapp/app/main.py")
             routes_text = "\n".join(
                 self._read_text(path)
@@ -543,7 +548,7 @@ class AgentWorkerBranchLoop:
                 missing.append("backend prompt-owned mutating API route")
             if any(marker in routes_text for marker in ("APIRouter(prefix=\"/api", "APIRouter(prefix='/api")) and "include_router" not in main:
                 missing.append("app.main includes API router")
-        elif worker == "generated_tests":
+        elif worker == "test_verifier_worker":
             py_test = self._read_text(branch_source / "miniapp/tests/test_generated_app.py")
             js_test = self._read_text(branch_source / "miniapp/tests/generated_app.test.mjs")
             if "unittest.TestCase" not in py_test or "def test_" not in py_test:
@@ -619,13 +624,18 @@ class AgentWorkerBranchLoop:
 
     @staticmethod
     def _role_surface_isolation_errors(worker_id: str, item: DraftAction) -> list[str]:
-        legacy_worker = legacy_worker_id(worker_id)
-        if legacy_worker not in {"client_ui", "specialist_ui", "manager_ui"}:
+        canonical = canonical_worker_id(worker_id)
+        role_by_worker = {
+            "client_surface_worker": "client",
+            "specialist_surface_worker": "specialist",
+            "manager_surface_worker": "manager",
+        }
+        if canonical not in role_by_worker:
             return []
         normalized = str(item.file_path or "").strip().replace("\\", "/")
         if not normalized.endswith((".html", ".js")):
             return []
-        role = legacy_worker.removesuffix("_ui")
+        role = role_by_worker[canonical]
         if f"miniapp/app/static/{role}/" not in normalized:
             return []
         text = f"{item.content or ''}\n{item.diff or ''}".lower()
@@ -663,16 +673,16 @@ class AgentWorkerBranchLoop:
         canonical = canonical_worker_id(worker_id)
         if path_is_allowed(canonical, path):
             return True
-        worker_id = legacy_worker_id(worker_id)
+        worker_id = canonical_worker_id(worker_id)
         owner = AgentWorkerManager.owner_for_path(path)
         if owner == worker_id:
             return True
         normalized = str(path or "").strip().replace("\\", "/")
         if owner == "shared_runtime" and normalized.startswith("miniapp/app/generated"):
-            return worker_id in {"backend_api", "generated_tests"}
+            return worker_id in {"backend_api_worker", "test_verifier_worker"}
         if owner == "shared_runtime" and normalized.startswith("miniapp/app/static/shared"):
-            return worker_id in {"client_ui", "specialist_ui", "manager_ui"}
-        if owner == "shared_runtime" and worker_id in {"backend_api", "generated_tests"}:
+            return worker_id in {"client_surface_worker", "specialist_surface_worker", "manager_surface_worker"}
+        if owner == "shared_runtime" and worker_id in {"backend_api_worker", "test_verifier_worker"}:
             return True
         return False
 
@@ -864,10 +874,10 @@ class AgentWorkerBranchLoop:
             ),
             "worker_feedback": list(worker_feedback or [])[-4:],
             "owned_slice_completion": {
-                "client_ui": ["index.html", "child page index.html files", "app.js", "styles.css with the prompt-derived client/source flow"],
-                "specialist_ui": ["index.html", "child page index.html files", "app.js", "styles.css with a POST/PATCH/PUT update flow when the prompt requires persisted changes"],
-                "manager_ui": ["index.html", "child page index.html files", "app.js", "styles.css with shared-state visibility and any manager-owned creation/control flow from the prompt"],
-                "generated_tests": [
+                "client_surface_worker": ["index.html", "child page index.html files", "app.js", "styles.css with the prompt-derived client/source flow"],
+                "specialist_surface_worker": ["index.html", "child page index.html files", "app.js", "styles.css with a POST/PATCH/PUT update flow when the prompt requires persisted changes"],
+                "manager_surface_worker": ["index.html", "child page index.html files", "app.js", "styles.css with shared-state visibility and any manager-owned creation/control flow from the prompt"],
+                "test_verifier_worker": [
                     "test_generated_app.py as import unittest + unittest.TestCase test_* methods",
                     "FastAPI tests must use `with TestClient(app) as client:` or explicitly create tables after importing generated ORM models before requests",
                     "generated_app.test.mjs as node:test",
@@ -877,7 +887,7 @@ class AgentWorkerBranchLoop:
                     "tests must import/run cleanly; do not write pytest-only top-level functions for Python",
                     "Python helpers must be valid code, for example '\\n'.join([a, b, c]) not str.join(a, b, c)",
                 ],
-                "backend_api": [
+                "backend_api_worker": [
                     "registered routes",
                     "schemas",
                     "table creation before requests",

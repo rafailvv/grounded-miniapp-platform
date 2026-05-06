@@ -1,4 +1,4 @@
-import type { RunCompactionBoundaries, RunCompactionReport, RunProtocolReport, RunTraceView, TraceBundleReport } from "../lib/api";
+import type { RunCompactionBoundaries, RunCompactionReport, RunProtocolReport, RunRepairCases, RunTraceView, TraceBundleReport } from "../lib/api";
 
 type TracePanelProps = {
   trace: RunTraceView | null;
@@ -6,9 +6,10 @@ type TracePanelProps = {
   protocol: RunProtocolReport | null;
   compaction: RunCompactionReport | null;
   compactionBoundaries: RunCompactionBoundaries | null;
+  repairCases: RunRepairCases | null;
 };
 
-export function TracePanel({ trace, traceBundle, protocol, compaction, compactionBoundaries }: TracePanelProps) {
+export function TracePanel({ trace, traceBundle, protocol, compaction, compactionBoundaries, repairCases }: TracePanelProps) {
   if (!trace) {
     return (
       <div className="workbench-panel">
@@ -38,6 +39,8 @@ export function TracePanel({ trace, traceBundle, protocol, compaction, compactio
   const sectionCount = Object.keys(compactionSections).length;
   const bookmarks = protocol?.bookmarks || [];
   const latestBookmark = protocol?.latest_bookmark || bookmarks[0];
+  const cases = repairCases?.items || [];
+  const activeCase = repairCases?.active_case || cases.find((item) => ["open", "failed_attempt", "blocked"].includes(item.status)) || null;
   const protocolCounts = protocolEvents.reduce<Record<string, number>>((acc, event) => {
     acc[event.type] = (acc[event.type] || 0) + 1;
     return acc;
@@ -219,6 +222,62 @@ export function TracePanel({ trace, traceBundle, protocol, compaction, compactio
         ) : null}
         {(compactionSections.next_repair_action as Record<string, unknown> | undefined) ? (
           <p className="muted">Next repair: {String((compactionSections.next_repair_action as Record<string, unknown>).failure_signature || (compactionSections.next_repair_action as Record<string, unknown>).required_next_tool || "recorded")}</p>
+        ) : null}
+      </div>
+      <div className="workbench-panel">
+        <div className="workbench-panel-header">
+          <strong>Repair cases</strong>
+          <span>{repairCases?.status || "missing"}</span>
+        </div>
+        <div className="trace-bundle-grid">
+          <div>
+            <strong>{cases.length}</strong>
+            <span>cases</span>
+          </div>
+          <div>
+            <strong>{activeCase ? activeCase.status : "none"}</strong>
+            <span>active</span>
+          </div>
+          <div>
+            <strong>{activeCase?.attempts?.length ?? 0}</strong>
+            <span>attempts</span>
+          </div>
+          <div>
+            <strong>{activeCase?.target_files?.length ?? 0}</strong>
+            <span>targets</span>
+          </div>
+        </div>
+        {activeCase ? (
+          <div className="run-detail-list compact">
+            <div className="run-detail-item">
+              <strong>{activeCase.failure_class || activeCase.issue_code || activeCase.case_id}</strong>
+              <span>{activeCase.likely_cause || activeCase.failure_signature || "evidence-driven repair case"}</span>
+            </div>
+            {activeCase.target_files?.slice(0, 4).map((file) => (
+              <div className="run-detail-item" key={`repair-target-${file}`}>
+                <strong>target</strong>
+                <span>{file}</span>
+              </div>
+            ))}
+            {activeCase.expected_proof?.slice(0, 3).map((proof, index) => (
+              <div className="run-detail-item" key={`repair-proof-${index}`}>
+                <strong>{String(proof.type || "proof")}</strong>
+                <span>{String(proof.status || proof.check || proof.ref || "required")}</span>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <p className="muted">No active repair case.</p>
+        )}
+        {cases.length ? (
+          <div className="timeline-list">
+            {cases.slice(0, 6).map((item) => (
+              <div className="timeline-event" key={item.case_id}>
+                <strong>{item.failure_class || item.issue_code || item.case_id}</strong>
+                <span>{item.status} · {item.attempts?.length ?? 0} attempts</span>
+              </div>
+            ))}
+          </div>
         ) : null}
       </div>
       {sections.map(([title, items]) => (

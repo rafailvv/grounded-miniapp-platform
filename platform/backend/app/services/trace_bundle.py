@@ -179,6 +179,8 @@ class TraceBundleReducer:
         memory_edges: list[dict[str, Any]] = []
         diff_edges: list[dict[str, Any]] = []
         acceptance_gate: list[dict[str, Any]] = []
+        repair_events: list[dict[str, Any]] = []
+        patch_hash_counts: dict[str, int] = {}
         for raw in raw_events:
             payload = TraceBundleReducer._read_json(bundle_dir / str(raw.get("payload_ref") or ""))
             event = {**raw, "payload": payload}
@@ -229,9 +231,15 @@ class TraceBundleReducer:
             if details.get("artifact_ref"):
                 artifacts.append({"event_seq": raw.get("seq"), "artifact_ref": details.get("artifact_ref"), "event_type": event_type})
             if event_type in {"turn_diff_before", "turn_diff_after"}:
-                diff_edges.append(TraceBundleReducer._compact_event(event))
+                compact = TraceBundleReducer._compact_event(event)
+                diff_edges.append(compact)
+                digest = str(payload.get("diff_sha256") or payload.get("patch_sha256") or details.get("diff_sha256") or "")
+                if digest:
+                    patch_hash_counts[digest] = patch_hash_counts.get(digest, 0) + 1
             if event_type == "final_acceptance_gate_decision":
                 acceptance_gate.append(TraceBundleReducer._compact_event(event))
+            if "repair" in event_type or details.get("repair_packets") or payload.get("repair_case_id"):
+                repair_events.append(TraceBundleReducer._compact_event(event))
             status = str(details.get("status") or payload.get("status") or "").lower() if isinstance(payload, dict) else ""
             if status in {"failed", "blocked", "conflict", "forbidden", "error"} or event_type in {"job_failed", "worker_failed", "tool_failed_reason"}:
                 blockers.append(TraceBundleReducer._compact_event(event))
@@ -239,11 +247,16 @@ class TraceBundleReducer:
                 proof_edges.append(TraceBundleReducer._compact_event(event))
         next_action = {"action": "none", "reason": "No blocking trace event."}
         if blockers:
+            next_best = repair_events[-1] if repair_events else blockers[-1]
             next_action = {
                 "action": "repair",
                 "reason": "Trace bundle contains blocking events.",
-                "event_seq": blockers[0].get("seq"),
+                "event_seq": next_best.get("seq"),
             }
+        last_failed_attempt = blockers[-1] if blockers else {}
+        repeated_digest = next((digest for digest, count in patch_hash_counts.items() if count > 1), "")
+        repeated_action = {"status": "repeated", "patch_sha256": repeated_digest} if repeated_digest else {}
+        stale_diff = {"status": "suspected", "reason": "latest blocking event is an edit/read-state failure", "event": last_failed_attempt} if "stale" in json.dumps(last_failed_attempt, ensure_ascii=False, default=str).lower() else {}
         return {
             "schema": "grounded.trace_bundle_state.v1",
             "trace_id": manifest.get("trace_id"),
@@ -263,6 +276,10 @@ class TraceBundleReducer:
             "artifacts": artifacts[-160:],
             "payload_refs": payload_refs[-300:],
             "next_action": next_action,
+            "last_failed_attempt": last_failed_attempt,
+            "repeated_action": repeated_action,
+            "next_best_repair_case": repair_events[-1] if repair_events else (blockers[-1] if blockers else {}),
+            "stale_diff": stale_diff,
             "reduced_at": _now(),
         }
 

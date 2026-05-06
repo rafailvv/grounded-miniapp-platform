@@ -575,27 +575,27 @@ def orchestration_metadata_for_contract(
     ]
     worker_summaries = [
         {
-            "worker": "backend_api",
+            "worker": "backend_api_worker",
             "ownership": ["miniapp/app/routes/**", "miniapp/app/main.py", "miniapp/app/db.py", "miniapp/app/schemas.py"],
             "responsibility": "Prompt-derived persistent resources, read/write APIs, and route registration.",
         },
         {
-            "worker": "client_ui",
+            "worker": "client_surface_worker",
             "ownership": ["miniapp/app/static/client/**"],
             "responsibility": "User-facing forms, saved-state controls, and client-side API calls.",
         },
         {
-            "worker": "specialist_ui",
+            "worker": "specialist_surface_worker",
             "ownership": ["miniapp/app/static/specialist/**"],
             "responsibility": "Prompt-derived specialist workflow, role actions, and saved-state visibility.",
         },
         {
-            "worker": "manager_ui",
+            "worker": "manager_surface_worker",
             "ownership": ["miniapp/app/static/manager/**"],
             "responsibility": "Prompt-derived manager workflow, shared-state visibility, and any manager-owned source/update controls.",
         },
         {
-            "worker": "generated_tests",
+            "worker": "test_verifier_worker",
             "ownership": ["miniapp/tests/test_generated_app.py", "miniapp/tests/generated_app.test.mjs"],
             "responsibility": "Acceptance tests covering every required flow in the contract.",
         },

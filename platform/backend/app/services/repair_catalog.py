@@ -519,25 +519,26 @@ class RepairCatalog:
         for entry in REPAIR_CATALOG:
             if any(pattern.search(text) for pattern in entry.patterns):
                 return entry.packet(evidence=issue)
+        issue_code = str(issue.get("code") or issue.get("check") or "uncatalogued_repair_case")
         return {
-            "signature": str(issue.get("signature") or issue.get("failure_signature") or "generation.unknown_failure"),
-            "issue_code": str(issue.get("code") or issue.get("check") or "unknown_failure"),
-            "code": str(issue.get("code") or issue.get("check") or "unknown_failure"),
+            "signature": str(issue.get("signature") or issue.get("failure_signature") or f"repair.uncatalogued_repair_case:{issue_code}"),
+            "issue_code": issue_code,
+            "code": issue_code,
             "severity": str(issue.get("severity") or "medium"),
-            "likely_root_cause": str(issue.get("details") or issue.get("message") or "The run failed without a catalogued signature."),
+            "likely_root_cause": str(issue.get("details") or issue.get("message") or "The run failed without a catalogued signature; create an evidence-driven repair case before patching."),
             "target_files": list(issue.get("paths") or []),
             "verification_check": str(issue.get("check") or "checks.run"),
             "verification_command": str(issue.get("verification_command") or "run_checks"),
-            "instruction": "Inspect the concrete check logs, patch the implicated files, and rerun the failing check.",
-            "auto_fixable": False,
+            "instruction": "Create an evidence-driven repair case: collect exact diagnostics for implicated files, patch only the constrained slice, and rerun the failing check.",
+            "auto_fixable": True,
             "required_next_tool": str(issue.get("required_next_tool") or "read_files"),
             "suggested_tool_after_read": str(issue.get("suggested_tool_after_read") or "apply_patch_to_draft_or_write_file"),
-            "retry_policy": str(issue.get("retry_policy") or "manual_triage"),
-            "retryable": bool(issue.get("retryable", False)),
+            "retry_policy": str(issue.get("retry_policy") or "evidence_driven_repair_case"),
+            "retryable": bool(issue.get("retryable", True)),
             "deterministic": bool(issue.get("deterministic", True)),
             "failure_class": str(issue.get("failure_class") or issue.get("check") or "checks.run"),
-            "failure_signature": str(issue.get("failure_signature") or issue.get("signature") or "generation.unknown_failure"),
-            "repair_recipe_id": str(issue.get("repair_recipe_id") or f"catalog.{issue.get('code') or issue.get('check') or 'unknown_failure'}"),
+            "failure_signature": str(issue.get("failure_signature") or issue.get("signature") or f"repair.uncatalogued_repair_case:{issue_code}"),
+            "repair_recipe_id": str(issue.get("repair_recipe_id") or f"catalog.{issue.get('code') or issue.get('check') or 'uncatalogued_repair_case'}"),
             "forbidden_tools_once": list(issue.get("forbidden_tools_once") or []),
             "expected_proof": str(issue.get("expected_proof") or issue.get("check") or "rerun failing check successfully"),
             "next_forced_action": {

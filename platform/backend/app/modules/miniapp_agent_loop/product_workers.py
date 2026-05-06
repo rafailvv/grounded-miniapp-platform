@@ -29,7 +29,7 @@ PRODUCT_WORKERS: tuple[ProductWorkerRole, ...] = (
     ProductWorkerRole(
         worker_id="backend_api_worker",
         worker_type="backend_api_worker",
-        aliases=("backend_api",),
+        aliases=(),
         owner_scope="Backend API, schemas, persistence, and shared role state",
         allowed_paths=("miniapp/app/routes", "miniapp/app/schemas.py", "miniapp/app/db.py", "miniapp/app/main.py"),
         forbidden_paths=("miniapp/app/static/client", "miniapp/app/static/specialist", "miniapp/app/static/manager", "miniapp/tests"),
@@ -39,7 +39,7 @@ PRODUCT_WORKERS: tuple[ProductWorkerRole, ...] = (
     ProductWorkerRole(
         worker_id="client_surface_worker",
         worker_type="client_surface_worker",
-        aliases=("client_ui",),
+        aliases=(),
         owner_scope="Client role surface and client child pages",
         allowed_paths=("miniapp/app/static/client",),
         forbidden_paths=("miniapp/app/static/specialist", "miniapp/app/static/manager", "miniapp/app/routes", "miniapp/tests"),
@@ -49,7 +49,7 @@ PRODUCT_WORKERS: tuple[ProductWorkerRole, ...] = (
     ProductWorkerRole(
         worker_id="specialist_surface_worker",
         worker_type="specialist_surface_worker",
-        aliases=("specialist_ui",),
+        aliases=(),
         owner_scope="Specialist role surface and specialist child pages",
         allowed_paths=("miniapp/app/static/specialist",),
         forbidden_paths=("miniapp/app/static/client", "miniapp/app/static/manager", "miniapp/app/routes", "miniapp/tests"),
@@ -59,7 +59,7 @@ PRODUCT_WORKERS: tuple[ProductWorkerRole, ...] = (
     ProductWorkerRole(
         worker_id="manager_surface_worker",
         worker_type="manager_surface_worker",
-        aliases=("manager_ui",),
+        aliases=(),
         owner_scope="Manager role surface and manager child pages",
         allowed_paths=("miniapp/app/static/manager",),
         forbidden_paths=("miniapp/app/static/client", "miniapp/app/static/specialist", "miniapp/app/routes", "miniapp/tests"),
@@ -69,17 +69,17 @@ PRODUCT_WORKERS: tuple[ProductWorkerRole, ...] = (
     ProductWorkerRole(
         worker_id="test_verifier_worker",
         worker_type="test_verifier_worker",
-        aliases=("generated_tests", "verifier"),
+        aliases=(),
         owner_scope="Generated acceptance tests and independent verification artifacts",
         allowed_paths=("miniapp/tests",),
         forbidden_paths=("miniapp/app/static/client", "miniapp/app/static/specialist", "miniapp/app/static/manager"),
         role=None,
-        expected_proof=("generated_tests", "api_workflow_smoke", "browser_flow_smoke"),
+        expected_proof=("generated_acceptance_tests", "api_workflow_smoke", "browser_flow_smoke"),
     ),
     ProductWorkerRole(
         worker_id="mobile_polish_worker",
         worker_type="mobile_polish_worker",
-        aliases=("design_verifier", "fresh_verifier"),
+        aliases=(),
         owner_scope="Mobile polish pass for role UI surfaces after green workflow",
         allowed_paths=("miniapp/app/static/client", "miniapp/app/static/specialist", "miniapp/app/static/manager", "miniapp/app/static/shared"),
         forbidden_paths=("miniapp/app/routes", "miniapp/app/schemas.py", "miniapp/app/db.py", "miniapp/tests"),
@@ -89,7 +89,7 @@ PRODUCT_WORKERS: tuple[ProductWorkerRole, ...] = (
     ProductWorkerRole(
         worker_id="repair_worker",
         worker_type="repair_worker",
-        aliases=("repair",),
+        aliases=(),
         owner_scope="Owned repair slice from a failure signature or repair packet",
         allowed_paths=("miniapp/app", "miniapp/tests"),
         forbidden_paths=("runtime", ".github", "docker"),
@@ -102,20 +102,15 @@ PRODUCT_WORKERS: tuple[ProductWorkerRole, ...] = (
 def canonical_worker_id(worker_id: str) -> str:
     value = str(worker_id or "").strip()
     for role in PRODUCT_WORKERS:
-        if value == role.worker_id or value in role.aliases:
+        if value == role.worker_id:
             return role.worker_id
     return value
-
-
-def legacy_worker_id(worker_id: str) -> str:
-    role = role_for_worker(worker_id)
-    return role.aliases[0] if role and role.aliases else str(worker_id or "").strip()
 
 
 def role_for_worker(worker_id: str) -> ProductWorkerRole | None:
     canonical = str(worker_id or "").strip()
     for role in PRODUCT_WORKERS:
-        if canonical == role.worker_id or canonical in role.aliases:
+        if canonical == role.worker_id:
             return role
     return None
 
@@ -163,7 +158,7 @@ def select_memory_items(memory: dict[str, Any], *, worker_id: str, limit: int = 
     role = role_for_worker(worker_id)
     selected: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
-    role_terms = {str(role.role or ""), canonical_worker_id(worker_id), legacy_worker_id(worker_id)}
+    role_terms = {str(role.role or ""), canonical_worker_id(worker_id)}
     role_terms = {item for item in role_terms if item}
     for item in memory.get("items") or []:
         if not isinstance(item, dict):

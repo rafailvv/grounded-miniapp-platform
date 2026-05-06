@@ -20,7 +20,6 @@ from app.modules.miniapp_agent_loop.agent_worker_manager import AgentWorkerManag
 from app.modules.miniapp_agent_loop.product_workers import (
     PRODUCT_WORKERS,
     canonical_worker_id,
-    legacy_worker_id,
     ownership_for_worker,
     worker_refs,
 )
@@ -41,6 +40,7 @@ from app.services.generation_enhancements import (
 )
 from app.services.miniapp_contract import MiniAppContractMaterializer, MiniAppRouteRegistry
 from app.services.repair_catalog import RepairCatalog
+from app.services.repair_cases import RepairCaseService
 from app.services.run_state_machine import RunStateMachine
 from app.services.tool_protocol import TOOL_PROTOCOL_VERSION, tool_envelope, tool_registry_contract
 from app.services.memory_pipeline import WorkspaceMemoryPipeline
@@ -75,6 +75,7 @@ class WorkbenchService:
         run_protocol_service: RunProtocolService | None = None,
         run_compaction_service: RunCompactionService | None = None,
         background_task_service: BackgroundTaskService | None = None,
+        repair_case_service: RepairCaseService | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
@@ -86,6 +87,7 @@ class WorkbenchService:
         self.run_protocol_service = run_protocol_service
         self.run_compaction_service = run_compaction_service
         self.background_task_service = background_task_service
+        self.repair_case_service = repair_case_service or RepairCaseService(store)
 
     def tool_events(self, run_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
@@ -442,7 +444,6 @@ class WorkbenchService:
         lanes = []
         for worker_id in worker_ids:
             canonical = canonical_worker_id(worker_id)
-            aliases = [legacy_worker_id(canonical), *[alias for role in PRODUCT_WORKERS if role.worker_id == canonical for alias in role.aliases]]
             summaries = [
                 item
                 for item in run.worker_summaries
@@ -465,7 +466,7 @@ class WorkbenchService:
                 ),
                 {},
             )
-            task = real_tasks.get(canonical) or real_tasks.get(legacy_worker_id(canonical)) or {}
+            task = real_tasks.get(canonical) or {}
             status = self._worker_status(canonical, run, summaries, merge_reports, mailbox_workers)
             if isinstance(output, dict) and output.get("status"):
                 status = str(output.get("status"))
@@ -475,7 +476,7 @@ class WorkbenchService:
                 {
                     "worker_id": canonical,
                     "worker_type": canonical,
-                    "alias_ids": sorted({alias for alias in aliases if alias and alias != canonical}),
+                    "alias_ids": [],
                     "status": status,
                     "badge": str(output.get("badge") or status) if isinstance(output, dict) else status,
                     "owner_scope": self._worker_scope(canonical),
@@ -532,9 +533,29 @@ class WorkbenchService:
             )
         if background_items:
             items = [*background_items, *items]
+        repair_cases = self.repair_case_service.list_cases(run_id)
+        repair_tasks = [
+            {
+                "task_id": f"{case.get('case_id')}:repair",
+                "title": str(case.get("failure_signature") or case.get("issue_code") or "Repair case"),
+                "phase": "repair_case",
+                "status": "blocked" if case.get("status") in {"blocked", "failed_attempt"} else str(case.get("status") or "planned"),
+                "owner": "repair_worker",
+                "files": list(case.get("target_files") or []),
+                "proof": {"expected": case.get("expected_proof"), "case_id": case.get("case_id")},
+                "blocker": case.get("likely_cause"),
+                "artifact_refs": {"repair_case": RepairCaseService.case_ref(run.workspace_id, run_id, str(case.get("case_id")))},
+                "source": "repair_case",
+                "updated_at": case.get("updated_at"),
+            }
+            for case in repair_cases.get("items") or []
+            if isinstance(case, dict)
+        ]
+        if repair_tasks:
+            items = [*repair_tasks, *items]
         if not items:
             items = self._tasks_from_activity(run)
-        return {"schema": "grounded.run_tasks.v1", "run_id": run_id, "workspace_id": run.workspace_id, "status": run.status, "items": items}
+        return {"schema": "grounded.run_tasks.v1", "run_id": run_id, "workspace_id": run.workspace_id, "status": run.status, "items": items, "repair_cases": repair_cases}
 
     def create_background_task(self, payload: dict[str, Any]) -> dict[str, Any]:
         if self.background_task_service is None:
@@ -736,6 +757,7 @@ class WorkbenchService:
         findings.extend(self._review_contract_findings(run=run, check_by_name=check_by_name, acceptance_required=acceptance_required))
         findings = self._dedupe_review_findings(findings)
         findings.sort(key=self._review_finding_sort_key)
+        repair_cases = self.repair_case_service.sync_from_review(run=run, findings=findings)
         blocker_count = sum(1 for item in findings if item.get("is_blocker_for_product_acceptance"))
         severity_counts: dict[str, int] = {}
         for item in findings:
@@ -756,6 +778,7 @@ class WorkbenchService:
                 "contract_mismatches": sum(1 for item in findings if item.get("category") == "product_contract"),
             },
             "findings": findings,
+            "repair_cases": repair_cases,
             "evidence": {
                 "diff_available": bool(artifacts.get("diff")),
                 "changed_files": changed_files,
@@ -1166,10 +1189,22 @@ class WorkbenchService:
         next_forced_action = dict((checkpoint or {}).get("next_forced_action") or {}) if isinstance(checkpoint, dict) else {}
         blocking = any(item.get("blocking", True) for item in issues)
         repair_packets = RepairCatalog.classify_many(issues)
-        repair_packets = self._llm_refine_unknown_repair_packets(run, artifacts, issues, repair_packets)
+        repair_packets = self._normalize_uncatalogued_repair_packets(run, issues, repair_packets)
         include_checkpoint_packets = bool(blocking or run.status not in {"completed", "awaiting_approval"})
         if checkpoint_packets and include_checkpoint_packets:
             repair_packets = [*checkpoint_packets, *repair_packets]
+        try:
+            trace_state = self.trace_bundle_state(run_id)
+        except Exception:
+            trace_state = {}
+        repair_cases = self.repair_case_service.sync_from_packets(
+            workspace_id=run.workspace_id,
+            run_id=run_id,
+            packets=repair_packets,
+            source="gate",
+            trace_state=trace_state if isinstance(trace_state, dict) else {},
+        ) if repair_packets else self.repair_case_service.list_cases(run_id)
+        repair_packets = RepairCaseService.enrich_packets(repair_packets, repair_cases)
         repair_history = [
             {**item, "resolved": True}
             for item in checkpoint_packets
@@ -1183,6 +1218,7 @@ class WorkbenchService:
             "blocking": blocking,
             "issues": issues,
             "repair_packets": repair_packets,
+            "repair_cases": repair_cases,
             "repair_history": repair_history,
             "next_forced_action": next_forced_action,
             "blocking_repair_packet": repair_packets[0] if blocking and repair_packets else {},
@@ -1201,6 +1237,7 @@ class WorkbenchService:
                 "final_report": f"final_report:{run_id}",
                 "resume_checkpoint": run.resume_checkpoint_ref,
                 "diagnostics_delta": (checkpoint or {}).get("diagnostics_delta_ref") if isinstance(checkpoint, dict) else None,
+                "repair_cases": RepairCaseService.index_ref(run_id),
             },
         }
         browser_proof = self._normalize_browser_proof_payload(run, artifacts)
@@ -1241,17 +1278,26 @@ class WorkbenchService:
         gate = self.gate(run_id)
         explicit = [item for item in run.repair_issue_signatures if isinstance(item, dict)]
         packets = RepairCatalog.classify_many([*explicit, *gate.get("issues", [])])
-        packets = self._llm_refine_unknown_repair_packets(run, self._run_artifacts_or_empty(run_id), [*explicit, *gate.get("issues", [])], packets)
+        packets = self._normalize_uncatalogued_repair_packets(run, [*explicit, *gate.get("issues", [])], packets)
         checkpoint = self.store.get("reports", run.resume_checkpoint_ref) if run.resume_checkpoint_ref else None
         checkpoint_packets = list((checkpoint or {}).get("repair_packets") or []) if isinstance(checkpoint, dict) else []
         include_checkpoint_packets = bool(gate.get("blocking") or run.status not in {"completed", "awaiting_approval"})
         if checkpoint_packets and include_checkpoint_packets:
             packets = [*checkpoint_packets, *packets]
+        repair_cases = self.repair_case_service.sync_from_packets(
+            workspace_id=run.workspace_id,
+            run_id=run_id,
+            packets=packets,
+            source="repair_signatures",
+            trace_state=self.store.get("reports", f"trace_reducer:{run.workspace_id}:{run_id}") or {},
+        ) if packets else self.repair_case_service.list_cases(run_id)
+        packets = RepairCaseService.enrich_packets(packets, repair_cases)
         payload = {
             "run_id": run_id,
             "status": "available" if packets else "empty",
             "blocking": bool(gate.get("blocking")),
             "items": packets,
+            "repair_cases": repair_cases,
             "history": [
                 {**item, "resolved": True}
                 for item in checkpoint_packets
@@ -1263,57 +1309,65 @@ class WorkbenchService:
         self.store.upsert("reports", f"repair_signatures:{run_id}", payload)
         return payload
 
-    def _llm_refine_unknown_repair_packets(
+    def repair_cases(self, run_id: str) -> dict[str, Any]:
+        self.run_service.get_run(run_id)
+        self.gate(run_id)
+        return self.repair_case_service.list_cases(run_id)
+
+    def repair_case(self, run_id: str, case_id: str) -> dict[str, Any]:
+        self.run_service.get_run(run_id)
+        case = self.repair_case_service.get_case(run_id, case_id)
+        if not case:
+            raise KeyError(case_id)
+        return case
+
+    def repair_case_attempts(self, run_id: str, case_id: str) -> dict[str, Any]:
+        self.run_service.get_run(run_id)
+        payload = self.repair_case_service.attempts(run_id, case_id)
+        if payload.get("status") == "missing":
+            raise KeyError(case_id)
+        return payload
+
+    def retry_repair_case(self, run_id: str, case_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        request = self.repair_case_service.retry_request(run, case_id)
+        created = self.run_service.create_run(run.workspace_id, request)
+        return {
+            "schema": "grounded.repair_case_retry.v1",
+            "status": "started",
+            "run_id": run_id,
+            "case_id": case_id,
+            "retry_run": created.model_dump(mode="json"),
+        }
+
+    def _normalize_uncatalogued_repair_packets(
         self,
         run: RunRecord,
-        artifacts: dict[str, Any],
         issues: list[dict[str, Any]],
         packets: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         refined: list[dict[str, Any]] = []
-        unknown_issue_iter = iter([issue for issue in issues if isinstance(issue, dict)])
+        uncatalogued_issue_iter = iter([issue for issue in issues if isinstance(issue, dict)])
         for packet in packets:
-            if not self._is_unknown_repair_packet(packet):
+            if not self._is_uncatalogued_repair_packet(packet):
                 refined.append(packet)
                 continue
-            issue = next(unknown_issue_iter, packet)
+            issue = next(uncatalogued_issue_iter, packet)
             cache_key = self._repair_classifier_cache_key(run.run_id, issue)
             cached = self.store.get("reports", cache_key)
             if isinstance(cached, dict) and isinstance(cached.get("packet"), dict):
                 refined.append(dict(cached["packet"]))
                 continue
-            if not self.openai_client.enabled:
-                classified = self._llm_classifier_unavailable_packet(issue)
-                self.store.upsert("reports", cache_key, {"run_id": run.run_id, "packet": classified, "status": "blocked", "created_at": datetime.now(timezone.utc).isoformat()})
-                refined.append(classified)
-                continue
-            try:
-                classified_raw = self.openai_client.classify_repair_issue(
-                    issue=issue,
-                    run_context={
-                        "run_id": run.run_id,
-                        "prompt": run.prompt,
-                        "acceptance_contract": run.acceptance_contract,
-                        "diff_summary": {
-                            "changed_files": run.touched_files or self._paths_from_diff(str(artifacts.get("diff") or "")),
-                            "diff_available": bool(str(artifacts.get("diff") or "").strip()),
-                        },
-                        "browser_proof": run.browser_flow_proof or artifacts.get("browser_flow_proof") or {},
-                        "checks": artifacts.get("check_results") or [],
-                    },
-                    model_profile=run.model_profile,
-                    generation_mode=run.generation_mode,
-                )
-                classified = self._normalize_llm_repair_packet(classified_raw, issue)
-            except Exception as exc:
-                classified = self._llm_classifier_failed_packet(issue, exc)
-            self.store.upsert("reports", cache_key, {"run_id": run.run_id, "packet": classified, "status": classified.get("status") or "available", "created_at": datetime.now(timezone.utc).isoformat()})
+            classified = self._uncatalogued_repair_case_packet(issue)
+            self.store.upsert("reports", cache_key, {"run_id": run.run_id, "packet": classified, "status": "available", "created_at": datetime.now(timezone.utc).isoformat()})
             refined.append(classified)
         return refined
 
     @staticmethod
-    def _is_unknown_repair_packet(packet: dict[str, Any]) -> bool:
-        return str(packet.get("signature") or "") == "generation.unknown_failure" or str(packet.get("issue_code") or packet.get("code") or "") == "unknown_failure"
+    def _is_uncatalogued_repair_packet(packet: dict[str, Any]) -> bool:
+        signature = str(packet.get("signature") or "")
+        code = str(packet.get("issue_code") or packet.get("code") or "")
+        return "uncatalogued_repair_case" in signature or code == "uncatalogued_repair_case"
 
     @staticmethod
     def _repair_classifier_cache_key(run_id: str, issue: dict[str, Any]) -> str:
@@ -1321,88 +1375,38 @@ class WorkbenchService:
         return f"repair_llm_classifier:{run_id}:{digest}"
 
     @staticmethod
-    def _normalize_llm_repair_packet(raw: dict[str, Any], issue: dict[str, Any]) -> dict[str, Any]:
-        signature = str(raw.get("signature") or raw.get("failure_signature") or "llm_repair.classified").strip()
-        issue_code = str(raw.get("issue_code") or raw.get("code") or "llm_classified_repair").strip()
-        target_files = [
+    def _uncatalogued_repair_case_packet(issue: dict[str, Any]) -> dict[str, Any]:
+        paths = [
             str(item).strip().replace("\\", "/")
-            for item in raw.get("target_files") or issue.get("paths") or []
+            for item in issue.get("paths") or issue.get("target_files") or []
             if str(item).strip().replace("\\", "/").startswith("miniapp/")
         ][:8]
-        required_next_tool = str(raw.get("required_next_tool") or "read_files").strip() or "read_files"
-        suggested = str(raw.get("suggested_tool_after_read") or "write_file").strip() or "write_file"
+        check = str(issue.get("check") or issue.get("failure_class") or "checks.run")
+        signature = str(issue.get("failure_signature") or issue.get("signature") or f"repair.uncatalogued_repair_case:{check}")
         return {
             "signature": signature,
-            "issue_code": issue_code,
-            "code": issue_code,
-            "severity": str(raw.get("severity") or issue.get("severity") or "high"),
-            "likely_root_cause": str(raw.get("likely_root_cause") or issue.get("details") or "LLM repair classifier identified a concrete repair path."),
-            "target_files": target_files,
-            "verification_check": str(raw.get("verification_check") or issue.get("check") or "checks.run"),
-            "verification_command": str(raw.get("verification_command") or "run_checks"),
-            "instruction": str(raw.get("instruction") or "Read the target files, apply the classified repair, and rerun the failing check."),
-            "auto_fixable": bool(raw.get("retryable", True)),
-            "required_next_tool": required_next_tool,
-            "suggested_tool_after_read": suggested,
-            "retry_policy": "llm_classified_repair",
-            "retryable": bool(raw.get("retryable", True)),
-            "deterministic": False,
-            "failure_class": str(issue.get("failure_class") or issue.get("check") or "llm_repair_classifier"),
+            "issue_code": "uncatalogued_repair_case",
+            "code": "uncatalogued_repair_case",
+            "severity": str(issue.get("severity") or "high"),
+            "likely_root_cause": str(issue.get("details") or issue.get("message") or "Uncatalogued failure requires exact evidence before patching."),
+            "target_files": paths,
+            "verification_check": check,
+            "verification_command": str(issue.get("verification_command") or "run_checks"),
+            "instruction": "Collect exact diagnostics for the implicated file/check, patch only the constrained slice, and rerun the failing proof.",
+            "auto_fixable": True,
+            "required_next_tool": "lsp.diagnostics" if paths else "semantic_scan",
+            "suggested_tool_after_read": "apply_patch_to_draft_or_write_file",
+            "retry_policy": "evidence_driven_repair_case",
+            "retryable": True,
+            "deterministic": True,
+            "failure_class": str(issue.get("failure_class") or check),
             "failure_signature": signature,
-            "repair_recipe_id": f"llm.{issue_code}",
+            "repair_recipe_id": "repair.uncatalogued_case",
             "forbidden_tools_once": [],
-            "next_forced_action": {
-                "required_next_tool": required_next_tool,
-                "target_files": target_files,
-                "verification_check": str(raw.get("verification_check") or issue.get("check") or "checks.run"),
-            },
-            "llm_usage": raw.get("_llm_usage") or {},
-            "llm_model": raw.get("_llm_model"),
-            "evidence": {"source_issue": issue, "classifier": "llm_json"},
-        }
-
-    @staticmethod
-    def _llm_classifier_unavailable_packet(issue: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "signature": "repair.llm_classifier_unavailable",
-            "issue_code": "llm_repair_classifier_unavailable",
-            "code": "llm_repair_classifier_unavailable",
-            "severity": "high",
-            "likely_root_cause": "Unknown repair issue requires LLM JSON classification, but OpenAI is not configured.",
-            "target_files": list(issue.get("paths") or []),
-            "verification_check": str(issue.get("check") or "checks.run"),
-            "verification_command": "run_checks",
-            "instruction": "Configure the LLM classifier, then classify the issue before another repair attempt.",
-            "auto_fixable": False,
-            "required_next_tool": "read_files",
-            "suggested_tool_after_read": "write_file",
-            "retry_policy": "requires_llm_classifier",
-            "retryable": False,
-            "deterministic": False,
-            "failure_class": "repair.llm_classifier_unavailable",
-            "failure_signature": "repair.llm_classifier_unavailable",
-            "repair_recipe_id": "llm.classifier_unavailable",
-            "forbidden_tools_once": [],
-            "next_forced_action": {"required_next_tool": "read_files", "target_files": list(issue.get("paths") or []), "verification_check": str(issue.get("check") or "checks.run")},
+            "next_forced_action": {"required_next_tool": "lsp.diagnostics" if paths else "semantic_scan", "target_files": paths, "verification_check": check},
+            "expected_proof": check,
             "evidence": {"source_issue": issue},
         }
-
-    @staticmethod
-    def _llm_classifier_failed_packet(issue: dict[str, Any], exc: Exception) -> dict[str, Any]:
-        packet = WorkbenchService._llm_classifier_unavailable_packet(issue)
-        packet.update(
-            {
-                "signature": "repair.llm_classifier_failed",
-                "issue_code": "llm_repair_classifier_failed",
-                "code": "llm_repair_classifier_failed",
-                "likely_root_cause": "LLM repair classifier failed before returning a typed packet.",
-                "failure_class": "repair.llm_classifier_failed",
-                "failure_signature": f"repair.llm_classifier_failed:{type(exc).__name__}",
-                "repair_recipe_id": "llm.classifier_failed",
-                "evidence": {"source_issue": issue, "error": str(exc), "error_type": type(exc).__name__},
-            }
-        )
-        return packet
 
     def final_report(self, run_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
@@ -1429,6 +1433,7 @@ class WorkbenchService:
             "browser_proof": self.browser_proof(run_id),
             "repair_signatures": self.repair_signatures(run_id).get("items", []),
             "repair_packets": gate.get("repair_packets", []),
+            "repair_cases": gate.get("repair_cases") or self.repair_case_service.list_cases(run_id),
             "next_forced_action": gate.get("next_forced_action", {}),
             "run_state": gate.get("run_state") or self.run_state(run_id),
             "diagnostics_delta": diagnostics_delta,
@@ -2544,16 +2549,21 @@ class WorkbenchService:
 
     @staticmethod
     def _path_owned_by_worker(worker_id: str, path: str) -> bool:
-        worker_id = legacy_worker_id(worker_id)
+        worker_id = canonical_worker_id(worker_id)
         normalized = str(path or "").replace("\\", "/")
         if worker_id == "planner":
             return normalized.startswith("docs/") or normalized.endswith("README.md")
-        if worker_id == "backend_api":
+        if worker_id == "backend_api_worker":
             return normalized.startswith("miniapp/app/") and "/static/" not in normalized
-        if worker_id in {"client_ui", "specialist_ui", "manager_ui"}:
-            role = worker_id.removesuffix("_ui")
+        role_by_worker = {
+            "client_surface_worker": "client",
+            "specialist_surface_worker": "specialist",
+            "manager_surface_worker": "manager",
+        }
+        if worker_id in role_by_worker:
+            role = role_by_worker[worker_id]
             return f"/static/{role}/" in normalized or normalized.startswith(f"miniapp/app/static/{role}/")
-        if worker_id == "generated_tests":
+        if worker_id == "test_verifier_worker":
             return "test" in normalized
         return False
 
@@ -2721,11 +2731,11 @@ class WorkbenchService:
         if normalized.startswith("miniapp/app/generated/"):
             return "generated_manifest"
         if normalized.startswith("miniapp/app/static/client/"):
-            return "client_ui"
+            return "client_surface_worker"
         if normalized.startswith("miniapp/app/static/specialist/"):
-            return "specialist_ui"
+            return "specialist_surface_worker"
         if normalized.startswith("miniapp/app/static/manager/"):
-            return "manager_ui"
+            return "manager_surface_worker"
         if "test" in normalized:
             return "tests"
         if normalized.endswith((".css", ".scss")):

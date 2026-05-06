@@ -544,6 +544,38 @@ def get_run_repair_signatures(run_id: str, container: ServiceContainer = Depends
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@router.get("/runs/{run_id}/repair-cases")
+def get_run_repair_cases(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.repair_cases(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/runs/{run_id}/repair-cases/{case_id}")
+def get_run_repair_case(run_id: str, case_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.repair_case(run_id, case_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/runs/{run_id}/repair-cases/{case_id}/attempts")
+def get_run_repair_case_attempts(run_id: str, case_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.repair_case_attempts(run_id, case_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/runs/{run_id}/repair-cases/{case_id}/retry")
+def retry_run_repair_case(run_id: str, case_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.retry_repair_case(run_id, case_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.post("/runs/{run_id}/resume", response_model=RunRecord)
 def resume_run(run_id: str, container: ServiceContainer = Depends(get_container)) -> RunRecord:
     try:

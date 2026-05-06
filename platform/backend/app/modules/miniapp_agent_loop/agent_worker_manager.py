@@ -10,7 +10,6 @@ from app.models.domain import DraftAction
 from app.modules.miniapp_agent_loop.product_workers import (
     PRODUCT_WORKERS,
     canonical_worker_id,
-    legacy_worker_id,
     ownership_for_worker,
     path_is_allowed,
     role_for_worker,
@@ -31,11 +30,11 @@ class AgentWorkerManager:
     """Generic worker ownership and merge guard for role-separated draft work."""
 
     SCOPES: tuple[AgentWorkerScope, ...] = (
-        AgentWorkerScope("backend_api", "backend/API", ("miniapp/app/routes", "miniapp/app/schemas.py", "miniapp/app/db.py", "miniapp/app/main.py")),
-        AgentWorkerScope("client_ui", "client UI", ("miniapp/app/static/client",)),
-        AgentWorkerScope("specialist_ui", "specialist UI", ("miniapp/app/static/specialist",)),
-        AgentWorkerScope("manager_ui", "manager UI", ("miniapp/app/static/manager",)),
-        AgentWorkerScope("generated_tests", "generated tests", ("miniapp/tests",)),
+        AgentWorkerScope("backend_api_worker", "backend/API", ("miniapp/app/routes", "miniapp/app/schemas.py", "miniapp/app/db.py", "miniapp/app/main.py")),
+        AgentWorkerScope("client_surface_worker", "client UI", ("miniapp/app/static/client",)),
+        AgentWorkerScope("specialist_surface_worker", "specialist UI", ("miniapp/app/static/specialist",)),
+        AgentWorkerScope("manager_surface_worker", "manager UI", ("miniapp/app/static/manager",)),
+        AgentWorkerScope("test_verifier_worker", "generated tests", ("miniapp/tests",)),
     )
 
     @classmethod
@@ -111,61 +110,6 @@ class AgentWorkerManager:
         }
 
     @classmethod
-    def _legacy_mailbox_for_plan(
-        cls,
-        *,
-        generation_mode: GenerationMode,
-        implementation_plan: dict[str, Any],
-    ) -> dict[str, object]:
-        enabled = (
-            os.getenv("GROUNDED_ENABLE_WORKER_BRANCHES", "").strip().lower() in {"1", "true", "yes", "on"}
-            and generation_mode == GenerationMode.QUALITY
-        )
-        disabled_reason = "" if enabled else "isolated worker branches are gated off unless GROUNDED_ENABLE_WORKER_BRANCHES=1 and generation mode is quality"
-        prompt_contract = implementation_plan.get("prompt_contract_v1") if isinstance(implementation_plan, dict) else {}
-        materialized_tests = bool(isinstance(prompt_contract, dict) and prompt_contract.get("materialized_tests"))
-        workers = [
-            {
-                "worker": scope.worker,
-                "owner_scope": scope.owner_scope,
-                "path_prefixes": list(scope.path_prefixes),
-                    "status": "pending" if enabled else "available_disabled",
-                    "disabled_reason": disabled_reason if not enabled else "",
-            }
-            for scope in cls.SCOPES
-            if not (materialized_tests and scope.worker == "generated_tests")
-        ]
-        if generation_mode == GenerationMode.QUALITY:
-            workers.append(
-                {
-                    "worker": "design_verifier",
-                    "owner_scope": "mobile design and verification",
-                    "path_prefixes": ["miniapp/app/static", "miniapp/tests"],
-                    "status": "pending" if enabled else "available_disabled",
-                    "disabled_reason": disabled_reason if not enabled else "",
-                }
-            )
-        return {
-            "enabled": enabled,
-            "disabled_reason": disabled_reason,
-            "mode": str(getattr(generation_mode, "value", generation_mode) or ""),
-            "workers": workers,
-            "plan_entities": list(implementation_plan.get("primary_entities") or [])[:8],
-            "worker_prompt_contract": (
-                "Each worker prompt must be self-contained: owner scope, path prefixes, exact product plan slice, "
-                "expected self-check, and repair instruction. Continue the same worker for failures in owned paths; "
-                "use a fresh verifier only after green checks."
-            ),
-            "write_coordination": (
-                "parallel_owned_branches"
-                if enabled
-                else "serial_contract_runtime_writes"
-            ),
-            "ownership_locks": cls.ownership_locks(),
-            "merge_policy": "accept non-conflicting owned diffs; return conflicts to the owning worker as a repair packet",
-        }
-
-    @classmethod
     def _mailbox_worker_payload(cls, *, worker_id: str, enabled: bool, disabled_reason: str, status: str) -> dict[str, Any]:
         role = role_for_worker(worker_id)
         ownership = ownership_for_worker(worker_id)
@@ -174,7 +118,7 @@ class AgentWorkerManager:
             "worker": canonical,
             "worker_id": canonical,
             "worker_type": canonical,
-            "alias_ids": list(role.aliases if role else (legacy_worker_id(worker_id),)),
+            "alias_ids": [],
             "owner_scope": role.owner_scope if role else canonical,
             "path_prefixes": list(ownership.get("allowed_paths") or []),
             "ownership": ownership,
@@ -191,7 +135,7 @@ class AgentWorkerManager:
                 "lock_id": role.worker_id,
                 "worker": role.worker_id,
                 "worker_type": role.worker_type,
-                "alias_ids": list(role.aliases),
+                "alias_ids": [],
                 "owner_scope": role.owner_scope,
                 "path_prefixes": list(role.allowed_paths),
                 "forbidden_paths": list(role.forbidden_paths),
@@ -218,7 +162,7 @@ class AgentWorkerManager:
             path = str(action.file_path or "").strip()
             raw_worker = cls._worker_from_action(action)
             owner = canonical_worker_id(raw_worker or cls.owner_for_path(path))
-            allowed = path_is_allowed(owner, path) or owner in {"test_verifier_worker"} and cls.owner_for_path(path) == "generated_tests"
+            allowed = path_is_allowed(owner, path) or owner in {"test_verifier_worker"} and cls.owner_for_path(path) == "test_verifier_worker"
             by_path.setdefault(path, []).append(
                 {
                     "owner": owner,

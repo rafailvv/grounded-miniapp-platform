@@ -32,6 +32,7 @@ from app.services.exec_runtime_service import ExecRuntimeService
 from app.services.background_task_service import BackgroundTaskService
 from app.services.run_compaction import RunCompactionService
 from app.services.run_protocol import RunProtocolService
+from app.services.repair_cases import RepairCaseService
 from app.services.workbench_service import WorkbenchService
 
 
@@ -42,6 +43,7 @@ class ServiceContainer:
         self.platform_db = PlatformDb(self.settings.data_dir / "platform.db")
         self.run_protocol_service = RunProtocolService(self.platform_db, self.store)
         self.run_compaction_service = RunCompactionService(self.store, self.run_protocol_service)
+        self.repair_case_service = RepairCaseService(self.store)
         self.rpc_event_hub = RpcEventHub()
         self.store.shard_large_runtime_payloads()
         self.workspace_log_service = WorkspaceLogService(self.settings)
@@ -120,6 +122,7 @@ class ServiceContainer:
             run_protocol_service=self.run_protocol_service,
             run_compaction_service=self.run_compaction_service,
             background_task_service=self.background_task_service,
+            repair_case_service=self.repair_case_service,
         )
         self.thread_service = ThreadService(
             self.platform_db,

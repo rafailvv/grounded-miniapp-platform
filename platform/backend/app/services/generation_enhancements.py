@@ -591,49 +591,49 @@ class WorkerRoleCatalog:
         items = [
             {
                 "worker_id": "backend_api_worker",
-                "alias_ids": ["backend_api"],
+                "alias_ids": [],
                 "purpose": "FastAPI routes, schemas, persistence, shared state.",
                 "allowed_paths": ["miniapp/app/**/*.py", "miniapp/requirements.txt"],
                 "handoff": "Owns API/persistence failures.",
             },
             {
                 "worker_id": "client_surface_worker",
-                "alias_ids": ["client_ui"],
+                "alias_ids": [],
                 "purpose": "Client role HTML/CSS/JS and client child pages.",
                 "allowed_paths": ["miniapp/app/static/client/**"],
                 "handoff": "Owns client selector and layout failures.",
             },
             {
                 "worker_id": "specialist_surface_worker",
-                "alias_ids": ["specialist_ui"],
+                "alias_ids": [],
                 "purpose": "Specialist role HTML/CSS/JS and child pages.",
                 "allowed_paths": ["miniapp/app/static/specialist/**"],
                 "handoff": "Owns specialist selector and layout failures.",
             },
             {
                 "worker_id": "manager_surface_worker",
-                "alias_ids": ["manager_ui"],
+                "alias_ids": [],
                 "purpose": "Manager role HTML/CSS/JS and child pages.",
                 "allowed_paths": ["miniapp/app/static/manager/**"],
                 "handoff": "Owns manager selector and layout failures.",
             },
             {
                 "worker_id": "test_verifier_worker",
-                "alias_ids": ["generated_tests", "verifier"],
+                "alias_ids": [],
                 "purpose": "Generated Python and JS acceptance tests.",
                 "allowed_paths": ["miniapp/tests/**"],
                 "handoff": "Owns stale or brittle generated tests.",
             },
             {
                 "worker_id": "mobile_polish_worker",
-                "alias_ids": ["design_verifier", "fresh_verifier"],
+                "alias_ids": [],
                 "purpose": "Independent mobile polish and visual QA after green workflow.",
                 "allowed_paths": ["miniapp/app/static/**"],
                 "handoff": "Owns mobile overflow, spacing, and role-surface polish failures.",
             },
             {
                 "worker_id": "repair_worker",
-                "alias_ids": ["repair"],
+                "alias_ids": [],
                 "purpose": "Focused owned repair from failure signature or merge decision.",
                 "allowed_paths": ["miniapp/app/**", "miniapp/tests/**"],
                 "handoff": "Runs only from an explicit repair packet.",
@@ -650,7 +650,17 @@ class AcceptanceScenarioGenerator:
             if isinstance(item, dict)
         ]
         if not flows:
-            flows = AcceptanceScenarioGenerator._fallback_flows(run)
+            return {
+                "schema": "grounded.acceptance_scenarios.v1",
+                "run_id": run.run_id,
+                "workspace_id": run.workspace_id,
+                "status": "blocked_contract_missing",
+                "items": [],
+                "source": "acceptance_contract_missing",
+                "blocking": True,
+                "message": "Acceptance scenarios require a prompt-derived acceptance/product contract; no product workflow fallback was generated.",
+                "created_at": _now(),
+            }
         scenarios = []
         for index, flow in enumerate(flows, start=1):
             flow_id = str(flow.get("id") or flow.get("name") or f"flow-{index}")
@@ -678,21 +688,9 @@ class AcceptanceScenarioGenerator:
             "workspace_id": run.workspace_id,
             "status": "planned" if scenarios else "empty",
             "items": scenarios[:8],
-            "source": "acceptance_contract" if (run.acceptance_contract or {}).get("flows") else "fallback",
+            "source": "acceptance_contract",
             "created_at": _now(),
         }
-
-    @staticmethod
-    def _fallback_flows(run: Any) -> list[dict[str, Any]]:
-        prompt = str(run.prompt or "Generated product workflow")
-        return [
-            {
-                "id": "persisted-workflow",
-                "title": prompt[:120],
-                "description": "Prompt-derived persisted workflow across role surfaces.",
-                "roles": list(run.target_role_scope or ROLE_ORDER),
-            }
-        ]
 
     @staticmethod
     def _steps_for_flow(flow: dict[str, Any], roles: list[str]) -> list[dict[str, Any]]:
@@ -781,11 +779,14 @@ class TraceReducer:
     def build(*, run: Any, timeline: list[dict[str, Any]], tool_events: list[dict[str, Any]], artifacts: dict[str, Any]) -> dict[str, Any]:
         phase_counts: dict[str, int] = {}
         blockers: list[dict[str, Any]] = []
+        repair_events: list[dict[str, Any]] = []
         for item in timeline:
             kind = str(item.get("kind") or "unknown")
             phase_counts[kind] = phase_counts.get(kind, 0) + 1
             if str(item.get("status") or "").lower() in {"failed", "blocked", "conflict"}:
                 blockers.append({"kind": kind, "title": item.get("title"), "payload": item.get("payload")})
+            if "repair" in kind or "repair" in str(item.get("title") or "").lower():
+                repair_events.append({"kind": kind, "title": item.get("title"), "payload": item.get("payload")})
         changed_files = list(run.touched_files or [])
         if not changed_files:
             changed_files = TraceReducer._paths_from_diff(str(artifacts.get("diff") or ""))
@@ -806,6 +807,10 @@ class TraceReducer:
             "changed_files": changed_files[:80],
             "quality_signals": quality,
             "next_action": TraceReducer._next_action(run, blockers, quality),
+            "last_failed_attempt": blockers[-1] if blockers else {},
+            "repeated_action": TraceReducer._repeated_action(tool_events),
+            "next_best_repair_case": repair_events[-1] if repair_events else (blockers[-1] if blockers else {}),
+            "stale_diff": TraceReducer._stale_diff(blockers),
             "created_at": _now(),
         }
 
@@ -826,6 +831,22 @@ class TraceReducer:
         if not quality.get("has_browser_proof"):
             return {"action": "browser_verify", "reason": "No browser proof is recorded."}
         return {"action": "none", "reason": "Trace has no blocking phase."}
+
+    @staticmethod
+    def _repeated_action(tool_events: list[dict[str, Any]]) -> dict[str, Any]:
+        counts: dict[str, int] = {}
+        for event in tool_events:
+            key = str(event.get("tool") or event.get("tool_call_id") or "")
+            if key:
+                counts[key] = counts.get(key, 0) + 1
+        repeated = [key for key, count in counts.items() if count > 1]
+        return {"status": "repeated", "tools": repeated[:8]} if repeated else {}
+
+    @staticmethod
+    def _stale_diff(blockers: list[dict[str, Any]]) -> dict[str, Any]:
+        latest = blockers[-1] if blockers else {}
+        text = json.dumps(latest, ensure_ascii=False, default=str).lower()
+        return {"status": "suspected", "event": latest} if "stale" in text or "old_string_not_found" in text else {}
 
 
 class MagicDocsBuilder:

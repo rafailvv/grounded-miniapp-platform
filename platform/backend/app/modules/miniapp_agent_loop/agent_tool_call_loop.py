@@ -21,9 +21,11 @@ from app.modules.miniapp_agent_loop.context_builder import AgentContextBuilder
 from app.modules.miniapp_agent_loop.diagnostics_delta import AgentDiagnosticsDelta
 from app.modules.miniapp_agent_loop.edit_validator import AgentEditValidator
 from app.modules.miniapp_agent_loop.agent_mutation_guard import AgentMutationGuard
+from app.modules.miniapp_agent_loop.lsp_tools import LspToolService
 from app.modules.miniapp_agent_loop.repair_packets import RepairTransitionPolicy
 from app.modules.miniapp_agent_loop.result_classifier import AgentLoopResultFactory
 from app.modules.miniapp_agent_loop.types import AgentLoopCallbacks, AgentLoopResult
+from app.services.repair_cases import RepairCaseService, patch_sha256
 from app.services.repair_catalog import RepairCatalog
 
 
@@ -43,6 +45,7 @@ class AgentToolCallLoop:
         self.edit_validator = AgentEditValidator()
         self.results = AgentLoopResultFactory()
         self.mutation_guard = AgentMutationGuard()
+        self.repair_cases = RepairCaseService(context_builder.store)
 
     @staticmethod
     def _budget_state(callbacks: AgentLoopCallbacks, turn: int) -> dict[str, object]:
@@ -165,7 +168,7 @@ class AgentToolCallLoop:
         initial_changed_files: list[str],
         callbacks: AgentLoopCallbacks,
     ) -> AgentLoopResult:
-        del draft_source, role_scope, generation_mode
+        del role_scope, generation_mode
 
         latest_execution: CheckExecutionRecord | None = None
         latest_preview_details: dict[str, Any] = {}
@@ -185,6 +188,8 @@ class AgentToolCallLoop:
         repair_packet_counts: dict[str, int] = {}
         latest_repair_packets: list[dict[str, Any]] = []
         latest_repair_transition: dict[str, Any] = {}
+        latest_repair_cases: dict[str, Any] = {"schema": "grounded.repair_cases.v1", "run_id": run_id, "status": "empty", "items": []}
+        active_repair_case_id = ""
         previous_diagnostics_snapshot: dict[str, dict[str, Any]] | None = None
         latest_diagnostics_delta: dict[str, Any] = {"status": "unchanged", "added": [], "changed": [], "resolved": []}
         pending_validation_after_patch = bool(initial_file_changes or initial_changed_files)
@@ -306,12 +311,23 @@ class AgentToolCallLoop:
                 check_packets = self._repair_packets_from_execution(latest_execution)
                 if check_packets:
                     latest_repair_packets = check_packets
+                    latest_repair_cases = self.repair_cases.sync_from_packets(
+                        workspace_id=workspace_id,
+                        run_id=run_id,
+                        packets=latest_repair_packets,
+                        source="agent_loop_checks",
+                        trace_state=self.context_builder.store.get("reports", f"trace_reducer:{workspace_id}:{run_id}") or {},
+                    )
+                    latest_repair_packets = RepairCaseService.enrich_packets(latest_repair_packets, latest_repair_cases)
+                    active_repair_case_id = RepairCaseService.active_case_id(latest_repair_cases)
                     callbacks.store_report(
                         f"repair_state:{workspace_id}:{run_id}",
                         {
                             "workspace_id": workspace_id,
                             "run_id": run_id,
                             "latest_repair_packets": latest_repair_packets,
+                            "repair_cases_ref": RepairCaseService.index_ref(run_id),
+                            "active_repair_case": latest_repair_cases.get("active_case"),
                             "diagnostics_delta": latest_diagnostics_delta,
                             "updated_at": utc_now().isoformat(),
                         },
@@ -534,6 +550,8 @@ class AgentToolCallLoop:
                         "latest_repair_packets": latest_repair_packets,
                         "next_forced_action": transition.next_forced_action,
                         "repair_transition": latest_repair_transition,
+                        "repair_cases_ref": RepairCaseService.index_ref(run_id),
+                        "active_repair_case": latest_repair_cases.get("active_case") if isinstance(latest_repair_cases, dict) else None,
                         "diagnostics_delta": latest_diagnostics_delta,
                         "updated_at": utc_now().isoformat(),
                     },
@@ -580,9 +598,19 @@ class AgentToolCallLoop:
             plan_repair_packets = self._repair_packets_from_plan(plan)
             if plan_repair_packets:
                 latest_repair_packets = self._with_repeated_counts(plan_repair_packets, repair_packet_counts)
+                latest_repair_cases = self.repair_cases.sync_from_packets(
+                    workspace_id=workspace_id,
+                    run_id=run_id,
+                    packets=latest_repair_packets,
+                    source="agent_loop_plan",
+                    trace_state=self.context_builder.store.get("reports", f"trace_reducer:{workspace_id}:{run_id}") or {},
+                )
+                latest_repair_packets = RepairCaseService.enrich_packets(latest_repair_packets, latest_repair_cases)
+                active_repair_case_id = RepairCaseService.active_case_id(latest_repair_cases)
                 plan.metadata = {
                     **dict(plan.metadata or {}),
                     "repair_packets": latest_repair_packets,
+                    "active_repair_case_id": active_repair_case_id,
                 }
                 callbacks.store_report(
                     f"repair_state:{workspace_id}:{run_id}",
@@ -590,6 +618,8 @@ class AgentToolCallLoop:
                         "workspace_id": workspace_id,
                         "run_id": run_id,
                         "latest_repair_packets": latest_repair_packets,
+                        "repair_cases_ref": RepairCaseService.index_ref(run_id),
+                        "active_repair_case": latest_repair_cases.get("active_case"),
                         "next_forced_action": latest_repair_transition.get("next_forced_action") if isinstance(latest_repair_transition, dict) else {},
                         "diagnostics_delta": latest_diagnostics_delta,
                         "updated_at": utc_now().isoformat(),
@@ -609,6 +639,7 @@ class AgentToolCallLoop:
                     "failure_signature": plan.failure_signature,
                     "metadata": dict(plan.metadata),
                     "repair_packets": latest_repair_packets if plan_repair_packets else [],
+                    "active_repair_case_id": active_repair_case_id,
                     "next_forced_action": latest_repair_transition.get("next_forced_action") if isinstance(latest_repair_transition, dict) else {},
                     "created_at": utc_now().isoformat(),
                 }
@@ -685,11 +716,71 @@ class AgentToolCallLoop:
                 if bool(plan.metadata.get("skip_contract_sync"))
                 else callbacks.apply_change_sync(list(plan.file_changes))
             )
+            current_patch_hash = patch_sha256(synced_file_changes)
+            changed_targets = [operation.file_path for operation in synced_file_changes if operation.file_path]
+            diagnostics_before = (
+                LspToolService.diagnostics(root=draft_source, targets=changed_targets, include_optional_tools=False)
+                if changed_targets
+                else {}
+            )
+            if active_repair_case_id and self.repair_cases.repeated_patch(run_id=run_id, case_id=active_repair_case_id, patch_hash=current_patch_hash):
+                repeated_packet = {
+                    "signature": f"repair.repeated_patch:{active_repair_case_id}",
+                    "issue_code": "repeated_identical_patch",
+                    "code": "repeated_identical_patch",
+                    "severity": "high",
+                    "likely_root_cause": "The repair loop attempted the same patch hash again for the active repair case.",
+                    "target_files": changed_targets,
+                    "verification_check": "repair_case_attempt_ledger",
+                    "instruction": "Do not repeat this patch. Read fresh evidence or choose a different constrained repair strategy.",
+                    "required_next_tool": "read_files",
+                    "suggested_tool_after_read": "apply_patch_to_draft_or_write_file",
+                    "retry_policy": "do_not_retry_same_patch",
+                    "failure_class": "repair.repeated_patch",
+                    "failure_signature": f"repair.repeated_patch:{active_repair_case_id}",
+                    "expected_proof": "next attempt uses different evidence or a different patch hash",
+                    "evidence": {"patch_sha256": current_patch_hash, "changed_files": changed_targets},
+                }
+                latest_repair_packets = self._with_repeated_counts([repeated_packet], repair_packet_counts)
+                self.repair_cases.record_attempt(
+                    workspace_id=workspace_id,
+                    run_id=run_id,
+                    case_id=active_repair_case_id,
+                    attempt={
+                        "status": "blocked",
+                        "files_read": list(latest_files_read),
+                        "changed_files": changed_targets,
+                        "patch_sha256": current_patch_hash,
+                        "diagnostics_before": diagnostics_before,
+                        "failure_reason": "repeated_identical_patch",
+                    },
+                )
+                callbacks.store_report(
+                    f"repair_state:{workspace_id}:{run_id}",
+                    {
+                        "workspace_id": workspace_id,
+                        "run_id": run_id,
+                        "latest_repair_packets": latest_repair_packets,
+                        "repair_cases_ref": RepairCaseService.index_ref(run_id),
+                        "active_repair_case": self.repair_cases.get_case(run_id, active_repair_case_id),
+                        "diagnostics_delta": latest_diagnostics_delta,
+                        "updated_at": utc_now().isoformat(),
+                    },
+                )
+                callbacks.append_event(
+                    job,
+                    "repair_iteration",
+                    "Repair attempt repeated an identical patch and was blocked by the attempt ledger.",
+                    {"turn": turn + 1, "repair_case_id": active_repair_case_id, "patch_sha256": current_patch_hash, "changed_files": changed_targets},
+                )
+                previous_snapshot = progress_snapshot
+                turn += 1
+                continue
             callbacks.append_event(
                 job,
                 "patch_apply_started",
                 "Applying agent patch to draft.",
-                {"turn": turn + 1, "files": [operation.file_path for operation in synced_file_changes]},
+                {"turn": turn + 1, "files": changed_targets, "active_repair_case_id": active_repair_case_id, "patch_sha256": current_patch_hash},
             )
             if callbacks.append_activity:
                 callbacks.append_activity(
@@ -751,12 +842,28 @@ class AgentToolCallLoop:
                     repeated_count=0,
                 )
                 latest_repair_packets = self._with_repeated_counts([conflict_packet], repair_packet_counts)
+                if active_repair_case_id:
+                    self.repair_cases.record_attempt(
+                        workspace_id=workspace_id,
+                        run_id=run_id,
+                        case_id=active_repair_case_id,
+                        attempt={
+                            "status": "conflict",
+                            "files_read": list(latest_files_read),
+                            "changed_files": changed_targets,
+                            "patch_sha256": current_patch_hash,
+                            "diagnostics_before": diagnostics_before,
+                            "failure_reason": apply_result.conflict_reason or apply_result.status,
+                        },
+                    )
                 callbacks.store_report(
                     f"repair_state:{workspace_id}:{run_id}",
                     {
                         "workspace_id": workspace_id,
                         "run_id": run_id,
                         "latest_repair_packets": latest_repair_packets,
+                        "repair_cases_ref": RepairCaseService.index_ref(run_id),
+                        "active_repair_case": self.repair_cases.get_case(run_id, active_repair_case_id) if active_repair_case_id else None,
                         "diagnostics_delta": latest_diagnostics_delta,
                         "updated_at": utc_now().isoformat(),
                     },
@@ -786,6 +893,30 @@ class AgentToolCallLoop:
                 continue
 
             changed_files = callbacks.post_apply_stabilize(workspace_id, run_id, apply_result, [operation.file_path for operation in synced_file_changes]) if callbacks.post_apply_stabilize else [operation.file_path for operation in synced_file_changes]
+            diagnostics_after = (
+                LspToolService.diagnostics(root=draft_source, changed_files=list(changed_files), changed_only=True, include_optional_tools=False)
+                if changed_files
+                else {}
+            )
+            if active_repair_case_id:
+                before_errors = int(diagnostics_before.get("error_count") or 0) if isinstance(diagnostics_before, dict) else 0
+                after_errors = int(diagnostics_after.get("error_count") or 0) if isinstance(diagnostics_after, dict) else 0
+                introduced_errors = after_errors > before_errors
+                self.repair_cases.record_attempt(
+                    workspace_id=workspace_id,
+                    run_id=run_id,
+                    case_id=active_repair_case_id,
+                    attempt={
+                        "status": "failed" if introduced_errors else "applied",
+                        "files_read": list(latest_files_read),
+                        "changed_files": list(changed_files),
+                        "patch_sha256": current_patch_hash,
+                        "diagnostics_before": diagnostics_before,
+                        "diagnostics_after": diagnostics_after,
+                        "proof_result": {"status": "failed" if introduced_errors else "pending", "reason": "changed-file diagnostics introduced new errors" if introduced_errors else "checks run on next loop iteration"},
+                        "failure_reason": "changed_file_diagnostics_regressed" if introduced_errors else "",
+                    },
+                )
             pending_validation_after_patch = True
             if callbacks.append_activity:
                 callbacks.append_activity(
