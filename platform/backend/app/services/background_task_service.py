@@ -281,6 +281,8 @@ class BackgroundTaskService:
             if isinstance(active_case, dict):
                 prompt = (
                     "Repair the source run from this active repair case. Do not broaden the task.\n"
+                    f"Original product prompt:\n{source.prompt[:3000]}\n"
+                    "Active repair case:\n"
                     f"{json.dumps(active_case.get('repair_prompt') or active_case, ensure_ascii=False, default=str)[:5000]}"
                 )
         if not prompt:

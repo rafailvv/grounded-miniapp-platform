@@ -48,6 +48,19 @@ def role_html_ids(source_dir: Path, relative_path: str) -> set[str]:
     return ids
 
 
+def role_surface_dom_ids(source_dir: Path, relative_path: str) -> set[str]:
+    root = role_static_root(source_dir, relative_path)
+    if root is None or not root.exists():
+        return set()
+    ids = role_html_ids(source_dir, relative_path)
+    for js_path in root.rglob("*.js"):
+        try:
+            ids.update(extract_html_ids(js_path.read_text(encoding="utf-8")))
+        except OSError:
+            continue
+    return ids
+
+
 def extract_script_refs(html_content: str) -> list[str]:
     refs = re.findall(r"""<script\b[^>]*\bsrc=["']([^"']+\.js(?:[?#][^"']*)?)["']""", str(html_content or ""), flags=re.IGNORECASE)
     return list(dict.fromkeys(ref.split("?", 1)[0].split("#", 1)[0] for ref in refs))

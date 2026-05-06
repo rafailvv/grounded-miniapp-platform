@@ -43,6 +43,7 @@ class AgentTranscriptStore:
     def __init__(self) -> None:
         self._events: dict[str, list[dict[str, Any]]] = {}
         self._last_response_id: dict[str, str] = {}
+        self._last_tool_call_ids: dict[str, list[str]] = {}
         self._pending_tool_results: dict[str, list[dict[str, Any]]] = {}
         self._pending_post_compact_messages: dict[str, list[dict[str, Any]]] = {}
         self._writers: dict[str, Callable[[dict[str, Any]], None]] = {}
@@ -79,6 +80,9 @@ class AgentTranscriptStore:
         response_id = snapshot.get("last_response_id") if isinstance(snapshot, dict) else None
         if response_id:
             self._last_response_id[run_key] = str(response_id)
+        tool_call_ids = snapshot.get("last_tool_call_ids") if isinstance(snapshot, dict) else None
+        if isinstance(tool_call_ids, list):
+            self._last_tool_call_ids[run_key] = [str(item) for item in tool_call_ids if str(item or "").strip()]
         pending = snapshot.get("tool_result_messages") if isinstance(snapshot, dict) else None
         if isinstance(pending, list):
             self._pending_tool_results[run_key] = [item for item in pending if isinstance(item, dict)]
@@ -110,15 +114,55 @@ class AgentTranscriptStore:
         return event
 
     def next_model_context(self, run_key: str) -> dict[str, Any]:
+        previous_response_id = self._last_response_id.get(run_key) or None
+        pending = list(self._pending_tool_results.get(run_key, []))
+        last_tool_call_ids = list(self._last_tool_call_ids.get(run_key, []))
+        if previous_response_id and last_tool_call_ids:
+            pending_by_id = {
+                str(item.get("tool_use_id") or item.get("call_id") or "").strip(): item
+                for item in pending
+                if isinstance(item, dict)
+            }
+            missing = [call_id for call_id in last_tool_call_ids if call_id not in pending_by_id]
+            if missing:
+                self._last_response_id.pop(run_key, None)
+                self._last_tool_call_ids[run_key] = []
+                self._pending_tool_results[run_key] = []
+                self.append(
+                    run_key,
+                    "tool_result_context_incomplete",
+                    {
+                        "previous_response_id": previous_response_id,
+                        "missing_tool_call_ids": missing[:12],
+                        "pending_tool_result_count": len(pending),
+                    },
+                )
+                previous_response_id = None
+                pending = []
+            else:
+                pending = [pending_by_id[call_id] for call_id in last_tool_call_ids]
+        elif pending and not previous_response_id:
+            self._pending_tool_results[run_key] = []
+            self.append(
+                run_key,
+                "tool_result_context_incomplete",
+                {
+                    "previous_response_id": None,
+                    "missing_tool_call_ids": [],
+                    "pending_tool_result_count": len(pending),
+                },
+            )
+            pending = []
         return {
-            "previous_response_id": self._last_response_id.get(run_key) or None,
-            "tool_result_messages": list(self._pending_tool_results.get(run_key, [])),
+            "previous_response_id": previous_response_id,
+            "tool_result_messages": pending,
             "post_compact_messages": list(self._pending_post_compact_messages.get(run_key, [])),
         }
 
     def clear_model_context(self, run_key: str) -> None:
         """Start the next model step from compact prompt context only."""
         self._last_response_id.pop(run_key, None)
+        self._last_tool_call_ids[run_key] = []
         self._pending_tool_results[run_key] = []
         self._pending_post_compact_messages[run_key] = []
         self.append(run_key, "compact_model_context_reset", {"reason": "context_window_pressure"})
@@ -140,6 +184,11 @@ class AgentTranscriptStore:
     ) -> None:
         if response_id:
             self._last_response_id[run_key] = response_id
+        self._last_tool_call_ids[run_key] = [
+            str(item.get("tool_use_id") or item.get("call_id") or item.get("id") or "").strip()
+            for item in tool_calls
+            if isinstance(item, dict) and str(item.get("tool_use_id") or item.get("call_id") or item.get("id") or "").strip()
+        ]
         if consumed_tool_result_count:
             self._pending_tool_results[run_key] = []
         if consumed_post_compact_count:
@@ -246,9 +295,11 @@ class AgentTranscriptStore:
     def compact_model_context(self, run_key: str, *, reason: str, preserve_response_id: bool = True) -> dict[str, Any]:
         previous_response_id = self._last_response_id.get(run_key)
         pending_count = len(self._pending_tool_results.get(run_key, []))
+        last_tool_call_count = len(self._last_tool_call_ids.get(run_key, []))
         self._pending_tool_results[run_key] = []
-        if not preserve_response_id:
+        if not preserve_response_id or pending_count or last_tool_call_count:
             self._last_response_id.pop(run_key, None)
+            self._last_tool_call_ids[run_key] = []
         event = self.append(
             run_key,
             "compact_model_context_reset",
@@ -256,6 +307,7 @@ class AgentTranscriptStore:
                 "reason": reason,
                 "previous_response_id": previous_response_id,
                 "pending_tool_result_count": pending_count,
+                "last_tool_call_count": last_tool_call_count,
                 "preserve_response_id": preserve_response_id,
             },
         )
@@ -333,6 +385,7 @@ class AgentTranscriptStore:
             "event_count": len(events),
             "counts": counts,
             "last_response_id": self._last_response_id.get(run_key),
+            "last_tool_call_ids": list(self._last_tool_call_ids.get(run_key, [])),
             "pending_tool_result_count": len(self._pending_tool_results.get(run_key, [])),
             "pending_post_compact_count": len(self._pending_post_compact_messages.get(run_key, [])),
             "events": events,

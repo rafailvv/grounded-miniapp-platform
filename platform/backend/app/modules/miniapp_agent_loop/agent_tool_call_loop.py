@@ -162,6 +162,27 @@ class AgentToolCallLoop:
             updated.append({**packet, "repeated_count": counts[signature]})
         return updated
 
+    @staticmethod
+    def _should_escalate_repeated_no_progress(
+        *,
+        repeated_count: int,
+        has_draft_diff: bool,
+        active_case: dict[str, Any] | None,
+        transition: dict[str, Any],
+    ) -> bool:
+        if not has_draft_diff or repeated_count < 2 or not isinstance(active_case, dict):
+            return False
+        attempts = active_case.get("attempts") if isinstance(active_case.get("attempts"), list) else []
+        next_action = active_case.get("next_action") if isinstance(active_case.get("next_action"), dict) else {}
+        attempt_count = max(len(attempts), int(next_action.get("attempt_count") or 0))
+        forced = transition.get("next_forced_action") if isinstance(transition.get("next_forced_action"), dict) else {}
+        action = str(next_action.get("action") or forced.get("action") or "").strip()
+        if action == "fresh_context_repair" and repeated_count >= 2:
+            return True
+        if attempt_count >= 3 and repeated_count >= 2:
+            return True
+        return repeated_count >= 5
+
     def run(
         self,
         *,
@@ -575,6 +596,74 @@ class AgentToolCallLoop:
                         "forced_targets": transition.forced_targets,
                         "reason": transition.reason,
                     },
+                )
+
+            active_case = latest_repair_cases.get("active_case") if isinstance(latest_repair_cases, dict) else None
+            if self._should_escalate_repeated_no_progress(
+                repeated_count=repeated_failure_signatures[current_signature],
+                has_draft_diff=has_draft_diff,
+                active_case=active_case if isinstance(active_case, dict) else None,
+                transition=latest_repair_transition,
+            ):
+                summary = "Repeated repair no-progress reached; focused repair continuation is required."
+                failure_reason = (
+                    f"{summary} failure_signature={current_signature[:240]} "
+                    f"repeat_count={repeated_failure_signatures[current_signature]}"
+                )
+                callbacks.store_report(
+                    f"repair_state:{workspace_id}:{run_id}",
+                    {
+                        "workspace_id": workspace_id,
+                        "run_id": run_id,
+                        "latest_repair_packets": latest_repair_packets,
+                        "repair_cases_ref": RepairCaseService.index_ref(run_id),
+                        "active_repair_case": active_case,
+                        "next_forced_action": latest_repair_transition.get("next_forced_action") if isinstance(latest_repair_transition, dict) else {},
+                        "diagnostics_delta": latest_diagnostics_delta,
+                        "continuation_recommended": True,
+                        "continuation_reason": "repeated_no_progress",
+                        "repeat_count": repeated_failure_signatures[current_signature],
+                        "updated_at": utc_now().isoformat(),
+                    },
+                )
+                callbacks.append_event(
+                    job,
+                    "repair_iteration",
+                    "Repeated repair no-progress reached; stopping this run for focused continuation.",
+                    {
+                        "turn": turn,
+                        "failure_signature": current_signature,
+                        "repeat_count": repeated_failure_signatures[current_signature],
+                        "active_repair_case_id": active_repair_case_id,
+                    },
+                )
+                if callbacks.append_activity:
+                    callbacks.append_activity(
+                        job,
+                        "blocked",
+                        "Focused repair continuation required",
+                        {
+                            "turn": turn,
+                            "failure_signature": current_signature,
+                            "repeat_count": repeated_failure_signatures[current_signature],
+                            "active_repair_case_id": active_repair_case_id,
+                        },
+                    )
+                return self.results.blocked(
+                    summary=summary,
+                    failure_reason=failure_reason,
+                    failure_class="generation.repeated_no_progress",
+                    failure_signature=f"repair.no_progress:{current_signature[:180]}",
+                    root_cause_summary="The same evidence-backed repair case repeated without strict-green progress; continue in a fresh focused repair context.",
+                    current_phase="blocked_repair_continuation_needed",
+                    latest_execution=latest_execution,
+                    latest_preview_details=latest_preview_details,
+                    latest_apply_result=latest_apply_result,
+                    iterations=iterations,
+                    repair_iterations=repair_iterations,
+                    all_file_changes=all_file_changes,
+                    last_assistant_message=latest_assistant_message,
+                    turn_history=turn_history,
                 )
 
             if callbacks.append_activity:

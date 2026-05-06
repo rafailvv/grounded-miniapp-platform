@@ -9,7 +9,7 @@ from typing import Any
 
 from app.models.artifacts import ValidationIssue
 from app.services.platform_shell import BASE_STYLESHEET_HREF, PAGE_SHELL_CLASS, PREVIEW_BRIDGE_SRC
-from app.validators.static_analysis import extract_html_ids, extract_js_dom_ids, extract_script_refs, role_html_ids
+from app.validators.static_analysis import extract_html_ids, extract_js_dom_ids, extract_script_refs, role_surface_dom_ids
 
 
 class BuildValidator:
@@ -300,7 +300,7 @@ class BuildValidator:
                 script_content = script_path.read_text(encoding="utf-8")
             except OSError:
                 continue
-            role_ids = role_html_ids(workspace_path, script_path_raw)
+            role_ids = role_surface_dom_ids(workspace_path, script_path_raw)
             html_ids = role_ids or page_ids
             script_ids = self._extract_unsafe_direct_dom_ids(script_content)
             missing_ids = sorted(script_ids - html_ids)

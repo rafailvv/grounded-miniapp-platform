@@ -204,6 +204,33 @@ def test_lsp_static_diagnostics_checks_role_dom_ids(tmp_path: Path) -> None:
     )
 
 
+def test_lsp_static_diagnostics_accepts_role_ids_rendered_from_js(tmp_path: Path) -> None:
+    static_dir = tmp_path / "miniapp" / "app" / "static" / "manager"
+    static_dir.mkdir(parents=True)
+    (static_dir / "index.html").write_text("<main id='app'></main>\n", encoding="utf-8")
+    (static_dir / "app.js").write_text(
+        """
+function renderPage() {
+  return `<form id="manager-update-form"><button type="submit">Save</button></form>`;
+}
+document.getElementById("app").innerHTML = renderPage();
+document.getElementById("manager-update-form")?.addEventListener("submit", () => {});
+""",
+        encoding="utf-8",
+    )
+    runner = object.__new__(CheckRunner)
+
+    result = runner._lsp_static_diagnostics(source_dir=tmp_path)
+
+    assert result.name == "lsp_static_diagnostics"
+    assert result.status == "passed"
+    assert not [
+        item
+        for item in result.diagnostics["items"]
+        if item.get("source") == "selector_static" and item.get("code") == "missing_dom_id"
+    ]
+
+
 def test_lsp_tool_service_reports_jumpable_changed_file_diagnostics(tmp_path: Path) -> None:
     app_dir = tmp_path / "miniapp" / "app"
     app_dir.mkdir(parents=True)
@@ -933,6 +960,31 @@ def test_agent_transcript_does_not_feed_unlinked_internal_results_to_model() -> 
 
     assert context["tool_result_messages"] == []
     assert snapshot["counts"]["tool_result_unlinked"] == 1
+
+
+def test_agent_transcript_drops_partial_tool_outputs_before_responses_resume() -> None:
+    transcript = AgentTranscriptStore()
+    transcript.append_model_turn(
+        "run_1",
+        attempt=1,
+        tool_round=0,
+        response_id="resp_1",
+        assistant_message="Read files.",
+        tool_calls=[
+            {"tool_use_id": "call_1", "tool": "read_files"},
+            {"tool_use_id": "call_2", "tool": "search_files"},
+        ],
+        model="gpt-5.4-mini",
+    )
+    transcript.append_tool_results("run_1", [{"tool_use_id": "call_1", "tool": "read_files", "files": []}])
+
+    context = transcript.next_model_context("run_1")
+    snapshot = transcript.snapshot("run_1")
+
+    assert context["previous_response_id"] is None
+    assert context["tool_result_messages"] == []
+    assert snapshot["counts"]["tool_result_context_incomplete"] == 1
+    assert snapshot["last_response_id"] is None
 
 
 def test_agent_transcript_persists_and_restores_pending_tool_results() -> None:

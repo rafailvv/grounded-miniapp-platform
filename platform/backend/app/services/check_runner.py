@@ -32,7 +32,7 @@ from app.validators.static_analysis import (
     extract_js_dom_ids,
     extract_script_refs,
     normalize_api_path,
-    role_html_ids,
+    role_surface_dom_ids,
     role_static_root,
 )
 from app.validators.suite import ValidationSuite
@@ -5936,7 +5936,7 @@ except Exception as exc:
             dom_ids = extract_js_dom_ids(js_content)
             if not dom_ids:
                 continue
-            html_ids = role_html_ids(source_dir, relative)
+            html_ids = role_surface_dom_ids(source_dir, relative)
             if not html_ids:
                 continue
             missing = sorted(dom_ids - html_ids)

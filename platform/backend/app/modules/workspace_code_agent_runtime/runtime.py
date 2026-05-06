@@ -228,6 +228,92 @@ class WorkspaceCodeAgentRuntime:
         payload = self.store.get("reports", f"{report_type}:{workspace_id}")
         return dict(payload) if isinstance(payload, dict) else None
 
+    def _stored_acceptance_contract_for_runtime(
+        self,
+        *,
+        workspace_id: str,
+        run_id: str,
+        request: GenerateRequest,
+        stored_run: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        candidates: list[dict[str, Any]] = []
+        candidates.extend(self._acceptance_contract_candidates(workspace_id=workspace_id, run_id=run_id, run_payload=stored_run))
+        source_run_id = str(request.resume_from_run_id or "").strip()
+        seen: set[str] = set()
+        while source_run_id and source_run_id not in seen:
+            seen.add(source_run_id)
+            source_payload = self.store.get("runs", source_run_id)
+            if not isinstance(source_payload, dict):
+                break
+            source_workspace = str(source_payload.get("workspace_id") or workspace_id)
+            candidates.extend(
+                self._acceptance_contract_candidates(
+                    workspace_id=source_workspace,
+                    run_id=source_run_id,
+                    run_payload=source_payload,
+                )
+            )
+            source_run_id = str(source_payload.get("resume_from_run_id") or "").strip()
+        required = [candidate for candidate in candidates if bool(candidate.get("required"))]
+        if required:
+            required.sort(key=lambda item: 0 if isinstance(item.get("prompt_hints"), dict) else 1)
+            return dict(required[0])
+        for candidate in candidates:
+            if candidate.get("blocking") or str(candidate.get("status") or "").startswith("blocked_"):
+                return dict(candidate)
+        return {}
+
+    def _acceptance_contract_candidates(
+        self,
+        *,
+        workspace_id: str,
+        run_id: str,
+        run_payload: dict[str, Any] | None,
+    ) -> list[dict[str, Any]]:
+        candidates: list[dict[str, Any]] = []
+        report = self.store.get("reports", f"acceptance_contract:{workspace_id}:{run_id}")
+        if isinstance(report, dict) and isinstance(report.get("contract"), dict):
+            candidates.append(dict(report["contract"]))
+        if isinstance(run_payload, dict) and isinstance(run_payload.get("acceptance_contract"), dict):
+            candidates.append(dict(run_payload["acceptance_contract"]))
+        return candidates
+
+    def _contract_prompt_for_runtime_contract(
+        self,
+        *,
+        workspace_id: str,
+        request: GenerateRequest,
+        stored_run: dict[str, Any] | None,
+        stored_plan: dict[str, Any],
+        acceptance_contract: dict[str, Any],
+    ) -> str:
+        candidate_run_ids: list[str] = []
+        repair_continuation = stored_plan.get("repair_continuation") if isinstance(stored_plan.get("repair_continuation"), dict) else {}
+        for value in (
+            acceptance_contract.get("contract_source_run_id"),
+            acceptance_contract.get("inherited_from_run_id"),
+            repair_continuation.get("contract_source_run_id"),
+            repair_continuation.get("source_run_id"),
+            request.resume_from_run_id,
+        ):
+            run_id = str(value or "").strip()
+            if run_id and run_id not in candidate_run_ids:
+                candidate_run_ids.append(run_id)
+        if isinstance(stored_run, dict):
+            prompt = str(stored_run.get("prompt") or "").strip()
+            if prompt and not candidate_run_ids:
+                return prompt
+        for run_id in candidate_run_ids:
+            payload = self.store.get("runs", run_id)
+            if not isinstance(payload, dict):
+                continue
+            if str(payload.get("workspace_id") or workspace_id) != workspace_id:
+                continue
+            prompt = str(payload.get("prompt") or "").strip()
+            if prompt:
+                return prompt
+        return request.prompt
+
     def retry_from_job(self, job_id: str, *, should_stop: Callable[[], bool] | None = None) -> JobRecord:
         job = self.get_job(job_id)
         request = GenerateRequest(
@@ -770,10 +856,11 @@ class WorkspaceCodeAgentRuntime:
         focused_visual_edit = focused_edit_kind == "visual_style_edit"
         create_intent = str(request.intent or "").strip().lower() == "create"
         stored_run = self.store.get("runs", run_id) if run_id else None
-        stored_acceptance_contract = (
-            dict(stored_run.get("acceptance_contract") or {})
-            if isinstance(stored_run, dict) and isinstance(stored_run.get("acceptance_contract"), dict)
-            else {}
+        stored_acceptance_contract = self._stored_acceptance_contract_for_runtime(
+            workspace_id=workspace_id,
+            run_id=run_id,
+            request=request,
+            stored_run=stored_run if isinstance(stored_run, dict) else None,
         )
         stored_plan = (
             dict(stored_run.get("implementation_plan") or {})
@@ -781,12 +868,18 @@ class WorkspaceCodeAgentRuntime:
             else {}
         )
         prompt_analysis: dict[str, Any] | None = None
+        stored_contract_is_authoritative = bool(
+            stored_acceptance_contract.get("required")
+            or stored_acceptance_contract.get("blocking")
+            or str(stored_acceptance_contract.get("status") or "").startswith("blocked_")
+            or isinstance(stored_acceptance_contract.get("prompt_hints"), dict)
+        )
         requires_prompt_analysis = (
             create_intent
             or focused_edit_kind == "behavior_workflow_edit"
             or generation_mode in {GenerationMode.BALANCED, GenerationMode.QUALITY}
-        )
-        if requires_prompt_analysis and not isinstance(stored_acceptance_contract.get("prompt_hints"), dict):
+        ) and not stored_contract_is_authoritative
+        if requires_prompt_analysis:
             prompt_analysis = self.openai_client.analyze_miniapp_prompt(
                 prompt=request.prompt,
                 generation_mode=generation_mode,
@@ -794,7 +887,7 @@ class WorkspaceCodeAgentRuntime:
             )
         acceptance_contract = (
             stored_acceptance_contract
-            if isinstance(stored_acceptance_contract.get("prompt_hints"), dict)
+            if stored_contract_is_authoritative
             else build_acceptance_contract(
                 prompt=request.prompt,
                 intent=str(request.intent or ""),
@@ -802,6 +895,13 @@ class WorkspaceCodeAgentRuntime:
                 focused_edit_kind=focused_edit_kind,
                 prompt_analysis=prompt_analysis,
             )
+        )
+        contract_prompt = self._contract_prompt_for_runtime_contract(
+            workspace_id=workspace_id,
+            request=request,
+            stored_run=stored_run if isinstance(stored_run, dict) else None,
+            stored_plan=stored_plan,
+            acceptance_contract=acceptance_contract,
         )
         orchestration = orchestration_metadata_for_contract(
             contract=acceptance_contract,
@@ -823,7 +923,7 @@ class WorkspaceCodeAgentRuntime:
             miniapp_contract = MiniAppContractCompiler.compile(
                 workspace_id=workspace_id,
                 run_id=run_id,
-                prompt=request.prompt,
+                prompt=contract_prompt,
                 intent=str(request.intent or ""),
                 generation_mode=generation_mode,
                 acceptance_contract=acceptance_contract,
@@ -1969,6 +2069,7 @@ class WorkspaceCodeAgentRuntime:
                 results=results,
                 preview_details=preview_details,
                 validation_snapshot=validation_snapshot,
+                acceptance_contract=acceptance_contract,
             )
             self._record_rollout_trace(
                 job,
@@ -5572,6 +5673,7 @@ class WorkspaceCodeAgentRuntime:
         results: list[RunCheckResult],
         preview_details: dict[str, Any],
         validation_snapshot: ValidationSnapshot | None,
+        acceptance_contract: dict[str, Any] | None = None,
     ) -> dict[str, object]:
         del preview_details
         return self.completion_gate.completion_state(
@@ -5582,7 +5684,7 @@ class WorkspaceCodeAgentRuntime:
             validation_snapshot=validation_snapshot,
             generation_mode=str(getattr(request.generation_mode, "value", request.generation_mode)),
             intent=request.intent,
-            acceptance_contract=getattr(request, "acceptance_contract", None),
+            acceptance_contract=acceptance_contract,
             focused_visual_edit=self._focused_edit_kind(request) == "css_only_visual",
         )
 

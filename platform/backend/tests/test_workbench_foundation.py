@@ -9,7 +9,7 @@ from typing import Any
 from fastapi.testclient import TestClient
 
 from app.main import create_app
-from app.models.domain import JobRecord, PreviewRecord, RunRecord
+from app.models.domain import CreateRunRequest, GenerateRequest, JobRecord, PreviewRecord, RunCheckResult, RunRecord
 from app.modules.miniapp_agent_loop.agent_command_policy import AgentCommandPolicy
 from app.modules.miniapp_agent_loop.agent_transcript import AgentTranscriptStore
 from app.services.repair_catalog import RepairCatalog
@@ -1495,6 +1495,291 @@ def test_run_service_schedules_auto_repair_continuation_from_active_case(tmp_pat
     saved = run_service.get_run(run.run_id)
     assert saved.current_stage == "auto_repair_queued"
     assert "Auto repair continuation" in (saved.summary or "")
+
+
+def test_run_service_schedules_auto_repair_continuation_for_repeated_no_progress(tmp_path: Path, monkeypatch) -> None:
+    app = create_app(data_dir=tmp_path)
+    run_service = app.state.container.run_service
+    repair_service = app.state.container.repair_case_service
+    run = RunRecord(
+        workspace_id="ws_1",
+        prompt="Build a prompt-derived workflow",
+        intent="create",
+        status="blocked",
+        apply_status="blocked",
+        draft_ready=True,
+        draft_status="ready",
+        failure_class="generation.repeated_no_progress",
+        failure_signature="repair.no_progress:browser_flow_smoke",
+        current_fix_phase="blocked_repair_continuation_needed",
+        failure_reason="Repeated repair no-progress reached.",
+    )
+    repair_service.sync_from_packets(
+        workspace_id=run.workspace_id,
+        run_id=run.run_id,
+        packets=[
+            {
+                "signature": "browser_flow_smoke:role_update_state_change",
+                "failure_class": "browser_flow_smoke",
+                "severity": "high",
+                "target_files": ["miniapp/app/static/specialist/app.js"],
+                "verification_check": "browser_flow_smoke",
+            }
+        ],
+        source="agent_loop_checks",
+    )
+
+    class FakeBackgroundTaskService:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def create_task(self, **kwargs):
+            self.calls.append(kwargs)
+            return type("Task", (), {"task_id": "task_auto_repair"})()
+
+    fake = FakeBackgroundTaskService()
+    monkeypatch.setenv("GROUNDED_AUTO_REPAIR_CONTINUATION_MAX", "1")
+    run_service.attach_background_task_service(fake)
+
+    run_service._schedule_auto_repair_continuation_if_needed(run)
+
+    assert fake.calls
+    assert fake.calls[0]["task_type"] == "repair_failed_run"
+    assert fake.calls[0]["input_payload"]["source_run_id"] == run.run_id
+    assert app.state.container.store.get("reports", f"auto_repair_continuation:{run.run_id}")["status"] == "scheduled"
+
+
+def test_repair_continuation_inherits_source_product_contract(tmp_path: Path, monkeypatch) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Original Product Workspace",
+            "description": "contract inheritance test",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    run_service = app.state.container.run_service
+    source = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Создай mini-app для общего рабочего процесса с ролями client, specialist и manager.",
+        intent="create",
+        target_role_scope=["client", "specialist", "manager"],
+        status="blocked",
+        apply_status="blocked",
+        draft_ready=True,
+        draft_status="ready",
+        acceptance_contract={
+            "required": True,
+            "status": "planned",
+            "prompt_hints": {
+                "prompt_summary": "shared role workflow",
+                "resource_hint": "рабочий процесс",
+                "field_hints": ["название", "статус"],
+                "role_field_hints": {"client": ["название"], "specialist": ["статус"], "manager": ["решение"]},
+                "role_action_prompts": {
+                    "client": ["создает рабочий процесс"],
+                    "specialist": ["обновляет статус"],
+                    "manager": ["принимает решение"],
+                },
+            },
+            "flows": [{"id": "role_shared_persistence", "steps": [{"role": "client", "kind": "prompt_state_source"}]}],
+            "required_endpoints": [
+                {"method": "GET", "path": "/api/workflows", "purpose": "read state"},
+                {"method": "POST", "path": "/api/workflows", "purpose": "create state"},
+            ],
+            "features": {"prompt_contract_v1": True, "platform_product_scaffold": False},
+        },
+        implementation_plan={"principle": "source product contract", "tasks": []},
+    )
+    app.state.container.store.upsert("runs", source.run_id, source.model_dump(mode="json"))
+    monkeypatch.setattr(run_service, "_execute_run", lambda *_args, **_kwargs: None)
+
+    continuation = run_service.create_run(
+        workspace["workspace_id"],
+        CreateRunRequest(
+            prompt="Repair only the active case.",
+            mode="fix",
+            intent="edit",
+            generation_mode="fast",
+            resume_from_run_id=source.run_id,
+        ),
+    )
+    saved = run_service.get_run(continuation.run_id)
+    workspace_after = app.state.container.workspace_service.get_workspace(workspace["workspace_id"])
+
+    assert saved.prompt == "Repair only the active case."
+    assert saved.acceptance_contract["required"] is True
+    assert saved.acceptance_contract["inherited_from_run_id"] == source.run_id
+    assert saved.acceptance_contract["repair_continuation"] is True
+    assert saved.flow_coverage["status"] == "planned"
+    assert saved.implementation_plan["repair_continuation"]["contract_inherited"] is True
+    assert workspace_after.name == "Original Product Workspace"
+
+
+def test_repair_continuation_recovers_contract_from_lineage(tmp_path: Path, monkeypatch) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Lineage Contract Workspace",
+            "description": "contract lineage test",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    run_service = app.state.container.run_service
+    contract = {
+        "required": True,
+        "status": "planned",
+        "prompt_hints": {
+            "prompt_summary": "shared role workflow",
+            "resource_hint": "общий процесс",
+            "field_hints": ["название", "статус"],
+            "role_field_hints": {"client": ["название"], "specialist": ["статус"], "manager": ["решение"]},
+            "role_action_prompts": {
+                "client": ["создает общий процесс"],
+                "specialist": ["меняет статус"],
+                "manager": ["принимает решение"],
+            },
+        },
+        "flows": [{"id": "role_shared_persistence"}],
+    }
+    root = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Создай mini-app для общего процесса между client, specialist и manager.",
+        intent="create",
+        target_role_scope=["client", "specialist", "manager"],
+        status="blocked",
+        apply_status="blocked",
+        draft_ready=True,
+        draft_status="ready",
+        acceptance_contract=contract,
+        implementation_plan={"principle": "root contract"},
+    )
+    intermediate = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Repair active case.",
+        mode="fix",
+        intent="edit",
+        target_role_scope=["client", "specialist", "manager"],
+        status="blocked",
+        apply_status="blocked",
+        draft_ready=True,
+        draft_status="ready",
+        resume_from_run_id=root.run_id,
+        acceptance_contract={"required": False, "flows": []},
+        implementation_plan={"repair_continuation": {"source_run_id": root.run_id}},
+    )
+    store = app.state.container.store
+    store.upsert("runs", root.run_id, root.model_dump(mode="json"))
+    store.upsert("runs", intermediate.run_id, intermediate.model_dump(mode="json"))
+    store.upsert(
+        "reports",
+        f"acceptance_contract:{workspace['workspace_id']}:{root.run_id}",
+        {"workspace_id": workspace["workspace_id"], "run_id": root.run_id, "contract": contract},
+    )
+    monkeypatch.setattr(run_service, "_execute_run", lambda *_args, **_kwargs: None)
+
+    continuation = run_service.create_run(
+        workspace["workspace_id"],
+        CreateRunRequest(
+            prompt="Continue repair from latest failed case.",
+            mode="fix",
+            intent="edit",
+            generation_mode="fast",
+            resume_from_run_id=intermediate.run_id,
+        ),
+    )
+    saved = run_service.get_run(continuation.run_id)
+
+    assert saved.acceptance_contract["required"] is True
+    assert saved.acceptance_contract["inherited_from_run_id"] == root.run_id
+    assert saved.acceptance_contract["continued_from_run_id"] == intermediate.run_id
+    assert saved.implementation_plan["repair_continuation"]["contract_source_run_id"] == root.run_id
+
+
+def test_runtime_repair_lineage_keeps_acceptance_gate_required(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Runtime Gate Workspace",
+            "description": "runtime gate contract test",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    contract = {
+        "required": True,
+        "prompt_hints": {
+            "prompt_summary": "shared role workflow",
+            "resource_hint": "общий процесс",
+            "field_hints": ["название"],
+            "role_field_hints": {"client": ["название"], "specialist": ["статус"], "manager": ["решение"]},
+            "role_action_prompts": {
+                "client": ["создает общий процесс"],
+                "specialist": ["обновляет статус"],
+                "manager": ["принимает решение"],
+            },
+        },
+        "flows": [{"id": "role_shared_persistence"}],
+    }
+    root = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Создай mini-app для общего процесса между ролями.",
+        intent="create",
+        acceptance_contract=contract,
+    )
+    child = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Repair active case.",
+        mode="fix",
+        intent="edit",
+        resume_from_run_id=root.run_id,
+        acceptance_contract={"required": False},
+    )
+    runtime = app.state.container.workspace_code_agent_runtime
+    store = app.state.container.store
+    store.upsert("runs", root.run_id, root.model_dump(mode="json"))
+    store.upsert("runs", child.run_id, child.model_dump(mode="json"))
+    store.upsert(
+        "reports",
+        f"acceptance_contract:{workspace['workspace_id']}:{root.run_id}",
+        {"workspace_id": workspace["workspace_id"], "run_id": root.run_id, "contract": contract},
+    )
+
+    inherited = runtime._stored_acceptance_contract_for_runtime(
+        workspace_id=workspace["workspace_id"],
+        run_id=child.run_id,
+        request=GenerateRequest(prompt="Repair active case.", mode="fix", intent="edit", generation_mode="fast", resume_from_run_id=root.run_id),
+        stored_run=child.model_dump(mode="json"),
+    )
+    state = runtime._completion_state(
+        workspace_id=workspace["workspace_id"],
+        run_id=child.run_id,
+        request=GenerateRequest(prompt="Repair active case.", mode="fix", intent="edit", generation_mode="fast", resume_from_run_id=root.run_id),
+        results=[
+            RunCheckResult(name="platform_invariants", status="passed"),
+            RunCheckResult(name="api_workflow_smoke", status="skipped"),
+            RunCheckResult(name="browser_flow_smoke", status="skipped"),
+        ],
+        preview_details={},
+        validation_snapshot=None,
+        acceptance_contract=inherited,
+    )
+
+    assert inherited["required"] is True
+    assert state["product_proof_required"] is True
+    assert state["strict_green"] is False
+    assert {issue["check"] for issue in state["remaining_issues"] if issue["kind"] == "required_product_proof"} == {
+        "api_workflow_smoke",
+        "browser_flow_smoke",
+    }
 
 
 def test_repair_catalog_extracts_nested_workflow_evidence() -> None:

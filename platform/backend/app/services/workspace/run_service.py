@@ -158,7 +158,12 @@ class RunService:
 
     def _start_run(self, workspace_id: str, request: CreateRunRequest, *, wait: bool) -> RunRecord:
         workspace = self.workspace_service.get_workspace(workspace_id)
-        suggested_workspace_name = self._derive_workspace_name_from_prompt(request.prompt)
+        source_run: RunRecord | None = None
+        if request.resume_from_run_id:
+            source_run = self.get_run(request.resume_from_run_id)
+            if source_run.workspace_id != workspace_id:
+                raise ValueError("Cannot resume a run from another workspace.")
+        suggested_workspace_name = "" if source_run is not None else self._derive_workspace_name_from_prompt(request.prompt)
         if suggested_workspace_name:
             workspace = self.workspace_service.rename_workspace(workspace_id, suggested_workspace_name)
         resolved_role_scope = self._resolve_target_role_scope(request)
@@ -184,6 +189,10 @@ class RunService:
             error_context=request.error_context,
         )
         focused_edit_kind = WorkspaceCodeAgentRuntime._focused_edit_kind(contract_probe)
+        contract_source_run, inherited_acceptance_contract = self._resolve_inherited_acceptance_contract(
+            source_run,
+            request=request,
+        )
         prompt_analysis: dict[str, Any] | None = None
         prompt_analysis_usage: dict[str, Any] = {}
         prompt_analysis_model: str | None = None
@@ -191,7 +200,7 @@ class RunService:
             resolved_intent == "create"
             or focused_edit_kind == "behavior_workflow_edit"
             or effective_generation_mode in {GenerationMode.BALANCED, GenerationMode.QUALITY}
-        )
+        ) and not inherited_acceptance_contract
         if requires_prompt_analysis:
             if not self.openai_client.enabled:
                 raise RuntimeError("LLM prompt analysis is required before creating a workflow run.")
@@ -206,26 +215,49 @@ class RunService:
                 )
             prompt_analysis_usage = dict((prompt_analysis or {}).pop("_llm_usage", {}) or {})
             prompt_analysis_model = str((prompt_analysis or {}).pop("_llm_model", "") or "") or None
-        acceptance_contract = build_acceptance_contract(
-            prompt=request.prompt,
-            intent=resolved_intent,
-            generation_mode=effective_generation_mode,
-            focused_edit_kind=focused_edit_kind,
-            prompt_analysis=prompt_analysis,
-        )
+        contract_prompt = contract_source_run.prompt if inherited_acceptance_contract and contract_source_run is not None else request.prompt
+        if inherited_acceptance_contract:
+            acceptance_contract = {
+                **inherited_acceptance_contract,
+                "required": True,
+                "inherited_from_run_id": contract_source_run.run_id if contract_source_run else request.resume_from_run_id,
+                "continued_from_run_id": source_run.run_id if source_run else request.resume_from_run_id,
+                "contract_source_run_id": contract_source_run.run_id if contract_source_run else request.resume_from_run_id,
+                "repair_continuation": True,
+            }
+        else:
+            acceptance_contract = build_acceptance_contract(
+                prompt=request.prompt,
+                intent=resolved_intent,
+                generation_mode=effective_generation_mode,
+                focused_edit_kind=focused_edit_kind,
+                prompt_analysis=prompt_analysis,
+            )
         orchestration = orchestration_metadata_for_contract(
             contract=acceptance_contract,
             generation_mode=effective_generation_mode,
             focused_edit_kind=focused_edit_kind,
         )
-        implementation_plan = build_implementation_plan(
-            prompt=request.prompt,
-            intent=resolved_intent,
-            generation_mode=effective_generation_mode,
-            acceptance_contract=acceptance_contract,
-            orchestration=orchestration,
-            prompt_analysis=prompt_analysis,
-        )
+        if inherited_acceptance_contract and source_run is not None:
+            implementation_plan = {
+                **dict(source_run.implementation_plan or {}),
+                "repair_continuation": {
+                    "enabled": True,
+                    "source_run_id": source_run.run_id,
+                    "contract_source_run_id": contract_source_run.run_id if contract_source_run else source_run.run_id,
+                    "source_prompt_preserved": True,
+                    "contract_inherited": True,
+                },
+            }
+        else:
+            implementation_plan = build_implementation_plan(
+                prompt=request.prompt,
+                intent=resolved_intent,
+                generation_mode=effective_generation_mode,
+                acceptance_contract=acceptance_contract,
+                orchestration=orchestration,
+                prompt_analysis=prompt_analysis,
+            )
         contract_blocked = bool(acceptance_contract.get("blocking")) or str(acceptance_contract.get("status") or "").startswith("blocked_")
         run = RunRecord(
             workspace_id=workspace_id,
@@ -265,7 +297,7 @@ class RunService:
             miniapp_contract = MiniAppContractCompiler.compile(
                 workspace_id=workspace_id,
                 run_id=run.run_id,
-                prompt=request.prompt,
+                prompt=contract_prompt,
                 intent=resolved_intent,
                 generation_mode=effective_generation_mode,
                 acceptance_contract=acceptance_contract,
@@ -2222,7 +2254,12 @@ class RunService:
             or bool((run.budget_status or {}).get("exhausted"))
             or str(run.current_stage or "") == "blocked_budget_exhausted"
         )
-        if not budget_exhausted:
+        repeated_no_progress = (
+            run.failure_class == "generation.repeated_no_progress"
+            or str(run.failure_signature or "").startswith("repair.no_progress:")
+            or str(run.current_fix_phase or "") == "blocked_repair_continuation_needed"
+        )
+        if not budget_exhausted and not repeated_no_progress:
             return
         if self.store.get("reports", f"auto_repair_continuation:{run.run_id}"):
             return
@@ -2251,6 +2288,8 @@ class RunService:
             "Continue this failed generation from the active repair case. "
             "Do not restart product design and do not invent fallback product semantics. "
             "Patch only the evidence-backed target slice, then rerun the expected proof.\n"
+            f"Original product prompt:\n{run.prompt[:3000]}\n"
+            "Active repair case:\n"
             f"{json.dumps(active_case.get('repair_prompt') or active_case, ensure_ascii=False, default=str)[:5000]}"
         )
         task = self.background_task_service.create_task(
@@ -2276,9 +2315,10 @@ class RunService:
         self._save_run(run)
         self._append_job_event(
             run.linked_job_id,
-            "auto_repair_continuation_queued",
+            "repair_started",
             "Auto repair continuation queued from active repair case.",
             {
+                "event": "auto_repair_continuation_queued",
                 "run_id": run.run_id,
                 "task_id": task.task_id,
                 "repair_case_id": active_case.get("case_id"),
@@ -2316,6 +2356,42 @@ class RunService:
             except KeyError:
                 break
         return depth
+
+    def _resolve_inherited_acceptance_contract(
+        self,
+        source_run: RunRecord | None,
+        *,
+        request: CreateRunRequest,
+    ) -> tuple[RunRecord | None, dict[str, Any]]:
+        if source_run is None or request.mode != "fix":
+            return None, {}
+        seen: set[str] = set()
+        current: RunRecord | None = source_run
+        while current is not None and current.run_id not in seen:
+            seen.add(current.run_id)
+            contract = self._required_acceptance_contract_for_run(current)
+            if contract:
+                return current, contract
+            if not current.resume_from_run_id:
+                break
+            try:
+                current = self.get_run(current.resume_from_run_id)
+            except KeyError:
+                break
+        return None, {}
+
+    def _required_acceptance_contract_for_run(self, run: RunRecord) -> dict[str, Any]:
+        candidates: list[dict[str, Any]] = []
+        report = self.store.get("reports", f"acceptance_contract:{run.workspace_id}:{run.run_id}")
+        if isinstance(report, dict) and isinstance(report.get("contract"), dict):
+            candidates.append(dict(report["contract"]))
+        if isinstance(run.acceptance_contract, dict):
+            candidates.append(dict(run.acceptance_contract))
+        required = [candidate for candidate in candidates if bool(candidate.get("required"))]
+        if not required:
+            return {}
+        required.sort(key=lambda item: 0 if isinstance(item.get("prompt_hints"), dict) else 1)
+        return dict(required[0])
 
     def _resolve_intent(self, workspace: WorkspaceRecord, request: CreateRunRequest, *, resolved_role_scope: list[str] | None = None) -> str:
         if request.intent != "auto":
