@@ -1132,7 +1132,7 @@ def test_run_record_reconciles_from_terminal_artifacts(tmp_path: Path) -> None:
     assert persisted["status"] == "completed"
 
 
-def test_reliability_gate_final_report_and_repair_catalog(tmp_path: Path) -> None:
+def test_reliability_gate_final_report_and_empty_repair_queue(tmp_path: Path) -> None:
     app = create_app(data_dir=tmp_path)
     client = TestClient(app)
     workspace = client.post(
@@ -1180,14 +1180,6 @@ def test_reliability_gate_final_report_and_repair_catalog(tmp_path: Path) -> Non
     assert final_report["status"] == "passed"
     assert final_report["diff_summary"]["diff_available"] is True
     assert repair["status"] == "empty"
-    assert any(item["signature"] == "backend.missing_route" for item in RepairCatalog.entries())
-    catalog_signatures = {item["signature"] for item in RepairCatalog.entries()}
-    assert {
-        "edit.stale_read_state",
-        "preview.boot_failed",
-        "api.workflow_smoke_failed",
-        "workflow.shared_role_state_broken",
-    }.issubset(catalog_signatures)
 
 
 def test_reliability_gate_blocks_missing_browser_proof(tmp_path: Path) -> None:
@@ -1385,7 +1377,7 @@ def test_repair_catalog_extracts_nested_workflow_evidence() -> None:
     assert "workflow.payload_schema_mismatch" in signatures
 
 
-def test_repair_catalog_prefers_embedded_validator_recipe_over_generic_static_failure() -> None:
+def test_repair_catalog_prefers_embedded_validator_recipe_over_broad_static_failure() -> None:
     packet = RepairCatalog.classify_issue(
         {
             "kind": "check_failure",

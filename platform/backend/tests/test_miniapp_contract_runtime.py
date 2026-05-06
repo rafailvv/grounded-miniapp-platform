@@ -43,14 +43,14 @@ def test_fast_contract_compiler_creates_deterministic_resource_and_routes() -> N
     routes = {(endpoint.method, endpoint.path) for endpoint in contract.endpoints}
 
     assert contract.version == "grounded.miniapp.contract.v1"
-    assert routes == set()
+    assert routes == {("GET", "/api/ledgers"), ("POST", "/api/ledgers")}
     assert contract.resources[0].slug == "ledgers"
     assert "miniapp/app/generated/route_manifest.json" in contract.allowed_file_graph.contract_owned_paths
     assert all("miniapp/app/routes/" not in path for path in contract.allowed_file_graph.contract_owned_paths)
     assert "miniapp/tests/test_generated_app.py" not in contract.allowed_file_graph.blocked_globs
 
 
-def test_materializer_is_idempotent_and_registry_passes(tmp_path: Path) -> None:
+def test_materializer_is_idempotent_and_registry_reports_missing_prompt_routes(tmp_path: Path) -> None:
     source = _template_source(tmp_path)
     contract = MiniAppContractCompiler.compile(
         workspace_id="ws_test",
@@ -70,7 +70,8 @@ def test_materializer_is_idempotent_and_registry_passes(tmp_path: Path) -> None:
     assert all("miniapp/app/routes/" not in path for path in first)
     assert "miniapp/tests/test_generated_app.py" not in first
     assert second == []
-    assert snapshot.status == "passed"
+    assert snapshot.status == "drift"
+    assert any(issue["code"] == "registry.missing_backend_route" for issue in snapshot.drift_issues)
     assert preloaded_issues == []
     assert preloaded_findings == []
     assert "/client" in snapshot.manifest_routes
@@ -81,16 +82,16 @@ def test_contract_materializer_does_not_write_product_role_shell(tmp_path: Path)
     original_client_html = (source / "miniapp/app/static/client/index.html").read_text(encoding="utf-8")
     original_manager_html = (source / "miniapp/app/static/manager/index.html").read_text(encoding="utf-8")
     original_manager_js = (source / "miniapp/app/static/manager/app.js").read_text(encoding="utf-8")
-    analysis = _analysis("каталог")
+    analysis = _analysis("рабочая матрица")
     analysis["role_field_hints"] = {
         "client": [],
         "specialist": [],
         "manager": ["название элемента", "тип", "доступность"],
     }
     analysis["role_action_prompts"] = {
-        "client": ["смотрит каталог"],
+        "client": ["смотрит рабочую матрицу"],
         "specialist": [],
-        "manager": ["публикует элементы"],
+        "manager": ["публикует элементы матрицы"],
     }
     analysis["role_state_contract"] = {
         "source_roles": ["manager"],
@@ -101,7 +102,7 @@ def test_contract_materializer_does_not_write_product_role_shell(tmp_path: Path)
     contract = MiniAppContractCompiler.compile(
         workspace_id="ws_test",
         run_id="run_test",
-        prompt="Создай каталог: менеджер публикует элементы, клиент смотрит каталог.",
+        prompt="Создай рабочую матрицу: менеджер публикует элементы, клиент смотрит матрицу.",
         intent="create",
         generation_mode=GenerationMode.QUALITY,
         prompt_analysis=analysis,
@@ -207,7 +208,8 @@ def test_registry_sync_adds_filesystem_child_pages_to_route_manifest(tmp_path: P
 
     assert "miniapp/app/generated/route_manifest.json" in changed
     assert "/client/history" in snapshot.manifest_routes
-    assert snapshot.status == "passed"
+    assert snapshot.status == "drift"
+    assert any(issue["code"] == "registry.missing_backend_route" for issue in snapshot.drift_issues)
 
 
 def test_contract_owned_files_are_blocked_from_llm_writes() -> None:

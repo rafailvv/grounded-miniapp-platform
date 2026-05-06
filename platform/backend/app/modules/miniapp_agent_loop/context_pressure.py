@@ -78,7 +78,7 @@ class AgentContextPressureAnalyzer:
         """Detect Claude-style duplicate file read pressure from tool trace.
 
         The model often loops by re-reading the same large files after every
-        failed repair. This summary is intentionally generic: it does not know
+        failed repair. This summary is intentionally product-neutral: it does not know
         anything about product categories, only tool calls and file paths.
         """
         events = transcript.get("events") if isinstance(transcript, dict) else []

@@ -63,11 +63,11 @@ class ProjectInstructionBundle:
         return "\n".join(lines)[:limit]
 
     @staticmethod
-    def _title(text: str, fallback: str) -> str:
+    def _title(text: str, default_title: str) -> str:
         for line in text.splitlines():
             if line.startswith("#"):
-                return line.lstrip("#").strip() or fallback
-        return fallback
+                return line.lstrip("#").strip() or default_title
+        return default_title
 
     @staticmethod
     def _summary(text: str) -> str:
@@ -658,7 +658,7 @@ class AcceptanceScenarioGenerator:
                 "items": [],
                 "source": "acceptance_contract_missing",
                 "blocking": True,
-                "message": "Acceptance scenarios require a prompt-derived acceptance/product contract; no product workflow fallback was generated.",
+                "message": "Acceptance scenarios require a prompt-derived acceptance/product contract; no platform-invented workflow was generated.",
                 "created_at": _now(),
             }
         scenarios = []
@@ -668,25 +668,28 @@ class AcceptanceScenarioGenerator:
                 role for role in (flow.get("roles") or run.target_role_scope or ROLE_ORDER)
                 if str(role) in ROLE_ORDER
             ] or list(ROLE_ORDER)
+            steps = AcceptanceScenarioGenerator._steps_for_flow(flow, roles)
             scenarios.append(
                 {
                     "scenario_id": _slug(flow_id),
                     "title": str(flow.get("title") or flow.get("description") or flow_id).strip()[:120],
                     "roles": roles,
-                    "steps": AcceptanceScenarioGenerator._steps_for_flow(flow, roles),
+                    "steps": steps,
                     "proof": {
                         "api_check": "api_workflow_smoke",
                         "browser_check": "browser_flow_smoke",
                         "source_check": "frontend_interaction_static_smoke",
                     },
-                    "status": AcceptanceScenarioGenerator._scenario_status(artifacts),
+                    "status": AcceptanceScenarioGenerator._scenario_status(artifacts) if steps else "blocked_contract_steps_missing",
+                    "blocking": not bool(steps),
                 }
             )
+        overall_status = "blocked_contract_steps_missing" if any(not item.get("steps") for item in scenarios) else "planned"
         return {
             "schema": "grounded.acceptance_scenarios.v1",
             "run_id": run.run_id,
             "workspace_id": run.workspace_id,
-            "status": "planned" if scenarios else "empty",
+            "status": overall_status if scenarios else "empty",
             "items": scenarios[:8],
             "source": "acceptance_contract",
             "created_at": _now(),
@@ -694,15 +697,8 @@ class AcceptanceScenarioGenerator:
 
     @staticmethod
     def _steps_for_flow(flow: dict[str, Any], roles: list[str]) -> list[dict[str, Any]]:
-        steps = [
-            {"kind": "open_role", "role": roles[0], "expectation": "Primary role surface loads."},
-            {"kind": "create_or_update", "role": roles[0], "expectation": "User-provided state is persisted through the API."},
-        ]
-        if len(roles) > 1:
-            steps.append({"kind": "consume_state", "role": roles[-1], "expectation": "Another role can see or act on the shared state."})
-        steps.append({"kind": "mobile_layout", "role": "all", "expectation": "No horizontal overflow or critical overlap."})
         custom_steps = [item for item in flow.get("steps") or [] if isinstance(item, dict)]
-        return custom_steps[:6] or steps
+        return custom_steps[:8]
 
     @staticmethod
     def _scenario_status(artifacts: dict[str, Any]) -> str:

@@ -1851,6 +1851,13 @@ class WorkbenchService:
                 status = "passed" if all(str(item.get("status")) == "passed" for item in matched) else "failed"
             return {"key": key, "label": label, "status": status, "required": required, "evidence": matched}
 
+        acceptance = self.acceptance_scenarios(run_id)
+        acceptance_items = list(acceptance.get("items") or [])
+        acceptance_blocked = str(acceptance.get("status") or "").startswith("blocked_") or any(
+            bool(item.get("blocking")) or str(item.get("status") or "").startswith("blocked_")
+            for item in acceptance_items
+            if isinstance(item, dict)
+        )
         items = [
             entry("backend_pytest", "Backend pytest", ("generated_backend_tests", "backend_tests", "pytest")),
             entry("frontend_js_smoke", "Frontend JS smoke", ("frontend_interaction_static_smoke", "js_syntax")),
@@ -1862,9 +1869,9 @@ class WorkbenchService:
             {
                 "key": "acceptance_scenarios",
                 "label": "Acceptance scenarios",
-                "status": "passed" if self.acceptance_scenarios(run_id).get("items") else "failed",
+                "status": "passed" if acceptance_items and not acceptance_blocked else "failed",
                 "required": True,
-                "evidence": self.acceptance_scenarios(run_id).get("items", []),
+                "evidence": acceptance_items,
             },
             {
                 "key": "visual_qa",

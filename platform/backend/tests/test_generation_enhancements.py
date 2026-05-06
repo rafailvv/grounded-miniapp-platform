@@ -226,14 +226,28 @@ def test_acceptance_visual_trace_and_magic_docs_reports(tmp_path: Path) -> None:
         model_profile="test",
         status="completed",
         apply_status="applied",
-        touched_files=["miniapp/app/static/client/index.html", "miniapp/app/routes/resources.py"],
+        touched_files=["miniapp/app/static/client/index.html", "miniapp/app/routes/briefings.py"],
         acceptance_contract={
             "required": True,
             "flows": [
                 {
-                    "id": "role-resource-flow",
-                    "title": "Prompt resource is handled by assigned roles",
+                    "id": "role-briefing-flow",
+                    "title": "Prompt briefing is handled by assigned roles",
                     "roles": ["client", "specialist", "manager"],
+                    "steps": [
+                        {
+                            "kind": "prompt_state_source",
+                            "role": "client",
+                            "entity": "briefing",
+                            "expectation": "Client records briefing data through app-owned UI and API.",
+                        },
+                        {
+                            "kind": "mobile_layout",
+                            "role": "all",
+                            "entity": "briefing",
+                            "expectation": "Role surfaces fit the mobile preview.",
+                        },
+                    ],
                 }
             ],
         },
@@ -244,7 +258,7 @@ def test_acceptance_visual_trace_and_magic_docs_reports(tmp_path: Path) -> None:
         "reports",
         f"run_artifacts:{run.run_id}",
         {
-            "diff": "diff --git a/miniapp/app/routes/resources.py b/miniapp/app/routes/resources.py\n",
+            "diff": "diff --git a/miniapp/app/routes/briefings.py b/miniapp/app/routes/briefings.py\n",
             "check_results": [
                 {"name": "api_workflow_smoke", "status": "passed", "details": "ok"},
                 {"name": "browser_flow_smoke", "status": "passed", "details": "ok", "diagnostics": {"mobile_layout": {"status": "passed"}}},
@@ -260,7 +274,7 @@ def test_acceptance_visual_trace_and_magic_docs_reports(tmp_path: Path) -> None:
     magic = client.post(f"/workspaces/{workspace['workspace_id']}/magic-docs/product-architecture").json()
 
     assert scenarios["schema"] == "grounded.acceptance_scenarios.v1"
-    assert scenarios["items"][0]["scenario_id"] == "role-resource-flow"
+    assert scenarios["items"][0]["scenario_id"] == "role-briefing-flow"
     assert scenarios["items"][0]["status"] == "proved"
     assert visual["schema"] == "grounded.visual_qa.v1"
     assert visual["viewports"] == [{"width": 360}, {"width": 390}, {"width": 430}]
@@ -293,7 +307,35 @@ def test_acceptance_scenarios_block_when_contract_missing(tmp_path: Path) -> Non
     assert scenarios["status"] == "blocked_contract_missing"
     assert scenarios["items"] == []
     assert scenarios["blocking"] is True
-    assert "fallback" in scenarios["message"]
+    assert "platform-invented" in scenarios["message"]
+
+
+def test_acceptance_scenarios_without_contract_steps_fail_matrix(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = _workspace(client)
+    run = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Build a prompt-defined role workflow",
+        intent="create",
+        target_role_scope=["client", "specialist", "manager"],
+        model_profile="test",
+        status="completed",
+        apply_status="applied",
+        acceptance_contract={
+            "required": True,
+            "flows": [{"id": "missing-steps", "title": "Missing prompt-derived steps", "roles": ["client"]}],
+        },
+    )
+    app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+
+    scenarios = client.get(f"/runs/{run.run_id}/acceptance-scenarios").json()
+    matrix = client.get(f"/runs/{run.run_id}/test-matrix").json()
+    acceptance_row = next(item for item in matrix["items"] if item["key"] == "acceptance_scenarios")
+
+    assert scenarios["status"] == "blocked_contract_steps_missing"
+    assert scenarios["items"][0]["blocking"] is True
+    assert acceptance_row["status"] == "failed"
 
 
 def test_context_pack_includes_workspace_memory_and_instruction_summary(tmp_path: Path) -> None:

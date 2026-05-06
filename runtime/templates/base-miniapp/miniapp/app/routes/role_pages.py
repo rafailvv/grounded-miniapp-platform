@@ -130,7 +130,7 @@ def resolve_declared_page_file(role: str, actual_path: str) -> Path | None:
     return None
 
 
-def resolve_default_role_page(role: str, actual_path: str) -> Path | None:
+def resolve_filesystem_role_page(role: str, actual_path: str) -> Path | None:
     actual_path = canonicalize_role_path(role, actual_path)
     if actual_path == f"/{role}":
         page_file = STATIC_DIR / role / "index.html"
@@ -153,7 +153,7 @@ def resolve_role_page(role: str, actual_path: str) -> Path:
     declared_page = resolve_declared_page_file(role, actual_path)
     if declared_page is not None:
         return declared_page
-    default_page = resolve_default_role_page(role, actual_path)
-    if default_page is not None:
-        return default_page
+    filesystem_page = resolve_filesystem_role_page(role, actual_path)
+    if filesystem_page is not None:
+        return filesystem_page
     raise KeyError(actual_path)

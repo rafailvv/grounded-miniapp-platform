@@ -41,7 +41,7 @@ async function miniappJson(input, init = {}, role = document.body?.dataset.role 
 
 function miniappRenderList(items, renderItem, emptyHtml) {
   if (!Array.isArray(items) || items.length === 0) {
-    return emptyHtml || '<div class="empty-state">No saved items yet.</div>';
+    return emptyHtml || "";
   }
   return items.map((item, index) => renderItem(item, index)).join("");
 }

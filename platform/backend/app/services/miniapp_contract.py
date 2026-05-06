@@ -130,6 +130,31 @@ class MiniAppContractCompiler:
         intent_value = str(intent or "").strip().lower() or "create"
         contract_hints = (acceptance_contract or {}).get("prompt_hints") if isinstance((acceptance_contract or {}).get("prompt_hints"), dict) else None
         hints = contract_hints or extract_prompt_planning_hints(prompt, prompt_analysis=prompt_analysis)
+        if (acceptance_contract or {}).get("blocking") or str((acceptance_contract or {}).get("status") or "").startswith("blocked_"):
+            allowed_graph = AllowedFileGraph(
+                contract_owned_paths=MiniAppContractMaterializer.contract_owned_paths(),
+                writable_globs=[],
+                readonly_paths=[],
+                blocked_globs=["miniapp/app/generated/**"],
+            )
+            contract = MiniAppContract(
+                workspace_id=workspace_id,
+                run_id=run_id,
+                prompt_summary=str(hints.get("prompt_summary") or prompt or "")[:1200],
+                generation_mode=mode_value,
+                intent=intent_value,
+                resources=[],
+                endpoints=[],
+                screens=[],
+                allowed_file_graph=allowed_graph,
+                acceptance_summary=dict(acceptance_contract or {}),
+            )
+            contract.artifacts = {
+                "miniapp_contract": "miniapp/app/generated/miniapp_contract.json",
+                "route_manifest": "miniapp/app/generated/route_manifest.json",
+                "validator_metadata": "miniapp/app/generated/contract_validator.json",
+            }
+            return contract
         slug_source = str(hints.get("resource_hint") or "").strip()
         resources: list[MiniAppResource] = []
         if slug_source:
@@ -261,16 +286,50 @@ class MiniAppContractCompiler:
             role_actions=role_actions,
             role_state_contract=role_state_contract or {},
         )
-        endpoints: list[MiniAppEndpoint] = []
         all_role_labels: dict[str, str] = {}
         for role in ROLE_ORDER:
             all_role_labels.update(dict(role_field_labels.get(role) or {}))
+        fields = list(dict.fromkeys([*field_labels.keys(), *all_role_labels.keys()]))
+        create_role = (source_roles or list(ROLE_ORDER))[:1][0]
+        update_role = (update_roles or source_roles or list(ROLE_ORDER))[:1][0]
+        endpoints: list[MiniAppEndpoint] = [
+            MiniAppEndpoint(
+                endpoint_id=f"{slug}.list",
+                method="GET",
+                path=f"/api/{slug}",
+                purpose="read prompt-derived persisted state",
+                resource=slug,
+                role="system",
+                request_fields=[],
+            ),
+            MiniAppEndpoint(
+                endpoint_id=f"{slug}.create",
+                method="POST",
+                path=f"/api/{slug}",
+                purpose="create prompt-derived persisted state",
+                resource=slug,
+                role=create_role,  # type: ignore[arg-type]
+                request_fields=fields,
+            ),
+        ]
+        if update_roles or status_values:
+            endpoints.append(
+                MiniAppEndpoint(
+                    endpoint_id=f"{slug}.update",
+                    method="PATCH",
+                    path=f"/api/{slug}/{{item_id}}",
+                    purpose="update prompt-derived persisted state",
+                    resource=slug,
+                    role=update_role,  # type: ignore[arg-type]
+                    request_fields=fields,
+                )
+            )
         return MiniAppResource(
             resource_id=slug,
             slug=slug,
             name=slug,
             display_name=display_name,
-            fields=list(dict.fromkeys([*field_labels.keys(), *all_role_labels.keys()])),
+            fields=fields,
             field_labels=field_labels,
             role_field_labels=role_field_labels,
             role_actions=role_actions,

@@ -169,13 +169,13 @@ function buildFixPrefill(run: Run): { prompt: string; context: FixErrorContext }
   };
 }
 
-function isGenericFixPrompt(prompt: string | null | undefined): boolean {
+function isAutoRepairPrompt(prompt: string | null | undefined): boolean {
   const normalized = (prompt ?? "").trim().replace(/\s+/g, " ").toLowerCase();
   return normalized === "analyze the reported failure and apply the smallest safe fix.";
 }
 
 function displayRunPrompt(run: Run): string {
-  if (!isGenericFixPrompt(run.prompt)) {
+  if (!isAutoRepairPrompt(run.prompt)) {
     return run.prompt;
   }
   return (

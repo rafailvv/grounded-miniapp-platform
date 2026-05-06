@@ -24,7 +24,7 @@ class VerificationWorkerResult:
 
 
 class VerificationWorker:
-    """Read-only final reviewer over generic workflow and mobile proof."""
+    """Read-only final reviewer over contract workflow and mobile proof."""
 
     REQUIRED_CREATE_CHECKS = {"api_workflow_smoke", "browser_flow_smoke"}
 

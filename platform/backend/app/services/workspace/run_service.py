@@ -221,6 +221,7 @@ class RunService:
             orchestration=orchestration,
             prompt_analysis=prompt_analysis,
         )
+        contract_blocked = bool(acceptance_contract.get("blocking")) or str(acceptance_contract.get("status") or "").startswith("blocked_")
         run = RunRecord(
             workspace_id=workspace_id,
             prompt=request.prompt,
@@ -244,13 +245,13 @@ class RunService:
             orchestration_phases=list(orchestration.get("phases") or []),
             worker_summaries=list(orchestration.get("worker_summaries") or []),
             flow_coverage={
-                "status": "planned" if acceptance_contract.get("required") else "not_required",
+                "status": "blocked_contract_missing" if contract_blocked else "planned" if acceptance_contract.get("required") else "not_required",
                 "required_flows": [flow.get("id") for flow in acceptance_contract.get("flows", []) if isinstance(flow, dict)],
             },
-            status="pending",
-            apply_status="pending",
-            current_stage="queued",
-            progress_percent=2,
+            status="blocked" if contract_blocked else "pending",
+            apply_status="blocked" if contract_blocked else "pending",
+            current_stage="blocked: acceptance contract missing" if contract_blocked else "queued",
+            progress_percent=100 if contract_blocked else 2,
             storage_version=2,
             token_usage=self._token_usage_from_prompt_analysis(prompt_analysis_usage),
         )
@@ -332,6 +333,22 @@ class RunService:
                 },
             )
         self.store.delete("reports", f"run_stop_request:{run.run_id}")
+        if contract_blocked:
+            if self.run_protocol_service is not None:
+                self.run_protocol_service.append_event(
+                    run_id=run.run_id,
+                    workspace_id=run.workspace_id,
+                    session_id=run.session_id,
+                    event_type="run_completed",
+                    status="blocked",
+                    message="Run blocked because prompt-derived acceptance contract is missing.",
+                    payload={
+                        "status": run.status,
+                        "reason": acceptance_contract.get("reason"),
+                        "issues": acceptance_contract.get("issues") or [],
+                    },
+                )
+            return self.get_run(run.run_id)
         if wait:
             self._active_workers[run.run_id] = threading.current_thread()
             self._execute_run(run.run_id, request.model_dump(mode="python"))
@@ -665,7 +682,7 @@ class RunService:
                 run.failure_signature = f"reliability_gate.blocked:{str(first_issue.get('check') or 'unknown')}"
                 changed = True
             details = str(first_issue.get("details") or "").strip()
-            if details and (not run.failure_reason or self._is_generic_failure_reason(run.failure_reason)):
+            if details and (not run.failure_reason or self._is_nonspecific_failure_reason(run.failure_reason)):
                 run.failure_reason = details
                 changed = True
         elif state.get("status") == "passed" and run.apply_status == "applied":
@@ -1008,7 +1025,7 @@ class RunService:
             if job.storage_version and job.storage_version > run.storage_version:
                 run.storage_version = job.storage_version
                 changed = True
-            if run.status in {"failed", "blocked"} and self._is_generic_failure_reason(run.failure_reason):
+            if run.status in {"failed", "blocked"} and self._is_nonspecific_failure_reason(run.failure_reason):
                 specific = self._specific_failure_reason_from_job(job)
                 if specific and specific != run.failure_reason:
                     run.failure_reason = specific
@@ -1274,7 +1291,7 @@ class RunService:
         return usage
 
     @staticmethod
-    def _is_generic_failure_reason(reason: str | None) -> bool:
+    def _is_nonspecific_failure_reason(reason: str | None) -> bool:
         text = str(reason or "").strip().lower()
         return not text or text.startswith("missing create coverage:") or text in {
             "workspace code agent exhausted its completion budget without reaching a usable state.",
@@ -1286,7 +1303,7 @@ class RunService:
     def _specific_failure_reason_from_job(job: JobRecord) -> str | None:
         def important_line(logs: list[Any]) -> str:
             specific_markers = ("operationalerror", "assertionerror", "syntaxerror", "no such table")
-            generic_markers = ("failed", "error:", "traceback")
+            broad_error_markers = ("failed", "error:", "traceback")
             clean = [" ".join(str(line or "").split()).strip() for line in logs if str(line or "").strip()]
             for line in reversed(clean):
                 try:
@@ -1301,7 +1318,7 @@ class RunService:
                     return line[:320]
             for line in reversed(clean):
                 lowered = line.lower()
-                if any(marker in lowered for marker in generic_markers):
+                if any(marker in lowered for marker in broad_error_markers):
                     return line[:320]
             return clean[-1][:320] if clean else ""
 

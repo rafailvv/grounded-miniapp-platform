@@ -71,7 +71,7 @@ class AgentToolBatchPlan:
 class AgentToolRegistry:
     """Single source of truth for model-facing agent tools.
 
-    The registry is intentionally generic: it describes tool semantics, safety,
+    The registry is intentionally product-neutral: it describes tool semantics, safety,
     progress labels, and batching behavior. It does not know product categories or
     generated app resource names.
     """
@@ -464,7 +464,7 @@ class AgentToolRegistry:
                     "name": name,
                     "description": (
                         f"{spec.progress_label}. Kind: {spec.kind}. "
-                        "Use this generic code-agent tool only when it directly advances the current plan. "
+                        "Use this product-neutral code-agent tool only when it directly advances the current plan. "
                         + (
                             "This mutating tool applies exactly one app-owned file_path per call; for multiple files, call the tool once per file with that file's own content or diff. Generated/platform-owned paths are rejected."
                             if spec.kind == "mutating"

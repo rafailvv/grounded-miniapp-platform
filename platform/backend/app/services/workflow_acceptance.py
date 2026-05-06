@@ -83,7 +83,15 @@ def _source_roles_from_prompt_hints(prompt_hints: dict[str, Any]) -> list[str]:
         for role in ROLE_ORDER
         if any(str(item).strip() for item in (role_fields.get(role) or []))
     ]
-    return field_owned_roles[:1]
+    if field_owned_roles:
+        return field_owned_roles[:1]
+    role_actions = prompt_hints.get("role_action_prompts") if isinstance(prompt_hints.get("role_action_prompts"), dict) else {}
+    action_roles = [
+        role
+        for role in ROLE_ORDER
+        if any(str(item).strip() for item in (role_actions.get(role) or []))
+    ]
+    return action_roles[:1]
 
 
 def normalize_prompt_contract_analysis(
@@ -251,6 +259,101 @@ def _role_screen_plan(
     }
 
 
+def _product_anchor_issues(prompt_hints: dict[str, Any]) -> list[str]:
+    issues: list[str] = []
+    if not str(prompt_hints.get("resource_hint") or "").strip():
+        issues.append("missing_prompt_derived_resource")
+    role_actions = prompt_hints.get("role_action_prompts") if isinstance(prompt_hints.get("role_action_prompts"), dict) else {}
+    role_fields = prompt_hints.get("role_field_hints") if isinstance(prompt_hints.get("role_field_hints"), dict) else {}
+    has_action = any(str(item).strip() for items in role_actions.values() for item in (items or []))
+    has_field = any(str(item).strip() for item in (prompt_hints.get("field_hints") or []))
+    has_role_field = any(str(item).strip() for items in role_fields.values() for item in (items or []))
+    state_contract = prompt_hints.get("role_state_contract") if isinstance(prompt_hints.get("role_state_contract"), dict) else {}
+    has_state_role = any(state_contract.get(key) for key in ("source_roles", "update_roles", "observer_roles"))
+    if not (has_action or has_field or has_role_field or has_state_role):
+        issues.append("missing_prompt_derived_role_actions_or_fields")
+    if not _source_roles_from_prompt_hints(prompt_hints):
+        issues.append("missing_prompt_derived_source_role")
+    return issues
+
+
+def _first_prompt_action(prompt_hints: dict[str, Any], role: str) -> str:
+    actions = prompt_hints.get("role_action_prompts") if isinstance(prompt_hints.get("role_action_prompts"), dict) else {}
+    for item in actions.get(role) or []:
+        label = _sanitize_prompt_label(item, limit=140)
+        if label:
+            return label
+    return ""
+
+
+def _prompt_fields_for_role(prompt_hints: dict[str, Any], role: str) -> list[str]:
+    role_fields = prompt_hints.get("role_field_hints") if isinstance(prompt_hints.get("role_field_hints"), dict) else {}
+    fields = _sanitize_prompt_list(role_fields.get(role), limit=8)
+    if fields:
+        return fields
+    return _sanitize_prompt_list(prompt_hints.get("field_hints"), limit=8)
+
+
+def _acceptance_steps_from_prompt_hints(prompt_hints: dict[str, Any]) -> list[dict[str, Any]]:
+    resource_label = _sanitize_prompt_label(prompt_hints.get("resource_hint"), limit=80)
+    if not resource_label:
+        return []
+    state_contract = prompt_hints.get("role_state_contract") if isinstance(prompt_hints.get("role_state_contract"), dict) else {}
+    source_roles = _source_roles_from_prompt_hints(prompt_hints)
+    update_roles = _sanitize_roles(state_contract.get("update_roles"))
+    observer_roles = _sanitize_roles(state_contract.get("observer_roles"))
+    if not observer_roles:
+        observer_roles = [role for role in ROLE_ORDER if role not in set(source_roles + update_roles)]
+    steps: list[dict[str, Any]] = []
+    for role in source_roles:
+        fields = _prompt_fields_for_role(prompt_hints, role)
+        steps.append(
+            {
+                "kind": "prompt_state_source",
+                "role": role,
+                "entity": resource_label,
+                "action": _first_prompt_action(prompt_hints, role) or f"capture prompt-derived {resource_label} state",
+                "fields": fields,
+                "expectation": f"{role} records {resource_label} data through app-owned UI and API using prompt-derived fields.",
+            }
+        )
+    for role in update_roles:
+        if role in source_roles:
+            continue
+        steps.append(
+            {
+                "kind": "prompt_state_update",
+                "role": role,
+                "entity": resource_label,
+                "action": _first_prompt_action(prompt_hints, role) or f"change prompt-derived {resource_label} state",
+                "fields": _prompt_fields_for_role(prompt_hints, role),
+                "expectation": f"{role} performs only the prompt-assigned persisted action for {resource_label}.",
+            }
+        )
+    for role in observer_roles:
+        if role in source_roles or role in update_roles:
+            continue
+        steps.append(
+            {
+                "kind": "prompt_state_observe",
+                "role": role,
+                "entity": resource_label,
+                "action": _first_prompt_action(prompt_hints, role) or f"read prompt-derived {resource_label} state",
+                "fields": _prompt_fields_for_role(prompt_hints, role),
+                "expectation": f"{role} sees the same persisted {resource_label} state without duplicate source controls.",
+            }
+        )
+    steps.append(
+        {
+            "kind": "mobile_layout",
+            "role": "all",
+            "entity": resource_label,
+            "expectation": "Role surfaces fit 360-430px Telegram mini-app widths without horizontal overflow or blocking overlap.",
+        }
+    )
+    return steps[:8]
+
+
 def normalized_generation_mode(generation_mode: GenerationMode | str | None) -> str:
     return str(getattr(generation_mode, "value", generation_mode) or "").strip().lower()
 
@@ -284,14 +387,54 @@ def build_acceptance_contract(
     if prompt_analysis is None:
         raise ValueError("LLM prompt analysis is required before building a workflow acceptance contract.")
     prompt_hints = extract_prompt_planning_hints(prompt, prompt_analysis=prompt_analysis)
+    anchor_issues = _product_anchor_issues(prompt_hints)
+    if anchor_issues:
+        return {
+            "required": True,
+            "status": "blocked_contract_missing",
+            "blocking": True,
+            "reason": "Prompt analysis did not provide enough prompt-derived product semantics; no platform-invented resource, item, or workflow will be generated.",
+            "issues": anchor_issues,
+            "intent": intent_value,
+            "generation_mode": mode_value,
+            "workflow_kind": workflow_kind or ("create" if intent_value == "create" else "product_quality_run"),
+            "roles": list(ROLE_ORDER),
+            "features": {
+                "cross_role_persistence": False,
+                "refresh_persistence": False,
+                "workflow_update": False,
+                "api_discovery_required": False,
+                "platform_product_scaffold": False,
+            },
+            "required_endpoints": [],
+            "prompt_hints": prompt_hints,
+            "api_contract": {
+                "field_hints": list(prompt_hints.get("field_hints") or [])[:12],
+                "role_field_hints": dict(prompt_hints.get("role_field_hints") or {}),
+                "resource_hint": prompt_hints.get("resource_hint") or None,
+                "role_state_contract": dict(prompt_hints.get("role_state_contract") or {}),
+                "analysis_source": prompt_hints.get("analysis_source"),
+                "analysis_status": prompt_hints.get("analysis_status"),
+            },
+            "required_controls": [],
+            "page_contract": {
+                "multi_page_role_apps": False,
+                "route_manifest_required": False,
+                "child_pages_must_be_reachable": False,
+            },
+            "flows": [],
+            "test_requirements": [],
+        }
     source_roles = _source_roles_from_prompt_hints(prompt_hints)
     state_contract = prompt_hints.get("role_state_contract") if isinstance(prompt_hints.get("role_state_contract"), dict) else {}
     update_roles = _sanitize_roles(state_contract.get("update_roles"))
+    acceptance_steps = _acceptance_steps_from_prompt_hints(prompt_hints)
     flows: list[dict[str, Any]] = [
         {
             "id": "role_shared_persistence",
             "title": "Shared persisted product workflow",
             "roles": list(ROLE_ORDER),
+            "steps": acceptance_steps,
             "requirements": [
                 "The agent chooses API routes, entities, and persistence shape from the prompt and current code; the platform does not provide a product CRUD scaffold.",
                 "Prompt-assigned source roles perform state-producing actions only when the prompt requires that behavior.",
@@ -311,6 +454,12 @@ def build_acceptance_contract(
                 "id": "related_resource_workflow",
                 "title": "Related prompt-derived operations",
                 "roles": list(ROLE_ORDER),
+                "steps": [
+                    item
+                    for item in acceptance_steps
+                    if item.get("kind") in {"prompt_state_update", "prompt_state_observe", "mobile_layout"}
+                ]
+                or acceptance_steps[:2],
                 "requirements": [
                     "The LLM-selected shared state supports only the read, mutate, publish, edit, summary, or operational workflows implied by the prompt.",
                     "Role pages expose different actions based on prompt-owned role responsibilities, not fixed processing roles.",
@@ -378,7 +527,7 @@ def build_implementation_plan(
     orchestration: dict[str, Any] | None = None,
     prompt_analysis: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build a generic agent plan from prompt-derived contract data.
+    """Build a contract-bound agent plan from prompt-derived contract data.
 
     The plan intentionally avoids fixed-category templates. It describes the
     workflow proof the agent must satisfy, while the concrete nouns/fields are
@@ -387,6 +536,50 @@ def build_implementation_plan(
     intent_value = str(intent or "").strip().lower()
     mode_value = normalized_generation_mode(generation_mode)
     contract = dict(acceptance_contract or {})
+    if contract.get("blocking") or str(contract.get("status") or "").startswith("blocked_"):
+        return {
+            "version": 1,
+            "required": bool(contract.get("required")),
+            "status": str(contract.get("status") or "blocked_contract_missing"),
+            "blocking": True,
+            "blocked_reason": str(contract.get("reason") or "Prompt-derived product contract is missing."),
+            "issues": list(contract.get("issues") or []),
+            "intent": intent_value,
+            "generation_mode": mode_value,
+            "principle": "blocked_until_prompt_derived_contract",
+            "roles": list(contract.get("roles") or ROLE_ORDER),
+            "prompt_hints": dict(contract.get("prompt_hints") or {}),
+            "primary_entities": [],
+            "role_actions": {role: [] for role in ROLE_ORDER},
+            "role_state_contract": {"source_roles": [], "update_roles": [], "observer_roles": [], "status_values": []},
+            "api_contract": {
+                "required_endpoints": [],
+                "must_persist": False,
+                "must_support_update": False,
+                "resource_hint": None,
+            },
+            "ui_contract": {
+                "required_controls": [],
+                "three_separate_role_apps": True,
+                "multi_page_role_apps": False,
+                "routeable_screen_plan": {"roles": {role: [] for role in ROLE_ORDER}},
+                "route_manifest_required": False,
+                "no_cross_role_navigation": True,
+                "role_specific_actions": False,
+            },
+            "test_contract": {
+                "generated_tests_required": False,
+                "browser_flow_required": False,
+                "proof_steps": [],
+            },
+            "agent_todos": [
+                {"id": "plan", "status": "blocked", "content": "Prompt-derived product contract is missing; do not generate platform-owned product semantics."}
+            ],
+            "mobile_design_contract": {},
+            "mode_quality_contract": {},
+            "routeable_screen_plan": {"roles": {role: [] for role in ROLE_ORDER}},
+            "orchestration": {"execution_style": "blocked", "phases": [], "worker_count": 0},
+        }
     existing_hints = contract.get("prompt_hints") if isinstance(contract.get("prompt_hints"), dict) else None
     if existing_hints:
         prompt_hints = existing_hints

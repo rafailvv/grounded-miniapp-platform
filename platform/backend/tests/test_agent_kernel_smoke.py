@@ -124,12 +124,50 @@ def test_balanced_quality_runs_require_acceptance_contract_with_prompt_analysis(
         prompt="Improve the operations flow",
         intent="edit",
         generation_mode=GenerationMode.BALANCED,
-        prompt_analysis=_prompt_analysis(resource="operations"),
+        prompt_analysis=_prompt_analysis(resource="operations", client=["name"]),
     )
 
     assert contract["required"] is True
     assert contract["workflow_kind"] == "product_quality_run"
     assert contract["api_contract"]["resource_hint"] == "operations"
+    assert contract["flows"][0]["steps"][0]["kind"] == "prompt_state_source"
+    assert contract["flows"][0]["steps"][0]["entity"] == "operations"
+    legacy_step_kind = "create" + "_or_update"
+    assert not any(step.get("kind") == legacy_step_kind for flow in contract["flows"] for step in flow.get("steps", []))
+
+
+def test_acceptance_contract_uses_role_actions_as_source_when_fields_are_absent() -> None:
+    contract = build_acceptance_contract(
+        prompt="Manager publishes the operating plan for everyone to read.",
+        intent="create",
+        generation_mode=GenerationMode.FAST,
+        prompt_analysis={
+            "prompt_summary": "manager-owned operating plan",
+            "resource_hint": "operating plan",
+            "field_hints": [],
+            "role_field_hints": {"client": [], "specialist": [], "manager": []},
+            "role_action_prompts": {"client": [], "specialist": [], "manager": ["publish operating plan"]},
+        },
+    )
+
+    assert not contract.get("blocking")
+    assert contract["flows"][0]["steps"][0]["role"] == "manager"
+    assert contract["flows"][0]["steps"][0]["action"] == "publish operating plan"
+
+
+def test_acceptance_contract_blocks_without_prompt_derived_resource() -> None:
+    contract = build_acceptance_contract(
+        prompt="Создай полезное мобильное приложение.",
+        intent="create",
+        generation_mode=GenerationMode.FAST,
+        prompt_analysis=_prompt_analysis(resource="", client=["название"]),
+    )
+
+    assert contract["status"] == "blocked_contract_missing"
+    assert contract["blocking"] is True
+    assert "missing_prompt_derived_resource" in contract["issues"]
+    assert contract["flows"] == []
+    assert contract["required_endpoints"] == []
 
 
 def test_lsp_static_diagnostics_reports_structured_python_issue(tmp_path: Path) -> None:
@@ -628,7 +666,11 @@ def test_miniapp_contract_uses_role_scoped_fields_and_business_resource_name() -
     assert resource.display_name == "Проект"
     assert set(resource.role_field_labels["client"].values()) == {"компанию", "телефон", "бюджет"}
     assert "комментарий цеха" in set(resource.role_field_labels["specialist"].values())
-    assert resource.endpoints == []
+    assert {(endpoint.method, endpoint.path) for endpoint in resource.endpoints} == {
+        ("GET", "/api/proekts"),
+        ("POST", "/api/proekts"),
+        ("PATCH", "/api/proekts/{item_id}"),
+    }
     assert "kommentariyCeha" not in resource.role_field_labels["client"]
 
 
@@ -764,8 +806,8 @@ def test_role_action_signals_follow_prompt_role_flow() -> None:
                 "observer_roles": ["client"],
             },
             "role_action_prompts": {
-                "manager": ["publishes the shared catalog"],
-                "client": ["filters and reads the catalog"],
+                "manager": ["publishes the shared board"],
+                "client": ["filters and reads the shared board"],
                 "specialist": ["updates fulfillment state"],
             },
         },
@@ -773,16 +815,16 @@ def test_role_action_signals_follow_prompt_role_flow() -> None:
 
     manager_source = """
     <form id="publish-form"><input name="name"><button>Publish</button></form>
-    <script>fetch("/api/catalog", { method: "POST", body: JSON.stringify({ name: "x" }) })</script>
+    <script>fetch("/api/board", { method: "POST", body: JSON.stringify({ name: "x" }) })</script>
     """
     client_observer = """
     <select id="category-filter"></select>
-    <section id="catalog"></section>
-    <script>fetch("/api/catalog").then(renderCatalog)</script>
+    <section id="shared-board"></section>
+    <script>fetch("/api/board").then(renderBoard)</script>
     """
     client_without_mutation = """
     <form id="filter-form"><input name="query"><button>Search</button></form>
-    <script>fetch("/api/catalog").then(renderCatalog)</script>
+    <script>fetch("/api/board").then(renderBoard)</script>
     """
 
     assert CheckRunner._role_action_signals("manager", manager_source, acceptance_contract=contract)
@@ -1522,7 +1564,7 @@ def test_coordinator_todo_gate_requires_real_build_and_verification() -> None:
     coordinator = AgentCoordinator(
         run_id="run_1",
         generation_mode=GenerationMode.FAST,
-        implementation_plan={"summary": "Build a generic role workflow"},
+        implementation_plan={"summary": "Build a prompt-derived role workflow"},
     )
 
     assert coordinator.ready_to_finalize() is False
@@ -1865,7 +1907,7 @@ def test_worker_branch_loop_runs_own_tool_transcript_and_patch(tmp_path: Path) -
         model_profile="",
         user_prompt="Build a role-separated mobile mini-app.",
         worker_task={"worker_id": "client_surface_worker", "owner_scope": "client role app"},
-        worker_prefix={"plan": "generic"},
+        worker_prefix={"plan": "prompt-derived"},
         max_steps=1,
     )
 

@@ -836,9 +836,32 @@ class WorkspaceCodeAgentRuntime:
         job.orchestration_phases = list(orchestration.get("phases") or [])
         job.worker_summaries = list(orchestration.get("worker_summaries") or [])
         job.flow_coverage = {
-            "status": "planned" if acceptance_contract.get("required") else "not_required",
+            "status": "blocked_contract_missing" if acceptance_contract.get("blocking") or str(acceptance_contract.get("status") or "").startswith("blocked_") else "planned" if acceptance_contract.get("required") else "not_required",
             "required_flows": [flow.get("id") for flow in acceptance_contract.get("flows", []) if isinstance(flow, dict)],
         }
+        if acceptance_contract.get("blocking") or str(acceptance_contract.get("status") or "").startswith("blocked_"):
+            return self.results.blocked(
+                summary="Run blocked because prompt-derived product contract is missing.",
+                failure_reason=str(acceptance_contract.get("reason") or "Prompt-derived product contract is missing."),
+                failure_class="acceptance_contract_missing",
+                failure_signature="acceptance.blocked_contract_missing",
+                root_cause_summary="Generation stopped before edits to avoid platform-invented product semantics.",
+                current_phase="planning",
+                latest_execution=None,
+                latest_preview_details={},
+                latest_apply_result=None,
+                iterations=[],
+                repair_iterations=[],
+                all_file_changes=[],
+                last_assistant_message="",
+                turn_history=[
+                    {
+                        "turn": 0,
+                        "result": "blocked_contract_missing",
+                        "issues": list(acceptance_contract.get("issues") or []),
+                    }
+                ],
+            )
         artifact_run_id = run_id or job.job_id
         self.tool_batch_summaries[artifact_run_id] = []
         self.context_pressure_history[artifact_run_id] = []
@@ -1310,7 +1333,7 @@ class WorkspaceCodeAgentRuntime:
             local_tool_results = list(tool_results)
             seen_tool_calls: set[str] = set()
             self_blocked_correction_sent = False
-            generic_fatal_correction_sent = False
+            empty_fatal_correction_sent = False
             output_cap_correction_sent = False
             context_length_correction_sent = False
             tool_budget_correction_sent = False
@@ -1610,11 +1633,11 @@ class WorkspaceCodeAgentRuntime:
                         files_read=list({*initial_context.keys(), *extra_file_context.keys()}),
                         metadata={"tool_calls": raw_tool_calls},
                     )
-                if not generic_fatal_correction_sent and self._is_empty_fatal_agent_response(llm_payload):
+                if not empty_fatal_correction_sent and self._is_empty_fatal_agent_response(llm_payload):
                     correction = self._empty_fatal_correction_result(llm_payload)
                     local_tool_results.append(correction)
                     tool_results.append(correction)
-                    generic_fatal_correction_sent = True
+                    empty_fatal_correction_sent = True
                     self._append_event(
                         job,
                         "repair_iteration",
@@ -3595,8 +3618,8 @@ class WorkspaceCodeAgentRuntime:
                     *focused_rules,
                     f"Keep each turn applyable: use mutating tools for a compact coherent edit, or request only the specific read-only tools needed for the next patch.",
                     "Use the implementation_plan and acceptance_contract as the product contract. Derive entities, fields, routes, labels, and role actions from the user's prompt and current code, not from platform templates.",
-                    "Do not satisfy the contract with fixed sample nouns or a platform-generic workflow; implement the concrete entities, controls, and persisted state described by the LLM-derived acceptance contract and the current code.",
-                    "Each role surface must satisfy its own LLM-derived role responsibilities. Do not satisfy a role with only a generic data-refresh page when the contract assigns concrete actions.",
+                    "Do not satisfy the contract with fixed sample nouns or a platform-invented workflow; implement the concrete entities, controls, and persisted state described by the LLM-derived acceptance contract and the current code.",
+                    "Each role surface must satisfy its own LLM-derived role responsibilities. Do not satisfy a role with only a role-agnostic data-refresh page when the contract assigns concrete actions.",
                     "Create/workflow completion requires real UI controls, JavaScript handlers, backend persistence, generated tests, cross-role visibility, refresh persistence, and browser/mobile proof.",
                     "Build three isolated role surfaces in the miniapp shell. Role responsibilities come only from the LLM-derived acceptance contract; do not link role roots to each other and do not force unrequested workflow semantics.",
                     "For multi-page role apps, shared static/<role>/app.js must initialize per page: use body[data-view] or route, guard optional DOM nodes from other pages, and bind every visible child-page form/button/control to persisted API behavior.",
@@ -5956,7 +5979,7 @@ class WorkspaceCodeAgentRuntime:
                 "importerror",
                 "no such table",
             )
-            generic_markers = (
+            nonspecific_markers = (
                 "failed",
                 "error:",
                 "traceback",
@@ -5975,7 +5998,7 @@ class WorkspaceCodeAgentRuntime:
                     return line[:320]
             for line in reversed(clean_logs):
                 lowered = line.lower()
-                if any(marker in lowered for marker in generic_markers):
+                if any(marker in lowered for marker in nonspecific_markers):
                     return line[:320]
             return clean_logs[-1][:320] if clean_logs else ""
 

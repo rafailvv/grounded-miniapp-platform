@@ -1005,7 +1005,7 @@ class CheckRunner:
     def _selector_wiring_issues(cls, role: str, js_path: Path, js_source: str, combined_html: str) -> list[ValidationIssue]:
         issues: list[ValidationIssue] = []
         for selector in cls._literal_query_selectors(js_source):
-            if cls._selector_is_dynamic_or_generic(selector):
+            if cls._selector_is_dynamic_or_broad(selector):
                 continue
             if cls._html_has_simple_selector(combined_html, selector):
                 continue
@@ -1073,7 +1073,7 @@ class CheckRunner:
         return list(dict.fromkeys(selectors))
 
     @staticmethod
-    def _selector_is_dynamic_or_generic(selector: str) -> bool:
+    def _selector_is_dynamic_or_broad(selector: str) -> bool:
         value = str(selector or "").strip()
         if not value or any(marker in value for marker in (" ", ">", "+", "~", ",", ":not", "${")):
             return True
@@ -2265,7 +2265,7 @@ class CheckRunner:
                 command="api workflow smoke",
                 logs=[],
             )
-        proof = self._run_generic_api_workflow_proof(source_dir=source_dir, acceptance_contract=contract)
+        proof = self._run_contract_api_workflow_proof(source_dir=source_dir, acceptance_contract=contract)
         logs = [str(item) for item in proof.get("logs") or [] if str(item).strip()]
         diagnostics = {
             "workflow_kind": contract.get("workflow_kind") or "create",
@@ -2284,11 +2284,11 @@ class CheckRunner:
             "failed_selector": proof.get("failed_selector"),
         }
         if not logs:
-            logs = ["Generic API workflow proof passed."]
+            logs = ["Contract API persistence proof passed."]
         return RunCheckResult(
             name="api_workflow_smoke",
             status="passed" if bool(proof.get("passed")) else "failed",
-            details="Generic API workflow proof checked prompt-derived API persistence before browser UI proof.",
+            details="Contract API persistence proof checked prompt-derived API state before browser UI proof.",
             command="api workflow smoke",
             logs=logs,
             diagnostics=diagnostics,
@@ -3173,7 +3173,7 @@ except Exception as exc:
             routes_by_role[role] = list(dict.fromkeys(routes))[:12]
         return routes_by_role
 
-    def _run_generic_api_workflow_proof(self, *, source_dir: Path, acceptance_contract: dict[str, Any]) -> dict[str, Any]:
+    def _run_contract_api_workflow_proof(self, *, source_dir: Path, acceptance_contract: dict[str, Any]) -> dict[str, Any]:
         backend_dir = source_dir / "miniapp"
         install_result = self._install_python_requirements(
             backend_dir,
@@ -3192,7 +3192,14 @@ except Exception as exc:
             if isinstance(endpoint, dict) and str(endpoint.get("path") or "").strip()
         ]
         api_paths = list(dict.fromkeys(path for path in api_paths if path.startswith("/api/")))
-        script = self._generic_api_workflow_python_script()
+        if not api_paths:
+            return {
+                "passed": False,
+                "failed_step": "contract_endpoints_missing",
+                "logs": ["Acceptance contract has no prompt-derived API endpoints; refusing to prove a platform-invented resource."],
+                "api_paths": [],
+            }
+        script = self._contract_api_workflow_python_script()
         env = {**os.environ}
         python_path_parts = [str(backend_dir)]
         if env.get("PYTHONPATH"):
@@ -3213,7 +3220,7 @@ except Exception as exc:
                 return {
                     "passed": False,
                     "failed_step": "timeout",
-                    "logs": self._command_logs("Generic API workflow proof timed out.", exc.stdout or "", exc.stderr or ""),
+                    "logs": self._command_logs("Contract API persistence proof timed out.", exc.stdout or "", exc.stderr or ""),
                 }
         output = "\n".join(filter(None, [result.stdout.strip(), result.stderr.strip()]))
         parsed: dict[str, Any] | None = None
@@ -3229,16 +3236,16 @@ except Exception as exc:
             return {
                 "passed": False,
                 "failed_step": "invalid_proof_output",
-                "logs": self._command_logs("Generic API workflow proof did not return JSON.", result.stdout, result.stderr),
+                "logs": self._command_logs("Contract API persistence proof did not return JSON.", result.stdout, result.stderr),
             }
         parsed.setdefault("logs", [])
         if result.returncode != 0:
             parsed["passed"] = False
-            parsed["logs"] = [*list(parsed.get("logs") or []), *self._command_logs("Generic API workflow proof failed.", "", output)]
+            parsed["logs"] = [*list(parsed.get("logs") or []), *self._command_logs("Contract API persistence proof failed.", "", output)]
         return parsed
 
     @staticmethod
-    def _generic_api_workflow_python_script() -> str:
+    def _contract_api_workflow_python_script() -> str:
         return r'''
 import json
 import sys
@@ -3358,10 +3365,6 @@ def build_payload(openapi, path, method, marker, purpose):
     props = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
     required = [str(item) for item in schema.get("required") or [] if str(item).strip()]
     names = list(dict.fromkeys([*required, *[name for name in props if name not in {"id", "pk"}]][:10]))
-    if not names and method.lower() == "patch":
-        names = ["status"]
-    if not names:
-        names = ["title"]
     return {name: value_for(name, props.get(name, {}), marker, purpose) for name in names}
 
 
@@ -3448,11 +3451,9 @@ STEPS = []
 requested_paths = json.loads(sys.argv[1] or "[]")
 all_paths = OPENAPI.get("paths") or {}
 api_paths = [path for path in requested_paths if path in all_paths and "get" in all_paths[path] and "post" in all_paths[path]]
-if not api_paths:
-    api_paths = [path for path, methods in all_paths.items() if path.startswith("/api/") and "get" in methods and "post" in methods]
 api_paths = list(dict.fromkeys(api_paths))
 if not api_paths:
-    fail("api_discovery", "No generic GET+POST /api resource was discoverable from the generated app OpenAPI schema.", api_paths=[])
+    fail("api_discovery", "No contract-declared GET+POST /api resource was found in the generated app OpenAPI schema.", api_paths=[])
 
 base_path = api_paths[0]
 marker = "browser-flow-proof"
@@ -3467,6 +3468,8 @@ try:
         STEPS.append({"step": "initial_get", "path": base_path, "status": before.status_code})
 
         create_payload = build_payload(OPENAPI, base_path, "post", marker, "create")
+        if not create_payload:
+            fail("request_schema", f"POST {base_path} has no prompt-derived request fields in its OpenAPI schema.", api_paths=api_paths, api_before=before_json)
         create = client.post(base_path, json=create_payload)
         if not (200 <= create.status_code < 300):
             fail("create_state", f"POST {base_path} returned {create.status_code}; payload={create_payload}; body={create.text[:500]}", api_paths=api_paths, api_before=before_json)
@@ -3494,13 +3497,15 @@ try:
                 "api_before": before_json,
                 "api_after": after_create_json,
                 "steps": STEPS,
-                "logs": [f"Generic workflow proof passed prompt-derived write/read persistence through {base_path}; no app-owned update route was required or discovered."],
+                "logs": [f"Contract API persistence proof passed prompt-derived write/read state through {base_path}; no app-owned update route was required or discovered."],
             }, ensure_ascii=False))
             sys.exit(0)
         if created_id is None:
             fail("persisted_id", "Persisted state did not expose an id-like field usable for the discovered update route.", api_paths=api_paths, api_after=after_create_json)
         update_path = concrete(update_template, created_id)
         update_payload = build_payload(OPENAPI, update_template, method, update_marker, "update")
+        if not update_payload:
+            fail("request_schema", f"{method.upper()} {update_path} has no prompt-derived request fields in its OpenAPI schema.", api_paths=api_paths, api_after=after_create_json)
         update = getattr(client, method)(update_path, json=update_payload)
         if not (200 <= update.status_code < 300):
             fail("update_state", f"{method.upper()} {update_path} returned {update.status_code}; payload={update_payload}; body={update.text[:500]}", api_paths=api_paths, api_after=after_create_json)
@@ -3529,10 +3534,10 @@ try:
             "api_before": before_json,
             "api_after": after_update_json,
             "steps": STEPS,
-            "logs": [f"Generic workflow proof passed through {base_path} and {update_path}."],
+            "logs": [f"Contract API persistence proof passed through {base_path} and {update_path}."],
         }, ensure_ascii=False))
 except Exception as exc:
-    fail("runtime_exception", f"Generic workflow proof crashed: {exc.__class__.__name__}: {exc}", api_paths=api_paths)
+    fail("runtime_exception", f"Contract API persistence proof crashed: {exc.__class__.__name__}: {exc}", api_paths=api_paths)
 '''
 
     @classmethod

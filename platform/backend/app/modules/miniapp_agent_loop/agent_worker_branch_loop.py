@@ -852,7 +852,7 @@ class AgentWorkerBranchLoop:
             "instructions": [
                 "Inspect only the files you need for your owner scope.",
                 "Patch a complete owned slice that supports the prompt-derived role workflow.",
-                "Use shared_prefix.implementation_plan.prompt_hints as the source for nouns, fields, labels, and role actions. If prompt_hints has concrete terms, do not build a generic placeholder record UI.",
+                "Use shared_prefix.implementation_plan.prompt_hints as the source for nouns, fields, labels, and role actions. If prompt_hints has concrete terms, do not build a template placeholder record UI.",
                 "This branch must produce actual file changes; do not finish with read-only tool calls only.",
                 "Keep each role surface independent and mobile-first. Do not include another role's primary workflow controls in this role just to make verification easier.",
                 "Prompt analysis decides the role split through shared_prefix.implementation_plan.role_state_contract; do not force a fixed client/specialist/manager workflow split. If the user's prompt assigns shared-state creation to manager or specialist, that role must own that creation flow and client must consume the persisted state without duplicate source controls.",

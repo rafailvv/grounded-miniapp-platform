@@ -74,14 +74,14 @@ def test_form_wiring_accepts_change_only_filter_forms(tmp_path: Path) -> None:
     assert not any(issue.code == "platform.workflow_form_without_submit_handler" for issue in issues)
 
 
-def test_frontend_api_refs_are_generic() -> None:
+def test_frontend_api_refs_are_parameterized() -> None:
     refs = CheckRunner._extract_frontend_api_refs(
-        "await fetchJSON('/api/entities', { method: 'POST' });\n"
-        "await fetchJSON(`/api/entities/${entityId}/state`, { method: 'PATCH' });\n"
+        "await fetchJSON('/api/briefings', { method: 'POST' });\n"
+        "await fetchJSON(`/api/briefings/${briefingId}/state`, { method: 'PATCH' });\n"
     )
 
-    assert ("POST", "/api/entities") in refs
-    assert ("PATCH", "/api/entities/{param}/state") in refs
+    assert ("POST", "/api/briefings") in refs
+    assert ("PATCH", "/api/briefings/{param}/state") in refs
 
 
 def test_connectivity_accepts_api_root_router_prefix(tmp_path: Path) -> None:
@@ -118,7 +118,7 @@ def test_preview_url_candidates_allow_container_to_reach_host_preview() -> None:
     assert "http://localhost:16544" in candidates
 
 
-def test_generated_js_html_includes_failure_is_reported_generically() -> None:
+def test_generated_js_html_includes_failure_is_reported_without_app_assumptions() -> None:
     diagnostics = CheckRunner._extract_generated_app_test_diagnostics(
         [
             "AssertionError [ERR_ASSERTION]: The expression evaluated to a falsy value:",

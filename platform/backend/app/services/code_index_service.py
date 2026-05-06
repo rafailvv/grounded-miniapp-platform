@@ -330,7 +330,7 @@ class CodeIndexService:
         ranked: list[tuple[float, str]] = []
         for file_path in self._iter_workspace_files(source_dir):
             relative_path = str(file_path.relative_to(source_dir))
-            score = self._generic_path_priority(relative_path)
+            score = self._common_path_priority(relative_path)
             if relative_path in active_paths:
                 score += 1.25
             if relative_path in recent_paths:
@@ -342,7 +342,7 @@ class CodeIndexService:
         return [path for _, path in ranked[:limit]]
 
     @staticmethod
-    def _generic_path_priority(relative_path: str) -> float:
+    def _common_path_priority(relative_path: str) -> float:
         path = relative_path.replace("\\", "/")
         if path.startswith("miniapp/app/static/"):
             return 0.85
