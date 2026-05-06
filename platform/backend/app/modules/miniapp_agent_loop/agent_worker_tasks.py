@@ -17,8 +17,8 @@ class AgentWorkerTaskPlanner:
                 "depth": "compact",
                 "passes": ["green_workflow"],
                 "design_bar": "clean mobile UI, minimal but usable, with one consistent light neutral visual system across roles",
-                "workflow_bar": "one complete prompt-derived flow across all roles",
-                "page_bar": "prompt-derived role pages only where they make the mobile workflow clearer",
+                "workflow_bar": "one complete prompt-derived flow across all roles, preserving all explicit role actions/resources from the prompt",
+                "page_bar": "at least the product_scale_contract minimum prompt-derived role pages; split broad mobile workflows instead of stacking a long dashboard",
             }
         if generation_mode == GenerationMode.QUALITY:
             return {
@@ -106,7 +106,7 @@ class AgentWorkerTaskPlanner:
             f"Forbidden paths for this worker: {forbidden_paths}. Expected proof: {expected_proof}. "
             f"Use the implementation plan ({plan_summary}) and the user's prompt-derived entities/actions as source of truth. "
             f"Mode depth is {mode_contract.get('depth')}: {mode_contract.get('workflow_bar')}; page organization: {mode_contract.get('page_bar')}; design bar: {mode_contract.get('design_bar')}. "
-            "Use implementation_plan.routeable_screen_plan for screen intent guidance; choose concrete route names from the prompt and keep only screens that clarify the mobile workflow. "
+            "Use implementation_plan.product_scale_contract.min_role_routes and implementation_plan.routeable_screen_plan for screen intent guidance; choose concrete route names from the prompt and satisfy the prompt-derived minimum routeable pages. "
             "miniapp/app/generated/miniapp_contract.json is prompt-analysis metadata only; do not treat it as a fixed product schema, route template, or API scaffold. "
             "Choose field keys and API routes from the prompt and keep them consistent across backend, JS payloads, renderers, and tests. "
             "Read the files you need, patch the smallest complete owned slice, run or request the relevant checks, and report exact changed paths and self-check result. "

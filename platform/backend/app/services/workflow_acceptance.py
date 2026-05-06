@@ -71,6 +71,17 @@ def _sanitize_role_state_contract(values: Any) -> dict[str, Any]:
     }
 
 
+def _merged_prompt_list(*values: Any, limit: int = 12, item_limit: int = 80) -> list[str]:
+    merged: list[str] = []
+    for value in values:
+        for item in _sanitize_prompt_list(value, limit=limit, item_limit=item_limit):
+            if item not in merged:
+                merged.append(item)
+            if len(merged) >= limit:
+                return merged
+    return merged
+
+
 def _source_roles_from_prompt_hints(prompt_hints: dict[str, Any]) -> list[str]:
     state_contract = prompt_hints.get("role_state_contract") if isinstance(prompt_hints, dict) else {}
     if isinstance(state_contract, dict):
@@ -112,6 +123,15 @@ def normalize_prompt_contract_analysis(
         or analysis.get("shared_resource")
         or analysis.get("primary_resource")
     )
+    resource_hints = _merged_prompt_list(
+        analysis.get("resource_hints"),
+        analysis.get("resources"),
+        analysis.get("entities"),
+        analysis.get("business_objects"),
+        limit=8,
+    )
+    if resource_hint and resource_hint not in resource_hints:
+        resource_hints.insert(0, resource_hint)
     role_actions = _sanitize_role_lists(
         analysis.get("role_action_prompts") or analysis.get("role_actions"),
         limit=4,
@@ -138,6 +158,7 @@ def normalize_prompt_contract_analysis(
         or analysis.get("state_contract")
         or analysis.get("role_ownership")
     )
+    role_state_contract = _augment_role_state_contract_from_actions(role_state_contract, role_actions)
 
     return {
         "schema_version": PROMPT_ANALYSIS_SCHEMA_VERSION,
@@ -149,6 +170,14 @@ def normalize_prompt_contract_analysis(
         "field_hints": field_hints[:12],
         "role_field_hints": role_fields,
         "resource_hint": resource_hint or None,
+        "resource_hints": resource_hints[:8],
+        "business_capabilities": _merged_prompt_list(
+            analysis.get("business_capabilities"),
+            analysis.get("capabilities"),
+            analysis.get("workflows"),
+            limit=10,
+            item_limit=140,
+        ),
         "role_action_prompts": role_actions,
         "role_state_contract": role_state_contract,
         "routeable_screen_plan": screen_plan,
@@ -175,35 +204,55 @@ def _role_screen_plan(
 ) -> dict[str, Any]:
     """Suggest routeable screen intents from LLM-owned prompt analysis."""
     mode_value = normalized_generation_mode(generation_mode)
+    derived = _derived_role_screen_plan(prompt_hints=prompt_hints, generation_mode=generation_mode)
     supplied = prompt_hints.get("routeable_screen_plan") if isinstance(prompt_hints, dict) else {}
     if isinstance(supplied, dict) and supplied.get("roles"):
         roles_payload = supplied.get("roles") if isinstance(supplied.get("roles"), dict) else {}
+        supplied_multi_page = bool(supplied.get("multi_page_recommended", derived["multi_page_recommended"]))
+        roles: dict[str, list[dict[str, Any]]] = {}
+        for role in ROLE_ORDER:
+            supplied_items = [
+                {
+                    "intent": _sanitize_prompt_label(item.get("intent"), limit=48) or "overview",
+                    "purpose": _sanitize_prompt_label(item.get("purpose"), limit=160)
+                    or "prompt-derived role screen",
+                    "source": _sanitize_prompt_list(item.get("source"), limit=3, item_limit=160)
+                    if isinstance(item, dict)
+                    else [],
+                }
+                for item in (roles_payload.get(role) or [])
+                if isinstance(item, dict)
+            ][:5]
+            derived_items = list((derived.get("roles") or {}).get(role) or [])
+            if not supplied_items:
+                supplied_items = derived_items
+            elif supplied_multi_page and len(supplied_items) == 1 and len(derived_items) > 1:
+                supplied_items = [*supplied_items, *derived_items[1:]]
+            roles[role] = _dedupe_screen_items(supplied_items, fallback=derived_items)[:5]
         return {
-            "multi_page_recommended": bool(supplied.get("multi_page_recommended", True)),
+            "multi_page_recommended": supplied_multi_page,
             "route_names_owned_by_agent": True,
             "no_fixed_page_count": True,
-            "roles": {
-                role: [
-                    {
-                        "intent": _sanitize_prompt_label(item.get("intent"), limit=48) or "overview",
-                        "purpose": _sanitize_prompt_label(item.get("purpose"), limit=160)
-                        or "prompt-derived role screen",
-                        "source": _sanitize_prompt_list(item.get("source"), limit=3, item_limit=160)
-                        if isinstance(item, dict)
-                        else [],
-                    }
-                    for item in (roles_payload.get(role) or [])
-                    if isinstance(item, dict)
-                ][:5]
-                or [{"intent": "overview", "purpose": "prompt-derived role entry screen", "source": []}]
-                for role in ROLE_ORDER
-            },
+            "roles": roles,
         }
+    return derived
+
+
+def _derived_role_screen_plan(
+    *,
+    prompt_hints: dict[str, Any],
+    generation_mode: GenerationMode | str | None,
+) -> dict[str, Any]:
+    """Derive screen intents from explicit role actions/fields already extracted by the LLM."""
+    mode_value = normalized_generation_mode(generation_mode)
     role_prompts = prompt_hints.get("role_action_prompts") if isinstance(prompt_hints, dict) else {}
     role_fields = prompt_hints.get("role_field_hints") if isinstance(prompt_hints.get("role_field_hints"), dict) else {}
     field_hints = prompt_hints.get("field_hints") if isinstance(prompt_hints, dict) else []
     sentences = prompt_hints.get("prompt_sentences") if isinstance(prompt_hints, dict) else []
     source_roles = set(_source_roles_from_prompt_hints(prompt_hints))
+    state_contract = prompt_hints.get("role_state_contract") if isinstance(prompt_hints.get("role_state_contract"), dict) else {}
+    update_roles = set(_sanitize_roles(state_contract.get("update_roles")))
+    observer_roles = set(_sanitize_roles(state_contract.get("observer_roles")))
 
     role_screens: dict[str, list[dict[str, Any]]] = {}
     for role in ROLE_ORDER:
@@ -219,6 +268,14 @@ def _role_screen_plan(
                 "source": source_phrases[:1],
             }
         ]
+        for phrase in source_phrases:
+            detected.append(
+                {
+                    "intent": _intent_for_prompt_action(phrase),
+                    "purpose": phrase,
+                    "source": [phrase],
+                }
+            )
         role_owned_fields = [
             str(item).strip()
             for item in (role_fields.get(role) or [])
@@ -233,16 +290,24 @@ def _role_screen_plan(
                     "source": list(source_fields)[:6],
                 }
             )
+        if role in update_roles and not any(item["intent"] == "detail_or_update" for item in detected):
+            detected.append(
+                {
+                    "intent": "detail_or_update",
+                    "purpose": "prompt-assigned update/control screen",
+                    "source": source_phrases[:2] or role_owned_fields[:4],
+                }
+            )
+        if role in observer_roles and not any(item["intent"] == "list_or_read" for item in detected):
+            detected.append(
+                {
+                    "intent": "list_or_read",
+                    "purpose": "read the prompt-derived shared state",
+                    "source": source_phrases[:2] or role_owned_fields[:4],
+                }
+            )
         # De-duplicate while preserving order.
-        unique: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        for item in detected:
-            intent = str(item.get("intent") or "")
-            if not intent or intent in seen:
-                continue
-            seen.add(intent)
-            unique.append(item)
-        role_screens[role] = unique[:5]
+        role_screens[role] = _dedupe_screen_items(detected)[:5]
 
     complexity_signals = sum(max(0, len(items) - 1) for items in role_screens.values())
     prompt_sentence_count = len(sentences) if isinstance(sentences, list) else 0
@@ -259,9 +324,130 @@ def _role_screen_plan(
     }
 
 
+def _intent_for_prompt_action(action: str) -> str:
+    text = _clean_text(action).lower()
+    if re.search(r"\b(view|see|read|browse|list|show)\b|вид|смотр|спис|читать|посмотр", text):
+        return "list_or_read"
+    if re.search(r"\b(confirm|summary|report|analytics|insight)\b|подтверж|отчет|отчёт|аналит|свод|выруч|загруз", text):
+        return "summary_or_insight"
+    if re.search(r"\b(update|edit|change|cancel|approve|mark|complete)\b|отмеч|меня|измен|обнов|отмен|статус|редакт|пришел|пришёл", text):
+        return "detail_or_update"
+    if re.search(r"\b(create|add|book|schedule|submit|choose|configure|publish|import)\b|созда|добав|запис|выбр|настро|оформ|публи", text):
+        return "create_or_configure"
+    return "overview"
+
+
+def _augment_role_state_contract_from_actions(
+    role_state_contract: dict[str, Any],
+    role_actions: dict[str, list[str]],
+) -> dict[str, Any]:
+    augmented = {
+        "source_roles": list(role_state_contract.get("source_roles") or []),
+        "update_roles": list(role_state_contract.get("update_roles") or []),
+        "observer_roles": list(role_state_contract.get("observer_roles") or []),
+        "status_values": list(role_state_contract.get("status_values") or []),
+    }
+    for role in ROLE_ORDER:
+        intents = {_intent_for_prompt_action(action) for action in role_actions.get(role) or []}
+        if "create_or_configure" in intents and role not in augmented["source_roles"]:
+            augmented["source_roles"].append(role)
+        if "detail_or_update" in intents and role not in augmented["update_roles"]:
+            augmented["update_roles"].append(role)
+        if intents & {"list_or_read", "summary_or_insight"} and role not in augmented["observer_roles"]:
+            augmented["observer_roles"].append(role)
+    return augmented
+
+
+def _dedupe_screen_items(items: list[dict[str, Any]], *, fallback: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    candidates = items or fallback or [{"intent": "overview", "purpose": "prompt-derived role entry screen", "source": []}]
+    for item in candidates:
+        intent = _sanitize_prompt_label(item.get("intent"), limit=48) or "overview"
+        purpose = _sanitize_prompt_label(item.get("purpose"), limit=160) or "prompt-derived role screen"
+        key = (intent, purpose.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(
+            {
+                "intent": intent,
+                "purpose": purpose,
+                "source": _sanitize_prompt_list(item.get("source"), limit=3, item_limit=160),
+            }
+        )
+    return result or [{"intent": "overview", "purpose": "prompt-derived role entry screen", "source": []}]
+
+
+def _role_has_prompt_responsibility(prompt_hints: dict[str, Any], role: str) -> bool:
+    role_prompts = prompt_hints.get("role_action_prompts") if isinstance(prompt_hints.get("role_action_prompts"), dict) else {}
+    role_fields = prompt_hints.get("role_field_hints") if isinstance(prompt_hints.get("role_field_hints"), dict) else {}
+    state_contract = prompt_hints.get("role_state_contract") if isinstance(prompt_hints.get("role_state_contract"), dict) else {}
+    state_roles = set(_sanitize_roles(state_contract.get("source_roles"))) | set(_sanitize_roles(state_contract.get("update_roles"))) | set(_sanitize_roles(state_contract.get("observer_roles")))
+    return bool(
+        any(str(item).strip() for item in (role_prompts.get(role) or []))
+        or any(str(item).strip() for item in (role_fields.get(role) or []))
+        or role in state_roles
+    )
+
+
+def _min_role_routes_for_screen_plan(
+    *,
+    prompt_hints: dict[str, Any],
+    screen_plan: dict[str, Any],
+    generation_mode: GenerationMode | str | None,
+) -> dict[str, int]:
+    mode_value = normalized_generation_mode(generation_mode)
+    multi_page = bool(screen_plan.get("multi_page_recommended"))
+    role_screens = screen_plan.get("roles") if isinstance(screen_plan.get("roles"), dict) else {}
+    result: dict[str, int] = {}
+    for role in ROLE_ORDER:
+        screens = [item for item in (role_screens.get(role) or []) if isinstance(item, dict)]
+        if not multi_page or not _role_has_prompt_responsibility(prompt_hints, role):
+            result[role] = 1
+            continue
+        cap = 4 if mode_value in {GenerationMode.BALANCED.value, GenerationMode.QUALITY.value} else 3
+        result[role] = max(2, min(cap, len(screens) or 1))
+    return result
+
+
+def _product_scale_contract(
+    *,
+    prompt_hints: dict[str, Any],
+    screen_plan: dict[str, Any],
+    generation_mode: GenerationMode | str | None,
+) -> dict[str, Any]:
+    role_actions = prompt_hints.get("role_action_prompts") if isinstance(prompt_hints.get("role_action_prompts"), dict) else {}
+    action_count = sum(1 for items in role_actions.values() for item in (items or []) if str(item).strip())
+    field_count = len([item for item in (prompt_hints.get("field_hints") or []) if str(item).strip()])
+    resource_count = len([item for item in (prompt_hints.get("resource_hints") or []) if str(item).strip()])
+    capability_count = len([item for item in (prompt_hints.get("business_capabilities") or []) if str(item).strip()])
+    sentence_count = len(prompt_hints.get("prompt_sentences") or [])
+    mode_value = normalized_generation_mode(generation_mode)
+    score = action_count + min(field_count, 6) + resource_count + capability_count + sentence_count
+    scale = "full_product" if score >= 12 or mode_value == GenerationMode.QUALITY.value else "standard_product" if score >= 7 else "compact_product"
+    return {
+        "scale": scale,
+        "signals": {
+            "role_action_count": action_count,
+            "field_count": field_count,
+            "resource_count": resource_count,
+            "capability_count": capability_count,
+            "prompt_sentence_count": sentence_count,
+            "generation_mode": mode_value,
+        },
+        "min_role_routes": _min_role_routes_for_screen_plan(
+            prompt_hints=prompt_hints,
+            screen_plan=screen_plan,
+            generation_mode=generation_mode,
+        ),
+        "principle": "Prompt breadth raises the minimum product surface; routes still come from explicit role actions and business objects, not a fixed template count.",
+    }
+
+
 def _product_anchor_issues(prompt_hints: dict[str, Any]) -> list[str]:
     issues: list[str] = []
-    if not str(prompt_hints.get("resource_hint") or "").strip():
+    if not str(prompt_hints.get("resource_hint") or "").strip() and not any(str(item).strip() for item in (prompt_hints.get("resource_hints") or [])):
         issues.append("missing_prompt_derived_resource")
     role_actions = prompt_hints.get("role_action_prompts") if isinstance(prompt_hints.get("role_action_prompts"), dict) else {}
     role_fields = prompt_hints.get("role_field_hints") if isinstance(prompt_hints.get("role_field_hints"), dict) else {}
@@ -429,6 +615,12 @@ def build_acceptance_contract(
     state_contract = prompt_hints.get("role_state_contract") if isinstance(prompt_hints.get("role_state_contract"), dict) else {}
     update_roles = _sanitize_roles(state_contract.get("update_roles"))
     acceptance_steps = _acceptance_steps_from_prompt_hints(prompt_hints)
+    screen_plan = _role_screen_plan(prompt_hints=prompt_hints, generation_mode=generation_mode)
+    product_scale_contract = _product_scale_contract(
+        prompt_hints=prompt_hints,
+        screen_plan=screen_plan,
+        generation_mode=generation_mode,
+    )
     flows: list[dict[str, Any]] = [
         {
             "id": "role_shared_persistence",
@@ -489,6 +681,8 @@ def build_acceptance_contract(
             "field_hints": list(prompt_hints.get("field_hints") or [])[:12],
             "role_field_hints": dict(prompt_hints.get("role_field_hints") or {}),
             "resource_hint": prompt_hints.get("resource_hint") or None,
+            "resource_hints": list(prompt_hints.get("resource_hints") or [])[:8],
+            "business_capabilities": list(prompt_hints.get("business_capabilities") or [])[:10],
             "role_state_contract": dict(prompt_hints.get("role_state_contract") or {}),
             "analysis_source": prompt_hints.get("analysis_source"),
             "analysis_status": prompt_hints.get("analysis_status"),
@@ -512,7 +706,11 @@ def build_acceptance_contract(
             "multi_page_role_apps": True,
             "route_manifest_required": True,
             "child_pages_must_be_reachable": True,
+            "routeable_screen_plan": screen_plan,
+            "min_role_routes": dict(product_scale_contract.get("min_role_routes") or {}),
+            "product_scale": product_scale_contract.get("scale"),
         },
+        "product_scale_contract": product_scale_contract,
         "flows": flows,
         "test_requirements": [item for flow in flows for item in flow.get("required_tests", [])],
     }
@@ -595,6 +793,8 @@ def build_implementation_plan(
                 "field_hints": [],
                 "role_field_hints": {role: [] for role in ROLE_ORDER},
                 "resource_hint": None,
+                "resource_hints": [],
+                "business_capabilities": [],
                 "role_action_prompts": {role: [] for role in ROLE_ORDER},
                 "role_state_contract": {
                     "source_roles": [],
@@ -606,6 +806,11 @@ def build_implementation_plan(
             }
         )
     screen_plan = _role_screen_plan(prompt_hints=prompt_hints, generation_mode=generation_mode)
+    product_scale_contract = dict(contract.get("product_scale_contract") or {}) or _product_scale_contract(
+        prompt_hints=prompt_hints,
+        screen_plan=screen_plan,
+        generation_mode=generation_mode,
+    )
     source_roles = _source_roles_from_prompt_hints(prompt_hints)
     state_contract = prompt_hints.get("role_state_contract") if isinstance(prompt_hints.get("role_state_contract"), dict) else {}
     update_roles = _sanitize_roles(state_contract.get("update_roles"))
@@ -624,7 +829,8 @@ def build_implementation_plan(
         "principle": "plan_inspect_build_verify_repair_final_browser_proof",
         "roles": list(contract.get("roles") or ROLE_ORDER),
         "prompt_hints": prompt_hints,
-        "primary_entities": [prompt_hints.get("resource_hint")] if prompt_hints.get("resource_hint") else [],
+        "primary_entities": list(prompt_hints.get("resource_hints") or ([prompt_hints.get("resource_hint")] if prompt_hints.get("resource_hint") else []))[:8],
+        "product_scale_contract": product_scale_contract,
         "role_actions": {
             role: (prompt_hints.get("role_action_prompts") or {}).get(role)
             or (
@@ -649,6 +855,8 @@ def build_implementation_plan(
             "field_hints": list(prompt_hints.get("field_hints") or [])[:12],
             "role_field_hints": dict(prompt_hints.get("role_field_hints") or {}),
             "resource_hint": prompt_hints.get("resource_hint") or None,
+            "resource_hints": list(prompt_hints.get("resource_hints") or [])[:8],
+            "business_capabilities": list(prompt_hints.get("business_capabilities") or [])[:10],
             "role_state_contract": {
                 "source_roles": source_roles,
                 "update_roles": update_roles,
@@ -663,6 +871,8 @@ def build_implementation_plan(
             "three_separate_role_apps": True,
             "multi_page_role_apps": True,
             "routeable_screen_plan": screen_plan,
+            "product_scale_contract": product_scale_contract,
+            "min_role_routes": dict(product_scale_contract.get("min_role_routes") or {}),
             "route_manifest_required": True,
             "no_cross_role_navigation": True,
             "role_specific_actions": True,

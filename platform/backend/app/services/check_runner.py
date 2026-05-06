@@ -4535,6 +4535,7 @@ except Exception as exc:
             for role, payload in coverage.items()
             if isinstance(payload, dict) and payload.get("status") == "present"
         ]
+        issues.extend(cls._prompt_scale_route_issues(coverage, acceptance_contract=acceptance_contract))
         if len(present_roles) == len(ROLE_ORDER):
             if cls._role_surfaces_too_similar(role_surface_text):
                 issues.append(
@@ -4547,6 +4548,85 @@ except Exception as exc:
                     )
                 )
         return issues, coverage, neutral_findings
+
+    @staticmethod
+    def _prompt_scale_route_issues(
+        coverage: dict[str, object],
+        *,
+        acceptance_contract: dict[str, Any] | None = None,
+    ) -> list[ValidationIssue]:
+        contract = acceptance_contract if isinstance(acceptance_contract, dict) else {}
+        page_contract = contract.get("page_contract") if isinstance(contract.get("page_contract"), dict) else {}
+        min_routes = page_contract.get("min_role_routes") if isinstance(page_contract.get("min_role_routes"), dict) else {}
+        if not min_routes or not bool(page_contract.get("multi_page_role_apps")):
+            return []
+        issues: list[ValidationIssue] = []
+        screen_plan = page_contract.get("routeable_screen_plan") if isinstance(page_contract.get("routeable_screen_plan"), dict) else {}
+        role_screens = screen_plan.get("roles") if isinstance(screen_plan.get("roles"), dict) else {}
+        for role in ROLE_ORDER:
+            try:
+                expected_routes = int(min_routes.get(role) or 1)
+            except (TypeError, ValueError):
+                expected_routes = 1
+            if expected_routes <= 1:
+                continue
+            payload = coverage.get(role)
+            if not isinstance(payload, dict) or payload.get("status") != "present":
+                continue
+            try:
+                actual_routes = int(payload.get("route_count") or 0)
+            except (TypeError, ValueError):
+                actual_routes = 0
+            payload["expected_route_count"] = expected_routes
+            if actual_routes >= expected_routes:
+                continue
+            intents = [
+                str(item.get("intent") or item.get("purpose") or "").strip()
+                for item in (role_screens.get(role) or [])
+                if isinstance(item, dict) and str(item.get("intent") or item.get("purpose") or "").strip()
+            ]
+            issues.append(
+                ValidationIssue(
+                    code="platform.prompt_scale_route_pages_missing",
+                    message=(
+                        f"{role} role has {actual_routes} routeable page(s), but the prompt-derived product scale requires at least "
+                        f"{expected_routes}. Split the explicit role workflow into reachable mobile pages, not one dashboard-only screen."
+                        + (f" Screen intents: {', '.join(intents[:5])}." if intents else "")
+                    ),
+                    severity="high",
+                    location=f"miniapp/app/static/{role}",
+                    blocking=True,
+                    repair_recipe={
+                        "recipe_id": "role.prompt_scale_pages",
+                        "failure_class": "platform_invariants",
+                        "failure_signature": f"role.prompt_scale_pages.{role}",
+                        "required_next_tool": "read_files",
+                        "suggested_tool_after_read": "apply_patch_to_draft_or_write_file",
+                        "target_files": [
+                            f"miniapp/app/static/{role}/index.html",
+                            f"miniapp/app/static/{role}/app.js",
+                            f"miniapp/app/static/{role}/styles.css",
+                        ],
+                        "verification_check": "platform_invariants",
+                        "verification_command": "run_checks platform_invariants",
+                        "retry_policy": "deterministic_repair",
+                        "deterministic": True,
+                        "retryable": True,
+                        "instruction": (
+                            "Create reachable child pages under this role's static directory for the prompt-derived screen intents. "
+                            "Keep route names/product labels from the user's prompt, make app.js page-aware with body[data-view] or route checks, "
+                            "and bind every visible form/button/control to the persisted API workflow."
+                        ),
+                        "evidence": {
+                            "role": role,
+                            "actual_route_count": actual_routes,
+                            "expected_route_count": expected_routes,
+                            "screen_intents": intents[:8],
+                        },
+                    },
+                )
+            )
+        return issues
 
     @staticmethod
     def _cross_role_surface_markers(role: str, content: str) -> list[str]:
@@ -7184,6 +7264,9 @@ except Exception as exc:
             duplicate_path_id = cls._python_duplicate_path_id_payload_issue("\n".join(source_lines))
             if duplicate_path_id:
                 diagnostics["path_id_payload_duplicate"] = duplicate_path_id
+            store_shape_issue = cls._python_json_store_shape_assertion_issue("\n".join(source_lines))
+            if store_shape_issue:
+                diagnostics["json_store_shape_assertion"] = store_shape_issue
         stack_excerpt = [str(line or "") for line in logs[-12:] if str(line or "").strip()]
         if stack_excerpt:
             diagnostics["stack_excerpt"] = stack_excerpt
@@ -7486,6 +7569,36 @@ except Exception as exc:
                     f"Generated Python tests add `{field_name}` to `{payload_var}` while also sending the id in the PATCH path. "
                     "For path-id PATCH endpoints, do not duplicate the path id in the JSON body unless the backend patch schema explicitly accepts it; "
                     "otherwise strict Pydantic schemas return 422."
+                ),
+            }
+        return None
+
+    @staticmethod
+    def _python_json_store_shape_assertion_issue(test_source: str) -> dict[str, object] | None:
+        source = str(test_source or "")
+        if "json.loads" not in source or "assertEqual(len(" not in source:
+            return None
+        assignment_pattern = re.compile(
+            r"\b(?P<var>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*json\.loads\([^\n]+read_text\(",
+            re.MULTILINE,
+        )
+        for match in assignment_pattern.finditer(source):
+            var_name = match.group("var")
+            assertion_pattern = re.compile(rf"\bassertEqual\(\s*len\(\s*{re.escape(var_name)}\s*\)\s*,\s*\d+\s*\)")
+            assertion_match = assertion_pattern.search(source[match.end() : match.end() + 1600])
+            if not assertion_match:
+                continue
+            window = source[match.start() : match.end() + 1600]
+            if re.search(rf"\b{re.escape(var_name)}\s*\.get\(\s*['\"]items['\"]", window):
+                continue
+            line_no = source[: match.start()].count("\n") + 1
+            return {
+                "line": line_no,
+                "json_var": var_name,
+                "expected_fix": (
+                    "Generated Python tests read a JSON persistence file and assert len(raw_json). "
+                    "The app may persist either a list or an object envelope such as {'next_id': ..., 'items': [...]}; "
+                    "normalize with `items = raw.get('items', raw) if isinstance(raw, dict) else raw` before asserting item count."
                 ),
             }
         return None

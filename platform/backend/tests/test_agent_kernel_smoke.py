@@ -603,6 +603,8 @@ def test_agent_prompt_is_tool_loop_contract_not_domain_template() -> None:
     assert "do not patch it directly" in prompt
     assert "manifest.roles.<role>.root" in prompt
     assert "return the persisted fields at the top level" in prompt
+    assert "product_scale_contract" in prompt
+    assert "normalize list-vs-envelope shape" in prompt
     assert "miniapp/app/generated/miniapp_contract.json" in prompt
     assert "keep names consistent across backend, JS payloads, renderers, and tests" in prompt
 
@@ -646,6 +648,70 @@ def test_implementation_plan_has_prompt_derived_routeable_screen_intents() -> No
     assert any(item["intent"] == "create_or_configure" for item in screen_plan["roles"]["client"])
     assert any(item["intent"] == "detail_or_update" for item in screen_plan["roles"]["specialist"])
     assert any(item["intent"] == "summary_or_insight" for item in screen_plan["roles"]["manager"])
+
+
+def test_ordinary_business_prompt_promotes_prompt_scale_to_role_pages() -> None:
+    prompt = (
+        "Сделай мини-приложение для моей студии маникюра. "
+        "Клиенты должны видеть услуги, цены и свободное время, записываться на удобную дату и получать подтверждение. "
+        "Мастера должны видеть свои записи на день и отмечать, что клиент пришел. "
+        "Администратор должен видеть все записи, добавлять услуги, менять цены и отменять запись."
+    )
+    prompt_analysis = {
+        "prompt_summary": "мини-приложение для студии маникюра",
+        "resource_hint": "запись",
+        "resource_hints": ["услуги", "цены", "свободное время", "запись"],
+        "business_capabilities": ["просмотр услуг и цен", "запись клиента", "день мастера", "администрирование услуг и записей"],
+        "field_hints": ["услуги", "цены", "свободное время", "дата", "подтверждение", "клиент пришел"],
+        "role_field_hints": {
+            "client": ["услуги", "цены", "свободное время", "дата", "подтверждение"],
+            "specialist": ["записи на день", "клиент пришел"],
+            "manager": ["записи", "услуги", "цены"],
+        },
+        "role_action_prompts": {
+            "client": ["видеть услуги", "видеть цены", "видеть свободное время", "записываться на удобную дату", "получать подтверждение"],
+            "specialist": ["видеть свои записи на день", "отмечать, что клиент пришел"],
+            "manager": ["видеть все записи", "добавлять услуги", "менять цены", "отменять запись"],
+        },
+        "role_state_contract": {
+            "source_roles": ["manager"],
+            "update_roles": ["manager"],
+            "observer_roles": ["client", "specialist"],
+        },
+        "routeable_screen_plan": {
+            "multi_page_recommended": True,
+            "roles": {
+                "client": [{"intent": "list_or_read", "purpose": "показать услуги, цены и свободное время"}],
+                "specialist": [],
+                "manager": [],
+            },
+        },
+    }
+    contract = build_acceptance_contract(
+        prompt=prompt,
+        intent="create",
+        generation_mode=GenerationMode.FAST,
+        prompt_analysis=prompt_analysis,
+    )
+    plan = build_implementation_plan(
+        prompt=prompt,
+        intent="create",
+        generation_mode=GenerationMode.FAST,
+        acceptance_contract=contract,
+    )
+
+    screen_plan = plan["routeable_screen_plan"]
+    scale_contract = plan["product_scale_contract"]
+
+    assert "client" in plan["role_state_contract"]["source_roles"]
+    assert "specialist" in plan["role_state_contract"]["update_roles"]
+    assert len(screen_plan["roles"]["client"]) >= 3
+    assert len(screen_plan["roles"]["specialist"]) >= 2
+    assert len(screen_plan["roles"]["manager"]) >= 3
+    assert scale_contract["scale"] == "full_product"
+    assert scale_contract["min_role_routes"]["client"] >= 3
+    assert scale_contract["min_role_routes"]["specialist"] >= 2
+    assert scale_contract["min_role_routes"]["manager"] >= 3
 
 
 def test_acceptance_contract_carries_prompt_field_hints() -> None:
@@ -744,6 +810,23 @@ def test_cross_role_update_visibility_accepts_prompt_owned_label_fields(tmp_path
     )
 
     assert issues == []
+
+
+def test_python_generated_test_diagnostic_detects_json_store_envelope_assertion() -> None:
+    test_source = """
+import json
+
+class GeneratedAppPythonTests(unittest.TestCase):
+    def test_store(self):
+        persisted = json.loads(self.store_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(persisted), 1)
+"""
+
+    diagnostic = CheckRunner._python_json_store_shape_assertion_issue(test_source)
+
+    assert diagnostic is not None
+    assert diagnostic["json_var"] == "persisted"
+    assert "raw.get('items', raw)" in diagnostic["expected_fix"]
 
 
 def test_contract_compiler_preserves_prompt_metadata_without_product_shell() -> None:
@@ -1119,6 +1202,67 @@ def test_role_surface_issues_accepts_generation_mode(tmp_path: Path) -> None:
 
     assert isinstance(issues, list)
     assert set(coverage) == {"client", "specialist", "manager"}
+
+
+def test_prompt_scale_requires_routeable_role_pages(tmp_path: Path) -> None:
+    contract = build_acceptance_contract(
+        prompt=(
+            "Клиент записывается и получает подтверждение. "
+            "Мастер видит записи дня и отмечает приход. "
+            "Администратор добавляет услуги, меняет цены и отменяет записи."
+        ),
+        intent="create",
+        generation_mode=GenerationMode.FAST,
+        prompt_analysis={
+            "prompt_summary": "студия маникюра",
+            "resource_hint": "запись",
+            "field_hints": ["услуга", "цена", "слот", "приход"],
+            "role_field_hints": {
+                "client": ["услуга", "слот", "подтверждение"],
+                "specialist": ["записи дня", "приход"],
+                "manager": ["услуги", "цены", "отмена"],
+            },
+            "role_action_prompts": {
+                "client": ["записываться", "получать подтверждение"],
+                "specialist": ["видеть записи дня", "отмечать приход"],
+                "manager": ["добавлять услуги", "менять цены", "отменять записи"],
+            },
+            "routeable_screen_plan": {"multi_page_recommended": True, "roles": {"client": [], "specialist": [], "manager": []}},
+        },
+    )
+    css = ".shell { display: grid; } .card { padding: 12px; } .button { min-height: 44px; }"
+    role_payloads = {
+        "client": (
+            "Записаться",
+            "document.querySelector('form')?.addEventListener('submit', () => fetch('/api/zapis', { method: 'POST' }));",
+        ),
+        "specialist": (
+            "День мастера",
+            "document.querySelector('button')?.addEventListener('click', () => fetch('/api/zapis/1', { method: 'PATCH' }));",
+        ),
+        "manager": (
+            "Управление",
+            "document.querySelector('form')?.addEventListener('submit', () => fetch('/api/zapis', { method: 'POST' })); fetch('/api/zapis/1', { method: 'PATCH' });",
+        ),
+    }
+    for role, (title, script) in role_payloads.items():
+        role_dir = tmp_path / "miniapp" / "app" / "static" / role
+        role_dir.mkdir(parents=True)
+        (role_dir / "index.html").write_text(
+            f"<main class='shell'><h1>{title}</h1><form><input name='name' /><button class='button'>Сохранить</button></form></main>",
+            encoding="utf-8",
+        )
+        (role_dir / "app.js").write_text(script, encoding="utf-8")
+        (role_dir / "styles.css").write_text(css, encoding="utf-8")
+
+    issues, coverage, _neutral = CheckRunner._role_surface_issues(
+        tmp_path,
+        generation_mode=GenerationMode.FAST,
+        acceptance_contract=contract,
+    )
+
+    assert any(issue.code == "platform.prompt_scale_route_pages_missing" for issue in issues)
+    assert coverage["client"]["expected_route_count"] >= 2  # type: ignore[index]
 
 
 def test_role_action_signals_follow_prompt_role_flow() -> None:

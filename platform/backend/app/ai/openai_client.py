@@ -166,7 +166,11 @@ class OpenAIClient:
         system_prompt = (
             "You extract a product-neutral mini-app contract from a user prompt. "
             "Use only the supplied prompt and the requested JSON schema. Return only valid JSON. "
-            "Use the user's wording for labels. If a detail is not explicit, leave the list empty. "
+            "Use the user's wording for labels. Extract every explicit business object and role action, even from ordinary small-business prompts. "
+            "If the prompt names several surfaces such as catalog, prices, availability, bookings, confirmations, daily work, or admin controls, keep them as separate resources/capabilities instead of collapsing everything into one CRUD item. "
+            "For routeable_screen_plan, include screen intents for every role that has explicit actions; do not leave specialist or manager empty when the prompt gives them responsibilities. "
+            "A prompt with three or more concrete role/action sentences should normally be multi-page because mobile workflows need focused screens. "
+            "If a detail is not explicit, leave that list empty. "
             "Do not add any workflow, state machine, or role responsibility unless the prompt explicitly asks for it."
         )
         user_prompt = json.dumps(
@@ -177,6 +181,8 @@ class OpenAIClient:
                 "required_json_shape": {
                     "prompt_summary": "short summary in the prompt language",
                     "resource_hint": "single shared business object name or null",
+                    "resource_hints": ["all explicit business objects/resources from the prompt"],
+                    "business_capabilities": ["distinct prompt-derived workflows/capabilities"],
                     "field_hints": ["all explicit create/update field labels from the prompt"],
                     "role_field_hints": {
                         "client": ["fields owned by client role"],
@@ -198,8 +204,8 @@ class OpenAIClient:
                         "multi_page_recommended": True,
                         "roles": {
                             "client": [{"intent": "overview|create_or_configure|list_or_read|detail_or_update|summary_or_insight", "purpose": "why this screen exists", "source": ["prompt phrase"]}],
-                            "specialist": [],
-                            "manager": [],
+                            "specialist": [{"intent": "overview|create_or_configure|list_or_read|detail_or_update|summary_or_insight", "purpose": "why this screen exists", "source": ["prompt phrase"]}],
+                            "manager": [{"intent": "overview|create_or_configure|list_or_read|detail_or_update|summary_or_insight", "purpose": "why this screen exists", "source": ["prompt phrase"]}],
                         },
                     },
                 },
