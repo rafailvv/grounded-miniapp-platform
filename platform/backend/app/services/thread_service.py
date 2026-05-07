@@ -10,6 +10,7 @@ from app.models.threads import ItemRecord, RolloutEventRecord, ThreadRecord, Thr
 from app.repositories.platform_db import PlatformDb
 from app.repositories.state_store import StateStore
 from app.services.exec_policy_service import ExecPolicyService
+from app.services.event_journal import EventJournalService
 from app.services.exec_runtime_service import ExecRuntimeService
 from app.services.rpc_event_hub import RpcEventHub
 from app.services.tool_protocol import tool_envelope
@@ -31,6 +32,7 @@ class ThreadService:
         store: StateStore | None = None,
         exec_policy_service: ExecPolicyService | None = None,
         exec_runtime_service: ExecRuntimeService | None = None,
+        event_journal_service: EventJournalService | None = None,
     ) -> None:
         self.db = db
         self.run_service = run_service
@@ -38,11 +40,13 @@ class ThreadService:
         self.event_hub = event_hub
         self.store = store or run_service.store
         self.exec_policy_service = exec_policy_service or ExecPolicyService()
+        self.event_journal_service = event_journal_service
         self.exec_runtime_service = exec_runtime_service or ExecRuntimeService(
             workspace_service=workspace_service,
             platform_db=db,
             event_hub=event_hub,
             store=self.store,
+            event_journal_service=event_journal_service,
         )
         self._monitors: dict[str, threading.Thread] = {}
 
@@ -424,6 +428,23 @@ class ThreadService:
         item = {**event, "sequence": len(payload.get("items") or []) + 1, "created_at": self._now().isoformat()}
         payload.setdefault("items", []).append(item)
         self.store.upsert("reports", key, payload)
+        if self.event_journal_service is not None:
+            try:
+                run = self.run_service.get_run(run_id)
+                result = item.get("result") if isinstance(item.get("result"), dict) else {}
+                status = str(result.get("status") or item.get("status") or "completed").lower()
+                event_type = "tool.failed" if status in {"failed", "blocked", "error"} else "tool.completed"
+                self.event_journal_service.append_run(
+                    workspace_id=run.workspace_id,
+                    run_id=run_id,
+                    event_type=event_type,
+                    actor=f"tool:{item.get('tool') or 'unknown'}",
+                    payload=item,
+                    summary=str(item.get("tool") or "Tool event"),
+                    idempotency_key=f"thread_tool:{run_id}:{item.get('tool_call_id') or item.get('sequence')}",
+                )
+            except Exception:
+                pass
 
     def _upsert_run_approval(self, run_id: str, item: dict[str, Any]) -> None:
         key = f"approvals:{run_id}"
@@ -492,12 +513,84 @@ class ThreadService:
 
     def _append_item(self, thread_id: str, turn_id: str | None, item_type: str, payload: dict[str, Any], *, notify_method: str | None = None) -> ItemRecord:
         item = self.db.append_item(ItemRecord(thread_id=thread_id, turn_id=turn_id, item_type=item_type, payload=payload))
+        self._journal_thread_event(
+            thread_id,
+            turn_id,
+            f"item.{item_type}",
+            item.model_dump(mode="json"),
+            actor=self._actor_for_item(item_type),
+            source_ref=item.item_id,
+            idempotency_key=f"item:{item.item_id}",
+        )
         self.event_hub.publish(notify_method or "item/completed", {"thread_id": thread_id, "turn_id": turn_id, "item": item.model_dump(mode="json")})
         return item
 
     def _append_event(self, thread_id: str, turn_id: str | None, event_type: str, payload: dict[str, Any]) -> RolloutEventRecord:
         event = self.db.append_event(RolloutEventRecord(thread_id=thread_id, turn_id=turn_id, event_type=event_type, payload=payload))
+        self._journal_thread_event(
+            thread_id,
+            turn_id,
+            event_type,
+            event.model_dump(mode="json"),
+            actor="system",
+            source_ref=event.event_id,
+            idempotency_key=f"event:{event.event_id}",
+        )
         return event
+
+    def _journal_thread_event(
+        self,
+        thread_id: str,
+        turn_id: str | None,
+        event_type: str,
+        payload: dict[str, Any],
+        *,
+        actor: str = "system",
+        source_ref: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> None:
+        if self.event_journal_service is None:
+            return
+        try:
+            thread = self._get_thread(thread_id)
+            self.event_journal_service.append_thread(
+                workspace_id=thread.workspace_id,
+                thread_id=thread_id,
+                turn_id=turn_id,
+                run_id=self._run_id_from_payload(payload),
+                event_type=event_type,
+                actor=actor,
+                payload=payload,
+                summary=event_type,
+                source_ref=source_ref,
+                idempotency_key=idempotency_key,
+            )
+        except Exception:
+            pass
+
+    @staticmethod
+    def _actor_for_item(item_type: str) -> str:
+        if item_type.startswith("user."):
+            return "user"
+        if item_type.startswith("agent."):
+            return "agent"
+        if item_type.startswith("command.") or item_type.startswith("tool."):
+            return "tool:thread"
+        return "system"
+
+    @staticmethod
+    def _run_id_from_payload(payload: dict[str, Any]) -> str | None:
+        value = payload.get("run_id")
+        if isinstance(value, str) and value.strip():
+            return value
+        nested_payload = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+        value = nested_payload.get("run_id")
+        if isinstance(value, str) and value.strip():
+            return value
+        run = nested_payload.get("run") if isinstance(nested_payload.get("run"), dict) else payload.get("run") if isinstance(payload.get("run"), dict) else None
+        if run and isinstance(run.get("run_id"), str):
+            return str(run["run_id"])
+        return None
 
     def _get_thread(self, thread_id: str) -> ThreadRecord:
         thread = self.db.get_thread(thread_id)

@@ -8,6 +8,7 @@ from uuid import uuid4
 from app.models.domain import RunRecord
 from app.repositories.platform_db import PlatformDb
 from app.repositories.state_store import StateStore
+from app.services.event_journal import EventJournalService
 
 
 RUN_PROTOCOL_EVENT_SCHEMA = "grounded.run_protocol_event.v1"
@@ -51,9 +52,10 @@ def diff_sha256(diff_text: str | None) -> str | None:
 class RunProtocolService:
     """Canonical run protocol overlay stored in existing run_events and reports."""
 
-    def __init__(self, db: PlatformDb, store: StateStore) -> None:
+    def __init__(self, db: PlatformDb, store: StateStore, *, event_journal_service: EventJournalService | None = None) -> None:
         self.db = db
         self.store = store
+        self.event_journal_service = event_journal_service
 
     def append_event(
         self,
@@ -95,6 +97,20 @@ class RunProtocolService:
         protocol_payload["sequence"] = sequence
         protocol_payload["event_id"] = event_id
         wrapper["payload"] = protocol_payload
+        if self.event_journal_service is not None:
+            try:
+                self.event_journal_service.append_run(
+                    workspace_id=workspace_id,
+                    run_id=run_id,
+                    event_type=f"protocol.{event_type}",
+                    actor="system",
+                    payload=protocol_payload,
+                    summary=message,
+                    source_ref=event_id,
+                    idempotency_key=f"protocol:{event_id}",
+                )
+            except Exception:
+                pass
         return wrapper
 
     def append_once_terminal(self, run: RunRecord, *, source_event_type: str | None = None) -> dict[str, Any] | None:

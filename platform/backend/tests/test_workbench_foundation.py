@@ -6,17 +6,36 @@ import shutil
 import time
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.core.config import get_settings
 from app.main import create_app
 from app.models.common import GenerationMode
 from app.models.domain import CreateRunRequest, GenerateRequest, JobRecord, PreviewRecord, RunCheckResult, RunRecord
+from app.models.event_journal import EventJournalPage, RunJournalState, ThreadJournalState
+from app.models.workbench import (
+    GateReport,
+    RepairAttemptsReport,
+    RepairCase,
+    RepairCasesReport,
+    RunBookmarksReport,
+    RunEventsReport,
+    RunProtocolReport,
+    RunTimelineReport,
+    RunTraceViewReport,
+    ToolEnvelope,
+    TraceBundleReport,
+    TraceState,
+)
 from app.modules.miniapp_agent_loop.agent_command_policy import AgentCommandPolicy
 from app.modules.miniapp_agent_loop.agent_tool_call_loop import AgentToolCallLoop
 from app.modules.miniapp_agent_loop.agent_transcript import AgentTranscriptStore
 from app.modules.workspace_code_agent_runtime.budget import completion_budget_status
+from app.openapi_export import export_openapi
+from app.repositories.platform_db import PlatformDb
 from app.services.repair_catalog import RepairCatalog
+from app.services.event_journal import EventJournalSecretError, EventJournalService
 from app.services.exec_policy_service import ExecPolicyService
 from app.services.tool_protocol import TOOL_PROTOCOL_VERSION, canonical_tool_name, tool_envelope
 from app.services.workspace.runtime_manager import PreviewRuntimeManager
@@ -45,14 +64,77 @@ def test_explicit_host_data_dir_env_still_overrides_data_dir(tmp_path: Path, mon
 def test_tool_protocol_normalizes_aliases() -> None:
     assert canonical_tool_name("run_command") == "shell.exec"
     envelope = tool_envelope(tool="apply_patch_to_draft", input_payload={"path": "miniapp/app/main.py"})
+    typed = ToolEnvelope.model_validate(envelope)
 
     assert envelope["version"] == TOOL_PROTOCOL_VERSION
     assert envelope["tool"] == "patch.apply"
+    assert typed.tool_call_id == envelope["tool_call_id"]
     assert envelope["status"] == "started"
     assert envelope["risk"] == "mutating"
     assert envelope["sandbox_profile"] == "agent_draft"
     assert "changed_files" in envelope
     assert envelope["approval"]["status"] == "not_required"
+
+
+def test_event_journal_v2_appends_payload_refs_dedupes_and_rejects_secrets(tmp_path: Path) -> None:
+    db = PlatformDb(tmp_path / "platform.db")
+    journal = EventJournalService(db)
+
+    first = journal.append_run(
+        workspace_id="ws_1",
+        run_id="run_1",
+        event_type="run.created",
+        payload={"status": "pending", "token_usage": {"total_tokens": 12}},
+        idempotency_key="run.created:run_1",
+    )
+    duplicate = journal.append_run(
+        workspace_id="ws_1",
+        run_id="run_1",
+        event_type="run.created",
+        payload={"status": "pending"},
+        idempotency_key="run.created:run_1",
+    )
+    second = journal.append_run(workspace_id="ws_1", run_id="run_1", event_type="run.started", payload={"status": "running"})
+    thread_event = journal.append_thread(workspace_id="ws_1", thread_id="thread_1", event_type="thread.started", payload={"run_id": "run_1"})
+    payload = journal.read_payload(first.payload_ref)
+
+    assert first.event_id == duplicate.event_id
+    assert first.sequence == 1
+    assert second.sequence == 2
+    assert payload is not None
+    assert payload.payload["status"] == "pending"
+    assert payload.payload_sha256 == first.payload_sha256
+    assert thread_event.sequence == 1
+    assert journal.list_run("run_1", after_sequence=1)[0].event_type == "run.started"
+    db.append_run_event("run_legacy", "legacy.started", {"message": "started"})
+    journal.backfill_run(workspace_id="ws_1", run_id="run_legacy")
+    journal.backfill_run(workspace_id="ws_1", run_id="run_legacy")
+    assert [item.event_type for item in journal.list_run("run_legacy")] == ["legacy.started"]
+    with pytest.raises(EventJournalSecretError):
+        journal.append_run(workspace_id="ws_1", run_id="run_1", event_type="tool.completed", payload={"api_key": "sk-" + "a" * 30})
+
+
+def test_create_run_writes_journal_v2_lifecycle_events(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Journal Lifecycle Workspace",
+            "description": "Journal lifecycle test",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    app.state.container.run_service._execute_run = lambda run_id, payload: None
+
+    run = app.state.container.run_service.create_run(
+        workspace["workspace_id"],
+        CreateRunRequest(prompt="Update the client wording", mode="fix", intent="edit", generation_mode="fast"),
+    )
+    events = client.get(f"/runs/{run.run_id}/events-v2").json()
+
+    assert {"run.created", "run.session_configured", "run.started"}.issubset({item["event_type"] for item in events["items"]})
 
 
 def test_exec_policy_classifies_and_redacts_commands() -> None:
@@ -368,6 +450,13 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
         f"worker_manager_merge_decision:{workspace['workspace_id']}:{run.run_id}",
         {"schema": "grounded.worker_manager_merge_decision.v1", "status": "empty", "decisions": []},
     )
+    app.state.container.event_journal_service.append_run(
+        workspace_id=workspace["workspace_id"],
+        run_id=run.run_id,
+        event_type="run.created",
+        payload={"run_id": run.run_id, "status": run.status},
+        idempotency_key=f"test.run.created:{run.run_id}",
+    )
 
     policy = client.get("/system/policies/exec").json()
     evaluation = client.post(
@@ -384,6 +473,8 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
     compaction_boundaries = client.get(f"/runs/{run.run_id}/compaction/boundaries").json()
     tasks = client.get(f"/runs/{run.run_id}/tasks").json()
     run_events = client.get(f"/runs/{run.run_id}/events").json()
+    run_events_v2 = client.get(f"/runs/{run.run_id}/events-v2").json()
+    run_journal_state = client.get(f"/runs/{run.run_id}/journal/state").json()
     doctor = client.get("/doctor").json()
     memory = client.post(
         f"/workspaces/{workspace['workspace_id']}/memory",
@@ -405,6 +496,9 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
     lsp_route_context = client.get(f"/workspaces/{workspace['workspace_id']}/lsp/route-static-context").json()
     thread = client.post("/threads", json={"workspace_id": workspace["workspace_id"], "title": "Workbench Thread"}).json()
     thread_snapshot = client.get(f"/threads/{thread['thread_id']}").json()
+    thread_events_v2 = client.get(f"/threads/{thread['thread_id']}/events-v2").json()
+    thread_journal_state = client.get(f"/threads/{thread['thread_id']}/journal/state").json()
+    event_payload = client.get(f"/event-payloads/{thread_events_v2['items'][0]['payload_ref']}").json()
     resumed_thread = client.post(f"/threads/{thread['thread_id']}/resume").json()
     patch_preflight = client.post(
         f"/workspaces/{workspace['workspace_id']}/patch/preflight",
@@ -423,6 +517,17 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
 
     assert policy["tool_protocol_version"] == TOOL_PROTOCOL_VERSION
     assert evaluation["decision"]["action"] == "allow"
+    RunTimelineReport.model_validate(timeline)
+    RunTraceViewReport.model_validate(trace)
+    TraceBundleReport.model_validate(trace_bundle)
+    TraceState.model_validate(trace_bundle_state)
+    RunProtocolReport.model_validate(protocol)
+    RunBookmarksReport.model_validate(bookmarks)
+    RunEventsReport.model_validate(run_events)
+    EventJournalPage.model_validate(run_events_v2)
+    EventJournalPage.model_validate(thread_events_v2)
+    RunJournalState.model_validate(run_journal_state)
+    ThreadJournalState.model_validate(thread_journal_state)
     assert timeline["items"][0]["kind"] == "prompt"
     assert trace["reducer"]["why"] == "Build a workflow"
     assert trace_bundle["schema"] == "grounded.trace_bundle.v1"
@@ -433,6 +538,8 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
     assert compaction_boundaries["schema"] == "grounded.run_compaction_boundaries.v1"
     assert tasks["schema"] == "grounded.run_tasks.v1"
     assert run_events["schema"] == "grounded.run_events.v1"
+    assert run_events_v2["schema"] == "grounded.event_journal_page.v2"
+    assert run_journal_state["latest_status"] == run.status
     assert doctor["checks"]
     assert memory["items"][0]["text"] == "Use dense operational UI."
     assert extracted_memory["schema"] == "grounded.memory_stage1.v1"
@@ -455,6 +562,9 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
     assert lsp_refs["schema"] == "grounded.lsp_find_references.v1"
     assert lsp_route_context["schema"] == "grounded.lsp_route_static_context.v1"
     assert thread_snapshot["thread"]["thread_id"] == thread["thread_id"]
+    assert thread_events_v2["items"][0]["event_type"] == "thread.started"
+    assert thread_journal_state["event_count"] >= 1
+    assert event_payload["payload_ref"] == thread_events_v2["items"][0]["payload_ref"]
     assert resumed_thread["status"] == "active"
     assert patch_preflight["status"] == "passed"
 
@@ -496,12 +606,17 @@ def test_run_events_are_persisted_by_platform_db(tmp_path: Path) -> None:
     )
 
     events = client.get(f"/runs/{run.run_id}/events").json()
+    events_v2 = client.get(f"/runs/{run.run_id}/events-v2").json()
+    state_v2 = client.get(f"/runs/{run.run_id}/journal/state").json()
 
     assert events["items"][0]["event_type"] == "run.started"
     assert events["items"][0]["payload"]["source_event_type"] == "job_started"
     assert events["protocol_events"][0]["type"] == "run_started"
     assert events["protocol_events"][0]["source_event_type"] == "job_started"
     assert events["state_snapshots"][0]["reason"] == "job_started"
+    assert {"trace.event_recorded", "run.started", "protocol.run_started"}.issubset({item["event_type"] for item in events_v2["items"]})
+    assert state_v2["status"] == "available"
+    assert state_v2["latest_status"] in {"running", "started"}
 
 
 def test_run_protocol_appends_events_and_bookmarks(tmp_path: Path) -> None:
@@ -876,6 +991,41 @@ def test_config_schema_is_versioned_json_schema(tmp_path: Path) -> None:
     assert schema["schemas"]["platform"]["properties"]["preview_port_base"]["type"] == "integer"
 
 
+def test_system_schema_manifest_and_openapi_export_include_workbench_contracts(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+
+    manifest = client.get("/system/schema").json()
+    openapi = client.get("/openapi.json").json()
+    exported = export_openapi()
+    model_names = {item["name"] for item in manifest["models"]}
+    component_names = set(openapi["components"]["schemas"])
+
+    assert manifest["schema"] == "grounded.system_schema.v1"
+    assert manifest["openapi_url"] == "/openapi.json"
+    assert manifest["generated_types_path"] == "platform/frontend/src/lib/generated/openapi-types.ts"
+    assert "model_shapes" not in manifest
+    for name in {
+        "RunEvent",
+        "RunEventV2",
+        "ThreadEventV2",
+        "EventJournalPage",
+        "EventJournalPayload",
+        "RunJournalState",
+        "ThreadJournalState",
+        "ToolEnvelope",
+        "CheckResult",
+        "ArtifactRef",
+        "GateReport",
+        "RepairCase",
+        "TraceState",
+        "ThreadSnapshot",
+    }:
+        assert name in model_names
+        assert name in component_names
+        assert name in exported["components"]["schemas"]
+
+
 def test_workspace_creation_does_not_start_preview_before_generated_app_exists(tmp_path: Path) -> None:
     app = create_app(data_dir=tmp_path)
     client = TestClient(app)
@@ -1243,13 +1393,22 @@ def test_reliability_gate_blocks_missing_browser_proof(tmp_path: Path) -> None:
     gate = client.get(f"/runs/{run.run_id}/gate").json()
     repair = client.get(f"/runs/{run.run_id}/repair-signatures").json()
     repair_cases = client.get(f"/runs/{run.run_id}/repair-cases").json()
+    journal = client.get(f"/runs/{run.run_id}/events-v2").json()
 
+    GateReport.model_validate(gate)
+    RepairCasesReport.model_validate(repair_cases)
     assert gate["status"] == "blocked"
     assert any(issue["check"] == "browser_flow_smoke" for issue in gate["issues"])
     assert any(item["signature"] == "preview.browser_flow_failed" for item in repair["items"])
     assert repair_cases["items"]
     assert repair_cases["active_case"]["failure_class"] in {"browser_flow_smoke", "browser_proof_gap"}
     assert repair_cases["active_case"]["repair_prompt"]["sections"]["expected_proof"]
+    case_id = repair_cases["active_case"]["case_id"]
+    RepairCase.model_validate(client.get(f"/runs/{run.run_id}/repair-cases/{case_id}").json())
+    RepairAttemptsReport.model_validate(client.get(f"/runs/{run.run_id}/repair-cases/{case_id}/attempts").json())
+    event_types = {item["event_type"] for item in journal["items"]}
+    assert "gate.evaluated" in event_types
+    assert "repair.case_opened" in event_types
 
 
 def test_reliability_gate_blocks_test_only_acceptance_diff(tmp_path: Path) -> None:
@@ -2238,6 +2397,9 @@ def test_staged_apply_commits_only_selected_files_and_discard_restores_draft(tmp
     assert applied["status"] == "awaiting_approval"
     assert ui_path in discarded["result"]["discarded_files"]
     assert (draft / ui_path).read_text(encoding="utf-8") == original_ui
+    journal = client.get(f"/runs/{run.run_id}/events-v2").json()
+    event_types = {item["event_type"] for item in journal["items"]}
+    assert {"apply.staged", "apply.applied", "apply.discarded"}.issubset(event_types)
 
 
 def test_staged_apply_uses_actual_diff_for_generated_manifest(tmp_path: Path) -> None:

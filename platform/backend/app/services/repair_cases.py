@@ -8,6 +8,7 @@ from typing import Any
 
 from app.models.domain import CreateRunRequest, RunRecord
 from app.repositories.state_store import StateStore
+from app.services.event_journal import EventJournalService
 
 
 REPAIR_CASE_SCHEMA = "grounded.repair_case.v1"
@@ -160,8 +161,9 @@ class RepairPromptBuilder:
 
 
 class RepairCaseService:
-    def __init__(self, store: StateStore) -> None:
+    def __init__(self, store: StateStore, *, event_journal_service: EventJournalService | None = None) -> None:
         self.store = store
+        self.event_journal_service = event_journal_service
 
     @staticmethod
     def index_ref(run_id: str) -> str:
@@ -264,6 +266,32 @@ class RepairCaseService:
                 values[self.case_ref(workspace_id, run_id, case_id)] = existing
         if values:
             self.store.upsert_many("reports", values)
+            for ref, case in values.items():
+                case_id = str(case.get("case_id") or "")
+                if not case_id:
+                    continue
+                event_type = "repair.case_updated" if case_id in existing_by_id else "repair.case_opened"
+                digest = _json_sha(
+                    {
+                        "case_id": case_id,
+                        "status": case.get("status"),
+                        "current": case.get("current"),
+                        "source": case.get("source"),
+                        "failure_signature": case.get("failure_signature"),
+                        "target_files": case.get("target_files") or [],
+                        "next_action": case.get("next_action") or {},
+                    }
+                )
+                payload = {key: value for key, value in case.items() if key != "repair_prompt"}
+                payload["case_ref"] = ref
+                self._journal_repair(
+                    workspace_id=workspace_id,
+                    run_id=run_id,
+                    event_type=event_type,
+                    payload=payload,
+                    summary=str(case.get("failure_signature") or case.get("case_id") or event_type),
+                    idempotency_key=f"repair.case:{run_id}:{case_id}:{digest}",
+                )
         all_refs = list(dict.fromkeys([*(self.store.get("reports", self.index_ref(run_id)) or {}).get("case_refs", []), *case_refs]))
         index = {
             "schema": REPAIR_CASE_INDEX_SCHEMA,
@@ -334,6 +362,23 @@ class RepairCaseService:
         case["next_action"] = self._next_action(case)
         case["repair_prompt"] = RepairPromptBuilder.build(case)
         self.store.upsert("reports", self.case_ref(workspace_id, run_id, case_id), case)
+        self._journal_repair(
+            workspace_id=workspace_id,
+            run_id=run_id,
+            event_type="repair.attempt_recorded",
+            payload={"case_id": case_id, "attempt": payload, "case_status": case.get("status")},
+            summary=f"Repair attempt {payload['status']}.",
+            idempotency_key=f"repair.attempt:{run_id}:{case_id}:{payload['attempt_id']}:{payload['status']}",
+        )
+        if str(payload.get("status") or "") in {"completed", "passed", "repaired", "resolved"}:
+            self._journal_repair(
+                workspace_id=workspace_id,
+                run_id=run_id,
+                event_type="repair.case_resolved",
+                payload={"case_id": case_id, "attempt": payload},
+                summary=f"Repair case {case_id} resolved.",
+                idempotency_key=f"repair.resolved:{run_id}:{case_id}:{payload['attempt_id']}",
+            )
         return case
 
     def repeated_patch(self, *, run_id: str, case_id: str, patch_hash: str) -> bool:
@@ -341,6 +386,31 @@ class RepairCaseService:
         if not case or not patch_hash:
             return False
         return any(str(item.get("patch_sha256") or "") == patch_hash for item in case.get("attempts") or [])
+
+    def _journal_repair(
+        self,
+        *,
+        workspace_id: str,
+        run_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+        summary: str = "",
+        idempotency_key: str | None = None,
+    ) -> None:
+        if self.event_journal_service is None:
+            return
+        try:
+            self.event_journal_service.append_run(
+                workspace_id=workspace_id,
+                run_id=run_id,
+                event_type=event_type,
+                actor="system",
+                payload=payload,
+                summary=summary,
+                idempotency_key=idempotency_key,
+            )
+        except Exception:
+            pass
 
     def retry_request(self, run: RunRecord, case_id: str) -> CreateRunRequest:
         case = self.get_case(run.run_id, case_id)

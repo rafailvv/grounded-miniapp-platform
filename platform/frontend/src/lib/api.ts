@@ -1,3 +1,8 @@
+import type { components } from "./generated/openapi-types";
+
+type ApiSchemas = components["schemas"];
+type RequiredKeys<T, K extends keyof T> = T & { [P in K]-?: NonNullable<T[P]> };
+
 export type Workspace = {
   workspace_id: string;
   name: string;
@@ -399,116 +404,23 @@ export type AgentItem = {
   created_at: string;
 };
 
-export type RunTimeline = {
-  run_id: string;
-  tool_protocol_version: string;
-  items: Array<{
-    sequence: number;
-    kind: string;
-    status: string;
-    title: string;
-    payload: Record<string, unknown>;
-    created_at: string;
-  }>;
-};
-
-export type RunTraceView = {
-  run_id: string;
-  trace_id: string;
-  status: string;
-  apply_status: string;
-  timeline: RunTimeline["items"];
-  reducer: {
-    why?: string;
-    failed_checks?: RunTimeline["items"];
-    patches?: RunTimeline["items"];
-    browser_proofs?: RunTimeline["items"];
-    failures?: RunTimeline["items"];
-    fixes?: RunTimeline["items"];
-  };
-  artifact_refs?: Record<string, string | null | undefined>;
-};
-
-export type TraceBundleReport = {
-  schema?: string;
-  run_id: string;
-  workspace_id: string;
-  status: string;
-  bundle_dir?: string;
-  manifest_path?: string;
-  trace_path?: string;
-  state_path?: string;
-  payload_dir?: string;
-  event_count?: number;
-  payload_count?: number;
-  state?: TraceBundleState;
-};
-
-export type TraceBundleState = {
-  schema?: string;
-  run_id?: string;
-  workspace_id?: string;
-  event_count?: number;
-  turns?: Array<Record<string, unknown>>;
-  tool_calls?: Array<Record<string, unknown>>;
-  prompt_contexts?: Array<Record<string, unknown>>;
-  skill_edges?: Array<Record<string, unknown>>;
-  memory_edges?: Array<Record<string, unknown>>;
-  diff_edges?: Array<Record<string, unknown>>;
-  acceptance_gate?: Array<Record<string, unknown>>;
-  artifacts?: Array<Record<string, unknown>>;
-  changed_files?: string[];
-  blockers?: Array<Record<string, unknown>>;
-  proof_edges?: Array<Record<string, unknown>>;
-  compact_boundaries?: Array<Record<string, unknown>>;
-  next_action?: Record<string, unknown>;
-  payload_refs?: Array<Record<string, unknown>>;
-};
-
-export type RunProtocolEvent = {
-  schema?: string;
-  event_id: string;
-  run_id: string;
-  workspace_id: string;
-  session_id?: string | null;
-  task_id?: string | null;
-  turn_id?: string | null;
-  sequence: number;
-  type: string;
-  status: string;
-  message?: string;
-  payload?: Record<string, unknown>;
-  refs?: Record<string, unknown>;
-  bookmark_id?: string | null;
-  source_event_type?: string | null;
-  created_at: string;
-};
-
-export type RunBookmark = {
-  schema?: string;
-  bookmark_id: string;
-  run_id: string;
-  workspace_id: string;
-  turn_id?: string | null;
-  response_id?: string | null;
-  checkpoint_ref?: string | null;
-  trace_bundle_ref?: string | null;
-  diff_sha256?: string | null;
-  tool_result_count?: number;
-  latest_check_ref?: string | null;
-  todo_state_ref?: string | null;
-  created_at: string;
-};
-
-export type RunProtocolReport = {
-  schema: string;
-  run_id: string;
-  workspace_id?: string;
-  status: string;
-  items: RunProtocolEvent[];
-  bookmarks?: RunBookmark[];
-  latest_bookmark?: RunBookmark | null;
-};
+export type RunTimeline = RequiredKeys<ApiSchemas["RunTimelineReport"], "items">;
+export type RunTraceView = RequiredKeys<ApiSchemas["RunTraceViewReport"], "timeline" | "artifact_refs" | "reduced_trace">;
+export type TraceBundleReport = RequiredKeys<ApiSchemas["TraceBundleReport"], "state">;
+export type TraceBundleState = ApiSchemas["TraceState"];
+export type RunProtocolEvent = ApiSchemas["RunProtocolEvent"];
+export type RunBookmark = ApiSchemas["RunBookmark"];
+export type RunProtocolReport = RequiredKeys<ApiSchemas["RunProtocolReport"], "items" | "bookmarks">;
+export type RunEventsReport = RequiredKeys<ApiSchemas["RunEventsReport"], "items" | "protocol_events" | "compaction_events" | "state_snapshots">;
+export type RunEventV2 = ApiSchemas["RunEventV2"];
+export type ThreadEventV2 = ApiSchemas["ThreadEventV2"];
+export type EventJournalPage = RequiredKeys<ApiSchemas["EventJournalPage"], "items">;
+export type EventJournalPayload = ApiSchemas["EventJournalPayload"];
+export type RunJournalState = RequiredKeys<ApiSchemas["RunJournalState"], "timeline">;
+export type ThreadJournalState = RequiredKeys<ApiSchemas["ThreadJournalState"], "events">;
+export type RunBookmarksReport = RequiredKeys<ApiSchemas["RunBookmarksReport"], "items">;
+export type ArtifactRef = ApiSchemas["ArtifactRef"];
+export type CheckResult = ApiSchemas["CheckResult"];
 
 export type RunCompactionReport = {
   schema: string;
@@ -757,45 +669,16 @@ export type ApprovalRecord = {
   decided_at?: string;
 };
 
-export type ToolEventEnvelope = {
-  tool_call_id: string;
-  tool: string;
-  version: string;
-  status?: string;
-  input: Record<string, unknown>;
-  risk: string;
-  approval: Record<string, unknown>;
-  approval_id?: string | null;
-  sandbox_profile?: string;
-  progress?: Array<Record<string, unknown>>;
-  result: Record<string, unknown>;
-  artifacts: Array<Record<string, unknown>>;
-  timing: Record<string, unknown>;
-  started_at?: string | null;
-  completed_at?: string | null;
-  duration_ms?: number | null;
-  stdout_ref?: string | null;
-  stderr_ref?: string | null;
-  changed_files?: string[];
-  failure_class?: string | null;
-  failure_signature?: string | null;
-  repair_recipe_ids?: string[];
-  retry?: Record<string, unknown>;
-  truncation?: Record<string, unknown>;
-  error?: Record<string, unknown> | null;
-  created_at?: string;
-};
+export type ToolEventEnvelope = RequiredKeys<
+  ApiSchemas["ToolEnvelope"],
+  "input" | "approval" | "progress" | "result" | "artifacts" | "timing" | "changed_files" | "repair_recipe_ids" | "retry" | "truncation"
+>;
+export type ToolEventsReport = RequiredKeys<ApiSchemas["ToolEventsReport"], "events">;
 
-export type RunGateReport = {
-  run_id: string;
-  workspace_id: string;
-  status: string;
-  blocking: boolean;
-  issues: Array<Record<string, unknown>>;
-  repair_packets: Array<Record<string, unknown>>;
-  requirements: Record<string, unknown>;
-  artifact_refs: Record<string, string | null | undefined>;
-};
+export type RunGateReport = RequiredKeys<
+  ApiSchemas["GateReport"],
+  "issues" | "repair_packets" | "repair_history" | "next_forced_action" | "blocking_repair_packet" | "requirements" | "artifact_refs" | "run_state"
+>;
 
 export type RunRepairSignatures = {
   run_id: string;
@@ -806,31 +689,20 @@ export type RunRepairSignatures = {
   repair_cases?: RunRepairCases;
 };
 
-export type RunRepairCase = {
-  schema?: string;
-  case_id: string;
-  run_id: string;
-  workspace_id: string;
-  status: string;
-  failure_signature?: string;
-  failure_class?: string;
-  issue_code?: string;
-  severity?: string;
-  likely_cause?: string;
-  target_files?: string[];
-  expected_proof?: Array<Record<string, unknown>>;
-  attempts?: Array<Record<string, unknown>>;
-  evidence?: Record<string, unknown>;
-  updated_at?: string;
-};
+export type RunRepairCase = RequiredKeys<
+  ApiSchemas["RepairCase"],
+  "target_files" | "forbidden_files" | "allowed_edit_slice" | "expected_proof" | "retry_policy" | "attempts" | "evidence" | "next_action"
+>;
 
-export type RunRepairCases = {
-  schema?: string;
+export type RunRepairCases = ApiSchemas["RepairCasesReport"] & {
+  schema: string;
   run_id: string;
   status: string;
   items: RunRepairCase[];
+  case_refs: string[];
   active_case?: RunRepairCase | null;
 };
+export type RepairAttemptsReport = RequiredKeys<ApiSchemas["RepairAttemptsReport"], "items">;
 
 export type RunFinalReport = {
   run_id: string;
@@ -1202,8 +1074,36 @@ export async function getRunProtocol(runId: string): Promise<RunProtocolReport> 
   return request<RunProtocolReport>(`/runs/${runId}/protocol`);
 }
 
-export async function getRunBookmarks(runId: string): Promise<{ schema: string; run_id: string; status: string; items: RunBookmark[] }> {
-  return request(`/runs/${runId}/bookmarks`);
+function journalQuery(params: { after_sequence?: number; limit?: number } = {}): string {
+  const search = new URLSearchParams();
+  if (params.after_sequence !== undefined) search.set("after_sequence", String(params.after_sequence));
+  if (params.limit !== undefined) search.set("limit", String(params.limit));
+  const suffix = search.toString();
+  return suffix ? `?${suffix}` : "";
+}
+
+export async function getRunEventsV2(runId: string, params: { after_sequence?: number; limit?: number } = {}): Promise<EventJournalPage> {
+  return request<EventJournalPage>(`/runs/${runId}/events-v2${journalQuery(params)}`);
+}
+
+export async function getRunJournalState(runId: string): Promise<RunJournalState> {
+  return request<RunJournalState>(`/runs/${runId}/journal/state`);
+}
+
+export async function getThreadEventsV2(threadId: string, params: { after_sequence?: number; limit?: number } = {}): Promise<EventJournalPage> {
+  return request<EventJournalPage>(`/threads/${threadId}/events-v2${journalQuery(params)}`);
+}
+
+export async function getThreadJournalState(threadId: string): Promise<ThreadJournalState> {
+  return request<ThreadJournalState>(`/threads/${threadId}/journal/state`);
+}
+
+export async function getEventJournalPayload(payloadRef: string): Promise<EventJournalPayload> {
+  return request<EventJournalPayload>(`/event-payloads/${encodeURIComponent(payloadRef)}`);
+}
+
+export async function getRunBookmarks(runId: string): Promise<RunBookmarksReport> {
+  return request<RunBookmarksReport>(`/runs/${runId}/bookmarks`);
 }
 
 export async function getRunTasks(runId: string): Promise<RunTaskReport> {
@@ -1273,8 +1173,8 @@ export async function getRunRepairCases(runId: string): Promise<RunRepairCases> 
   return request<RunRepairCases>(`/runs/${runId}/repair-cases`);
 }
 
-export async function getRunRepairCaseAttempts(runId: string, caseId: string): Promise<{ schema?: string; status: string; items: Array<Record<string, unknown>> }> {
-  return request(`/runs/${runId}/repair-cases/${encodeURIComponent(caseId)}/attempts`);
+export async function getRunRepairCaseAttempts(runId: string, caseId: string): Promise<RepairAttemptsReport> {
+  return request<RepairAttemptsReport>(`/runs/${runId}/repair-cases/${encodeURIComponent(caseId)}/attempts`);
 }
 
 export async function retryRunRepairCase(runId: string, caseId: string): Promise<Record<string, unknown>> {

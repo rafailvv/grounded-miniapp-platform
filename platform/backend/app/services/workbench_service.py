@@ -15,6 +15,21 @@ from typing import Any
 from uuid import uuid4
 
 from app.models.domain import CreateRunRequest, RunRecord
+from app.models.workbench import (
+    GateReport,
+    RepairAttemptsReport,
+    RepairCase,
+    RepairCasesReport,
+    RunBookmarksReport,
+    RunEventsReport,
+    RunProtocolReport,
+    RunTimelineReport,
+    RunTraceViewReport,
+    ToolEventsReport,
+    TraceBundleReport,
+    TraceState,
+    WorkbenchApiModel,
+)
 from app.modules.miniapp_agent_loop.lsp_tools import LspToolService
 from app.modules.miniapp_agent_loop.agent_worker_manager import AgentWorkerManager
 from app.modules.miniapp_agent_loop.product_workers import (
@@ -25,6 +40,7 @@ from app.modules.miniapp_agent_loop.product_workers import (
 )
 from app.repositories.platform_db import PlatformDb
 from app.services.background_task_service import BackgroundTaskService
+from app.services.event_journal import EventJournalService
 from app.repositories.state_store import StateStore
 from app.services.exec_policy_service import ExecPolicyService
 from app.services.generation_enhancements import (
@@ -62,6 +78,10 @@ def re_slug(value: object) -> str:
 class WorkbenchService:
     """Read-model and scaffold service for the agent workbench APIs."""
 
+    @staticmethod
+    def _typed_payload(model: type[WorkbenchApiModel], payload: dict[str, Any]) -> dict[str, Any]:
+        return model.model_validate(payload).model_dump(mode="json", by_alias=True)
+
     def __init__(
         self,
         *,
@@ -76,6 +96,7 @@ class WorkbenchService:
         run_compaction_service: RunCompactionService | None = None,
         background_task_service: BackgroundTaskService | None = None,
         repair_case_service: RepairCaseService | None = None,
+        event_journal_service: EventJournalService | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
@@ -87,7 +108,8 @@ class WorkbenchService:
         self.run_protocol_service = run_protocol_service
         self.run_compaction_service = run_compaction_service
         self.background_task_service = background_task_service
-        self.repair_case_service = repair_case_service or RepairCaseService(store)
+        self.event_journal_service = event_journal_service
+        self.repair_case_service = repair_case_service or RepairCaseService(store, event_journal_service=event_journal_service)
 
     def tool_events(self, run_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
@@ -117,14 +139,14 @@ class WorkbenchService:
                     risk="read_only",
                 )
             )
-        return {"run_id": run_id, "tool_protocol_version": TOOL_PROTOCOL_VERSION, "events": events}
+        return self._typed_payload(ToolEventsReport, {"run_id": run_id, "tool_protocol_version": TOOL_PROTOCOL_VERSION, "events": events})
 
     def run_events(self, run_id: str, *, after_sequence: int = 0, limit: int = 500) -> dict[str, Any]:
         self.run_service.get_run(run_id)
         items = self.platform_db.list_run_events(run_id, after_sequence=after_sequence, limit=limit) if self.platform_db is not None else []
         snapshots = self.platform_db.list_run_state_snapshots(run_id, limit=20) if self.platform_db is not None else []
         protocol_events = self.run_protocol_service.protocol_events(run_id).get("items", []) if self.run_protocol_service is not None else []
-        return {
+        return self._typed_payload(RunEventsReport, {
             "run_id": run_id,
             "schema": "grounded.run_events.v1",
             "status": "ok",
@@ -134,24 +156,27 @@ class WorkbenchService:
             "compaction_events": [item for item in protocol_events if item.get("type") == "compact_boundary"],
             "state_snapshots": snapshots,
             "next_sequence": max([int(item.get("sequence") or 0) for item in items], default=int(after_sequence or 0)),
-        }
+        })
 
     def protocol(self, run_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
         if self.run_protocol_service is None:
-            return {"schema": "grounded.run_protocol.v1", "run_id": run_id, "workspace_id": run.workspace_id, "status": "unavailable", "items": []}
+            return self._typed_payload(
+                RunProtocolReport,
+                {"schema": "grounded.run_protocol.v1", "run_id": run_id, "workspace_id": run.workspace_id, "status": "unavailable", "items": []},
+            )
         payload = self.run_protocol_service.protocol_events(run_id)
         bookmarks = self.run_protocol_service.bookmarks(run_id)
         payload["workspace_id"] = run.workspace_id
         payload["bookmarks"] = bookmarks.get("items") or []
         payload["latest_bookmark"] = (bookmarks.get("items") or [None])[0]
-        return payload
+        return self._typed_payload(RunProtocolReport, payload)
 
     def bookmarks(self, run_id: str) -> dict[str, Any]:
         self.run_service.get_run(run_id)
         if self.run_protocol_service is None:
-            return {"schema": "grounded.run_bookmarks.v1", "run_id": run_id, "status": "unavailable", "items": []}
-        return self.run_protocol_service.bookmarks(run_id)
+            return self._typed_payload(RunBookmarksReport, {"schema": "grounded.run_bookmarks.v1", "run_id": run_id, "status": "unavailable", "items": []})
+        return self._typed_payload(RunBookmarksReport, self.run_protocol_service.bookmarks(run_id))
 
     def resume_from_bookmark(self, run_id: str, bookmark_id: str, *, prompt: str | None = None, fork: bool = False) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
@@ -235,7 +260,7 @@ class WorkbenchService:
             ),
         }
         self.store.upsert("reports", f"trace_view:{run_id}", payload)
-        return payload
+        return self._typed_payload(RunTraceViewReport, payload)
 
     def record_tool_event(self, run_id: str | None, event: dict[str, Any]) -> dict[str, Any]:
         if not run_id:
@@ -246,6 +271,14 @@ class WorkbenchService:
         item = {**event, "sequence": len(payload.get("items") or []) + 1, "created_at": datetime.now(timezone.utc).isoformat()}
         payload.setdefault("items", []).append(item)
         self.store.upsert("reports", key, payload)
+        self._journal_run_event(
+            run_id,
+            self._tool_journal_event_type(item),
+            item,
+            actor=f"tool:{item.get('tool') or 'unknown'}",
+            summary=str(item.get("tool") or "Tool event"),
+            idempotency_key=f"tool:{run_id}:{item.get('tool_call_id') or item.get('sequence')}",
+        )
         return item
 
     def evaluate_command_for_run(self, run_id: str, command: str, *, preset: str = "safe_auto") -> dict[str, Any]:
@@ -346,14 +379,14 @@ class WorkbenchService:
             items.append(self._timeline_item("failure", run.status, run.failure_reason or "Run did not complete", {"failure_class": run.failure_class}))
         if run.status == "completed":
             items.append(self._timeline_item("complete", "completed", "Run completed", {"summary": run.summary}))
-        return {
+        return self._typed_payload(RunTimelineReport, {
             "run_id": run_id,
             "tool_protocol_version": TOOL_PROTOCOL_VERSION,
             "items": [
                 {**item, "sequence": index + 1}
                 for index, item in enumerate(sorted(items, key=lambda item: str(item.get("created_at") or "")))
             ],
-        }
+        })
 
     def observability(self, run_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
@@ -1052,20 +1085,20 @@ class WorkbenchService:
         ref = run.trace_bundle_ref or f"trace_bundle:{run.workspace_id}:{run_id}"
         payload = self.store.get("reports", ref)
         if not isinstance(payload, dict):
-            return {
+            return self._typed_payload(TraceBundleReport, {
                 "schema": "grounded.trace_bundle.v1",
                 "run_id": run_id,
                 "workspace_id": run.workspace_id,
                 "status": "missing",
                 "event_count": 0,
                 "state": {},
-            }
+            })
         state = payload.get("state")
         if not isinstance(state, dict):
             state = self.trace_bundle_state(run_id)
             payload = {**payload, "state": state}
             self.store.upsert("reports", ref, payload)
-        return payload
+        return self._typed_payload(TraceBundleReport, payload)
 
     def trace_bundle_state(self, run_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
@@ -1089,14 +1122,14 @@ class WorkbenchService:
                 "next_action": {"action": "none", "reason": "Trace bundle is missing."},
             }
         self.store.upsert("reports", f"trace_reducer:{run.workspace_id}:{run_id}", state)
-        return self._augment_trace_state_with_protocol(run_id, state)
+        return self._typed_payload(TraceState, self._augment_trace_state_with_protocol(run_id, state))
 
     def _augment_trace_state_with_protocol(self, run_id: str, state: dict[str, Any]) -> dict[str, Any]:
         if self.run_protocol_service is None:
-            return state
+            return self._typed_payload(TraceState, state)
         protocol = self.run_protocol_service.protocol_events(run_id).get("items") or []
         if not protocol:
-            return state
+            return self._typed_payload(TraceState, state)
         turns = list(state.get("turns") or [])
         tool_calls = list(state.get("tool_calls") or [])
         proof_edges = list(state.get("proof_edges") or [])
@@ -1134,7 +1167,7 @@ class WorkbenchService:
                 "reason": "Latest model response bookmark is available.",
                 "bookmark_id": next_target.get("bookmark_id"),
             }
-        return {
+        return self._typed_payload(TraceState, {
             **state,
             "turns": turns[-80:],
             "tool_calls": tool_calls[-160:],
@@ -1145,7 +1178,7 @@ class WorkbenchService:
             "model_response_bookmarks": bookmarks[:80],
             "final_terminal_event": terminal,
             "next_action": next_action or {"action": "none", "reason": "No blocking trace event."},
-        }
+        })
 
     def gate(self, run_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
@@ -1277,8 +1310,42 @@ class WorkbenchService:
         payload["artifact_refs"]["run_state"] = f"run_state:{run_id}"
         self.store.upsert("reports", f"gate:{run_id}", payload)
         self.store.upsert("reports", f"run_state:{run_id}", state)
+        digest = hashlib.sha256(
+            json.dumps(
+                {
+                    "status": payload.get("status"),
+                    "blocking": payload.get("blocking"),
+                    "issues": [
+                        {
+                            "kind": item.get("kind"),
+                            "check": item.get("check"),
+                            "details": item.get("details"),
+                        }
+                        for item in payload.get("issues") or []
+                        if isinstance(item, dict)
+                    ],
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        self._journal_run_event(
+            run_id,
+            "gate.evaluated",
+            {
+                "run_id": run_id,
+                "workspace_id": run.workspace_id,
+                "status": payload.get("status"),
+                "blocking": payload.get("blocking"),
+                "issues": payload.get("issues") or [],
+                "run_state": state,
+            },
+            summary=f"Gate {payload.get('status')}.",
+            idempotency_key=f"gate:{run_id}:{digest}",
+        )
         self.run_service.reconcile_run_with_gate(run_id, payload)
-        return payload
+        return self._typed_payload(GateReport, payload)
 
     @classmethod
     def _has_product_runtime_change(cls, diff_text: str, touched_files: list[str] | None) -> bool:
@@ -1340,21 +1407,21 @@ class WorkbenchService:
     def repair_cases(self, run_id: str) -> dict[str, Any]:
         self.run_service.get_run(run_id)
         self.gate(run_id)
-        return self.repair_case_service.list_cases(run_id)
+        return self._typed_payload(RepairCasesReport, self.repair_case_service.list_cases(run_id))
 
     def repair_case(self, run_id: str, case_id: str) -> dict[str, Any]:
         self.run_service.get_run(run_id)
         case = self.repair_case_service.get_case(run_id, case_id)
         if not case:
             raise KeyError(case_id)
-        return case
+        return self._typed_payload(RepairCase, case)
 
     def repair_case_attempts(self, run_id: str, case_id: str) -> dict[str, Any]:
         self.run_service.get_run(run_id)
         payload = self.repair_case_service.attempts(run_id, case_id)
         if payload.get("status") == "missing":
             raise KeyError(case_id)
-        return payload
+        return self._typed_payload(RepairAttemptsReport, payload)
 
     def retry_repair_case(self, run_id: str, case_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
@@ -2111,6 +2178,7 @@ class WorkbenchService:
         }
         self.store.upsert("reports", f"staged_files:{run_id}", record)
         self.record_tool_event(run_id, tool_envelope(tool="approval.stage", input_payload=record, result={"status": "staged"}, risk="mutating"))
+        self._journal_run_event(run_id, "apply.staged", record, summary="Files staged for apply.", idempotency_key=f"apply.staged:{run_id}:{record['updated_at']}")
         return record
 
     def discard_files(self, run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -2120,6 +2188,7 @@ class WorkbenchService:
         record = {"run_id": run_id, "files": files, "result": result, "status": "discarded", "updated_at": datetime.now(timezone.utc).isoformat()}
         self.store.upsert("reports", f"discarded_files:{run_id}", record)
         self.record_tool_event(run_id, tool_envelope(tool="file.discard", input_payload={"files": files}, result=record, risk="mutating"))
+        self._journal_run_event(run_id, "apply.discarded", record, summary="Draft files discarded.", idempotency_key=f"apply.discarded:{run_id}:{record['updated_at']}")
         return record
 
     def apply_staged(self, run_id: str) -> Any:
@@ -2155,6 +2224,13 @@ class WorkbenchService:
         artifacts["staged_apply"] = {"files": files, "revision_id": revision.revision_id, "fully_applied": fully_applied}
         self.store.upsert("reports", f"run_artifacts:{run_id}", artifacts)
         self.record_tool_event(run_id, tool_envelope(tool="patch.apply", input_payload={"files": files}, result=artifacts["staged_apply"], risk="mutating"))
+        self._journal_run_event(
+            run_id,
+            "apply.applied",
+            {"run_id": run_id, "workspace_id": run.workspace_id, **artifacts["staged_apply"]},
+            summary="Staged draft files applied.",
+            idempotency_key=f"apply.applied:{run_id}:{revision.revision_id}",
+        )
         return run
 
     def diff(self, run_id: str, *, base: str, target: str, file: str | None = None, worker_id: str | None = None, category: str | None = None, status: str | None = None) -> dict[str, Any]:
@@ -2477,6 +2553,13 @@ class WorkbenchService:
         item = {**existing, "status": "approved" if approved else "rejected", "decided_at": datetime.now(timezone.utc).isoformat()}
         self._upsert_approval(run_id, item)
         self.record_tool_event(run_id, tool_envelope(tool="approval.decision", input_payload={"approval_id": approval_id}, result=item, risk="safe"))
+        self._journal_run_event(
+            run_id,
+            "approval.decided",
+            {"approval": item},
+            summary=str(item.get("summary") or item.get("kind") or "Approval decided."),
+            idempotency_key=f"approval.decided:{run_id}:{approval_id}:{item['status']}",
+        )
         return item
 
     def _upsert_approval(self, run_id: str, item: dict[str, Any]) -> None:
@@ -2493,6 +2576,14 @@ class WorkbenchService:
             items.append(item)
         payload["items"] = items
         self.store.upsert("reports", key, payload)
+        if str(item.get("status") or "") == "pending":
+            self._journal_run_event(
+                run_id,
+                "approval.requested",
+                {"approval": item},
+                summary=str(item.get("summary") or item.get("kind") or "Approval requested."),
+                idempotency_key=f"approval.requested:{run_id}:{item.get('approval_id')}",
+            )
         if self.run_protocol_service is not None and not replaced and str(item.get("status") or "") == "pending":
             try:
                 run = self.run_service.get_run(run_id)
@@ -2514,6 +2605,44 @@ class WorkbenchService:
             if isinstance(item, dict) and item.get("approval_id") == approval_id:
                 return item
         return None
+
+    def _journal_run_event(
+        self,
+        run_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+        *,
+        actor: str = "system",
+        summary: str = "",
+        source_ref: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> None:
+        if self.event_journal_service is None:
+            return
+        try:
+            run = self.run_service.get_run(run_id)
+            self.event_journal_service.append_run(
+                workspace_id=run.workspace_id,
+                run_id=run_id,
+                event_type=event_type,
+                actor=actor,
+                payload=payload,
+                summary=summary,
+                source_ref=source_ref,
+                idempotency_key=idempotency_key,
+            )
+        except Exception:
+            pass
+
+    @staticmethod
+    def _tool_journal_event_type(item: dict[str, Any]) -> str:
+        result = item.get("result") if isinstance(item.get("result"), dict) else {}
+        status = str(result.get("status") or item.get("status") or "").lower()
+        if status in {"failed", "blocked", "error", "errored"}:
+            return "tool.failed"
+        if status in {"pending", "requested", "starting", "started"}:
+            return "tool.requested"
+        return "tool.completed"
 
     def _stored_tool_events(self, run_id: str) -> list[dict[str, Any]]:
         payload = self.store.get("reports", f"tool_events:{run_id}") or {}

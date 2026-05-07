@@ -88,6 +88,7 @@ from app.services.check_runner import CheckRunner
 from app.services.miniapp_contract import MiniAppContractCompiler, MiniAppContractMaterializer, MiniAppRouteRegistry
 from app.services.platform_shell import BASE_STYLESHEET_HREF, BASE_STYLESHEET_PATH, PAGE_SHELL_INLINE_STYLE
 from app.services.run_compaction import RunCompactionService
+from app.services.event_journal import EventJournalService
 from app.services.run_protocol import RunProtocolService, diff_sha256
 from app.services.trace_bundle import TraceBundleWriter
 from app.services.generation_enhancements import SkillPackCatalog
@@ -163,6 +164,7 @@ class WorkspaceCodeAgentRuntime:
         platform_db: PlatformDb | None = None,
         run_protocol_service: RunProtocolService | None = None,
         run_compaction_service: RunCompactionService | None = None,
+        event_journal_service: EventJournalService | None = None,
     ) -> None:
         self.store = store
         self.workspace_service = workspace_service
@@ -209,6 +211,7 @@ class WorkspaceCodeAgentRuntime:
         self.platform_db = platform_db
         self.run_protocol_service = run_protocol_service
         self.run_compaction_service = run_compaction_service
+        self.event_journal_service = event_journal_service
 
     def get_job(self, job_id: str) -> JobRecord:
         payload = self.store.get("jobs", job_id)
@@ -6899,6 +6902,17 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         }
         try:
             event = self.platform_db.append_run_event(job.linked_run_id, sdk_event_type, payload)
+            if self.event_journal_service is not None:
+                self.event_journal_service.append_run(
+                    workspace_id=job.workspace_id,
+                    run_id=job.linked_run_id,
+                    event_type=sdk_event_type,
+                    actor="agent",
+                    payload=payload,
+                    summary=message,
+                    source_ref=str(event.get("event_id") or ""),
+                    idempotency_key=f"runtime:{event.get('event_id')}",
+                )
             if self.run_protocol_service is not None:
                 session_id = None
                 run_payload = self.store.get("runs", job.linked_run_id)
@@ -7137,6 +7151,24 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         try:
             writer = self._trace_bundle_writer(job)
             event = writer.record(event_type, payload or {})
+            if self.event_journal_service is not None and job.linked_run_id:
+                try:
+                    self.event_journal_service.append_run(
+                        workspace_id=job.workspace_id,
+                        run_id=job.linked_run_id,
+                        event_type="trace.event_recorded",
+                        actor="system",
+                        payload={
+                            "trace_event_type": event_type,
+                            "trace_event": event,
+                            "trace_bundle_ref": f"trace_bundle:{job.workspace_id}:{job.linked_run_id}",
+                        },
+                        summary=str(event.get("summary") or event_type),
+                        source_ref=str(event.get("payload_ref") or ""),
+                        idempotency_key=f"trace:{job.linked_run_id}:{event.get('seq')}:{event.get('payload_ref')}",
+                    )
+                except Exception:
+                    pass
             job.trace_bundle_ref = job.trace_bundle_ref or f"trace_bundle:{job.workspace_id}:{job.linked_run_id or job.job_id}"
             self._store_report(
                 job.trace_bundle_ref,

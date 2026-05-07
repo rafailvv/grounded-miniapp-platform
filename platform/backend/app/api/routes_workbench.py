@@ -7,6 +7,24 @@ from pydantic import BaseModel
 
 from app.api.deps import get_container
 from app.models.domain import RunRecord
+from app.models.event_journal import EventJournalPage, EventJournalPayload, RunJournalState, ThreadJournalState
+from app.models.threads import ThreadSnapshot
+from app.models.workbench import (
+    GateReport,
+    RepairAttemptsReport,
+    RepairCase,
+    RepairCasesReport,
+    RunBookmarksReport,
+    RunEventsReport,
+    RunProtocolReport,
+    RunTimelineReport,
+    RunTraceViewReport,
+    SystemSchemaManifest,
+    ToolEventsReport,
+    TraceBundleReport,
+    TraceState,
+    system_schema_manifest,
+)
 from app.services.container import ServiceContainer
 from app.services.run_protocol import RunProtocolConflict
 from app.services.tool_protocol import tool_registry_contract
@@ -130,37 +148,62 @@ def list_run_approvals(run_id: str, container: ServiceContainer = Depends(get_co
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.get("/runs/{run_id}/tool-events")
-def get_tool_events(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+@router.get("/runs/{run_id}/tool-events", response_model=ToolEventsReport)
+def get_tool_events(run_id: str, container: ServiceContainer = Depends(get_container)) -> ToolEventsReport:
     try:
         return container.workbench_service.tool_events(run_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.get("/runs/{run_id}/events")
+@router.get("/runs/{run_id}/events", response_model=RunEventsReport)
 def get_run_events(
     run_id: str,
     after_sequence: int = 0,
     limit: int = 500,
     container: ServiceContainer = Depends(get_container),
-) -> dict[str, Any]:
+) -> RunEventsReport:
     try:
         return container.workbench_service.run_events(run_id, after_sequence=after_sequence, limit=limit)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.get("/runs/{run_id}/protocol")
-def get_run_protocol(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+@router.get("/runs/{run_id}/events-v2", response_model=EventJournalPage)
+def get_run_events_v2(
+    run_id: str,
+    after_sequence: int = 0,
+    limit: int = 500,
+    container: ServiceContainer = Depends(get_container),
+) -> EventJournalPage:
+    try:
+        container.run_service.get_run(run_id)
+        items = container.event_journal_service.list_run(run_id, after_sequence=after_sequence, limit=limit)
+        next_sequence = max([item.sequence for item in items], default=int(after_sequence or 0))
+        return EventJournalPage(scope="run", run_id=run_id, items=items, next_sequence=next_sequence)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/runs/{run_id}/journal/state", response_model=RunJournalState)
+def get_run_journal_state(run_id: str, container: ServiceContainer = Depends(get_container)) -> RunJournalState:
+    try:
+        container.run_service.get_run(run_id)
+        return container.event_journal_service.reduce_run(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/runs/{run_id}/protocol", response_model=RunProtocolReport)
+def get_run_protocol(run_id: str, container: ServiceContainer = Depends(get_container)) -> RunProtocolReport:
     try:
         return container.workbench_service.protocol(run_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.get("/runs/{run_id}/bookmarks")
-def get_run_bookmarks(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+@router.get("/runs/{run_id}/bookmarks", response_model=RunBookmarksReport)
+def get_run_bookmarks(run_id: str, container: ServiceContainer = Depends(get_container)) -> RunBookmarksReport:
     try:
         return container.workbench_service.bookmarks(run_id)
     except KeyError as exc:
@@ -211,16 +254,16 @@ def reject_tool_action(run_id: str, approval_id: str, container: ServiceContaine
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.get("/runs/{run_id}/timeline")
-def get_run_timeline(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+@router.get("/runs/{run_id}/timeline", response_model=RunTimelineReport)
+def get_run_timeline(run_id: str, container: ServiceContainer = Depends(get_container)) -> RunTimelineReport:
     try:
         return container.workbench_service.timeline(run_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.get("/runs/{run_id}/trace-view")
-def get_run_trace_view(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+@router.get("/runs/{run_id}/trace-view", response_model=RunTraceViewReport)
+def get_run_trace_view(run_id: str, container: ServiceContainer = Depends(get_container)) -> RunTraceViewReport:
     try:
         return container.workbench_service.trace_view(run_id)
     except KeyError as exc:
@@ -235,16 +278,16 @@ def get_run_trace_reducer(run_id: str, container: ServiceContainer = Depends(get
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.get("/runs/{run_id}/trace-bundle")
-def get_run_trace_bundle(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+@router.get("/runs/{run_id}/trace-bundle", response_model=TraceBundleReport)
+def get_run_trace_bundle(run_id: str, container: ServiceContainer = Depends(get_container)) -> TraceBundleReport:
     try:
         return container.workbench_service.trace_bundle(run_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.get("/runs/{run_id}/trace-bundle/state")
-def get_run_trace_bundle_state(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+@router.get("/runs/{run_id}/trace-bundle/state", response_model=TraceState)
+def get_run_trace_bundle_state(run_id: str, container: ServiceContainer = Depends(get_container)) -> TraceState:
     try:
         return container.workbench_service.trace_bundle_state(run_id)
     except KeyError as exc:
@@ -287,16 +330,36 @@ def start_thread(request: ThreadStartRequest, container: ServiceContainer = Depe
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.get("/threads/{thread_id}")
-def get_thread(thread_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+@router.get("/threads/{thread_id}", response_model=ThreadSnapshot)
+def get_thread(thread_id: str, container: ServiceContainer = Depends(get_container)) -> ThreadSnapshot:
     try:
         snapshot = container.thread_service.read_thread(thread_id)
-        return {
-            "thread": snapshot.thread.model_dump(mode="json"),
-            "turns": [turn.model_dump(mode="json") for turn in snapshot.turns],
-            "items": [item.model_dump(mode="json") for item in snapshot.items],
-            "events": [event.model_dump(mode="json") for event in snapshot.events],
-        }
+        return snapshot
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/threads/{thread_id}/events-v2", response_model=EventJournalPage)
+def get_thread_events_v2(
+    thread_id: str,
+    after_sequence: int = 0,
+    limit: int = 500,
+    container: ServiceContainer = Depends(get_container),
+) -> EventJournalPage:
+    try:
+        container.thread_service.read_thread(thread_id, include_events=False)
+        items = container.event_journal_service.list_thread(thread_id, after_sequence=after_sequence, limit=limit)
+        next_sequence = max([item.sequence for item in items], default=int(after_sequence or 0))
+        return EventJournalPage(scope="thread", thread_id=thread_id, items=items, next_sequence=next_sequence)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/threads/{thread_id}/journal/state", response_model=ThreadJournalState)
+def get_thread_journal_state(thread_id: str, container: ServiceContainer = Depends(get_container)) -> ThreadJournalState:
+    try:
+        container.thread_service.read_thread(thread_id, include_events=False)
+        return container.event_journal_service.reduce_thread(thread_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -317,16 +380,10 @@ def start_thread_turn(thread_id: str, request: TurnStartRequest, container: Serv
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.get("/threads/{thread_id}/snapshot")
-def get_thread_snapshot(thread_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+@router.get("/threads/{thread_id}/snapshot", response_model=ThreadSnapshot)
+def get_thread_snapshot(thread_id: str, container: ServiceContainer = Depends(get_container)) -> ThreadSnapshot:
     try:
-        snapshot = container.thread_service.read_thread(thread_id)
-        return {
-            "thread": snapshot.thread.model_dump(mode="json"),
-            "turns": [turn.model_dump(mode="json") for turn in snapshot.turns],
-            "items": [item.model_dump(mode="json") for item in snapshot.items],
-            "events": [event.model_dump(mode="json") for event in snapshot.events],
-        }
+        return container.thread_service.read_thread(thread_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -512,8 +569,8 @@ def get_run_observability(run_id: str, container: ServiceContainer = Depends(get
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.get("/runs/{run_id}/gate")
-def get_run_gate(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+@router.get("/runs/{run_id}/gate", response_model=GateReport)
+def get_run_gate(run_id: str, container: ServiceContainer = Depends(get_container)) -> GateReport:
     try:
         return container.workbench_service.gate(run_id)
     except KeyError as exc:
@@ -544,24 +601,24 @@ def get_run_repair_signatures(run_id: str, container: ServiceContainer = Depends
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.get("/runs/{run_id}/repair-cases")
-def get_run_repair_cases(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+@router.get("/runs/{run_id}/repair-cases", response_model=RepairCasesReport)
+def get_run_repair_cases(run_id: str, container: ServiceContainer = Depends(get_container)) -> RepairCasesReport:
     try:
         return container.workbench_service.repair_cases(run_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.get("/runs/{run_id}/repair-cases/{case_id}")
-def get_run_repair_case(run_id: str, case_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+@router.get("/runs/{run_id}/repair-cases/{case_id}", response_model=RepairCase)
+def get_run_repair_case(run_id: str, case_id: str, container: ServiceContainer = Depends(get_container)) -> RepairCase:
     try:
         return container.workbench_service.repair_case(run_id, case_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.get("/runs/{run_id}/repair-cases/{case_id}/attempts")
-def get_run_repair_case_attempts(run_id: str, case_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+@router.get("/runs/{run_id}/repair-cases/{case_id}/attempts", response_model=RepairAttemptsReport)
+def get_run_repair_case_attempts(run_id: str, case_id: str, container: ServiceContainer = Depends(get_container)) -> RepairAttemptsReport:
     try:
         return container.workbench_service.repair_case_attempts(run_id, case_id)
     except KeyError as exc:
@@ -600,6 +657,21 @@ def get_workspace_git_status(workspace_id: str, container: ServiceContainer = De
 @router.get("/system/config/schema")
 def get_config_schema(container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     return container.workbench_service.config_schema()
+
+
+@router.get("/system/schema", response_model=SystemSchemaManifest, response_model_exclude_none=True)
+def get_system_schema() -> SystemSchemaManifest:
+    return system_schema_manifest()
+
+
+@router.get("/event-payloads/{payload_ref:path}", response_model=EventJournalPayload)
+def get_event_payload(payload_ref: str, container: ServiceContainer = Depends(get_container)) -> EventJournalPayload:
+    if container.platform_db.find_event_by_payload_ref(payload_ref) is None:
+        raise HTTPException(status_code=404, detail="Event payload not found.")
+    payload = container.event_journal_service.read_payload(payload_ref)
+    if payload is None:
+        raise HTTPException(status_code=404, detail="Event payload not found.")
+    return payload
 
 
 @router.get("/system/migrations")

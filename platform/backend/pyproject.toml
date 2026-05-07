@@ -17,6 +17,7 @@ dependencies = [
 
 [project.scripts]
 grounded = "app.cli:main"
+grounded-openapi = "app.openapi_export:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

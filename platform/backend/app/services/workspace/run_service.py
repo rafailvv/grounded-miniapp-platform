@@ -35,6 +35,7 @@ from app.services.check_runner import CheckRunner
 from app.services.memory_pipeline import WorkspaceMemoryPipeline
 from app.services.miniapp_contract import MiniAppContractCompiler
 from app.services.repair_cases import RepairCaseService
+from app.services.event_journal import EventJournalService
 from app.services.run_protocol import RunProtocolService
 from app.services.run_state_machine import RunStateMachine
 from app.services.workflow_acceptance import build_acceptance_contract, build_implementation_plan, orchestration_metadata_for_contract
@@ -114,6 +115,7 @@ class RunService:
         openai_client: OpenAIClient,
         workspace_log_service: WorkspaceLogService,
         run_protocol_service: RunProtocolService | None = None,
+        event_journal_service: EventJournalService | None = None,
     ) -> None:
         self.store = store
         self.workspace_service = workspace_service
@@ -123,6 +125,7 @@ class RunService:
         self.openai_client = openai_client
         self.workspace_log_service = workspace_log_service
         self.run_protocol_service = run_protocol_service
+        self.event_journal_service = event_journal_service
         self.background_task_service: Any | None = None
         self._active_workers: dict[str, threading.Thread] = {}
         self._startup_started_at = datetime.now(timezone.utc)
@@ -148,6 +151,13 @@ class RunService:
         run.current_stage = "stopping"
         run.updated_at = datetime.now(timezone.utc)
         self._save_run(run)
+        self._journal_run(
+            run,
+            "run.stop_requested",
+            {"run_id": run.run_id, "status": run.status, "current_stage": run.current_stage},
+            summary="Run stop requested.",
+            idempotency_key=f"run.stop_requested:{run.run_id}:{run.updated_at.isoformat()}",
+        )
         return run
 
     def create_run(self, workspace_id: str, request: CreateRunRequest) -> RunRecord:
@@ -338,6 +348,53 @@ class RunService:
                 },
             )
         self._save_run(run)
+        self._journal_run(
+            run,
+            "run.created",
+            {
+                "run_id": run.run_id,
+                "workspace_id": run.workspace_id,
+                "status": run.status,
+                "apply_status": run.apply_status,
+                "current_stage": run.current_stage,
+                "mode": run.mode,
+                "intent": run.intent,
+                "generation_mode": str(getattr(run.generation_mode, "value", run.generation_mode)),
+                "model_profile": run.model_profile,
+                "resume_from_run_id": run.resume_from_run_id,
+                "forked_from_run_id": run.forked_from_run_id,
+            },
+            summary="Run record created.",
+            idempotency_key=f"run.created:{run.run_id}",
+        )
+        self._journal_run(
+            run,
+            "run.session_configured",
+            {
+                "workspace_id": workspace_id,
+                "session_id": run.session_id,
+                "resume_from_run_id": run.resume_from_run_id,
+                "resume_bookmark_id": run.resume_bookmark_id,
+                "forked_from_run_id": run.forked_from_run_id,
+            },
+            summary="Run session context configured.",
+            idempotency_key=f"run.session_configured:{run.run_id}",
+        )
+        self._journal_run(
+            run,
+            "run.started",
+            {
+                "run_id": run.run_id,
+                "workspace_id": run.workspace_id,
+                "status": run.status,
+                "apply_status": run.apply_status,
+                "current_stage": run.current_stage,
+                "mode": run.mode,
+                "intent": run.intent,
+            },
+            summary="Run started.",
+            idempotency_key=f"run.started:{run.run_id}",
+        )
         if self.run_protocol_service is not None:
             self.run_protocol_service.append_event(
                 run_id=run.run_id,
@@ -385,6 +442,20 @@ class RunService:
                         "issues": acceptance_contract.get("issues") or [],
                     },
                 )
+            self._journal_run(
+                run,
+                "run.blocked",
+                {
+                    "run_id": run.run_id,
+                    "status": run.status,
+                    "apply_status": run.apply_status,
+                    "current_stage": run.current_stage,
+                    "reason": acceptance_contract.get("reason"),
+                    "issues": acceptance_contract.get("issues") or [],
+                },
+                summary="Run blocked because prompt-derived acceptance contract is missing.",
+                idempotency_key=f"run.blocked:{run.run_id}:contract",
+            )
             return self.get_run(run.run_id)
         if wait:
             self._active_workers[run.run_id] = threading.current_thread()
@@ -750,6 +821,22 @@ class RunService:
             run.progress_percent = 100 if run.status in TERMINAL_RUN_STATUSES else run.progress_percent
             run.updated_at = datetime.now(timezone.utc)
             self._save_run(run)
+            event_type = "run.blocked" if run.status == "blocked" else "run.failed" if run.status == "failed" else "run.completed" if run.status == "completed" else "run.status_changed"
+            self._journal_run(
+                run,
+                event_type,
+                {
+                    "run_id": run.run_id,
+                    "status": run.status,
+                    "apply_status": run.apply_status,
+                    "current_stage": run.current_stage,
+                    "gate_status": gate_status,
+                    "blocking": state.get("blocking"),
+                    "issues": state.get("issues") or [],
+                },
+                summary=f"Run status changed to {run.status}.",
+                idempotency_key=f"run.status_changed:{run.run_id}:{run.updated_at.isoformat()}",
+            )
             artifacts_payload = self.store.get("reports", f"run_artifacts:{run_id}")
             if isinstance(artifacts_payload, dict):
                 artifacts_payload["run"] = run.model_dump(mode="json")
@@ -772,6 +859,13 @@ class RunService:
         run.progress_percent = 99
         run.updated_at = datetime.now(timezone.utc)
         self._save_run(run)
+        self._journal_run(
+            run,
+            "apply.started",
+            {"run_id": run.run_id, "status": run.status, "apply_status": run.apply_status, "current_stage": run.current_stage},
+            summary="Manual apply started.",
+            idempotency_key=f"apply.started:{run.run_id}:{run.updated_at.isoformat()}",
+        )
         self._append_job_event(run.linked_job_id, "apply_started", "Applying the reviewed draft to the source workspace.")
         revision = self.workspace_service.approve_draft(run.workspace_id, run.run_id, f"Approve AI draft for run {run.run_id}")
         self.workspace_service.discard_draft(run.workspace_id, run.run_id)
@@ -787,6 +881,18 @@ class RunService:
         run.latency_breakdown["apply_ms"] = int((time.perf_counter() - apply_started_at) * 1000)
         run.updated_at = datetime.now(timezone.utc)
         self._save_run(run)
+        self._journal_run(
+            run,
+            "apply.applied",
+            {
+                "run_id": run.run_id,
+                "status": run.status,
+                "apply_status": run.apply_status,
+                "revision_id": revision.revision_id,
+            },
+            summary="Draft was applied successfully.",
+            idempotency_key=f"apply.applied:{run.run_id}:{revision.revision_id}",
+        )
         self._append_job_event(run.linked_job_id, "apply_completed", "Draft was applied successfully.")
         self.workspace_log_service.append(
             run.workspace_id,
@@ -812,6 +918,13 @@ class RunService:
         run.progress_percent = 100
         run.updated_at = datetime.now(timezone.utc)
         self._save_run(run)
+        self._journal_run(
+            run,
+            "apply.discarded",
+            {"run_id": run.run_id, "status": run.status, "apply_status": run.apply_status, "draft_status": run.draft_status},
+            summary="Run draft discarded.",
+            idempotency_key=f"apply.discarded:{run.run_id}:{run.updated_at.isoformat()}",
+        )
         self.workspace_log_service.append(
             run.workspace_id,
             source="run",
@@ -845,6 +958,19 @@ class RunService:
         run.candidate_revision_id = revision.revision_id
         run.updated_at = datetime.now(timezone.utc)
         self._save_run(run)
+        self._journal_run(
+            run,
+            "run.rollback",
+            {
+                "run_id": run.run_id,
+                "status": run.status,
+                "apply_status": run.apply_status,
+                "source_revision_id": run.result_revision_id,
+                "rollback_revision_id": revision.revision_id,
+            },
+            summary="Applied run rolled back.",
+            idempotency_key=f"run.rollback:{run.run_id}:{revision.revision_id}",
+        )
         self.workspace_log_service.append(
             run.workspace_id,
             source="run",
@@ -882,6 +1008,33 @@ class RunService:
         result = self.code_agent_runtime.read_process_output(process_id, stream=stream, start=start, end=end)
         result["run_id"] = run_id
         return result
+
+    def _journal_run(
+        self,
+        run: RunRecord,
+        event_type: str,
+        payload: dict[str, Any],
+        *,
+        actor: str = "system",
+        summary: str = "",
+        source_ref: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> None:
+        if self.event_journal_service is None:
+            return
+        try:
+            self.event_journal_service.append_run(
+                workspace_id=run.workspace_id,
+                run_id=run.run_id,
+                event_type=event_type,
+                actor=actor,
+                payload=payload,
+                summary=summary,
+                source_ref=source_ref,
+                idempotency_key=idempotency_key,
+            )
+        except Exception:
+            logger.exception("Failed to append run journal event %s for run %s.", event_type, run.run_id)
 
     def _save_run(self, run: RunRecord) -> None:
         existing = self.store.get("runs", run.run_id)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 import json
 import sqlite3
 import threading
@@ -8,6 +9,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from app.models.event_journal import EventPayloadRecord, RunEventV2, ThreadEventV2
 from app.models.threads import ArtifactRecord, ItemRecord, RolloutEventRecord, ThreadRecord, TurnRecord
 
 
@@ -18,7 +20,7 @@ def _utc_iso() -> str:
 class PlatformDb:
     """SQLite-backed append-oriented store for thread/turn/item state."""
 
-    CURRENT_SCHEMA_VERSION = 1
+    CURRENT_SCHEMA_VERSION = 2
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -177,6 +179,64 @@ class PlatformDb:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_run_events_run_sequence ON run_events(run_id, sequence, event_id)")
             conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS event_payloads (
+                    payload_ref TEXT PRIMARY KEY,
+                    sha256 TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_event_payloads_sha256 ON event_payloads(sha256)")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS run_events_v2 (
+                    event_id TEXT PRIMARY KEY,
+                    workspace_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    payload_ref TEXT NOT NULL,
+                    payload_sha256 TEXT NOT NULL,
+                    summary TEXT NOT NULL DEFAULT '',
+                    source_ref TEXT,
+                    idempotency_key TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(payload_ref) REFERENCES event_payloads(payload_ref)
+                )
+                """
+            )
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_run_events_v2_run_sequence ON run_events_v2(run_id, sequence)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_run_events_v2_workspace_created ON run_events_v2(workspace_id, created_at, event_id)")
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_run_events_v2_idempotency ON run_events_v2(run_id, idempotency_key) WHERE idempotency_key IS NOT NULL")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS thread_events_v2 (
+                    event_id TEXT PRIMARY KEY,
+                    workspace_id TEXT NOT NULL,
+                    thread_id TEXT NOT NULL,
+                    turn_id TEXT,
+                    run_id TEXT,
+                    sequence INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    payload_ref TEXT NOT NULL,
+                    payload_sha256 TEXT NOT NULL,
+                    summary TEXT NOT NULL DEFAULT '',
+                    source_ref TEXT,
+                    idempotency_key TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(payload_ref) REFERENCES event_payloads(payload_ref)
+                )
+                """
+            )
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_thread_events_v2_thread_sequence ON thread_events_v2(thread_id, sequence)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_thread_events_v2_workspace_created ON thread_events_v2(workspace_id, created_at, event_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_thread_events_v2_run ON thread_events_v2(run_id, sequence) WHERE run_id IS NOT NULL")
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_thread_events_v2_idempotency ON thread_events_v2(thread_id, idempotency_key) WHERE idempotency_key IS NOT NULL")
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS run_state_snapshots (
                     snapshot_id TEXT PRIMARY KEY,
                     run_id TEXT NOT NULL,
@@ -199,6 +259,18 @@ class PlatformDb:
         else:
             payload = dict(record or {})
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+    @staticmethod
+    def _dump_json(payload: Any) -> str:
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
+
+    @staticmethod
+    def _run_event_v2_from_row(row: sqlite3.Row) -> RunEventV2:
+        return RunEventV2.model_validate(dict(row))
+
+    @staticmethod
+    def _thread_event_v2_from_row(row: sqlite3.Row) -> ThreadEventV2:
+        return ThreadEventV2.model_validate(dict(row))
 
     @staticmethod
     def _loads(row: sqlite3.Row, model: type[ThreadRecord] | type[TurnRecord] | type[ItemRecord] | type[RolloutEventRecord] | type[ArtifactRecord]):
@@ -346,6 +418,187 @@ class PlatformDb:
                 (thread_id, int(after_sequence or 0), max(1, min(limit, 1000))),
             ).fetchall()
         return [self._loads(row, RolloutEventRecord) for row in rows]
+
+    def append_run_event_v2(
+        self,
+        *,
+        workspace_id: str,
+        run_id: str,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+        actor: str = "system",
+        summary: str = "",
+        source_ref: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> RunEventV2:
+        created_at = _utc_iso()
+        with self._lock, self._connect() as conn:
+            if idempotency_key:
+                existing = conn.execute(
+                    "SELECT * FROM run_events_v2 WHERE run_id = ? AND idempotency_key = ?",
+                    (run_id, idempotency_key),
+                ).fetchone()
+                if existing:
+                    return self._run_event_v2_from_row(existing)
+            row = conn.execute(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence FROM run_events_v2 WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            sequence = int(row["next_sequence"] if row else 1)
+            event_id = f"run_evt_v2_{uuid4().hex}"
+            payload_record = self._insert_event_payload(conn, event_id=event_id, payload=payload or {}, created_at=created_at)
+            values = (
+                event_id,
+                workspace_id,
+                run_id,
+                sequence,
+                event_type,
+                actor or "system",
+                payload_record.payload_ref,
+                payload_record.payload_sha256,
+                str(summary or "")[:500],
+                source_ref,
+                idempotency_key,
+                created_at,
+            )
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO run_events_v2(event_id, workspace_id, run_id, sequence, event_type, actor, payload_ref, payload_sha256, summary, source_ref, idempotency_key, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    values,
+                )
+            except sqlite3.IntegrityError:
+                if idempotency_key:
+                    existing = conn.execute(
+                        "SELECT * FROM run_events_v2 WHERE run_id = ? AND idempotency_key = ?",
+                        (run_id, idempotency_key),
+                    ).fetchone()
+                    if existing:
+                        return self._run_event_v2_from_row(existing)
+                raise
+            created = conn.execute("SELECT * FROM run_events_v2 WHERE event_id = ?", (event_id,)).fetchone()
+        assert created is not None
+        return self._run_event_v2_from_row(created)
+
+    def append_thread_event_v2(
+        self,
+        *,
+        workspace_id: str,
+        thread_id: str,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+        turn_id: str | None = None,
+        run_id: str | None = None,
+        actor: str = "system",
+        summary: str = "",
+        source_ref: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> ThreadEventV2:
+        created_at = _utc_iso()
+        with self._lock, self._connect() as conn:
+            if idempotency_key:
+                existing = conn.execute(
+                    "SELECT * FROM thread_events_v2 WHERE thread_id = ? AND idempotency_key = ?",
+                    (thread_id, idempotency_key),
+                ).fetchone()
+                if existing:
+                    return self._thread_event_v2_from_row(existing)
+            row = conn.execute(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence FROM thread_events_v2 WHERE thread_id = ?",
+                (thread_id,),
+            ).fetchone()
+            sequence = int(row["next_sequence"] if row else 1)
+            event_id = f"thread_evt_v2_{uuid4().hex}"
+            payload_record = self._insert_event_payload(conn, event_id=event_id, payload=payload or {}, created_at=created_at)
+            values = (
+                event_id,
+                workspace_id,
+                thread_id,
+                turn_id,
+                run_id,
+                sequence,
+                event_type,
+                actor or "system",
+                payload_record.payload_ref,
+                payload_record.payload_sha256,
+                str(summary or "")[:500],
+                source_ref,
+                idempotency_key,
+                created_at,
+            )
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO thread_events_v2(event_id, workspace_id, thread_id, turn_id, run_id, sequence, event_type, actor, payload_ref, payload_sha256, summary, source_ref, idempotency_key, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    values,
+                )
+            except sqlite3.IntegrityError:
+                if idempotency_key:
+                    existing = conn.execute(
+                        "SELECT * FROM thread_events_v2 WHERE thread_id = ? AND idempotency_key = ?",
+                        (thread_id, idempotency_key),
+                    ).fetchone()
+                    if existing:
+                        return self._thread_event_v2_from_row(existing)
+                raise
+            created = conn.execute("SELECT * FROM thread_events_v2 WHERE event_id = ?", (event_id,)).fetchone()
+        assert created is not None
+        return self._thread_event_v2_from_row(created)
+
+    def list_run_events_v2(self, run_id: str, *, after_sequence: int = 0, limit: int = 500) -> list[RunEventV2]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM run_events_v2 WHERE run_id = ? AND sequence > ? ORDER BY sequence, event_id LIMIT ?",
+                (run_id, int(after_sequence or 0), max(1, min(limit, 2000))),
+            ).fetchall()
+        return [self._run_event_v2_from_row(row) for row in rows]
+
+    def list_thread_events_v2(self, thread_id: str, *, after_sequence: int = 0, limit: int = 500) -> list[ThreadEventV2]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM thread_events_v2 WHERE thread_id = ? AND sequence > ? ORDER BY sequence, event_id LIMIT ?",
+                (thread_id, int(after_sequence or 0), max(1, min(limit, 2000))),
+            ).fetchall()
+        return [self._thread_event_v2_from_row(row) for row in rows]
+
+    def get_event_payload(self, payload_ref: str) -> EventPayloadRecord | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT * FROM event_payloads WHERE payload_ref = ?", (payload_ref,)).fetchone()
+        if row is None:
+            return None
+        payload = json.loads(str(row["payload_json"]))
+        return EventPayloadRecord(payload_ref=str(row["payload_ref"]), payload_sha256=str(row["sha256"]), created_at=str(row["created_at"]), payload=payload if isinstance(payload, dict) else {"value": payload})
+
+    def find_event_by_payload_ref(self, payload_ref: str) -> dict[str, Any] | None:
+        with self._lock, self._connect() as conn:
+            run_row = conn.execute(
+                "SELECT 'run' AS scope, event_id, workspace_id, run_id, NULL AS thread_id, sequence, event_type, created_at FROM run_events_v2 WHERE payload_ref = ?",
+                (payload_ref,),
+            ).fetchone()
+            if run_row is not None:
+                return dict(run_row)
+            thread_row = conn.execute(
+                "SELECT 'thread' AS scope, event_id, workspace_id, run_id, thread_id, sequence, event_type, created_at FROM thread_events_v2 WHERE payload_ref = ?",
+                (payload_ref,),
+            ).fetchone()
+            return dict(thread_row) if thread_row is not None else None
+
+    def _insert_event_payload(self, conn: sqlite3.Connection, *, event_id: str, payload: dict[str, Any], created_at: str) -> EventPayloadRecord:
+        payload_json = self._dump_json(payload)
+        digest = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+        payload_ref = f"event_payload:{event_id}"
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO event_payloads(payload_ref, sha256, payload_json, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (payload_ref, digest, payload_json, created_at),
+        )
+        return EventPayloadRecord(payload_ref=payload_ref, payload_sha256=digest, payload=payload, created_at=created_at)
 
     def append_run_event(self, run_id: str, event_type: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         created_at = _utc_iso()

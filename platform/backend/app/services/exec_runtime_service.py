@@ -11,6 +11,7 @@ from app.modules.miniapp_agent_loop.agent_command_policy import CommandPolicyDec
 from app.modules.miniapp_agent_loop.agent_process_manager import AgentProcessManager
 from app.repositories.platform_db import PlatformDb
 from app.repositories.state_store import StateStore
+from app.services.event_journal import EventJournalService
 from app.services.rpc_event_hub import RpcEventHub
 from app.services.tool_protocol import tool_envelope
 from app.services.workspace.service import WorkspaceService
@@ -26,11 +27,13 @@ class ExecRuntimeService:
         platform_db: PlatformDb,
         event_hub: RpcEventHub,
         store: StateStore,
+        event_journal_service: EventJournalService | None = None,
     ) -> None:
         self.workspace_service = workspace_service
         self.platform_db = platform_db
         self.event_hub = event_hub
         self.store = store
+        self.event_journal_service = event_journal_service
         self.process_manager = AgentProcessManager()
         self._sessions: dict[str, dict[str, Any]] = {}
         self._lock = threading.RLock()
@@ -69,6 +72,19 @@ class ExecRuntimeService:
         with self._lock:
             self._sessions[process_id] = session
         self.platform_db.record_exec_process(process_id, session)
+        if run_id and self.event_journal_service is not None:
+            try:
+                self.event_journal_service.append_run(
+                    workspace_id=workspace_id,
+                    run_id=str(run_id),
+                    event_type="tool.requested",
+                    actor="tool:shell.exec",
+                    payload={"tool": "shell.exec", "process_id": process_id, "command": command, "status": "requested", "policy_decision": session.get("policy_decision") or {}},
+                    summary="Shell command requested.",
+                    idempotency_key=f"exec.requested:{process_id}",
+                )
+            except Exception:
+                pass
         self._publish("command/exec/started", session)
         worker = threading.Thread(
             target=self._run_worker,
@@ -169,6 +185,21 @@ class ExecRuntimeService:
                     payload=session,
                 )
             )
+            if self.event_journal_service is not None:
+                try:
+                    self.event_journal_service.append_thread(
+                        workspace_id=str(session.get("workspace_id") or ""),
+                        thread_id=str(thread_id),
+                        turn_id=session.get("turn_id"),
+                        run_id=str(session.get("run_id") or "") or None,
+                        event_type="item.command.exec.completed",
+                        actor="tool:shell.exec",
+                        payload=session,
+                        summary=f"Shell command {session['status']}.",
+                        idempotency_key=f"exec.thread.completed:{process_id}",
+                    )
+                except Exception:
+                    pass
         self._publish("command/exec/completed", session)
         run_id = session.get("run_id")
         if run_id:
@@ -191,6 +222,27 @@ class ExecRuntimeService:
                     ],
                 ),
             )
+            if self.event_journal_service is not None:
+                try:
+                    self.event_journal_service.append_run(
+                        workspace_id=str(session.get("workspace_id") or ""),
+                        run_id=str(run_id),
+                        event_type="tool.completed" if session["status"] == "completed" else "tool.failed",
+                        actor="tool:shell.exec",
+                        payload={
+                            "tool": "shell.exec",
+                            "process_id": process_id,
+                            "command": command,
+                            "status": session["status"],
+                            "exit_code": session.get("exit_code"),
+                            "duration_ms": session.get("duration_ms"),
+                            "result": result_payload,
+                        },
+                        summary=f"Shell command {session['status']}.",
+                        idempotency_key=f"exec.completed:{process_id}",
+                    )
+                except Exception:
+                    pass
 
     def _update_session(self, process_id: str, patch: dict[str, Any]) -> dict[str, Any]:
         with self._lock:

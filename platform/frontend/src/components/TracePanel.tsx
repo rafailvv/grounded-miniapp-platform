@@ -1,4 +1,4 @@
-import type { RunCompactionBoundaries, RunCompactionReport, RunProtocolReport, RunRepairCases, RunTraceView, TraceBundleReport } from "../lib/api";
+import type { RunCompactionBoundaries, RunCompactionReport, RunProtocolReport, RunRepairCase, RunRepairCases, RunTraceView, TraceBundleReport, TraceBundleState } from "../lib/api";
 
 type TracePanelProps = {
   trace: RunTraceView | null;
@@ -21,8 +21,8 @@ export function TracePanel({ trace, traceBundle, protocol, compaction, compactio
     );
   }
 
-  const reducer = trace.reducer || {};
-  const bundleState = traceBundle?.state || {};
+  const reducer = trace.reducer;
+  const bundleState: TraceBundleState = traceBundle?.state ?? { event_count: 0 };
   const blockers = bundleState.blockers || [];
   const promptContexts = bundleState.prompt_contexts || [];
   const skillEdges = bundleState.skill_edges || [];
@@ -39,8 +39,8 @@ export function TracePanel({ trace, traceBundle, protocol, compaction, compactio
   const sectionCount = Object.keys(compactionSections).length;
   const bookmarks = protocol?.bookmarks || [];
   const latestBookmark = protocol?.latest_bookmark || bookmarks[0];
-  const cases = repairCases?.items || [];
-  const activeCase = repairCases?.active_case || cases.find((item) => ["open", "failed_attempt", "blocked"].includes(item.status)) || null;
+  const cases: RunRepairCase[] = repairCases?.items || [];
+  const activeCase: RunRepairCase | null = repairCases?.active_case || cases.find((item) => ["open", "failed_attempt", "blocked"].includes(item.status)) || null;
   const protocolCounts = protocolEvents.reduce<Record<string, number>>((acc, event) => {
     acc[event.type] = (acc[event.type] || 0) + 1;
     return acc;

@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 from typing import Any, Literal
 from uuid import uuid4
 
+from app.models.workbench import ToolEnvelope
+
 
 TOOL_PROTOCOL_VERSION = "grounded.tool.v2"
 
@@ -281,7 +283,7 @@ def tool_envelope(
             "retryable": bool(error.get("retryable") or False),
             "details": error.get("details") or {},
         }
-    return {
+    payload = {
         "tool_call_id": tool_call_id or f"tool_{uuid4().hex}",
         "tool": canonical,
         "version": TOOL_PROTOCOL_VERSION,
@@ -309,6 +311,7 @@ def tool_envelope(
         "error": normalized_error,
         "created_at": created_at,
     }
+    return ToolEnvelope.model_validate(payload).model_dump(mode="json", by_alias=True)
 
 
 def structured_tool_error(
