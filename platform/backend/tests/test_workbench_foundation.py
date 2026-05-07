@@ -148,10 +148,15 @@ def test_exec_policy_classifies_and_redacts_commands() -> None:
 
     assert allowed["decision"]["action"] == "allow"
     assert allowed["decision"]["risk"] == "read_only"
+    assert allowed["decision"]["shell_parse"]["kind"] == "simple_command"
+    assert allowed["decision"]["network_policy"]["blocked"] is False
+    assert allowed["decision"]["resolved_argv"]
+    assert Path(allowed["decision"]["resolved_argv"][0]).is_absolute()
     assert allowed["sandbox_summary"]["profile"] == "analysis_only"
     assert blocked["decision"]["action"] == "forbidden"
     assert blocked["approval"]["status"] == "blocked"
     assert redirection["decision"]["action"] == "forbidden"
+    assert redirection["decision"]["blocked_syntax"]["code"] == "shell_metacharacter"
     assert git_internal["decision"]["action"] == "forbidden"
     assert "sk-secretvalue" not in redacted["command"]
 
@@ -239,6 +244,37 @@ prefix_rule(
     assert untrusted.executable_resolution["status"] == "untrusted_absolute"
 
 
+def test_exec_policy_json_amendments_are_additive_and_cannot_unblock_network() -> None:
+    policy = AgentCommandPolicy.from_rule_payload(
+        {
+            "schema": "grounded.agent_exec_policy.v1",
+            "source": "amendments.json",
+            "amendments": [
+                {
+                    "prefixes": [["python3", "-m", "pytest"]],
+                    "action": "allow",
+                    "reason": "Allow focused pytest diagnostics.",
+                    "match": ["python3 -m pytest miniapp/tests -q"],
+                },
+                {
+                    "prefixes": [["curl"]],
+                    "action": "allow",
+                    "reason": "Unsafe network override should not take effect.",
+                    "match": ["curl https://example.com"],
+                },
+            ],
+        }
+    )
+
+    pytest_decision = policy.decide("python3 -m pytest miniapp/tests -q")
+    curl_decision = policy.decide("curl https://example.com")
+
+    assert pytest_decision.action == "allow"
+    assert pytest_decision.matched_amendments
+    assert curl_decision.action == "forbidden"
+    assert curl_decision.network_policy["code"] == "direct_network_tool"
+
+
 def test_policy_simulation_endpoint_returns_matched_rules(tmp_path: Path) -> None:
     app = create_app(data_dir=tmp_path)
     client = TestClient(app)
@@ -247,6 +283,8 @@ def test_policy_simulation_endpoint_returns_matched_rules(tmp_path: Path) -> Non
     doctor = client.get("/doctor").json()
 
     assert response["decision"]["action"] == "forbidden"
+    assert response["decision"]["network_policy"]["code"] == "package_network_operation"
+    assert response["shell_parse"]["kind"] == "simple_command"
     assert response["matched_rules"]
     assert response["selected_decision"] == "forbidden"
     assert response["policy_file"]["status"] == "loaded"
@@ -2286,6 +2324,8 @@ def test_exec_runtime_streams_and_blocks_workspace_escape(tmp_path: Path) -> Non
         symlink_session = _wait_for_exec_session(app, symlinked["process_id"])
 
     assert started["status"] in {"starting", "running"}
+    assert started["policy_decision"]["resolved_argv"]
+    assert Path(started["policy_decision"]["resolved_argv"][0]).is_absolute()
     assert output["status"] == "completed"
     assert "app" in output["content"]
     assert resized["ok"] is True

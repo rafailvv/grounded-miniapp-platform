@@ -25,6 +25,7 @@ class PatchService:
         target_root = self.workspace_service.draft_source_dir(workspace_id, run_id) if run_id else self.workspace_service.source_dir(workspace_id)
         conflicts: list[dict[str, Any]] = []
         files: list[dict[str, Any]] = []
+        sandbox_paths: list[str] = []
         if base_revision_id and workspace.current_revision_id and base_revision_id != workspace.current_revision_id:
             conflicts.append(
                 {
@@ -82,6 +83,18 @@ class PatchService:
             if operation.diff:
                 file_report["line_anchor_count"] = sum(1 for line in str(operation.diff).splitlines() if line.startswith("@@"))
             files.append(file_report)
+            sandbox_paths.append(normalized)
+        sandbox_report = self.workspace_service.sandbox_service.preflight_apply(
+            target_root,
+            sandbox_paths,
+            profile="agent_draft_write" if run_id else "source_apply_gate",
+            operation="apply",
+            allow_generated=run_id is None,
+        ).model_dump(mode="json")
+        if sandbox_report.get("status") == "blocked":
+            for violation in sandbox_report.get("violations") or []:
+                if isinstance(violation, dict):
+                    conflicts.append({"code": violation.get("code"), "message": violation.get("message"), "path": violation.get("path")})
         return {
             "workspace_id": workspace_id,
             "run_id": run_id,
@@ -89,6 +102,7 @@ class PatchService:
             "status": "passed" if not conflicts else "conflict",
             "conflicts": conflicts,
             "files": files,
+            "sandbox_report": sandbox_report,
             "deterministic": True,
             "validation_before_apply": True,
         }

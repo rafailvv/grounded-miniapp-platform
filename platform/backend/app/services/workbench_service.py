@@ -59,6 +59,7 @@ from app.services.repair_catalog import RepairCatalog
 from app.services.repair_cases import RepairCaseService
 from app.services.run_state_machine import RunStateMachine
 from app.services.tool_protocol import TOOL_PROTOCOL_VERSION, tool_envelope, tool_registry_contract
+from app.modules.miniapp_agent_loop.tool_router import ToolRouter
 from app.services.memory_pipeline import WorkspaceMemoryPipeline
 from app.services.run_compaction import RunCompactionService
 from app.services.run_protocol import RunProtocolConflict, RunProtocolService, diff_sha256
@@ -283,7 +284,8 @@ class WorkbenchService:
 
     def evaluate_command_for_run(self, run_id: str, command: str, *, preset: str = "safe_auto") -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
-        evaluation = self.exec_policy_service.evaluate_command(command, preset=preset)
+        root = self.workspace_service.draft_source_dir(run.workspace_id, run_id) if self.workspace_service.draft_exists(run.workspace_id, run_id) else self.workspace_service.source_dir(run.workspace_id)
+        evaluation = self.exec_policy_service.evaluate_command(command, preset=preset, root=root)
         approval = dict(evaluation.get("approval") or {})
         if approval.get("required") and approval.get("approval_id"):
             self._upsert_approval(
@@ -1779,7 +1781,7 @@ class WorkbenchService:
 
     def mcp_tools(self) -> dict[str, Any]:
         config = self._mcp_config()
-        return {"items": config.get("tools", []), "tool_protocol": tool_registry_contract()}
+        return {"items": config.get("tools", []), "tool_protocol": {**tool_registry_contract(), "router": ToolRouter.manifest()}}
 
     def call_mcp_tool(self, tool_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -2345,12 +2347,23 @@ class WorkbenchService:
         from app.services.patch_service import PatchService
 
         service = PatchService(self.workspace_service)
-        return service.preflight(
+        report = service.preflight(
             workspace_id=workspace_id,
             patch_actions=ops,
             run_id=payload.get("run_id"),
             base_revision_id=payload.get("base_revision_id"),
         )
+        run_id = payload.get("run_id")
+        if run_id:
+            event_type = "sandbox.preflight_passed" if (report.get("sandbox_report") or {}).get("status") == "passed" else "sandbox.preflight_blocked"
+            self._journal_run_event(
+                str(run_id),
+                event_type,
+                {"workspace_id": workspace_id, "report": report.get("sandbox_report") or {}},
+                summary="Sandbox preflight completed.",
+                idempotency_key=f"{event_type}:{run_id}:{len(ops)}:{report.get('status')}",
+            )
+        return report
 
     def _run_artifacts_or_empty(self, run_id: str) -> dict[str, Any]:
         try:

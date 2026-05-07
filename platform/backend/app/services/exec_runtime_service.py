@@ -12,6 +12,7 @@ from app.modules.miniapp_agent_loop.agent_process_manager import AgentProcessMan
 from app.repositories.platform_db import PlatformDb
 from app.repositories.state_store import StateStore
 from app.services.event_journal import EventJournalService
+from app.services.sandbox_service import SandboxService
 from app.services.rpc_event_hub import RpcEventHub
 from app.services.tool_protocol import tool_envelope
 from app.services.workspace.service import WorkspaceService
@@ -28,13 +29,15 @@ class ExecRuntimeService:
         event_hub: RpcEventHub,
         store: StateStore,
         event_journal_service: EventJournalService | None = None,
+        sandbox_service: SandboxService | None = None,
     ) -> None:
         self.workspace_service = workspace_service
         self.platform_db = platform_db
         self.event_hub = event_hub
         self.store = store
         self.event_journal_service = event_journal_service
-        self.process_manager = AgentProcessManager()
+        self.sandbox_service = sandbox_service or workspace_service.sandbox_service
+        self.process_manager = AgentProcessManager(sandbox_service=self.sandbox_service)
         self._sessions: dict[str, dict[str, Any]] = {}
         self._lock = threading.RLock()
 
@@ -202,6 +205,19 @@ class ExecRuntimeService:
                     pass
         self._publish("command/exec/completed", session)
         run_id = session.get("run_id")
+        if run_id and result_payload.get("semantic_status") == "blocked_by_sandbox" and self.event_journal_service is not None:
+            try:
+                self.event_journal_service.append_run(
+                    workspace_id=str(session.get("workspace_id") or ""),
+                    run_id=str(run_id),
+                    event_type="sandbox.exec_blocked",
+                    actor="system",
+                    payload={"process_id": process_id, "command": command, "result": result_payload},
+                    summary="Shell command blocked by sandbox.",
+                    idempotency_key=f"sandbox.exec_blocked:{process_id}",
+                )
+            except Exception:
+                pass
         if run_id:
             self._record_run_tool_event(
                 str(run_id),

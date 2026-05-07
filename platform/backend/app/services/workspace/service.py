@@ -15,6 +15,7 @@ from app.core.config import Settings
 from app.models.artifacts import ApplyPatchResult, PatchEnvelope, PatchOperationModel
 from app.models.domain import DraftAction, RevisionRecord, SaveFileRequest, WorkspaceRecord, utc_now
 from app.repositories.state_store import StateStore
+from app.services.sandbox_service import SandboxService, SandboxViolationError
 from app.services.workspace.log_service import WorkspaceLogService
 
 
@@ -36,10 +37,11 @@ class WorkspaceService:
     IGNORED_TREE_SUFFIXES = (".pyc", ".pyo", ".tsbuildinfo", ".db", ".sqlite", ".sqlite3")
     IGNORED_TREE_NAMES = {".DS_Store", "vite.config.js", "vite.config.d.ts"}
 
-    def __init__(self, settings: Settings, store: StateStore, workspace_log_service: WorkspaceLogService) -> None:
+    def __init__(self, settings: Settings, store: StateStore, workspace_log_service: WorkspaceLogService, sandbox_service: SandboxService | None = None) -> None:
         self.settings = settings
         self.store = store
         self.workspace_log_service = workspace_log_service
+        self.sandbox_service = sandbox_service or SandboxService()
         self.code_index_service = None
 
     @staticmethod
@@ -255,7 +257,7 @@ class WorkspaceService:
         source_dir = workspace_root / "source"
         if source_dir.exists():
             shutil.rmtree(source_dir)
-        self._copy_tree(self.settings.template_dir, source_dir)
+        self._copy_tree(self.settings.template_dir, source_dir, allow_generated=True)
         self._git_init(source_dir)
         commit_sha = self._git_commit(source_dir, "Clone canonical template")
         revision = RevisionRecord(commit_sha=commit_sha, message="Clone canonical template", source="template_clone")
@@ -355,7 +357,7 @@ class WorkspaceService:
         if draft_source.exists():
             shutil.rmtree(draft_source)
         draft_source.parent.mkdir(parents=True, exist_ok=True)
-        self._copy_tree(self.source_dir(workspace_id), draft_source)
+        self._copy_tree(self.source_dir(workspace_id), draft_source, allow_generated=True)
         return draft_source
 
     def ensure_draft(self, workspace_id: str, run_id: str) -> Path:
@@ -372,7 +374,7 @@ class WorkspaceService:
         if target_draft.exists():
             shutil.rmtree(target_draft)
         target_draft.parent.mkdir(parents=True, exist_ok=True)
-        self._copy_tree(source_draft, target_draft)
+        self._copy_tree(source_draft, target_draft, allow_generated=True)
         self.workspace_log_service.append(
             workspace_id,
             source="workspace",
@@ -451,13 +453,15 @@ class WorkspaceService:
             source_path = source_dir / relative_path
             draft_path = draft_source / relative_path
             if draft_path.exists() and draft_path.is_file():
-                source_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(draft_path, source_path)
+                self.sandbox_service.safe_copy_file(
+                    draft_source,
+                    source_dir,
+                    relative_path,
+                    profile="source_apply_gate",
+                    allow_generated=True,
+                )
             elif source_path.exists():
-                if source_path.is_dir():
-                    shutil.rmtree(source_path)
-                else:
-                    source_path.unlink()
+                self.sandbox_service.safe_delete_path(source_dir, relative_path, profile="source_apply_gate", allow_generated=True)
         commit_sha = self._git_commit(source_dir, message)
         revision = RevisionRecord(commit_sha=commit_sha, message=message, source="ai_patch")
         workspace = self.get_workspace(workspace_id)
@@ -487,14 +491,16 @@ class WorkspaceService:
             source_path = source_dir / relative_path
             draft_path = draft_source / relative_path
             if source_path.exists() and source_path.is_file():
-                draft_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(source_path, draft_path)
+                self.sandbox_service.safe_copy_file(
+                    source_dir,
+                    draft_source,
+                    relative_path,
+                    profile="agent_draft_write",
+                    allow_generated=True,
+                )
                 discarded.append(str(relative_path))
             elif draft_path.exists():
-                if draft_path.is_dir():
-                    shutil.rmtree(draft_path)
-                else:
-                    draft_path.unlink()
+                self.sandbox_service.safe_delete_path(draft_source, relative_path, profile="agent_draft_write", allow_generated=True)
                 discarded.append(str(relative_path))
         self.workspace_log_service.append(
             workspace_id,
@@ -507,9 +513,12 @@ class WorkspaceService:
     def save_file(self, workspace_id: str, request: SaveFileRequest) -> RevisionRecord | None:
         source_dir = self.source_dir(workspace_id) if not request.run_id else self.draft_source_dir(workspace_id, request.run_id)
         relative_path = self._safe_relative_path(request.relative_path)
-        file_path = source_dir / relative_path
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(request.content, encoding="utf-8")
+        self.sandbox_service.safe_write_text(
+            source_dir,
+            relative_path,
+            request.content,
+            profile="agent_draft_write" if request.run_id else "source_apply_gate",
+        )
         if request.run_id:
             return None
         commit_sha = self._git_commit(source_dir, f"Manual edit: {relative_path}")
@@ -609,14 +618,20 @@ class WorkspaceService:
         return self._apply_envelope_to_target(draft_source, workspace_id, run_id, envelope)
 
     def read_file(self, workspace_id: str, relative_path: str, run_id: str | None = None) -> str:
-        file_path = self._target_dir(workspace_id, run_id) / self._safe_relative_path(relative_path)
-        return file_path.read_text(encoding="utf-8")
+        root = self._target_dir(workspace_id, run_id)
+        decision = self.sandbox_service.resolve_path(root, relative_path, operation="read", profile="analysis_readonly", allow_generated=True)
+        if not decision.allowed:
+            raise ValueError(decision.reason)
+        return Path(decision.absolute_path).read_text(encoding="utf-8")
 
     def try_read_text_file(self, workspace_id: str, relative_path: str, run_id: str | None = None) -> str | None:
         try:
-            file_path = self._target_dir(workspace_id, run_id) / self._safe_relative_path(relative_path)
-            return file_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
+            root = self._target_dir(workspace_id, run_id)
+            decision = self.sandbox_service.resolve_path(root, relative_path, operation="read", profile="analysis_readonly", allow_generated=True)
+            if not decision.allowed:
+                return None
+            return Path(decision.absolute_path).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError, ValueError):
             return None
 
     def file_tree(self, workspace_id: str, run_id: str | None = None) -> list[dict[str, str]]:
@@ -626,10 +641,13 @@ class WorkspaceService:
             relative_path = path.relative_to(source_dir)
             if self._is_ignored_workspace_path(relative_path):
                 continue
+            decision = self.sandbox_service.resolve_path(source_dir, relative_path, operation="read", profile="analysis_readonly", allow_generated=True)
+            if not decision.allowed:
+                continue
             tree.append(
                 {
                     "path": str(relative_path),
-                    "type": "directory" if path.is_dir() else "file",
+                    "type": "directory" if path.is_dir() and not path.is_symlink() else "file",
                 }
             )
         return tree
@@ -672,8 +690,11 @@ class WorkspaceService:
         return self.source_dir(workspace_id)
 
     def _safe_relative_path(self, relative_path: str) -> Path:
-        candidate = Path(relative_path)
-        if candidate.is_absolute() or ".." in candidate.parts:
+        raw = str(relative_path or "")
+        if "\\" in raw or any(ord(ch) < 32 or ord(ch) == 127 for ch in raw):
+            raise ValueError("File paths must stay within the workspace.")
+        candidate = Path(raw)
+        if candidate.is_absolute() or raw.startswith("~") or ".." in candidate.parts:
             raise ValueError("File paths must stay within the workspace.")
         return candidate
 
@@ -684,6 +705,27 @@ class WorkspaceService:
         run_id: str | None,
         envelope: PatchEnvelope,
     ) -> ApplyPatchResult:
+        profile = "agent_draft_write" if run_id else "source_apply_gate"
+        allow_generated = run_id is None
+        operation_paths = [str(operation.file_path or "") for operation in envelope.ops]
+        preflight = self.sandbox_service.preflight_apply(
+            target_root,
+            operation_paths,
+            profile=profile,
+            operation="apply",
+            allow_generated=allow_generated,
+            operation_ids={str(operation.file_path or ""): operation.operation_id for operation in envelope.ops},
+        )
+        if preflight.status != "passed":
+            return ApplyPatchResult(
+                workspace_id=workspace_id,
+                run_id=run_id,
+                base_revision_id=envelope.base_revision_id,
+                status="blocked",
+                conflict_reason="; ".join(item.message for item in preflight.violations) or "Sandbox preflight failed.",
+                changed_files=[],
+            )
+        snapshots = {item.path: item.snapshot for item in preflight.items}
         changed_files: list[str] = []
 
         backups: dict[str, tuple[str, str | None]] = {}
@@ -705,15 +747,17 @@ class WorkspaceService:
             for relative_path, (kind, content) in reversed(list(backups.items())):
                 target_path = target_root / self._safe_relative_path(relative_path)
                 if kind == "file":
-                    target_path.parent.mkdir(parents=True, exist_ok=True)
-                    target_path.write_text(content or "", encoding="utf-8")
+                    self.sandbox_service.safe_write_text(
+                        target_root,
+                        relative_path,
+                        content or "",
+                        profile=profile,
+                        allow_generated=allow_generated,
+                    )
                     continue
                 if kind == "missing":
                     if target_path.exists():
-                        if target_path.is_dir():
-                            shutil.rmtree(target_path)
-                        else:
-                            target_path.unlink()
+                        self.sandbox_service.safe_delete_path(target_root, relative_path, profile=profile, allow_generated=allow_generated)
 
         def failed(status: str, reason: str) -> ApplyPatchResult:
             rollback()
@@ -749,10 +793,16 @@ class WorkspaceService:
             if operation.op == "delete":
                 backup_path(operation.file_path, target_path)
                 if target_path.exists():
-                    if target_path.is_dir():
-                        shutil.rmtree(target_path)
-                    else:
-                        target_path.unlink()
+                    try:
+                        self.sandbox_service.safe_delete_path(
+                            target_root,
+                            operation.file_path,
+                            profile=profile,
+                            snapshot=snapshots.get(str(relative_path)),
+                            allow_generated=allow_generated,
+                        )
+                    except ValueError as exc:
+                        return failed("blocked", str(exc))
                     changed_files.append(operation.file_path)
                 continue
             if operation.op == "patch":
@@ -768,8 +818,17 @@ class WorkspaceService:
                     )
                     if codex_result is None:
                         return failed("conflict", f"Patch operation {operation.operation_id} could not be applied as a Codex update patch.")
-                    target_path.parent.mkdir(parents=True, exist_ok=True)
-                    target_path.write_text(codex_result, encoding="utf-8")
+                    try:
+                        self.sandbox_service.safe_write_text(
+                            target_root,
+                            operation.file_path,
+                            codex_result,
+                            profile=profile,
+                            snapshot=snapshots.get(str(relative_path)),
+                            allow_generated=allow_generated,
+                        )
+                    except ValueError as exc:
+                        return failed("blocked", str(exc))
                     if operation.file_path not in changed_files:
                         changed_files.append(operation.file_path)
                     continue
@@ -777,8 +836,17 @@ class WorkspaceService:
                     hunk_result = self._apply_line_free_hunks(existing_content, patch_diff)
                     if hunk_result is None:
                         return failed("conflict", f"Patch operation {operation.operation_id} could not be applied as a line-free hunk patch.")
-                    target_path.parent.mkdir(parents=True, exist_ok=True)
-                    target_path.write_text(hunk_result, encoding="utf-8")
+                    try:
+                        self.sandbox_service.safe_write_text(
+                            target_root,
+                            operation.file_path,
+                            hunk_result,
+                            profile=profile,
+                            snapshot=snapshots.get(str(relative_path)),
+                            allow_generated=allow_generated,
+                        )
+                    except ValueError as exc:
+                        return failed("blocked", str(exc))
                     if operation.file_path not in changed_files:
                         changed_files.append(operation.file_path)
                     continue
@@ -788,6 +856,16 @@ class WorkspaceService:
                 expected_path = operation.file_path.strip().replace("\\", "/")
                 if any(path != expected_path for path in patch_paths):
                     return failed("failed", f"Patch operation {operation.operation_id} touched paths outside {operation.file_path}.")
+                diff_preflight = self.sandbox_service.preflight_apply(
+                    target_root,
+                    patch_paths,
+                    profile=profile,
+                    operation="apply",
+                    allow_generated=allow_generated,
+                )
+                if diff_preflight.status != "passed":
+                    return failed("blocked", "; ".join(item.message for item in diff_preflight.violations) or "Sandbox preflight failed.")
+                snapshots.update({item.path: item.snapshot for item in diff_preflight.items})
                 for path in patch_paths:
                     self._safe_relative_path(path)
                     backup_path(path, target_root / self._safe_relative_path(path))
@@ -800,22 +878,32 @@ class WorkspaceService:
                 )
                 if check_result.returncode != 0:
                     return failed("conflict", check_result.stderr.strip() or check_result.stdout.strip() or f"Patch operation {operation.operation_id} could not be applied.")
-                apply_result = subprocess.run(
-                    ["git", "apply", "--whitespace=nowarn", "--"],
-                    cwd=target_root,
-                    input=patch_diff,
-                    capture_output=True,
-                    text=True,
+                staging_error = self._apply_unified_diff_via_staging(
+                    target_root=target_root,
+                    patch_diff=patch_diff,
+                    patch_paths=patch_paths,
+                    profile=profile,
+                    snapshots=snapshots,
+                    allow_generated=allow_generated,
                 )
-                if apply_result.returncode != 0:
-                    return failed("failed", apply_result.stderr.strip() or apply_result.stdout.strip() or f"Patch operation {operation.operation_id} failed during apply.")
+                if staging_error:
+                    return failed("failed" if not staging_error.startswith("Sandbox") else "blocked", staging_error)
                 changed_files.extend(path for path in patch_paths if path not in changed_files)
                 continue
             if operation.content is None:
                 return failed("failed", f"Patch operation {operation.operation_id} is missing content.")
             backup_path(operation.file_path, target_path)
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-            target_path.write_text(operation.content, encoding="utf-8")
+            try:
+                self.sandbox_service.safe_write_text(
+                    target_root,
+                    operation.file_path,
+                    operation.content,
+                    profile=profile,
+                    snapshot=snapshots.get(str(relative_path)),
+                    allow_generated=allow_generated,
+                )
+            except ValueError as exc:
+                return failed("blocked", str(exc))
             changed_files.append(operation.file_path)
         result = ApplyPatchResult(
             workspace_id=workspace_id,
@@ -830,6 +918,55 @@ class WorkspaceService:
             result.model_dump(mode="json"),
         )
         return result
+
+    def _apply_unified_diff_via_staging(
+        self,
+        *,
+        target_root: Path,
+        patch_diff: str,
+        patch_paths: list[str],
+        profile: str,
+        snapshots: dict[str, dict[str, object]],
+        allow_generated: bool,
+    ) -> str | None:
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                staging_root = Path(temp_dir) / "source"
+                self.sandbox_service.safe_copy_tree(target_root, staging_root, profile="source_apply_gate", allow_generated=True)
+                apply_result = subprocess.run(
+                    ["git", "apply", "--whitespace=nowarn", "--"],
+                    cwd=staging_root,
+                    input=patch_diff,
+                    capture_output=True,
+                    text=True,
+                )
+                if apply_result.returncode != 0:
+                    return apply_result.stderr.strip() or apply_result.stdout.strip() or "Patch failed during staging apply."
+                for path in patch_paths:
+                    relative_path = self._safe_relative_path(path)
+                    staged_path = staging_root / relative_path
+                    if staged_path.exists() and staged_path.is_file():
+                        self.sandbox_service.safe_copy_file(
+                            staging_root,
+                            target_root,
+                            relative_path,
+                            profile=profile,  # type: ignore[arg-type]
+                            destination_snapshot=snapshots.get(str(relative_path)),
+                            allow_generated=allow_generated,
+                        )
+                    elif (target_root / relative_path).exists():
+                        self.sandbox_service.safe_delete_path(
+                            target_root,
+                            relative_path,
+                            profile=profile,  # type: ignore[arg-type]
+                            snapshot=snapshots.get(str(relative_path)),
+                            allow_generated=allow_generated,
+                        )
+                return None
+        except SandboxViolationError as exc:
+            return f"Sandbox preflight failed: {exc}"
+        except ValueError as exc:
+            return str(exc)
 
     def _git_init(self, source_dir: Path) -> None:
         if (source_dir / ".git").exists():
@@ -1217,82 +1354,16 @@ class WorkspaceService:
         text = "\n".join(lines)
         return text if text.endswith("\n") else f"{text}\n"
 
-    @staticmethod
-    def _copy_tree(source_dir: Path, destination_dir: Path) -> None:
-        shutil.copytree(
+    def _copy_tree(self, source_dir: Path, destination_dir: Path, *, allow_generated: bool = False) -> None:
+        self.sandbox_service.safe_copy_tree(
             source_dir,
             destination_dir,
-            ignore=shutil.ignore_patterns(
-                ".git",
-                "node_modules",
-                "dist",
-                "build",
-                "__pycache__",
-                ".pytest_cache",
-                ".mypy_cache",
-                ".ruff_cache",
-                ".next",
-                ".vite",
-                ".cache",
-                ".sandbox",
-                ".DS_Store",
-                "vite.config.js",
-                "vite.config.d.ts",
-                "*.pyc",
-                "*.pyo",
-                "*.db",
-                "*.sqlite",
-                "*.sqlite3",
-                "*.tsbuildinfo",
-            ),
-            symlinks=True,
+            profile="agent_draft_write",
+            allow_generated=allow_generated,
         )
 
-    @classmethod
-    def _replace_workspace_contents_from_draft(cls, source_dir: Path, draft_source_dir: Path) -> None:
-        for child in source_dir.iterdir():
-            if child.name == ".git":
-                continue
-            if child.is_dir():
-                shutil.rmtree(child)
-            else:
-                child.unlink()
-        for child in draft_source_dir.iterdir():
-            if cls._is_ignored_workspace_path(Path(child.name)):
-                continue
-            destination = source_dir / child.name
-            if child.is_symlink():
-                destination.symlink_to(child.readlink(), target_is_directory=child.is_dir())
-            elif child.is_dir():
-                shutil.copytree(
-                    child,
-                    destination,
-                    symlinks=True,
-                    ignore=shutil.ignore_patterns(
-                        "node_modules",
-                        "dist",
-                        "build",
-                        "__pycache__",
-                        ".pytest_cache",
-                        ".mypy_cache",
-                        ".ruff_cache",
-                        ".next",
-                        ".vite",
-                        ".cache",
-                        ".sandbox",
-                        ".DS_Store",
-                        "vite.config.js",
-                        "vite.config.d.ts",
-                        "*.pyc",
-                        "*.pyo",
-                        "*.db",
-                        "*.sqlite",
-                        "*.sqlite3",
-                        "*.tsbuildinfo",
-                    ),
-                )
-            else:
-                shutil.copy2(child, destination)
+    def _replace_workspace_contents_from_draft(self, source_dir: Path, draft_source_dir: Path) -> None:
+        self.sandbox_service.safe_replace_workspace_from_draft(source_dir, draft_source_dir)
 
     def _restore_tree_from_commit(self, source_dir: Path, commit_sha: str) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -67,6 +67,7 @@ from app.modules.miniapp_agent_loop.agent_tool_runtime import (
     truncate_tool_text,
     validate_workspace_command,
 )
+from app.modules.miniapp_agent_loop.tool_router import ToolRouter
 from app.modules.miniapp_agent_loop.types import AgentLoopCallbacks, AgentLoopResult, AgentTurnPlan
 from app.modules.miniapp_agent_loop.turn_diff_tracker import AgentTurnDiffTracker
 from app.modules.miniapp_agent_loop.verification_worker import VerificationWorker
@@ -193,7 +194,7 @@ class WorkspaceCodeAgentRuntime:
         self.context_pressure = AgentContextPressureAnalyzer()
         self.rollout_trace = RolloutTraceRecorder()
         self.transcript_store = AgentTranscriptStore()
-        self.process_manager = AgentProcessManager()
+        self.process_manager = AgentProcessManager(sandbox_service=workspace_service.sandbox_service)
         self.trace_bundle_writers: dict[str, TraceBundleWriter] = {}
         self.tool_batch_summaries: dict[str, list[dict[str, object]]] = {}
         self.context_pressure_history: dict[str, list[dict[str, Any]]] = {}
@@ -3274,7 +3275,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             pending_post_compact_messages = list(transcript_context.get("post_compact_messages") or [])
             if pending_post_compact_messages:
                 user_prompt = self._with_post_compact_messages(user_prompt, pending_post_compact_messages)
-            available_tools = AgentToolRegistry.openai_tools()
+            available_tools = ToolRouter.allowed_openai_tools()
             forced_tool_names = {
                 str(item)
                 for item in (next_forced_action or {}).get("forced_tool_names", [])
@@ -3289,12 +3290,12 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                         if str(item).strip()
                     }
             if forced_tool_names:
-                available_tools = AgentToolRegistry.openai_tools(forced_tool_names)
+                available_tools = ToolRouter.allowed_openai_tools(forced_allowed=forced_tool_names)
             if generated_tests_repair or browser_step_repair or (
                 create_repair_turn
                 and (tool_round > self._tool_round_limit(generation_mode) or repeated_no_progress > 0)
             ):
-                available_tools = AgentToolRegistry.openai_tools(forced_tool_names or {"apply_patch_to_draft", "write_file"})
+                available_tools = ToolRouter.allowed_openai_tools(forced_allowed=forced_tool_names or {"apply_patch_to_draft", "write_file"})
             response = self.openai_client.generate_agent_tool_step(
                 tools=available_tools,
                 system_prompt=self._agent_system_prompt(),
@@ -4021,6 +4022,10 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                 "output_cap_chars": spec.output_cap_chars,
                 "activity": spec.activity,
                 "progress_label": spec.progress_label,
+                "aliases": list(spec.aliases),
+                "mode_visibility": list(spec.mode_visibility),
+                "dynamic": bool(spec.dynamic),
+                "deferred": bool(spec.deferred or spec.kind == "mutating"),
             }
         return payload
 
@@ -5335,6 +5340,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             execute_checks=execute_checks,
             append_activity=append_activity if job is not None else None,
             append_batch_summary=append_batch_summary,
+            hook_manager=self.hook_manager,
         )
         if job is not None:
             artifact_run_id = run_id or job.job_id
@@ -5741,24 +5747,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
 
     @staticmethod
     def _agent_tool_calls(raw_tool_calls: list[Any]) -> list[dict[str, Any]]:
-        allowed_tools = {
-            "list_files",
-            "read_files",
-            "search_files",
-            "inspect_diff",
-            "read_artifact_ref",
-            "semantic_scan",
-            "run_checks",
-            "run_command",
-            "apply_patch_to_draft",
-            "write_file",
-            "browser_verify",
-        }
-        return [
-            item
-            for item in normalize_tool_calls(raw_tool_calls)
-            if str(item.get("tool") or "").strip().lower() in allowed_tools
-        ]
+        return normalize_tool_calls(raw_tool_calls)
 
     @staticmethod
     def _is_mutating_agent_tool_call(request_item: dict[str, Any]) -> bool:

@@ -11,7 +11,9 @@ import time
 from typing import Any, Callable
 from uuid import uuid4
 
+from app.models.sandbox import SandboxExecutionPlan
 from app.modules.miniapp_agent_loop.agent_command_policy import CommandPolicyDecision
+from app.services.sandbox_service import SandboxService
 
 
 DEFAULT_AGENT_ENV = {
@@ -86,6 +88,7 @@ class AgentCommandResult:
     process_id: str
     command: str
     argv: list[str]
+    resolved_argv: list[str]
     cwd: str
     started_at: str
     duration_ms: int
@@ -106,6 +109,7 @@ class AgentCommandResult:
             "process_id": self.process_id,
             "command": self.command,
             "argv": self.argv,
+            "resolved_argv": self.resolved_argv,
             "cwd": self.cwd,
             "started_at": self.started_at,
             "duration_ms": self.duration_ms,
@@ -154,9 +158,16 @@ class AgentCommandSemantics:
 class AgentProcessManager:
     """Safe streaming process runner for agent diagnostic commands."""
 
-    def __init__(self, *, deterministic_env: dict[str, str] | None = None, resource_limits: dict[str, int] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        deterministic_env: dict[str, str] | None = None,
+        resource_limits: dict[str, int] | None = None,
+        sandbox_service: SandboxService | None = None,
+    ) -> None:
         self.deterministic_env = dict(deterministic_env or DEFAULT_AGENT_ENV)
         self.resource_limits = dict(resource_limits or DEFAULT_RESOURCE_LIMITS)
+        self.sandbox_service = sandbox_service or SandboxService()
         self._active: dict[str, subprocess.Popen[str]] = {}
         self._active_meta: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
@@ -172,6 +183,7 @@ class AgentProcessManager:
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
         yield_time_ms: int = 1000,
         process_id: str | None = None,
+        execution_plan: SandboxExecutionPlan | None = None,
     ) -> AgentCommandResult:
         started = time.perf_counter()
         started_at = datetime.now(timezone.utc).isoformat()
@@ -180,8 +192,18 @@ class AgentProcessManager:
         stderr_buffer = HeadTailOutputBuffer(max_chars=max_output_chars)
         output_delta_count = 0
         cwd = draft_source / "miniapp" if decision.cwd_policy == "miniapp" else draft_source
+        base_exec_argv = list(decision.resolved_argv or decision.argv)
+        plan = execution_plan or self.sandbox_service.build_execution_plan(
+            root=draft_source,
+            cwd=cwd,
+            argv=base_exec_argv,
+            profile="analysis_readonly",
+            network_mode="blocked",
+            write_roots=[cwd / ".sandbox" / "tmp", cwd / ".sandbox" / "home"],
+        )
+        exec_argv = list(plan.wrapped_argv or base_exec_argv)
         policy_payload = self._policy_payload(decision)
-        sandbox_summary = self._sandbox_summary(draft_source=draft_source, cwd=cwd, decision=decision)
+        sandbox_summary = self._sandbox_summary(draft_source=draft_source, cwd=cwd, decision=decision, execution_plan=plan)
 
         def emit(payload: dict[str, Any]) -> None:
             if progress_callback is not None:
@@ -192,6 +214,7 @@ class AgentProcessManager:
                 command=command,
                 process_id=resolved_process_id,
                 argv=list(decision.argv),
+                resolved_argv=exec_argv,
                 cwd=str(cwd),
                 started_at=started_at,
                 duration_ms=int((time.perf_counter() - started) * 1000),
@@ -212,6 +235,7 @@ class AgentProcessManager:
                 command=command,
                 process_id=resolved_process_id,
                 argv=[],
+                resolved_argv=[],
                 cwd=str(cwd),
                 started_at=started_at,
                 duration_ms=int((time.perf_counter() - started) * 1000),
@@ -232,6 +256,7 @@ class AgentProcessManager:
                 command=command,
                 process_id=resolved_process_id,
                 argv=list(decision.argv),
+                resolved_argv=exec_argv,
                 cwd=str(cwd),
                 started_at=started_at,
                 duration_ms=int((time.perf_counter() - started) * 1000),
@@ -252,6 +277,7 @@ class AgentProcessManager:
                 command=command,
                 process_id=resolved_process_id,
                 argv=list(decision.argv),
+                resolved_argv=exec_argv,
                 cwd=str(cwd),
                 started_at=started_at,
                 duration_ms=int((time.perf_counter() - started) * 1000),
@@ -266,6 +292,26 @@ class AgentProcessManager:
                 policy_decision={**policy_payload, "sandbox": sandbox_summary},
                 error=f"Command argument escapes workspace allowlist: {escaped_arg}",
             )
+        if not plan.allowed:
+            return AgentCommandResult(
+                command=command,
+                process_id=resolved_process_id,
+                argv=list(decision.argv),
+                resolved_argv=exec_argv,
+                cwd=str(cwd),
+                started_at=started_at,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                exit_code=None,
+                semantic_status="blocked_by_sandbox",
+                success=False,
+                timed_out=False,
+                timeout_seconds=timeout_seconds,
+                stdout=stdout_buffer.snapshot(),
+                stderr=stderr_buffer.snapshot(),
+                output_delta_count=0,
+                policy_decision={**policy_payload, "sandbox": sandbox_summary},
+                error=plan.reason,
+            )
 
         env = self._sandbox_env(cwd)
         if not cwd.exists():
@@ -273,6 +319,7 @@ class AgentProcessManager:
                 command=command,
                 process_id=resolved_process_id,
                 argv=list(decision.argv),
+                resolved_argv=exec_argv,
                 cwd=str(cwd),
                 started_at=started_at,
                 duration_ms=int((time.perf_counter() - started) * 1000),
@@ -287,10 +334,10 @@ class AgentProcessManager:
                 policy_decision={**policy_payload, "sandbox": sandbox_summary},
                 error=f"Command cwd does not exist: {cwd}",
             )
-        emit({"status": "started", "process_id": resolved_process_id, "command": command, "argv": list(decision.argv), "cwd": str(cwd), "sandbox": sandbox_summary})
+        emit({"status": "started", "process_id": resolved_process_id, "command": command, "argv": list(decision.argv), "resolved_argv": exec_argv, "cwd": str(cwd), "sandbox": sandbox_summary})
         try:
             process = subprocess.Popen(
-                list(decision.argv),
+                exec_argv,
                 cwd=cwd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
@@ -308,6 +355,7 @@ class AgentProcessManager:
                 command=command,
                 process_id=resolved_process_id,
                 argv=list(decision.argv),
+                resolved_argv=exec_argv,
                 cwd=str(cwd),
                 started_at=started_at,
                 duration_ms=int((time.perf_counter() - started) * 1000),
@@ -328,6 +376,7 @@ class AgentProcessManager:
                 "process_id": resolved_process_id,
                 "command": command,
                 "argv": list(decision.argv),
+                "resolved_argv": exec_argv,
                 "cwd": str(cwd),
                 "started_at": started_at,
                 "status": "running",
@@ -449,6 +498,7 @@ class AgentProcessManager:
             command=command,
             process_id=resolved_process_id,
             argv=list(decision.argv),
+            resolved_argv=exec_argv,
             cwd=str(cwd),
             started_at=started_at,
             duration_ms=duration_ms,
@@ -532,11 +582,15 @@ class AgentProcessManager:
 
     def _sandbox_env(self, cwd: Path) -> dict[str, str]:
         tmp_dir = cwd / ".sandbox" / "tmp"
+        home_dir = cwd / ".sandbox" / "home"
         tmp_dir.mkdir(parents=True, exist_ok=True)
-        base: dict[str, str] = {}
-        for key in ("PATH", "HOME", "USER", "SHELL"):
-            if os.environ.get(key):
-                base[key] = str(os.environ[key])
+        home_dir.mkdir(parents=True, exist_ok=True)
+        base: dict[str, str] = {
+            "PATH": os.defpath,
+            "HOME": str(home_dir),
+            "USER": "agent",
+            "SHELL": "/bin/false",
+        }
         base.update(self.deterministic_env)
         base.update(
             {
@@ -545,6 +599,7 @@ class AgentProcessManager:
                 "TMP": str(tmp_dir),
                 "GIT_CONFIG_NOSYSTEM": "1",
                 "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+                "PYTHONDONTWRITEBYTECODE": "1",
                 "HTTP_PROXY": "http://127.0.0.1:9",
                 "HTTPS_PROXY": "http://127.0.0.1:9",
                 "ALL_PROXY": "socks5://127.0.0.1:9",
@@ -627,16 +682,26 @@ class AgentProcessManager:
                 return text
         return None
 
-    def _sandbox_summary(self, *, draft_source: Path, cwd: Path, decision: CommandPolicyDecision) -> dict[str, Any]:
+    def _sandbox_summary(self, *, draft_source: Path, cwd: Path, decision: CommandPolicyDecision, execution_plan: SandboxExecutionPlan) -> dict[str, Any]:
         return {
             "mode": "workspace_process_group",
+            "profile": execution_plan.profile,
+            "provider": execution_plan.provider,
+            "enforcement": execution_plan.enforcement,
             "fs_allowlist": [str(draft_source.resolve())],
             "cwd": str(cwd),
-            "network_mode": "blocked",
+            "network_mode": execution_plan.network.mode,
             "env_isolated": True,
             "resource_limits": dict(self.resource_limits),
             "process_group_kill": os.name == "posix",
             "cwd_policy": decision.cwd_policy,
+            "resolved_argv": list(decision.resolved_argv or decision.argv),
+            "wrapped_argv": list(execution_plan.wrapped_argv),
+            "read_roots": list(execution_plan.read_roots),
+            "write_roots": list(execution_plan.write_roots),
+            "shell_parse": decision.parse_tree,
+            "network_policy": decision.network_policy,
+            "violations": [item.model_dump(mode="json") for item in execution_plan.violations],
         }
 
     @staticmethod
@@ -646,6 +711,10 @@ class AgentProcessManager:
             "reason": decision.reason,
             "normalized_command": decision.normalized_command,
             "argv": list(decision.argv),
+            "resolved_argv": list(decision.resolved_argv or decision.argv),
             "matched_prefix": list(decision.matched_prefix),
             "cwd_policy": decision.cwd_policy,
+            "shell_parse": decision.parse_tree,
+            "blocked_syntax": decision.blocked_syntax,
+            "network_policy": decision.network_policy,
         }

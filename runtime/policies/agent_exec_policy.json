@@ -36,5 +36,14 @@
       "match": ["rm -rf miniapp", "curl https://example.com"],
       "not_match": ["git status"]
     }
+  ],
+  "amendments": [
+    {
+      "prefixes": [["git", "clone"], ["git", "fetch"], ["git", "pull"], ["git", "push"], ["git", "ls-remote"]],
+      "action": "forbidden",
+      "reason": "Git network operations are blocked before command amendments can allow execution.",
+      "match": ["git clone https://example.com/repo.git", "git fetch origin"],
+      "not_match": ["git status --short"]
+    }
   ]
 }

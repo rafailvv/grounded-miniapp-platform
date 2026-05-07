@@ -43,6 +43,10 @@ class AgentToolSpec:
     output_cap_chars: int = 6000
     activity: AgentActivityKind = "reading"
     progress_label: str = "Reading workspace context"
+    aliases: tuple[str, ...] = ()
+    mode_visibility: tuple[str, ...] = ("default", "read_only", "mutation_required", "verification", "worker_branch")
+    dynamic: bool = False
+    deferred: bool = False
 
 
 @dataclass(frozen=True)
@@ -212,6 +216,7 @@ class AgentToolRegistry:
             output_cap_chars=14000,
             activity="browser_verifying",
             progress_label="Running browser workflow proof",
+            dynamic=True,
         ),
         "apply_patch_to_draft": AgentToolSpec(
             name="apply_patch_to_draft",
@@ -219,6 +224,7 @@ class AgentToolRegistry:
             concurrency_safe=False,
             activity="applying_patch",
             progress_label="Applying one draft file patch",
+            deferred=True,
         ),
         "write_file": AgentToolSpec(
             name="write_file",
@@ -226,6 +232,7 @@ class AgentToolRegistry:
             concurrency_safe=False,
             activity="editing",
             progress_label="Writing one draft file",
+            deferred=True,
         ),
         "edit_file_exact": AgentToolSpec(
             name="edit_file_exact",
@@ -233,6 +240,7 @@ class AgentToolRegistry:
             concurrency_safe=False,
             activity="editing",
             progress_label="Applying an exact old/new string edit to one draft file",
+            deferred=True,
         ),
         "file.read": AgentToolSpec(
             name="file.read",
@@ -248,6 +256,8 @@ class AgentToolRegistry:
             concurrency_safe=False,
             activity="editing",
             progress_label="Writing a file through the unified tool protocol",
+            aliases=("write_file",),
+            deferred=True,
         ),
         "file.edit": AgentToolSpec(
             name="file.edit",
@@ -255,6 +265,8 @@ class AgentToolRegistry:
             concurrency_safe=False,
             activity="applying_patch",
             progress_label="Editing a file through the unified tool protocol",
+            aliases=("edit_file_exact",),
+            deferred=True,
         ),
         "search.grep": AgentToolSpec(
             name="search.grep",
@@ -286,6 +298,8 @@ class AgentToolRegistry:
             output_cap_chars=14000,
             activity="browser_verifying",
             progress_label="Running browser verification through the unified tool protocol",
+            aliases=("browser_verify",),
+            dynamic=True,
         ),
         "patch.apply": AgentToolSpec(
             name="patch.apply",
@@ -293,6 +307,8 @@ class AgentToolRegistry:
             concurrency_safe=False,
             activity="applying_patch",
             progress_label="Applying a strict patch through the unified tool protocol",
+            aliases=("apply_patch_to_draft",),
+            deferred=True,
         ),
         "contract.compile": AgentToolSpec(
             name="contract.compile",
@@ -307,6 +323,7 @@ class AgentToolRegistry:
             concurrency_safe=False,
             activity="checking",
             progress_label="Synchronizing prompt-contract metadata",
+            deferred=True,
         ),
         "ask_user": AgentToolSpec(
             name="ask_user",
@@ -388,10 +405,10 @@ class AgentToolRegistry:
         )
 
     @classmethod
-    def openai_tools(cls, allowed_names: set[str] | None = None) -> list[dict[str, Any]]:
+    def openai_tools(cls, allowed_names: set[str] | None = None, *, include_dynamic: bool = False) -> list[dict[str, Any]]:
         tools: list[dict[str, Any]] = []
         for name in sorted(cls._SPECS):
-            if "." in name or name == "browser_verify":
+            if "." in name or (name == "browser_verify" and not include_dynamic):
                 continue
             if allowed_names is not None and name not in allowed_names:
                 continue

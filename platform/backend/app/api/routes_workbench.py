@@ -28,6 +28,7 @@ from app.models.workbench import (
 from app.services.container import ServiceContainer
 from app.services.run_protocol import RunProtocolConflict
 from app.services.tool_protocol import tool_registry_contract
+from app.modules.miniapp_agent_loop.tool_router import ToolRouter
 
 router = APIRouter(tags=["workbench"])
 
@@ -103,7 +104,7 @@ class BackgroundTaskUpdateRequest(BaseModel):
 def get_exec_policy(container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     return {
         **container.exec_policy_service.snapshot(),
-        "tool_registry": tool_registry_contract(),
+        "tool_registry": {**tool_registry_contract(), "router": ToolRouter.manifest()},
     }
 
 
@@ -135,7 +136,7 @@ def evaluate_workspace_command(
         container.workspace_service.get_workspace(workspace_id)
         if request.run_id:
             return {"workspace_id": workspace_id, **container.workbench_service.evaluate_command_for_run(request.run_id, request.command, preset=request.preset)}
-        return {"workspace_id": workspace_id, **container.exec_policy_service.evaluate_command(request.command, preset=request.preset)}
+        return {"workspace_id": workspace_id, **container.exec_policy_service.evaluate_command(request.command, preset=request.preset, root=container.workspace_service.source_dir(workspace_id))}
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 

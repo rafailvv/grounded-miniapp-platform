@@ -167,7 +167,7 @@ class OpenAIClient:
             "You extract a product-neutral mini-app contract from a user prompt. "
             "Use only the supplied prompt and the requested JSON schema. Return only valid JSON. "
             "Use the user's wording for labels. Extract every explicit business object and role action, even from ordinary small-business prompts. "
-            "If the prompt names several surfaces such as catalog, prices, availability, bookings, confirmations, daily work, or admin controls, keep them as separate resources/capabilities instead of collapsing everything into one CRUD item. "
+            "If the prompt names several surfaces such as catalog, prices, availability, reservations, confirmations, daily work, or admin controls, keep them as separate resources/capabilities instead of collapsing everything into one CRUD item. "
             "For routeable_screen_plan, include screen intents for every role that has explicit actions; do not leave specialist or manager empty when the prompt gives them responsibilities. "
             "A prompt with three or more concrete role/action sentences should normally be multi-page because mobile workflows need focused screens. "
             "If a detail is not explicit, leave that list empty. "

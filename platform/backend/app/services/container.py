@@ -29,6 +29,7 @@ from app.validators.suite import ValidationSuite
 from app.ai.openai_client import OpenAIClient
 from app.services.exec_policy_service import ExecPolicyService
 from app.services.exec_runtime_service import ExecRuntimeService
+from app.services.sandbox_service import SandboxService
 from app.services.event_journal import EventJournalService
 from app.services.background_task_service import BackgroundTaskService
 from app.services.run_compaction import RunCompactionService
@@ -49,7 +50,8 @@ class ServiceContainer:
         self.rpc_event_hub = RpcEventHub()
         self.store.shard_large_runtime_payloads()
         self.workspace_log_service = WorkspaceLogService(self.settings)
-        self.workspace_service = WorkspaceService(self.settings, self.store, self.workspace_log_service)
+        self.sandbox_service = SandboxService()
+        self.workspace_service = WorkspaceService(self.settings, self.store, self.workspace_log_service, sandbox_service=self.sandbox_service)
         self.code_index_service = CodeIndexService(self.settings, self.store)
         self.workspace_service.attach_code_index_service(self.code_index_service)
         self.document_service = DocumentIntelligenceService(self.settings, self.store, self.code_index_service)
@@ -101,13 +103,14 @@ class ServiceContainer:
             run_protocol_service=self.run_protocol_service,
             event_journal_service=self.event_journal_service,
         )
-        self.exec_policy_service = ExecPolicyService(self.settings.runtime_dir / "policies" / "agent_exec_policy.json")
+        self.exec_policy_service = ExecPolicyService(self.settings.runtime_dir / "policies" / "agent_exec_policy.json", sandbox_service=self.sandbox_service)
         self.exec_runtime_service = ExecRuntimeService(
             workspace_service=self.workspace_service,
             platform_db=self.platform_db,
             event_hub=self.rpc_event_hub,
             store=self.store,
             event_journal_service=self.event_journal_service,
+            sandbox_service=self.sandbox_service,
         )
         self.background_task_service = BackgroundTaskService(
             store=self.store,

@@ -192,3 +192,15 @@ prefix_rule(
         "git status",
     ],
 )
+
+amendment_rule(
+    pattern = ["git", "clone"],
+    decision = "forbidden",
+    justification = "Git network operations are blocked before command amendments can allow execution.",
+    match = [
+        "git clone https://example.com/repo.git",
+    ],
+    not_match = [
+        "git status --short",
+    ],
+)

@@ -10,7 +10,7 @@ from app.ai.model_registry import CODEX_MINI_MODEL, models_for_role
 from app.models.common import GenerationMode
 from app.models.domain import CheckExecutionRecord, CreateRunRequest, DraftAction, RunCheckResult, WorkspaceRecord, utc_now
 from app.modules.miniapp_agent_loop.agent_file_state import AgentFileStateCache
-from app.modules.miniapp_agent_loop.agent_command_policy import DEFAULT_COMMAND_POLICY, decide_workspace_command
+from app.modules.miniapp_agent_loop.agent_command_policy import DEFAULT_COMMAND_POLICY, AgentCommandPolicy, decide_workspace_command
 from app.modules.miniapp_agent_loop.agent_coordinator import AgentCoordinator
 from app.modules.miniapp_agent_loop.agent_hooks import AgentHookManager
 from app.modules.miniapp_agent_loop.agent_kernel import agent_tool_kind, compact_agent_memory, plan_agent_tool_batches
@@ -21,6 +21,7 @@ from app.modules.miniapp_agent_loop.agent_tool_call_loop import AgentToolCallLoo
 from app.modules.miniapp_agent_loop.agent_transcript import AgentTranscriptStore
 from app.modules.miniapp_agent_loop.agent_tool_registry import AgentToolRegistry
 from app.modules.miniapp_agent_loop.agent_tool_changes import file_changes_from_mutating_tool_calls
+from app.modules.miniapp_agent_loop.tool_router import ToolRouter, ToolRouterContext
 from app.modules.miniapp_agent_loop.diagnostics_delta import AgentDiagnosticsDelta
 from app.modules.miniapp_agent_loop.agent_worker_manager import AgentWorkerManager
 from app.modules.miniapp_agent_loop.agent_worker_branch_loop import AgentWorkerBranchLoop
@@ -34,6 +35,7 @@ from app.modules.miniapp_agent_loop.repair_packets import RepairTransitionPolicy
 from app.modules.miniapp_agent_loop.rollout_trace import RolloutTraceRecorder
 from app.modules.miniapp_agent_loop.semantic_tools import semantic_scan
 from app.modules.miniapp_agent_loop.agent_tool_runtime import validate_workspace_command
+from app.services.tool_protocol import TOOL_RISK_DEFAULTS
 from app.modules.miniapp_agent_loop.turn_diff_tracker import AgentTurnDiffTracker
 from app.modules.miniapp_agent_loop.types import AgentTurnPlan
 from app.modules.miniapp_agent_loop.verification_worker import VerificationWorker
@@ -1220,6 +1222,149 @@ def test_agent_registry_exposes_real_openai_tool_contract() -> None:
     assert all(tool["type"] == "function" for tool in tools)
 
 
+class _RouterWorkspace:
+    def __init__(self, root: Path) -> None:
+        self.root = root
+
+    def file_tree(self, workspace_id: str, *, run_id: str) -> list[dict[str, str]]:
+        del workspace_id, run_id
+        return [
+            {"path": str(path.relative_to(self.root)).replace("\\", "/"), "type": "file"}
+            for path in sorted(self.root.rglob("*"))
+            if path.is_file()
+        ]
+
+    def try_read_text_file(self, workspace_id: str, relative_path: str, *, run_id: str) -> str | None:
+        del workspace_id, run_id
+        target = self.root / relative_path
+        return target.read_text(encoding="utf-8") if target.exists() else None
+
+    def diff(self, workspace_id: str, *, run_id: str) -> str:
+        del workspace_id, run_id
+        return ""
+
+
+def _router_context(tmp_path: Path, *, mode: str = "default", hook_manager: AgentHookManager | None = None) -> ToolRouterContext:
+    root = tmp_path
+    (root / "miniapp/app/static/client").mkdir(parents=True, exist_ok=True)
+    (root / "miniapp/app/static/client/app.js").write_text("console.log('ok');\n", encoding="utf-8")
+
+    def execute_checks(_: list[str]) -> tuple[CheckExecutionRecord, dict[str, object]]:
+        return (
+            CheckExecutionRecord(
+                workspace_id="ws_router",
+                run_id="run_router",
+                changed_files=[],
+                results=[RunCheckResult(name="router_check", status="passed", details="ok")],
+                started_at=utc_now(),
+                completed_at=utc_now(),
+                duration_ms=0,
+            ),
+            {"preview": "ok"},
+        )
+
+    return ToolRouterContext(
+        workspace_id="ws_router",
+        run_id="run_router",
+        draft_source=root,
+        workspace_service=_RouterWorkspace(root),  # type: ignore[arg-type]
+        execute_checks=execute_checks,
+        hook_manager=hook_manager,
+        mode=mode,
+    )
+
+
+def test_tool_router_normalizes_alias_and_returns_typed_envelope(tmp_path: Path) -> None:
+    router = ToolRouter(_router_context(tmp_path))
+
+    result = router.route_batch(
+        [
+            {
+                "tool": "read_files",
+                "tool_use_id": "read_1",
+                "targets": ["miniapp/app/static/client/app.js"],
+                "reason": "inspect",
+            }
+        ]
+    )
+
+    read_result = result.model_results[1]
+    envelope = read_result["envelope"]
+    assert result.loaded_context["miniapp/app/static/client/app.js"] == "console.log('ok');\n"
+    assert read_result["tool_use_id"] == "read_1"
+    assert envelope["tool_call_id"] == "read_1"  # type: ignore[index]
+    assert envelope["tool"] == "file.read"  # type: ignore[index]
+    assert envelope["status"] == "completed"  # type: ignore[index]
+
+
+def test_tool_router_schema_validation_reports_extra_and_missing_args(tmp_path: Path) -> None:
+    router = ToolRouter(_router_context(tmp_path))
+
+    extra = router.route_batch([{"tool": "read_files", "tool_use_id": "bad_1", "targets": [], "reason": "x", "unexpected": True}])
+    missing = router.route_batch([{"tool": "run_command", "tool_use_id": "bad_2", "reason": "x"}])
+
+    assert extra.model_results[1]["status"] == "failed"
+    assert extra.model_results[1]["envelope"]["error"]["code"] == "tool_schema_invalid"  # type: ignore[index]
+    assert extra.model_results[1]["envelope"]["tool"] == "file.read"  # type: ignore[index]
+    assert missing.model_results[1]["status"] == "failed"
+    assert missing.model_results[1]["envelope"]["error"]["details"]["missing"] == ["command"]  # type: ignore[index]
+
+
+def test_tool_router_mode_filtering_and_forced_tools() -> None:
+    default_names = {tool["name"] for tool in ToolRouter.allowed_openai_tools()}
+    mutation_names = {tool["name"] for tool in ToolRouter.allowed_openai_tools(mode="mutation_required", forced_allowed={"write_file"})}
+    forced_browser_names = {tool["name"] for tool in ToolRouter.allowed_openai_tools(forced_allowed={"browser_verify"})}
+
+    assert "read_files" in default_names
+    assert "ask_user" not in default_names
+    assert "browser_verify" not in default_names
+    assert mutation_names == {"write_file"}
+    assert forced_browser_names == {"browser_verify"}
+
+
+def test_tool_router_disallowed_and_hook_block_return_failed_envelopes(tmp_path: Path, monkeypatch) -> None:
+    disallowed = ToolRouter(_router_context(tmp_path, mode="read_only")).route_batch(
+        [{"tool": "write_file", "tool_use_id": "write_1", "file_path": "miniapp/app/static/client/app.js", "content": "changed", "reason": "x"}]
+    )
+    assert disallowed.model_results[1]["status"] == "failed"
+    assert disallowed.model_results[1]["envelope"]["error"]["code"] == "tool_not_allowed"  # type: ignore[index]
+
+    hook_manager = AgentHookManager()
+    monkeypatch.setitem(TOOL_RISK_DEFAULTS, "file.read", "forbidden")
+    blocked = ToolRouter(_router_context(tmp_path, hook_manager=hook_manager)).route_batch(
+        [{"tool": "read_files", "tool_use_id": "read_blocked", "targets": ["miniapp/app/static/client/app.js"], "reason": "x"}]
+    )
+
+    assert blocked.model_results[1]["status"] == "failed"
+    assert blocked.model_results[1]["envelope"]["error"]["code"] == "tool_hook_blocked"  # type: ignore[index]
+    assert hook_manager.snapshot("run_router")["counts"]["pre_tool_use:failed"] == 1
+
+
+def test_tool_router_mutating_tools_defer_without_writing_files(tmp_path: Path) -> None:
+    target = tmp_path / "miniapp/app/static/client/app.js"
+    router = ToolRouter(_router_context(tmp_path))
+
+    result = router.route_batch(
+        [
+            {
+                "tool": "write_file",
+                "tool_use_id": "write_1",
+                "file_path": "miniapp/app/static/client/app.js",
+                "content": "console.log('changed');\n",
+                "reason": "replace",
+            }
+        ]
+    )
+
+    write_result = result.model_results[1]
+    envelope = write_result["envelope"]
+    assert write_result["status"] == "deferred"
+    assert envelope["tool"] == "file.write"  # type: ignore[index]
+    assert envelope["approval"]["required"] is True  # type: ignore[index]
+    assert result.deferred_changes[0].file_path == "miniapp/app/static/client/app.js"
+    assert target.read_text(encoding="utf-8") == "console.log('ok');\n"
+
+
 def test_role_surface_issues_accepts_generation_mode(tmp_path: Path) -> None:
     css = """
     .dashboard { display: grid; }
@@ -1760,7 +1905,7 @@ def test_runtime_syncs_missing_api_route_from_frontend_contract(tmp_path: Path) 
             file_path="miniapp/app/static/client/app.js",
             operation="create",
             content="await fetch('/api/zapis', { method: 'POST', body: JSON.stringify({}) });\n",
-            reason="client creates a booking",
+            reason="client creates a reservation",
         )
     ]
 
@@ -2923,12 +3068,109 @@ def test_command_policy_blocks_shell_expansion_invariants() -> None:
 def test_command_policy_handles_shell_git_rg_and_find_parser_invariants() -> None:
     assert decide_workspace_command("bash -lc 'rg api miniapp/app'").action == "allow"
     assert decide_workspace_command("bash -lc 'rg api miniapp/app > out.txt'").action == "forbidden"
+    assert decide_workspace_command("bash -lc 'bash -lc \"rg api miniapp/app\"'").action == "forbidden"
     assert decide_workspace_command("git status --short").action == "allow"
     assert decide_workspace_command("git diff --output out.patch").action == "forbidden"
     assert decide_workspace_command("git -c core.pager=cat status").action == "forbidden"
     assert decide_workspace_command("rg --pre tool miniapp/app").action == "forbidden"
     assert decide_workspace_command("find miniapp/app -type f").action == "allow"
     assert decide_workspace_command("find miniapp/app -exec rm {} ;").action == "forbidden"
+
+
+def test_command_policy_blocks_shell_bypass_executables_and_ast_forms() -> None:
+    blocked = [
+        "zsh -lc 'rg api miniapp/app'",
+        "pwsh -Command Get-ChildItem",
+        "powershell -Command Get-ChildItem",
+        "cmd /c dir",
+        "/usr/bin/env python -m py_compile miniapp/app/main.py",
+        "./python -m py_compile miniapp/app/main.py",
+        "eval rg api miniapp/app",
+        "source .venv/bin/activate",
+        "rg api miniapp/app | cat",
+        "rg api miniapp/app || true",
+        "rg api miniapp/app &",
+        "rg $(pwd) miniapp/app",
+        "rg foo <(cat miniapp/app/main.py)",
+        "rg foo ${HOME}",
+        "rg foo {miniapp/app,miniapp/tests}",
+        "rg api miniapp/app\nls miniapp",
+    ]
+
+    for command in blocked:
+        assert decide_workspace_command(command).action == "forbidden", command
+
+
+def test_command_policy_blocks_network_and_package_operations() -> None:
+    blocked = {
+        "curl https://example.com": "direct_network_tool",
+        "wget https://example.com": "direct_network_tool",
+        "ssh example.com": "direct_network_tool",
+        "python -m pip install requests": "package_network_operation",
+        "pip install requests": "package_network_operation",
+        "npm add vite": "package_network_operation",
+        "pnpm update": "package_network_operation",
+        "yarn add vite": "package_network_operation",
+        "git clone https://example.com/repo.git": "git_network_operation",
+        "git fetch origin": "git_network_operation",
+        "git pull": "git_network_operation",
+        "git push": "git_network_operation",
+        "git ls-remote origin": "git_network_operation",
+        "git submodule update --init": "git_network_operation",
+        "node --experimental-network-imports --test tests/generated_app.test.mjs": "node_network_imports",
+    }
+
+    for command, code in blocked.items():
+        decision = decide_workspace_command(command)
+        assert decision.action == "forbidden", command
+        assert decision.network_policy.get("code") == code, command
+
+
+def test_command_policy_resolves_basename_to_trusted_host_path() -> None:
+    decision = decide_workspace_command("python3 -m py_compile miniapp/app/main.py")
+
+    assert decision.action == "allow"
+    assert decision.executable_resolution["status"] == "trusted_basename"
+    assert decision.resolved_argv
+    assert Path(decision.resolved_argv[0]).is_absolute()
+
+
+def test_command_policy_additive_amendments_are_deny_precedence_and_safe_only() -> None:
+    policy = AgentCommandPolicy.from_dsl_text(
+        """
+amendment_rule(
+    pattern = ["python3", "-m", "pytest"],
+    decision = "allow",
+    justification = "allow focused pytest diagnostics",
+    match = ["python3 -m pytest miniapp/tests -q"],
+)
+amendment_rule(
+    pattern = ["python3", "-m", "pytest", "--snapshot-update"],
+    decision = "forbidden",
+    justification = "deny pytest snapshot updates",
+    match = ["python3 -m pytest --snapshot-update miniapp/tests"],
+)
+amendment_rule(
+    pattern = ["curl"],
+    decision = "allow",
+    justification = "attempted unsafe network override",
+    match = ["curl https://example.com"],
+)
+""",
+        source="amendments.codexpolicy",
+    )
+
+    allowed = policy.decide("python3 -m pytest miniapp/tests -q")
+    denied = policy.decide("python3 -m pytest --snapshot-update miniapp/tests")
+    network = policy.decide("curl https://example.com")
+
+    assert allowed.action == "allow"
+    assert allowed.matched_amendments
+    assert denied.action == "forbidden"
+    assert denied.matched_amendments
+    assert network.action == "forbidden"
+    assert network.network_policy["code"] == "direct_network_tool"
+    assert network.matched_amendments == ()
 
 
 def test_hook_trace_declares_record_only_side_effects() -> None:

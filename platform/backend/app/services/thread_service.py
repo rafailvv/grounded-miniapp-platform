@@ -352,7 +352,8 @@ class ThreadService:
 
     def exec_command(self, *, workspace_id: str, command: str, thread_id: str | None = None, turn_id: str | None = None, timeout: int = 30, approval_id: str | None = None, preset: str = "safe_auto") -> dict[str, Any]:
         linked_run_id = self._get_turn(turn_id).linked_run_id if turn_id else None
-        evaluation = self.exec_policy_service.evaluate_command(command, preset=preset)
+        source_dir = self.workspace_service.source_dir(workspace_id)
+        evaluation = self.exec_policy_service.evaluate_command(command, preset=preset, root=source_dir)
         decision = evaluation.get("decision") if isinstance(evaluation.get("decision"), dict) else {}
         approval = evaluation.get("approval") if isinstance(evaluation.get("approval"), dict) else {}
         if linked_run_id:

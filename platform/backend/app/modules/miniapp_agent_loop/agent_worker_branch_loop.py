@@ -18,19 +18,12 @@ from app.modules.miniapp_agent_loop.agent_tool_changes import (
     file_changes_from_mutating_tool_calls,
     is_mutating_agent_tool_call,
 )
-from app.modules.miniapp_agent_loop.agent_tool_registry import AgentToolRegistry
 from app.modules.miniapp_agent_loop.agent_transcript import AgentTranscriptStore
 from app.modules.miniapp_agent_loop.agent_worker_manager import AgentWorkerManager
 from app.modules.miniapp_agent_loop.product_workers import canonical_worker_id, path_is_allowed
 from app.modules.miniapp_agent_loop.edit_validator import AgentEditValidator
-from app.modules.miniapp_agent_loop.semantic_tools import semantic_scan
 from app.modules.miniapp_agent_loop.agent_tool_runtime import normalize_tool_calls
-from app.modules.miniapp_agent_loop.agent_tool_runtime import (
-    list_workspace_files,
-    run_workspace_command,
-    search_workspace_files,
-    summarize_read_file_payloads,
-)
+from app.modules.miniapp_agent_loop.tool_router import ToolRouter, ToolRouterContext
 from app.services.workspace.service import WorkspaceService
 
 
@@ -165,9 +158,9 @@ class AgentWorkerBranchLoop:
                 transcript_context = transcript.next_model_context(transcript_key)
                 pending_tool_results = list(transcript_context.get("tool_result_messages") or [])
                 available_tools = (
-                    AgentToolRegistry.openai_tools({"apply_patch_to_draft", "write_file"})
+                    ToolRouter.allowed_openai_tools(mode="mutation_required", forced_allowed={"apply_patch_to_draft", "write_file"})
                     if mutation_required
-                    else AgentToolRegistry.openai_tools()
+                    else ToolRouter.allowed_openai_tools(mode="worker_branch")
                 )
                 response = self.openai_client.generate_agent_tool_step(
                     tools=available_tools,
@@ -712,116 +705,23 @@ class AgentWorkerBranchLoop:
         append_activity: Callable[[str, str, dict[str, Any] | None], None],
         append_batch_summary: Callable[[dict[str, object]], None],
     ) -> tuple[dict[str, str], list[dict[str, object]]]:
-        del append_batch_summary
-        workspace_tree = self.workspace_service.file_tree(workspace_id, run_id=run_id)
-        loaded_context: dict[str, str] = {}
-        results: list[dict[str, object]] = []
-
-        def targets(request_item: dict[str, Any]) -> list[str]:
-            return [
-                str(item or "").strip().replace("\\", "/").lstrip("./")
-                for item in request_item.get("targets") or []
-                if str(item or "").strip()
-            ]
-
-        for index, request_item in enumerate(tool_calls, start=1):
-            tool = str(request_item.get("tool") or "").strip().lower()
-            use_id = str(request_item.get("tool_use_id") or f"{tool}_{index}")
-            request_targets = targets(request_item)
-            reason = str(request_item.get("reason") or "").strip()
-            append_activity("tool_progress", "Worker branch tool started", {"tool_use_id": use_id, "tool": tool, "status": "started"})
-            if tool == "list_files":
-                results.append({**list_workspace_files(workspace_tree=workspace_tree, targets=request_targets), "tool_use_id": use_id, "reason": reason})
-            elif tool == "read_files":
-                file_contents: dict[str, str] = {}
-                for target in request_targets[:16]:
-                    content = file_cache.read(
-                        run_id=run_id,
-                        root=draft_source,
-                        path=target,
-                        read_text=lambda relative_path: self.workspace_service.try_read_text_file(
-                            workspace_id,
-                            relative_path,
-                            run_id=run_id,
-                        ),
-                    )
-                    if content is not None:
-                        file_contents[target] = content
-                        loaded_context[target] = content
-                results.append(
-                    {
-                        "tool": "read_files",
-                        "tool_use_id": use_id,
-                        "targets": request_targets,
-                        "files": summarize_read_file_payloads(file_contents=file_contents),
-                        "reason": reason,
-                    }
-                )
-            elif tool == "search_files":
-                pattern = str(request_item.get("pattern") or "").strip()
-                results.append(
-                    {
-                        **search_workspace_files(
-                            workspace_tree=workspace_tree,
-                            read_text_file=lambda relative_path: file_cache.read(
-                                run_id=run_id,
-                                root=draft_source,
-                                path=relative_path,
-                                read_text=lambda cached_path: self.workspace_service.try_read_text_file(
-                                    workspace_id,
-                                    cached_path,
-                                    run_id=run_id,
-                                ),
-                            ),
-                            pattern=pattern,
-                            targets=request_targets,
-                        ),
-                        "tool_use_id": use_id,
-                        "reason": reason,
-                    }
-                )
-            elif tool == "semantic_scan":
-                results.append({**semantic_scan(root=draft_source, targets=request_targets), "tool_use_id": use_id, "reason": reason})
-            elif tool == "inspect_diff":
-                results.append({"tool": "inspect_diff", "tool_use_id": use_id, "diff": self.workspace_service.diff(workspace_id, run_id=run_id)[:12000], "reason": reason})
-            elif tool == "read_artifact_ref":
-                artifact_ref = str(request_item.get("artifact_ref") or (request_targets[0] if request_targets else "")).strip()
-                payload = self.read_artifact(artifact_ref) if self.read_artifact is not None and artifact_ref else None
-                results.append({"tool": "read_artifact_ref", "tool_use_id": use_id, "artifact_ref": artifact_ref, "found": payload is not None, "payload": payload, "reason": reason})
-            elif tool == "run_command":
-                command = str(request_item.get("command") or "").strip()
-                results.append(
-                    {
-                        **run_workspace_command(
-                            draft_source=draft_source,
-                            command=command,
-                            timeout_seconds=AgentToolRegistry.spec("run_command").timeout_seconds if AgentToolRegistry.spec("run_command") else 25,
-                            max_output_chars=AgentToolRegistry.spec("run_command").output_cap_chars if AgentToolRegistry.spec("run_command") else 6000,
-                            process_manager=process_manager,
-                            process_id=use_id,
-                        ),
-                        "tool_use_id": use_id,
-                        "reason": reason,
-                    }
-                )
-            elif tool in {"run_checks", "browser_verify"}:
-                execution, preview = execute_checks(request_targets)
-                results.append(
-                    {
-                        "tool": tool,
-                        "tool_use_id": use_id,
-                        "results": [
-                            {"name": item.name, "status": item.status, "details": item.details}
-                            for item in execution.results
-                        ],
-                        "preview": preview,
-                        "reason": reason,
-                    }
-                )
-            else:
-                results.append({"tool": tool or "unknown", "tool_use_id": use_id, "status": "ignored", "reason": reason})
-            append_activity("tool_progress", "Worker branch tool completed", {"tool_use_id": use_id, "tool": tool, "status": "completed"})
-        return loaded_context, results
+        router = ToolRouter(
+            ToolRouterContext(
+                workspace_id=workspace_id,
+                run_id=run_id,
+                draft_source=draft_source,
+                workspace_service=self.workspace_service,
+                execute_checks=execute_checks,
+                file_state_cache=file_cache,
+                process_manager=process_manager,
+                read_artifact=self.read_artifact,
+                append_activity=append_activity,
+                append_batch_summary=append_batch_summary,
+                mode="worker_branch",
+            )
+        )
+        result = router.route_batch(tool_calls)
+        return result.loaded_context, result.model_results
 
     @staticmethod
     def _system_prompt() -> str:

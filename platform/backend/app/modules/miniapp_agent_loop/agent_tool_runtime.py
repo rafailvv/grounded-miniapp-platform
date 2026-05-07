@@ -7,55 +7,15 @@ from typing import Any
 from app.modules.miniapp_agent_loop.agent_command_policy import command_policy_snapshot as current_command_policy_snapshot
 from app.modules.miniapp_agent_loop.agent_command_policy import decide_workspace_command
 from app.modules.miniapp_agent_loop.agent_process_manager import AgentProcessManager
-from app.modules.miniapp_agent_loop.agent_tool_registry import AgentToolRegistry
 
 
 MAX_TOOL_OUTPUT_CHARS = 6000
 
 
 def normalize_tool_calls(raw_tool_calls: list[Any]) -> list[dict[str, Any]]:
-    normalized: list[dict[str, Any]] = []
-    if not isinstance(raw_tool_calls, list):
-        return normalized
-    for item in raw_tool_calls:
-        if not isinstance(item, dict):
-            continue
-        tool = str(item.get("tool") or "").strip().lower()
-        if tool not in AgentToolRegistry.names():
-            continue
-        raw_targets = item.get("targets") or []
-        if not isinstance(raw_targets, list):
-            raw_targets = []
-        targets: list[str] = []
-        for target in raw_targets:
-            value = _strip_leading_dot_slash(target)
-            if not value or value in targets:
-                continue
-            targets.append(value)
-        mode = str(item.get("mode") or ("exact" if tool == "run_checks" else "")).strip().lower()
-        if tool == "run_checks" and mode not in {"exact", "final"}:
-            mode = "exact"
-        normalized.append(
-            {
-                "tool": tool,
-                "tool_use_id": str(item.get("tool_use_id") or "").strip(),
-                "mode": mode,
-                "targets": targets[:12],
-                "file_path": _strip_leading_dot_slash(item.get("file_path") or ""),
-                "pattern": str(item.get("pattern") or "").strip(),
-                "command": str(item.get("command") or "").strip(),
-                "artifact_ref": str(item.get("artifact_ref") or "").strip(),
-                "content": str(item.get("content") or ""),
-                "diff": str(item.get("diff") or ""),
-                "old_string": str(item.get("old_string") or ""),
-                "new_string": str(item.get("new_string") or ""),
-                "replace_all": bool(item.get("replace_all") or False),
-                "worker_id": str(item.get("worker_id") or "").strip(),
-                "owner_scope": str(item.get("owner_scope") or "").strip(),
-                "reason": str(item.get("reason") or "").strip(),
-            }
-        )
-    return normalized
+    from app.modules.miniapp_agent_loop.tool_router import ToolRouter
+
+    return ToolRouter.normalize_tool_calls(raw_tool_calls)
 
 
 def _strip_leading_dot_slash(raw_path: object) -> str:

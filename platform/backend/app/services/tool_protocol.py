@@ -10,7 +10,7 @@ from app.models.workbench import ToolEnvelope
 TOOL_PROTOCOL_VERSION = "grounded.tool.v2"
 
 ToolRisk = Literal["safe", "read_only", "mutating", "network", "destructive", "forbidden", "unknown"]
-SandboxProfile = Literal["analysis_only", "agent_draft", "apply_gate", "developer_bypass"]
+SandboxProfile = Literal["analysis_readonly", "agent_draft_write", "source_apply_gate", "developer_bypass", "analysis_only", "agent_draft", "apply_gate"]
 
 
 CANONICAL_TOOL_ALIASES: dict[str, str] = {
@@ -142,8 +142,93 @@ def tool_registry_contract() -> dict[str, Any]:
 
 
 TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
+    "file.list": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "workspace_id": {"type": "string"},
+            "run_id": {"type": "string"},
+            "targets": {"type": "array", "items": {"type": "string"}},
+            "reason": {"type": "string"},
+        },
+    },
+    "file.read": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "workspace_id": {"type": "string"},
+            "run_id": {"type": "string"},
+            "targets": {"type": "array", "items": {"type": "string"}},
+            "reason": {"type": "string"},
+        },
+    },
+    "artifact.read": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "workspace_id": {"type": "string"},
+            "run_id": {"type": "string"},
+            "artifact_ref": {"type": "string"},
+            "targets": {"type": "array", "items": {"type": "string"}},
+            "reason": {"type": "string"},
+        },
+    },
+    "search.grep": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "workspace_id": {"type": "string"},
+            "run_id": {"type": "string"},
+            "pattern": {"type": "string"},
+            "targets": {"type": "array", "items": {"type": "string"}},
+            "reason": {"type": "string"},
+        },
+    },
+    "semantic.scan": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "workspace_id": {"type": "string"},
+            "run_id": {"type": "string"},
+            "targets": {"type": "array", "items": {"type": "string"}},
+            "reason": {"type": "string"},
+        },
+    },
+    "diff.inspect": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "workspace_id": {"type": "string"},
+            "run_id": {"type": "string"},
+            "targets": {"type": "array", "items": {"type": "string"}},
+            "reason": {"type": "string"},
+        },
+    },
+    "shell.exec": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["command"],
+        "properties": {
+            "workspace_id": {"type": "string"},
+            "run_id": {"type": "string"},
+            "command": {"type": "string"},
+            "process_id": {"type": "string"},
+            "reason": {"type": "string"},
+        },
+    },
+    "browser.verify": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "workspace_id": {"type": "string"},
+            "run_id": {"type": "string"},
+            "targets": {"type": "array", "items": {"type": "string"}},
+            "reason": {"type": "string"},
+        },
+    },
     "contract.compile": {
         "type": "object",
+        "additionalProperties": False,
         "required": ["workspace_id", "run_id", "prompt", "generation_mode"],
         "properties": {
             "workspace_id": {"type": "string"},
@@ -154,6 +239,7 @@ TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
     },
     "registry.sync": {
         "type": "object",
+        "additionalProperties": False,
         "required": ["workspace_id", "run_id", "contract_id"],
         "properties": {
             "workspace_id": {"type": "string"},
@@ -164,15 +250,19 @@ TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
     },
     "checks.run": {
         "type": "object",
+        "additionalProperties": False,
         "required": ["workspace_id", "run_id"],
         "properties": {
             "workspace_id": {"type": "string"},
             "run_id": {"type": "string"},
             "targets": {"type": "array", "items": {"type": "string"}},
+            "mode": {"type": "string", "enum": ["exact", "final", ""]},
+            "reason": {"type": "string"},
         },
     },
     "lsp.diagnostics": {
         "type": "object",
+        "additionalProperties": False,
         "required": ["workspace_id"],
         "properties": {
             "workspace_id": {"type": "string"},
@@ -180,50 +270,72 @@ TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
             "targets": {"type": "array", "items": {"type": "string"}},
             "files": {"type": "array", "items": {"type": "string"}},
             "changed_only": {"type": "boolean"},
+            "reason": {"type": "string"},
         },
     },
     "lsp.symbol_context": {
         "type": "object",
+        "additionalProperties": False,
         "required": ["workspace_id"],
-        "properties": {"workspace_id": {"type": "string"}, "run_id": {"type": "string"}, "query": {"type": "string"}, "targets": {"type": "array", "items": {"type": "string"}}},
+        "properties": {"workspace_id": {"type": "string"}, "run_id": {"type": "string"}, "query": {"type": "string"}, "pattern": {"type": "string"}, "targets": {"type": "array", "items": {"type": "string"}}, "reason": {"type": "string"}},
     },
     "lsp.find_references": {
         "type": "object",
-        "required": ["workspace_id", "symbol"],
-        "properties": {"workspace_id": {"type": "string"}, "run_id": {"type": "string"}, "symbol": {"type": "string"}, "targets": {"type": "array", "items": {"type": "string"}}},
+        "additionalProperties": False,
+        "required": ["workspace_id"],
+        "properties": {"workspace_id": {"type": "string"}, "run_id": {"type": "string"}, "symbol": {"type": "string"}, "query": {"type": "string"}, "pattern": {"type": "string"}, "targets": {"type": "array", "items": {"type": "string"}}, "reason": {"type": "string"}},
     },
     "lsp.route_static_context": {
         "type": "object",
+        "additionalProperties": False,
         "required": ["workspace_id"],
-        "properties": {"workspace_id": {"type": "string"}, "run_id": {"type": "string"}, "targets": {"type": "array", "items": {"type": "string"}}},
+        "properties": {"workspace_id": {"type": "string"}, "run_id": {"type": "string"}, "targets": {"type": "array", "items": {"type": "string"}}, "reason": {"type": "string"}},
     },
     "patch.apply": {
         "type": "object",
+        "additionalProperties": False,
         "required": ["file_path"],
         "properties": {
+            "workspace_id": {"type": "string"},
+            "run_id": {"type": "string"},
             "file_path": {"type": "string"},
             "diff": {"type": "string"},
             "content": {"type": "string"},
+            "worker_id": {"type": "string"},
+            "owner_scope": {"type": "string"},
+            "reason": {"type": "string"},
             "allowed_file_graph": {"type": "object"},
         },
     },
     "file.write": {
         "type": "object",
+        "additionalProperties": False,
         "required": ["file_path", "content"],
         "properties": {
+            "workspace_id": {"type": "string"},
+            "run_id": {"type": "string"},
             "file_path": {"type": "string"},
             "content": {"type": "string"},
+            "worker_id": {"type": "string"},
+            "owner_scope": {"type": "string"},
+            "reason": {"type": "string"},
             "allowed_file_graph": {"type": "object"},
         },
     },
     "file.edit": {
         "type": "object",
+        "additionalProperties": False,
         "required": ["file_path", "old_string", "new_string"],
         "properties": {
+            "workspace_id": {"type": "string"},
+            "run_id": {"type": "string"},
             "file_path": {"type": "string"},
             "old_string": {"type": "string"},
             "new_string": {"type": "string"},
             "replace_all": {"type": "boolean"},
+            "worker_id": {"type": "string"},
+            "owner_scope": {"type": "string"},
+            "reason": {"type": "string"},
             "allowed_file_graph": {"type": "object"},
         },
     },
@@ -292,7 +404,7 @@ def tool_envelope(
         "risk": risk or default_tool_risk(canonical),
         "approval": approval or {"required": False, "status": "not_required"},
         "approval_id": (approval or {}).get("approval_id") if isinstance(approval, dict) else None,
-        "sandbox_profile": sandbox_profile or ("agent_draft" if default_tool_risk(canonical) == "mutating" else "analysis_only"),
+        "sandbox_profile": sandbox_profile or ("agent_draft_write" if default_tool_risk(canonical) == "mutating" else "analysis_readonly"),
         "progress": progress or [],
         "result": result or {},
         "artifacts": artifacts or [],
