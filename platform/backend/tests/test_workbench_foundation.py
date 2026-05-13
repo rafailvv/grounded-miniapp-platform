@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import shutil
 import time
@@ -28,7 +29,8 @@ from app.models.workbench import (
     TraceBundleReport,
     TraceState,
 )
-from app.modules.miniapp_agent_loop.agent_command_policy import AgentCommandPolicy
+from app.modules.miniapp_agent_loop.agent_command_policy import AgentCommandPolicy, CommandPolicyDecision
+from app.modules.miniapp_agent_loop.agent_process_manager import AgentProcessManager
 from app.modules.miniapp_agent_loop.agent_tool_call_loop import AgentToolCallLoop
 from app.modules.miniapp_agent_loop.agent_transcript import AgentTranscriptStore
 from app.modules.workspace_code_agent_runtime.budget import completion_budget_status
@@ -37,6 +39,7 @@ from app.repositories.platform_db import PlatformDb
 from app.services.repair_catalog import RepairCatalog
 from app.services.event_journal import EventJournalSecretError, EventJournalService
 from app.services.exec_policy_service import ExecPolicyService
+from app.services.sandbox_service import SandboxService, SandboxViolationError
 from app.services.tool_protocol import TOOL_PROTOCOL_VERSION, canonical_tool_name, tool_envelope
 from app.services.workspace.runtime_manager import PreviewRuntimeManager
 
@@ -71,7 +74,7 @@ def test_tool_protocol_normalizes_aliases() -> None:
     assert typed.tool_call_id == envelope["tool_call_id"]
     assert envelope["status"] == "started"
     assert envelope["risk"] == "mutating"
-    assert envelope["sandbox_profile"] == "agent_draft"
+    assert envelope["sandbox_profile"] == "agent_draft_write"
     assert "changed_files" in envelope
     assert envelope["approval"]["status"] == "not_required"
 
@@ -152,13 +155,86 @@ def test_exec_policy_classifies_and_redacts_commands() -> None:
     assert allowed["decision"]["network_policy"]["blocked"] is False
     assert allowed["decision"]["resolved_argv"]
     assert Path(allowed["decision"]["resolved_argv"][0]).is_absolute()
-    assert allowed["sandbox_summary"]["profile"] == "analysis_only"
+    assert allowed["sandbox_summary"]["profile"] == "analysis_readonly"
     assert blocked["decision"]["action"] == "forbidden"
     assert blocked["approval"]["status"] == "blocked"
     assert redirection["decision"]["action"] == "forbidden"
     assert redirection["decision"]["blocked_syntax"]["code"] == "shell_metacharacter"
     assert git_internal["decision"]["action"] == "forbidden"
     assert "sk-secretvalue" not in redacted["command"]
+
+
+def test_sandbox_service_blocks_traversal_symlinks_and_hardlink_writes(tmp_path: Path) -> None:
+    sandbox = SandboxService()
+    root = tmp_path / "root"
+    root.mkdir()
+    inside = root / "inside.txt"
+    inside.write_text("inside", encoding="utf-8")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside", encoding="utf-8")
+
+    inside_link = root / "inside_link.txt"
+    outside_link = root / "outside_link.txt"
+    inside_link.symlink_to(inside)
+    outside_link.symlink_to(outside)
+    linked = root / "linked.txt"
+    linked.write_text("linked", encoding="utf-8")
+    try:
+        os.link(linked, tmp_path / "linked-peer.txt")
+    except OSError:
+        pytest.skip("hardlinks are unavailable on this filesystem")
+
+    assert sandbox.resolve_path(root, "inside.txt", operation="read", profile="analysis_readonly").allowed
+    assert sandbox.resolve_path(root, "../outside.txt", operation="read", profile="analysis_readonly").allowed is False
+    assert sandbox.resolve_path(root, "bad\\path.txt", operation="read", profile="analysis_readonly").allowed is False
+    assert sandbox.resolve_path(root, "inside_link.txt", operation="read", profile="analysis_readonly").allowed
+    assert sandbox.resolve_path(root, "outside_link.txt", operation="read", profile="analysis_readonly").allowed is False
+    assert sandbox.resolve_path(root, "inside_link.txt", operation="write", profile="agent_draft_write").allowed is False
+    assert sandbox.resolve_path(root, "linked.txt", operation="write", profile="agent_draft_write").allowed is False
+
+
+def test_sandbox_execution_fails_closed_without_hard_network_provider(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    sandbox = SandboxService()
+    monkeypatch.setattr(sandbox, "network_provider", lambda: "none")
+    plan = sandbox.build_execution_plan(root=tmp_path, cwd=tmp_path, argv=["python3", "-c", "print('x')"])
+
+    assert plan.allowed is False
+    assert plan.enforcement == "unavailable"
+    assert any(item.code == "network_provider_unavailable" for item in plan.violations)
+
+
+def test_sandbox_exec_blocks_raw_socket_on_macos(tmp_path: Path) -> None:
+    sandbox = SandboxService()
+    if sandbox.network_provider() != "sandbox-exec":
+        pytest.skip("macOS sandbox-exec provider is not available")
+    python = shutil.which("python3")
+    if not python:
+        pytest.skip("python3 is unavailable")
+    command = "python3 -c socket-connect"
+    code = "import socket; s=socket.socket(); s.settimeout(.2); s.connect(('1.1.1.1',80)); print('connected')"
+    decision = CommandPolicyDecision(
+        action="allow",
+        reason="test",
+        command=command,
+        normalized_command=command,
+        argv=("python3", "-c", code),
+        resolved_argv=(python, "-c", code),
+        matched_prefix=("python3",),
+        network_policy={"blocked": False},
+    )
+
+    result = AgentProcessManager(sandbox_service=sandbox).run(
+        draft_source=tmp_path,
+        command=command,
+        decision=decision,
+        timeout_seconds=5,
+        max_output_chars=4000,
+    )
+
+    assert result.policy_decision["sandbox"]["provider"] == "sandbox-exec"
+    assert result.policy_decision["sandbox"]["enforcement"] == "hard"
+    assert result.exit_code != 0
+    assert "PermissionError" in result.stderr.get("excerpt", "")
 
 
 def test_exec_policy_loads_json_policy_and_validates_not_match_examples() -> None:
@@ -2332,6 +2408,67 @@ def test_exec_runtime_streams_and_blocks_workspace_escape(tmp_path: Path) -> Non
     assert "Absolute and home-relative paths are blocked" in escaped_error
     if symlink_session is not None:
         assert symlink_session["result"]["semantic_status"] == "blocked_by_sandbox"
+
+
+def test_workspace_source_apply_blocks_draft_symlink_before_mutating_source(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Symlink Apply Workspace",
+            "description": "sandbox source apply",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    service = app.state.container.workspace_service
+    source = service.source_dir(workspace["workspace_id"])
+    original_readme = (source / "README.md").read_text(encoding="utf-8")
+    draft = service.prepare_draft(workspace["workspace_id"], "run_symlink")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside", encoding="utf-8")
+    symlink_path = draft / "miniapp/app/static/client/evil.js"
+    symlink_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        symlink_path.symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are unavailable on this filesystem")
+
+    with pytest.raises(SandboxViolationError):
+        service.approve_draft(workspace["workspace_id"], "run_symlink", "blocked symlink apply")
+
+    assert (source / "README.md").read_text(encoding="utf-8") == original_readme
+    assert not (source / "miniapp/app/static/client/evil.js").exists()
+
+
+def test_workspace_source_apply_blocks_hardlinked_target(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Hardlink Apply Workspace",
+            "description": "sandbox hardlink apply",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    service = app.state.container.workspace_service
+    workspace_id = workspace["workspace_id"]
+    source = service.source_dir(workspace_id)
+    draft = service.prepare_draft(workspace_id, "run_hardlink")
+    (draft / "README.md").write_text("# changed\n", encoding="utf-8")
+    peer = tmp_path / "readme-peer.md"
+    try:
+        os.link(source / "README.md", peer)
+    except OSError:
+        pytest.skip("hardlinks are unavailable on this filesystem")
+
+    with pytest.raises(SandboxViolationError):
+        service.apply_selected_draft_files(workspace_id, "run_hardlink", ["README.md"], message="blocked hardlink apply")
+
+    assert peer.read_text(encoding="utf-8") == (source / "README.md").read_text(encoding="utf-8")
 
 
 def _workspace_with_run(tmp_path: Path) -> tuple[Any, TestClient, dict, RunRecord]:

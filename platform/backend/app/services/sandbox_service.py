@@ -338,6 +338,21 @@ class SandboxService:
                 continue
             if self._is_ignored_path(PurePosixPath(child.name), allow_generated=True):
                 continue
+            decision = self.resolve_path(source_root, child.name, operation="delete", profile="source_apply_gate", allow_generated=True)
+            if not decision.allowed:
+                raise SandboxViolationError(decision)
+        for draft_path in sorted(draft_root.rglob("*")):
+            relative = draft_path.relative_to(draft_root)
+            if self._is_ignored_path(PurePosixPath(relative.as_posix()), allow_generated=True):
+                continue
+            decision = self.resolve_path(draft_root, relative, operation="apply", profile="source_apply_gate", allow_generated=True)
+            if not decision.allowed:
+                raise SandboxViolationError(decision)
+        for child in sorted(source_root.iterdir(), key=lambda item: item.name):
+            if child.name == ".git":
+                continue
+            if self._is_ignored_path(PurePosixPath(child.name), allow_generated=True):
+                continue
             self.safe_delete_path(source_root, child.name, profile="source_apply_gate", allow_generated=True)
         self.safe_copy_tree(draft_root, source_root, profile="source_apply_gate", allow_generated=True)
 
@@ -471,7 +486,7 @@ class SandboxService:
             return True
         if path.name.endswith(self.IGNORED_SUFFIXES):
             return True
-        return bool(text.startswith(self.GENERATED_PREFIX) and not allow_generated)
+        return bool((text == self.GENERATED_PREFIX.rstrip("/") or text.startswith(self.GENERATED_PREFIX)) and not allow_generated)
 
     def _execution_read_roots(self, root: Path, argv: list[str]) -> list[Path]:
         roots = [
@@ -503,16 +518,19 @@ class SandboxService:
         def subpath(path: Path) -> str:
             return f'(subpath "{str(path)}")'
 
-        read_filters = " ".join(subpath(path) if path.is_dir() else literal(path) for path in read_roots)
-        write_filters = " ".join(subpath(path) for path in write_roots)
-        write_clause = f"(allow file-write* {write_filters} (literal \"/dev/null\"))" if write_filters else "(allow file-write* (literal \"/dev/null\"))"
-        return (
-            "(version 1)"
-            "(deny default)"
-            "(allow process*)"
-            "(allow sysctl-read)"
-            f"(allow file-read* {read_filters})"
-            f"{write_clause}"
+        read_filters = "\n  ".join(subpath(path) if path.is_dir() else literal(path) for path in read_roots)
+        write_filters = "\n  ".join([*(subpath(path) for path in write_roots), literal(Path("/dev/null"))])
+        return "\n".join(
+            [
+                "(version 1)",
+                "(deny default)",
+                '(import "bsd.sb")',
+                "(allow process*)",
+                "(allow mach-lookup)",
+                "(allow sysctl-read)",
+                f"(allow file-read*\n  {read_filters})",
+                f"(allow file-write*\n  {write_filters})",
+            ]
         )
 
     @staticmethod

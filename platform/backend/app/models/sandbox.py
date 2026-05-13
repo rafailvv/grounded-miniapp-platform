@@ -74,7 +74,7 @@ class ApplySafetyItem(StrictModel):
 
 
 class ApplySafetyReport(StrictModel):
-    schema: str = "grounded.apply_safety_report.v1"
+    schema_: str = Field(default="grounded.apply_safety_report.v1", alias="schema")
     status: Literal["passed", "blocked"] = "passed"
     profile: SandboxProfile
     root: str

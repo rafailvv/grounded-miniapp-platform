@@ -589,7 +589,7 @@ class ToolRouter:
             concurrency_safe=bool(spec.concurrency_safe if spec else False),
             timeout_seconds=int(spec.timeout_seconds if spec else 25),
             output_cap_chars=int(spec.output_cap_chars if spec else 6000),
-            sandbox_profile="agent_draft" if risk == "mutating" else "analysis_only",
+            sandbox_profile="agent_draft_write" if risk == "mutating" else "analysis_readonly",
             deferred=kind == "mutating",
             dynamic=bool(spec.dynamic if spec else False),
         )
@@ -922,7 +922,12 @@ class ToolRouter:
                     details={"repair_packet": packet, "trace": trace},
                 ),
             )
-        sandbox_report = self.context.workspace_service.sandbox_service.preflight_apply(
+        sandbox_service = getattr(self.context.workspace_service, "sandbox_service", None)
+        if sandbox_service is None:
+            from app.services.sandbox_service import SandboxService
+
+            sandbox_service = SandboxService()
+        sandbox_report = sandbox_service.preflight_apply(
             self.context.draft_source,
             [item.file_path for item in changes],
             profile="agent_draft_write",

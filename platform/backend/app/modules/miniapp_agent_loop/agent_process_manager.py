@@ -600,6 +600,7 @@ class AgentProcessManager:
                 "GIT_CONFIG_NOSYSTEM": "1",
                 "PIP_DISABLE_PIP_VERSION_CHECK": "1",
                 "PYTHONDONTWRITEBYTECODE": "1",
+                "PYTHONPYCACHEPREFIX": str(tmp_dir / "pycache"),
                 "HTTP_PROXY": "http://127.0.0.1:9",
                 "HTTPS_PROXY": "http://127.0.0.1:9",
                 "ALL_PROXY": "socks5://127.0.0.1:9",
