@@ -123,6 +123,7 @@ type RunProgressDisplayMap = Record<string, number>;
 
 const ROLE_ORDER = ["client", "specialist", "manager"] as const;
 type RoleKey = (typeof ROLE_ORDER)[number];
+const PRIMARY_WORKBENCH_TABS = ["preview", "timeline", "code", "diff", "logs"] as const;
 
 const PREVIEW_BOOT_ROLES: Record<RoleKey, boolean> = {
   client: true,
@@ -3398,7 +3399,7 @@ export default function App() {
                 </p>
               </header>
               <WorkbenchTabs
-                tabs={["preview", "timeline", "tasks", "trace", "code", "diff", "logs", "workers", "review", "checks", "doctor", "memory", "search", "lsp"] as const}
+                tabs={PRIMARY_WORKBENCH_TABS}
                 activeTab={activeTab}
                 onChange={setActiveTab}
               />
