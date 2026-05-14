@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from app.core.config import Settings, get_settings
@@ -36,6 +37,7 @@ from app.services.run_compaction import RunCompactionService
 from app.services.run_protocol import RunProtocolService
 from app.services.repair_cases import RepairCaseService
 from app.services.workbench_service import WorkbenchService
+from app.services.starter_workspace_service import StarterWorkspaceService
 
 
 class ServiceContainer:
@@ -145,8 +147,20 @@ class ServiceContainer:
             event_journal_service=self.event_journal_service,
         )
         self.export_service = ExportService(self.settings, self.store, self.workspace_service)
+        self.starter_workspace_service = StarterWorkspaceService(
+            settings=self.settings,
+            store=self.store,
+            workspace_service=self.workspace_service,
+            workspace_log_service=self.workspace_log_service,
+        )
 
 
 def build_container(*, repo_root: Path | None = None, data_dir: Path | None = None) -> ServiceContainer:
     settings = get_settings(repo_root=repo_root, data_dir=data_dir)
-    return ServiceContainer(settings)
+    container = ServiceContainer(settings)
+    bootstrap_flag = os.getenv("PLATFORM_BOOTSTRAP_STARTER_WORKSPACE", "")
+    disabled = bootstrap_flag.lower() in {"0", "false", "no", "off"}
+    bootstrap_starter = bootstrap_flag == "1" or (data_dir is None and not disabled)
+    if bootstrap_starter:
+        container.starter_workspace_service.ensure_default_workspace()
+    return container

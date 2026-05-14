@@ -269,6 +269,30 @@ class WorkspaceService:
         self.workspace_log_service.append(workspace_id, source="workspace", message="Canonical template cloned.")
         return workspace
 
+    def install_workspace_snapshot(self, workspace: WorkspaceRecord, snapshot_source_dir: Path, *, revision_message: str) -> WorkspaceRecord:
+        workspace_root = self.workspace_root(workspace.workspace_id)
+        workspace_root.mkdir(parents=True, exist_ok=True)
+        source_dir = workspace_root / "source"
+        if source_dir.exists():
+            shutil.rmtree(source_dir)
+        self._copy_tree(snapshot_source_dir, source_dir, allow_generated=True)
+        self._git_init(source_dir)
+        commit_sha = self._git_commit(source_dir, revision_message)
+        revision = RevisionRecord(commit_sha=commit_sha, message=revision_message, source="manual_edit")
+        workspace.path = str(workspace_root)
+        workspace.template_cloned = True
+        workspace.current_revision_id = revision.revision_id
+        workspace.revisions.append(revision)
+        workspace.updated_at = revision.created_at
+        self.store.upsert("workspaces", workspace.workspace_id, workspace.model_dump(mode="json"))
+        self.workspace_log_service.append(
+            workspace.workspace_id,
+            source="workspace",
+            message="Starter workspace snapshot installed.",
+            payload={"name": workspace.name, "snapshot": str(snapshot_source_dir)},
+        )
+        return workspace
+
     def reset_workspace(self, workspace_id: str) -> WorkspaceRecord:
         workspace = self.clone_template(workspace_id)
         latest = workspace.revisions[-1]

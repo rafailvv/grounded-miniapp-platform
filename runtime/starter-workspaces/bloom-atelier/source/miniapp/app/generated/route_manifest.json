@@ -1,0 +1,39 @@
+{
+  "roles": {
+    "client": {
+      "routes": {
+        "home": "static/client/index.html",
+        "catalog": "static/client/catalog/index.html",
+        "cart": "static/client/cart/index.html",
+        "orders": "static/client/orders/index.html",
+        "order": "static/client/order/index.html"
+      }
+    },
+    "specialist": {
+      "routes": {
+        "home": "static/specialist/index.html",
+        "queue": "static/specialist/queue/index.html",
+        "order": "static/specialist/order/index.html",
+        "stock": "static/specialist/stock/index.html"
+      }
+    },
+    "manager": {
+      "routes": {
+        "home": "static/manager/index.html",
+        "catalog": "static/manager/catalog/index.html",
+        "orders": "static/manager/orders/index.html",
+        "analytics": "static/manager/analytics/index.html"
+      }
+    }
+  },
+  "shared": {
+    "api": [
+      "/api/shop",
+      "/api/bouquets",
+      "/api/cart/checkout",
+      "/api/orders/{id}",
+      "/api/inventory",
+      "/api/analytics"
+    ]
+  }
+}
