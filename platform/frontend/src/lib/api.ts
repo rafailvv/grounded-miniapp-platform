@@ -1,3 +1,8 @@
+import type { components } from "./generated/openapi-types";
+
+type ApiSchemas = components["schemas"];
+type RequiredKeys<T, K extends keyof T> = T & { [P in K]-?: NonNullable<T[P]> };
+
 export type Workspace = {
   workspace_id: string;
   name: string;
@@ -11,6 +16,18 @@ export type Workspace = {
     source: string;
     created_at: string;
   }>;
+};
+
+export type PreviewRuntimeInfo = {
+  url?: string | null;
+  role_urls?: Record<string, string>;
+  runtime_mode?: string;
+  status?: string;
+  stage?: string;
+  progress_percent?: number;
+  draft_run_id?: string | null;
+  latency_breakdown?: Record<string, number>;
+  last_error?: string | null;
 };
 
 export type Run = {
@@ -27,11 +44,14 @@ export type Run = {
   llm_model?: string | null;
   linked_job_id?: string | null;
   resume_from_run_id?: string | null;
+  session_id?: string | null;
+  resume_bookmark_id?: string | null;
+  forked_from_run_id?: string | null;
   source_revision_id?: string | null;
   result_revision_id?: string | null;
   candidate_revision_id?: string | null;
   status: "pending" | "running" | "awaiting_approval" | "completed" | "blocked" | "failed";
-  apply_status: "pending" | "applied" | "awaiting_approval" | "blocked" | "failed" | "rolled_back";
+  apply_status: "pending" | "applied" | "awaiting_approval" | "blocked" | "failed" | "rolled_back" | "noop";
   draft_status: "none" | "ready" | "approved" | "discarded" | "failed";
   draft_ready: boolean;
   approval_required: boolean;
@@ -69,10 +89,85 @@ export type Run = {
     issues: Array<{ code?: string; message?: string; severity?: string }>;
   };
   touched_files: string[];
+  role_coverage?: Record<string, unknown>;
+  generated_tests?: Record<string, unknown>;
+  neutral_template_findings?: Array<Record<string, unknown>>;
+  orchestration_phases?: Array<Record<string, unknown>>;
+  implementation_plan?: Record<string, unknown>;
+  agent_activity_events?: Array<{
+    type?: string;
+    message?: string;
+    created_at?: string;
+    details?: Record<string, unknown>;
+    batch_id?: string;
+    worker?: string | null;
+    worker_id?: string | null;
+    owner_scope?: string | null;
+    tool_use_id?: string;
+    phase?: string;
+    elapsed_ms?: number;
+    artifact_ref?: string | null;
+    summary?: string;
+    duration_ms?: number;
+    status?: string;
+    hook?: string;
+    semantic_status?: string;
+  }>;
+  agent_memory?: Record<string, unknown>;
+  acceptance_contract?: Record<string, unknown>;
+  worker_summaries?: Array<Record<string, unknown>>;
+  flow_coverage?: Record<string, unknown>;
+  browser_flow_proof?: Record<string, unknown>;
+  agent_transcript_ref?: string | null;
+  tool_trace_ref?: string | null;
+  file_change_history_ref?: string | null;
+  browser_proof_ref?: string | null;
+  large_tool_outputs_ref?: string | null;
+  file_state_cache_ref?: string | null;
+  turn_diff_ref?: string | null;
+  environment_snapshot_ref?: string | null;
+  tool_batch_summaries_ref?: string | null;
+  worker_mailbox_ref?: string | null;
+  scratchpad_ref?: string | null;
+  memory_ref?: string | null;
+  worker_drafts_ref?: string | null;
+  worker_merge_ref?: string | null;
+  trace_bundle_ref?: string | null;
+  trace_reducer_ref?: string | null;
+  command_policy_ref?: string | null;
+  verification_report_ref?: string | null;
+  rollout_trace_ref?: string | null;
+  exec_trace_ref?: string | null;
+  process_outputs_ref?: string | null;
+  tool_result_messages_ref?: string | null;
+  active_processes?: Array<Record<string, unknown>>;
+  artifact_read_trace_ref?: string | null;
+  resume_checkpoint_ref?: string | null;
+  worker_branch_refs?: Array<string>;
+  verifier_review_ref?: string | null;
+  browser_step_refs?: Array<string>;
+  active_tool_uses?: Array<Record<string, unknown>>;
+  context_pressure_ref?: string | null;
+  hook_trace_ref?: string | null;
+  semantic_graph_ref?: string | null;
+  worker_prefix_ref?: string | null;
+  replay_trace_ref?: string | null;
+  miniapp_contract_ref?: string | null;
+  route_registry_ref?: string | null;
+  contract_compile_ref?: string | null;
+  repair_recipes_ref?: string | null;
+  repair_issue_signatures?: Array<Record<string, unknown>>;
+  mobile_layout_report?: Record<string, unknown>;
   artifacts: Record<string, string>;
   repair_iterations?: Array<Record<string, unknown>>;
-  fix_attempts?: Array<Record<string, unknown>>;
-  scope_expansions?: Array<Record<string, unknown>>;
+  token_usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    reasoning_tokens?: number;
+    total_tokens?: number;
+    turn_count?: number;
+    last_turn?: Record<string, unknown>;
+  };
   rolled_back: boolean;
   rolled_back_at?: string | null;
   created_at: string;
@@ -88,43 +183,98 @@ export type RunArtifacts = {
     summary?: string | null;
     assumptions_report?: Array<{ text?: string; rationale?: string }>;
     validation_snapshot?: {
-      grounded_spec_valid: boolean;
-      app_ir_valid: boolean;
+      platform_valid: boolean;
+      checks_valid: boolean;
       build_valid: boolean;
       blocking: boolean;
       issues: Array<{ code: string; message: string; severity?: string }>;
     } | null;
   };
-  grounded_spec?: Record<string, unknown> | null;
   validation?: Record<string, unknown> | null;
-  assumptions?: Record<string, unknown> | null;
-  traceability?: Record<string, unknown> | null;
   trace?: { entries?: Array<{ stage: string; message: string; created_at?: string }> } | null;
-  code_change_plan?: {
-    summary?: string;
-    targets?: Array<{ file_path: string; operation: "create" | "replace" | "delete"; reason: string; risk: string }>;
-    risks?: string[];
-    acceptance_checks?: string[];
-  } | null;
+  agent_diagnostics?: { items?: Array<Record<string, unknown>> } | null;
   iterations?: Array<{
     iteration_id: string;
     assistant_message: string;
     files_read: string[];
-    operations: Array<{ file_path: string; operation: "create" | "replace" | "delete"; reason: string }>;
+    file_changes: Array<{ file_path: string; operation: "create" | "replace" | "delete" | "patch"; reason: string }>;
     check_results: Array<{ name: string; status: string; details?: string | null }>;
     diff_summary?: string | null;
     role_scope: Array<"client" | "specialist" | "manager">;
     created_at: string;
   }>;
-  candidate_diff?: string;
   check_results?: Array<{ name: string; status: string; details?: string | null }>;
+  role_coverage?: Record<string, unknown>;
+  generated_tests?: Record<string, unknown>;
+  neutral_template_findings?: Array<Record<string, unknown>>;
+  orchestration_phases?: Array<Record<string, unknown>>;
+  implementation_plan?: Record<string, unknown>;
+  agent_activity_events?: Array<{
+    type?: string;
+    message?: string;
+    created_at?: string;
+    details?: Record<string, unknown>;
+    batch_id?: string;
+    worker?: string | null;
+    worker_id?: string | null;
+    owner_scope?: string | null;
+    tool_use_id?: string;
+    phase?: string;
+    elapsed_ms?: number;
+    artifact_ref?: string | null;
+    summary?: string;
+    duration_ms?: number;
+    status?: string;
+    hook?: string;
+    semantic_status?: string;
+  }>;
+  agent_memory?: Record<string, unknown>;
+  acceptance_contract?: Record<string, unknown>;
+  worker_summaries?: Array<Record<string, unknown>>;
+  flow_coverage?: Record<string, unknown>;
+  browser_flow_proof?: Record<string, unknown>;
+  agent_transcript_ref?: string | null;
+  tool_trace_ref?: string | null;
+  file_change_history_ref?: string | null;
+  browser_proof_ref?: string | null;
+  large_tool_outputs_ref?: string | null;
+  file_state_cache_ref?: string | null;
+  turn_diff_ref?: string | null;
+  environment_snapshot_ref?: string | null;
+  tool_batch_summaries_ref?: string | null;
+  worker_mailbox_ref?: string | null;
+  scratchpad_ref?: string | null;
+  memory_ref?: string | null;
+  worker_drafts_ref?: string | null;
+  worker_merge_ref?: string | null;
+  trace_bundle_ref?: string | null;
+  trace_reducer_ref?: string | null;
+  command_policy_ref?: string | null;
+  verification_report_ref?: string | null;
+  rollout_trace_ref?: string | null;
+  exec_trace_ref?: string | null;
+  process_outputs_ref?: string | null;
+  tool_result_messages_ref?: string | null;
+  active_processes?: Array<Record<string, unknown>>;
+  artifact_read_trace_ref?: string | null;
+  resume_checkpoint_ref?: string | null;
+  worker_branch_refs?: Array<string>;
+  verifier_review_ref?: string | null;
+  browser_step_refs?: Array<string>;
+  active_tool_uses?: Array<Record<string, unknown>>;
+  context_pressure_ref?: string | null;
+  hook_trace_ref?: string | null;
+  semantic_graph_ref?: string | null;
+  worker_prefix_ref?: string | null;
+  replay_trace_ref?: string | null;
+  repair_issue_signatures?: Array<Record<string, unknown>>;
+  mobile_layout_report?: Record<string, unknown>;
   draft_preview?: {
     status: string;
     runtime_mode: string;
     url?: string | null;
     role_urls?: Record<string, string>;
   };
-  final_summary?: string | null;
   diff?: string;
   failure_analysis?: {
     mode?: "generate" | "fix";
@@ -141,8 +291,6 @@ export type RunArtifacts = {
     container_statuses?: Array<Record<string, unknown>>;
   } | null;
   fix_case?: Record<string, unknown> | null;
-  fix_attempts?: { items?: Array<Record<string, unknown>> } | null;
-  scope_expansions?: { items?: Array<Record<string, unknown>> } | null;
   fix_runtime?: Record<string, unknown> | null;
   preview?: {
     status: string;
@@ -197,16 +345,11 @@ export type WorkspaceLogs = {
       }>;
     } | null;
     validation?: Record<string, unknown> | null;
-    assumptions?: Record<string, unknown> | null;
-    traceability?: Record<string, unknown> | null;
     iterations?: Record<string, unknown> | null;
     candidate_diff?: Record<string, unknown> | null;
     check_results?: Record<string, unknown> | null;
     fix_case?: Record<string, unknown> | null;
-    fix_attempts?: Record<string, unknown> | null;
-    scope_expansions?: Record<string, unknown> | null;
     fix_runtime?: Record<string, unknown> | null;
-    spec_summary?: Record<string, unknown> | null;
   };
 };
 
@@ -225,6 +368,586 @@ export type SystemConfiguration = {
   supports_staged_apply: boolean;
   research_artifacts_enabled: boolean;
 };
+
+export type AgentThread = {
+  thread_id: string;
+  workspace_id: string;
+  title: string;
+  status: "active" | "running" | "idle" | "archived" | "failed";
+  archived: boolean;
+  current_turn_id?: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type AgentTurn = {
+  turn_id: string;
+  thread_id: string;
+  workspace_id: string;
+  kind: "user" | "agent" | "review" | "compaction" | "repair";
+  status: "queued" | "running" | "completed" | "failed" | "interrupted";
+  prompt: string;
+  linked_run_id?: string | null;
+  metadata?: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+};
+
+export type AgentItem = {
+  item_id: string;
+  thread_id: string;
+  turn_id?: string | null;
+  item_type: string;
+  status: "started" | "completed" | "failed";
+  sequence: number;
+  payload: Record<string, unknown>;
+  created_at: string;
+};
+
+export type RunTimeline = RequiredKeys<ApiSchemas["RunTimelineReport"], "items">;
+export type RunTraceView = RequiredKeys<ApiSchemas["RunTraceViewReport"], "timeline" | "artifact_refs" | "reduced_trace">;
+export type TraceBundleReport = RequiredKeys<ApiSchemas["TraceBundleReport"], "state">;
+export type TraceBundleState = ApiSchemas["TraceState"];
+export type RunProtocolEvent = ApiSchemas["RunProtocolEvent"];
+export type RunBookmark = ApiSchemas["RunBookmark"];
+export type RunProtocolReport = RequiredKeys<ApiSchemas["RunProtocolReport"], "items" | "bookmarks">;
+export type RunEventsReport = RequiredKeys<ApiSchemas["RunEventsReport"], "items" | "protocol_events" | "compaction_events" | "state_snapshots">;
+export type RunEventV2 = ApiSchemas["RunEventV2"];
+export type ThreadEventV2 = ApiSchemas["ThreadEventV2"];
+export type EventJournalPage = RequiredKeys<ApiSchemas["EventJournalPage"], "items">;
+export type EventJournalPayload = ApiSchemas["EventJournalPayload"];
+export type RunJournalState = RequiredKeys<ApiSchemas["RunJournalState"], "timeline">;
+export type ThreadJournalState = RequiredKeys<ApiSchemas["ThreadJournalState"], "events">;
+export type RunBookmarksReport = RequiredKeys<ApiSchemas["RunBookmarksReport"], "items">;
+export type ArtifactRef = ApiSchemas["ArtifactRef"];
+export type CheckResult = ApiSchemas["CheckResult"];
+
+export type RunCompactionReport = {
+  schema: string;
+  status: string;
+  run_id: string;
+  workspace_id?: string;
+  boundary_id?: string;
+  compaction_ref?: string;
+  boundary_ref?: string;
+  post_compact_message_ref?: string;
+  post_compact_status?: string;
+  consumed_by_turn_id?: string | null;
+  sections?: Record<string, unknown>;
+  refs?: Record<string, string | null | undefined>;
+  created_at?: string;
+};
+
+export type RunCompactionBoundaries = {
+  schema: string;
+  status: string;
+  run_id: string;
+  items: Array<Record<string, unknown>>;
+};
+
+export type DoctorReport = {
+  status: string;
+  checks: Array<{
+    name: string;
+    status: string;
+    details?: string;
+    command?: string;
+    required?: boolean;
+  }>;
+  created_at?: string;
+};
+
+export type WorkerReport = {
+  schema?: string;
+  run_id: string;
+  workspace_id?: string;
+  workers: Array<{
+    worker_id: string;
+    worker_type?: string;
+    alias_ids?: string[];
+    status: string;
+    badge?: string;
+    owner_scope: string;
+    ownership?: Record<string, unknown>;
+    changed_files: string[];
+    summaries?: Array<Record<string, unknown>>;
+    merge_reports?: Array<Record<string, unknown>>;
+    disabled_reason?: string | null;
+    context_ref?: string | null;
+    memory_snapshot_ref?: string | null;
+    output_ref?: string | null;
+    task_id?: string | null;
+    proof_refs?: string[];
+    merge_decision_ref?: string | null;
+    merge_decision?: Record<string, unknown> | null;
+  }>;
+  worker_branch_refs?: string[];
+  merge_decision_ref?: string | null;
+  mailbox?: Record<string, unknown>;
+};
+
+export type RunTaskReport = {
+  schema?: string;
+  run_id: string;
+  workspace_id: string;
+  status: string;
+  items: Array<{
+    task_id: string;
+    title: string;
+    phase?: string;
+    status: "planned" | "in_progress" | "blocked" | "completed" | string;
+    owner?: string;
+    files?: string[];
+    proof?: Record<string, unknown> | string;
+    blocker?: Record<string, unknown> | string | null;
+    artifact_refs?: Record<string, string | null | undefined>;
+    updated_at?: string | null;
+    source?: string;
+    background_status?: string;
+    attempt?: number;
+    max_attempts?: number;
+    output_summary?: string | null;
+    linked_refs?: Record<string, unknown>;
+  }>;
+  repair_cases?: RunRepairCases;
+};
+
+export type BackgroundTask = {
+  task_id: string;
+  workspace_id: string;
+  run_id?: string | null;
+  parent_task_id?: string | null;
+  type: string;
+  status: string;
+  title: string;
+  owner?: string;
+  input?: Record<string, unknown>;
+  output_summary?: string | null;
+  error?: string | null;
+  attempt?: number;
+  max_attempts?: number;
+  linked_refs?: Record<string, unknown>;
+  created_at?: string;
+  started_at?: string | null;
+  completed_at?: string | null;
+  updated_at?: string;
+};
+
+export type BackgroundTaskOutput = {
+  schema: string;
+  task_id: string;
+  items: Array<{
+    sequence: number;
+    event_type: string;
+    message: string;
+    payload?: Record<string, unknown>;
+    created_at: string;
+  }>;
+  next_cursor: number;
+  has_more: boolean;
+};
+
+export type ReviewReport = {
+  schema?: string;
+  run_id: string;
+  workspace_id?: string;
+  status: string;
+  summary?: {
+    finding_count?: number;
+    blocker_count?: number;
+    severity_counts?: Record<string, number>;
+    missing_tests?: number;
+    stale_test_risks?: number;
+    browser_proof_gaps?: number;
+    contract_mismatches?: number;
+  };
+  findings: Array<{
+    code?: string;
+    severity?: string;
+    category?: string;
+    source?: string;
+    message?: string;
+    file_path?: string;
+    path?: string;
+    line?: number;
+    is_blocker_for_product_acceptance?: boolean;
+    evidence?: Record<string, unknown>;
+  } & Record<string, unknown>>;
+  evidence?: Record<string, unknown>;
+};
+
+export type TestMatrixReport = {
+  run_id: string;
+  workspace_id: string;
+  status: string;
+  items: Array<{
+    key: string;
+    label: string;
+    status: string;
+    required: boolean;
+    evidence?: Array<Record<string, unknown>>;
+  }>;
+};
+
+export type PromptContractReport = {
+  run_id: string;
+  status: string;
+  analysis_source?: string | null;
+  analysis_status?: string | null;
+  resource_hint?: string | null;
+  field_hints?: string[];
+  role_field_hints?: Record<string, string[]>;
+  findings: Array<Record<string, unknown>>;
+};
+
+export type MiniAppContractReport = {
+  run_id: string;
+  workspace_id: string;
+  status: string;
+  contract: Record<string, unknown>;
+  registry_snapshot: Record<string, unknown>;
+  drift_issues: Array<Record<string, unknown>>;
+  repair_recipes: Array<Record<string, unknown>>;
+  artifact_refs: Record<string, string | null>;
+};
+
+export type RunStateReport = {
+  schema: string;
+  run_id: string;
+  workspace_id: string;
+  status: string;
+  blocking: boolean;
+  terminal: boolean;
+  apply_ok: boolean;
+  manual_approval_ok: boolean;
+  gate_status: string;
+  gate_blocking: boolean;
+  issues: Array<Record<string, unknown>>;
+  invariant_issues: Array<Record<string, unknown>>;
+  source_state: Record<string, unknown>;
+  artifact_refs?: Record<string, string | null | undefined>;
+  created_at?: string;
+};
+
+export type WorkspaceMemory = {
+  workspace_id: string;
+  items: Array<{
+    memory_id?: string;
+    kind: string;
+    text: string;
+    citation?: Record<string, unknown> | null;
+    created_at?: string;
+  }>;
+  project_rules?: Array<string | Record<string, unknown>>;
+  user_preferences?: Array<string | Record<string, unknown>>;
+  product_decisions?: Array<string | Record<string, unknown>>;
+  platform_constraints?: Array<string | Record<string, unknown>>;
+  repeated_fixes?: Array<string | Record<string, unknown>>;
+  pipeline?: MemoryPipelineReport;
+  stale_check?: Record<string, unknown>;
+};
+
+export type MemoryPipelineReport = {
+  schema?: string;
+  workspace_id: string;
+  status: string;
+  stage1_count?: number;
+  stage1_items?: number;
+  consolidated_at?: string | null;
+  items?: Array<Record<string, unknown>>;
+};
+
+export type ApprovalRecord = {
+  approval_id: string;
+  status: "pending" | "approved" | "rejected" | string;
+  kind?: string;
+  risk?: string;
+  summary?: string;
+  input?: Record<string, unknown>;
+  policy_decision?: Record<string, unknown>;
+  created_at?: string;
+  decided_at?: string;
+};
+
+export type ToolEventEnvelope = RequiredKeys<
+  ApiSchemas["ToolEnvelope"],
+  "input" | "approval" | "progress" | "result" | "artifacts" | "timing" | "changed_files" | "repair_recipe_ids" | "retry" | "truncation"
+>;
+export type ToolEventsReport = RequiredKeys<ApiSchemas["ToolEventsReport"], "events">;
+
+export type RunGateReport = RequiredKeys<
+  ApiSchemas["GateReport"],
+  "issues" | "repair_packets" | "repair_history" | "next_forced_action" | "blocking_repair_packet" | "requirements" | "artifact_refs" | "run_state"
+>;
+
+export type RunRepairSignatures = {
+  run_id: string;
+  status: string;
+  blocking: boolean;
+  items: Array<Record<string, unknown>>;
+  catalog: Array<Record<string, unknown>>;
+  repair_cases?: RunRepairCases;
+};
+
+export type RunRepairCase = RequiredKeys<
+  ApiSchemas["RepairCase"],
+  "target_files" | "forbidden_files" | "allowed_edit_slice" | "expected_proof" | "retry_policy" | "attempts" | "evidence" | "next_action"
+>;
+
+export type RunRepairCases = ApiSchemas["RepairCasesReport"] & {
+  schema: string;
+  run_id: string;
+  status: string;
+  items: RunRepairCase[];
+  case_refs: string[];
+  active_case?: RunRepairCase | null;
+};
+export type RepairAttemptsReport = RequiredKeys<ApiSchemas["RepairAttemptsReport"], "items">;
+
+export type RunFinalReport = {
+  run_id: string;
+  workspace_id: string;
+  status: string;
+  blocking: boolean;
+  prompt: string;
+  summary?: string | null;
+  acceptance_contract: Record<string, unknown>;
+  diff_summary: Record<string, unknown>;
+  checks: Array<Record<string, unknown>>;
+  browser_proof: Record<string, unknown>;
+  repair_signatures: Array<Record<string, unknown>>;
+  preview: Record<string, unknown>;
+  artifact_refs: Record<string, string | null | undefined>;
+  created_at: string;
+};
+
+export type StagedApplyState = {
+  run_id: string;
+  files: string[];
+  categories?: Record<string, string>;
+  status: string;
+  updated_at?: string;
+};
+
+export type FileSearchResult = {
+  workspace_id: string;
+  run_id?: string | null;
+  query: string;
+  items: Array<{
+    path: string;
+    hits: Array<{ line: number; text: string }>;
+    score?: number;
+    language?: string;
+    symbols?: Array<{ kind: string; name: string; line: number }>;
+  }>;
+  symbols?: Array<{ path: string; kind: string; name: string; line: number }>;
+};
+
+export type LspDiagnosticsReport = {
+  schema?: string;
+  workspace_id: string;
+  run_id?: string | null;
+  status: string;
+  items: Array<{ path: string; file?: string; severity: string; message: string; source: string; line?: number; column?: number; code?: string; jump?: { path: string; line: number; column?: number; label?: string } }>;
+  symbols?: Array<{ path: string; kind: string; name: string; line: number; column?: number; jump?: { path: string; line: number; column?: number; label?: string } }>;
+  tool_status?: Record<string, unknown>;
+  error_count?: number;
+  warning_count?: number;
+  changed_only?: boolean;
+  changed_files?: string[];
+};
+
+export type CommandPaletteAction = {
+  id: string;
+  label: string;
+  description?: string;
+  disabled?: boolean;
+};
+
+export type SlashCommand = {
+  id: string;
+  name: string;
+  kind: string;
+  description: string;
+  requires: string[];
+};
+
+export type SlashCommandList = {
+  schema: string;
+  items: SlashCommand[];
+};
+
+export type GeneratedReport = {
+  schema?: string;
+  status?: string;
+  items?: unknown[];
+  issues?: unknown[];
+  content?: string;
+  [key: string]: unknown;
+};
+
+type RpcEnvelope = {
+  id?: number;
+  method?: string;
+  params?: Record<string, unknown>;
+  result?: unknown;
+  error?: { code: number; message: string; data?: unknown };
+};
+
+type RpcNotificationHandler = (message: RpcEnvelope) => void;
+
+class RpcConnectionError extends Error {
+  constructor(message = "RPC socket connection failed.") {
+    super(message);
+    this.name = "RpcConnectionError";
+  }
+}
+
+function isRpcConnectionError(error: unknown): boolean {
+  return (
+    error instanceof RpcConnectionError ||
+    (error instanceof Error &&
+      (error.message === "RPC socket connection failed." || error.message === "RPC socket is not open."))
+  );
+}
+
+class JsonRpcClient {
+  private socket: WebSocket | null = null;
+  private nextId = 1;
+  private pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
+  private connected: Promise<void> | null = null;
+  private handlers = new Set<RpcNotificationHandler>();
+
+  async call<T>(method: string, params: Record<string, unknown> = {}): Promise<T> {
+    await this.ensureConnected();
+    const socket = this.socket;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      throw new Error("RPC socket is not open.");
+    }
+    const id = this.nextId++;
+    const result = new Promise<T>((resolve, reject) => {
+      this.pending.set(id, { resolve: resolve as (value: unknown) => void, reject });
+    });
+    socket.send(JSON.stringify({ id, method, params }));
+    return result;
+  }
+
+  subscribe(handler: RpcNotificationHandler): () => void {
+    this.handlers.add(handler);
+    void this.ensureConnected().catch(() => undefined);
+    return () => {
+      this.handlers.delete(handler);
+    };
+  }
+
+  private async ensureConnected(): Promise<void> {
+    if (this.socket?.readyState === WebSocket.OPEN) {
+      return;
+    }
+    if (this.connected) {
+      return this.connected;
+    }
+    this.connected = new Promise<void>((resolve, reject) => {
+      const socket = new WebSocket(this.rpcUrl());
+      this.socket = socket;
+      let settled = false;
+      const fail = (error: Error) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        this.connected = null;
+        if (this.socket === socket) {
+          this.socket = null;
+        }
+        if (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN) {
+          socket.close();
+        }
+        this.rejectPending(error);
+        reject(error);
+      };
+      const succeed = () => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        resolve();
+      };
+      const timeout = window.setTimeout(() => {
+        fail(new RpcConnectionError("RPC socket connection failed."));
+      }, 5000);
+      socket.addEventListener("open", async () => {
+        try {
+          await this.callRaw("initialize", { clientInfo: { name: "grounded-miniapp-frontend" } });
+          window.clearTimeout(timeout);
+          succeed();
+        } catch (error) {
+          window.clearTimeout(timeout);
+          fail(error instanceof Error ? error : new RpcConnectionError("RPC socket connection failed."));
+        }
+      });
+      socket.addEventListener("message", (event) => {
+        const message = JSON.parse(String(event.data)) as RpcEnvelope;
+        if (typeof message.id === "number") {
+          const pending = this.pending.get(message.id);
+          if (!pending) {
+            return;
+          }
+          this.pending.delete(message.id);
+          if (message.error) {
+            pending.reject(new Error(message.error.message));
+          } else {
+            pending.resolve(message.result);
+          }
+          return;
+        }
+        this.handlers.forEach((handler) => handler(message));
+      });
+      socket.addEventListener("close", () => {
+        this.socket = null;
+        this.connected = null;
+        window.clearTimeout(timeout);
+        if (!settled) {
+          fail(new RpcConnectionError("RPC socket connection failed."));
+        }
+      });
+      socket.addEventListener("error", () => {
+        window.clearTimeout(timeout);
+        fail(new RpcConnectionError("RPC socket connection failed."));
+      });
+    });
+    return this.connected;
+  }
+
+  private async callRaw<T>(method: string, params: Record<string, unknown>): Promise<T> {
+    const socket = this.socket;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      throw new Error("RPC socket is not open.");
+    }
+    const id = this.nextId++;
+    const result = new Promise<T>((resolve, reject) => {
+      this.pending.set(id, { resolve: resolve as (value: unknown) => void, reject });
+    });
+    socket.send(JSON.stringify({ id, method, params }));
+    return result;
+  }
+
+  private rpcUrl(): string {
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    return `${protocol}//${window.location.host}/rpc`;
+  }
+
+  private rejectPending(error: Error): void {
+    for (const pending of this.pending.values()) {
+      pending.reject(error);
+    }
+    this.pending.clear();
+  }
+}
+
+const rpcClient = new JsonRpcClient();
+const workspaceThreadIds = new Map<string, string>();
+const runTurnRefs = new Map<string, { threadId: string; turnId: string }>();
 
 export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`/api${path}`, {
@@ -245,7 +968,7 @@ export async function listWorkspaces(): Promise<Workspace[]> {
 }
 
 export async function ensureWorkspace(): Promise<Workspace> {
-  const workspace = await request<Workspace>("/workspaces", {
+  return request<Workspace>("/workspaces", {
     method: "POST",
     body: JSON.stringify({
       name: "Research Workspace",
@@ -254,19 +977,10 @@ export async function ensureWorkspace(): Promise<Workspace> {
       preview_profile: "telegram_mock",
     }),
   });
-  return request<Workspace>(`/workspaces/${workspace.workspace_id}/clone-template`, {
-    method: "POST",
-  });
 }
 
 export async function openWorkspace(workspaceId: string): Promise<Workspace> {
-  const workspace = await request<Workspace>(`/workspaces/${workspaceId}`);
-  if (workspace.template_cloned) {
-    return workspace;
-  }
-  return request<Workspace>(`/workspaces/${workspace.workspace_id}/clone-template`, {
-    method: "POST",
-  });
+  return request<Workspace>(`/workspaces/${workspaceId}`);
 }
 
 export async function deleteWorkspace(workspaceId: string): Promise<void> {
@@ -299,19 +1013,37 @@ export async function createRun(
     };
   },
 ): Promise<Run> {
-  return request<Run>(`/workspaces/${workspaceId}/runs`, {
-    method: "POST",
-    body: JSON.stringify({
-      mode: "generate",
-      intent: "auto",
-      apply_strategy: "staged_auto_apply",
-      target_role_scope: [],
-      generation_mode: "balanced",
-      target_platform: "telegram_mini_app",
-      preview_profile: "telegram_mock",
-      ...payload,
-    }),
-  });
+  const runPayload = {
+    mode: "generate",
+    intent: "auto",
+    apply_strategy: "staged_auto_apply",
+    target_role_scope: [],
+    generation_mode: "balanced",
+    target_platform: "telegram_mini_app",
+    preview_profile: "telegram_mock",
+    ...payload,
+  };
+  try {
+    const threadId = await getOrCreateWorkspaceThread(workspaceId);
+    const turn = await rpcClient.call<AgentTurn>("turn/start", {
+      thread_id: threadId,
+      ...runPayload,
+    });
+    const run = turn.metadata?.run as Run | undefined;
+    if (!run?.run_id) {
+      throw new Error("RPC turn did not return a linked run.");
+    }
+    runTurnRefs.set(run.run_id, { threadId, turnId: turn.turn_id });
+    return run;
+  } catch (error) {
+    if (!isRpcConnectionError(error)) {
+      throw error;
+    }
+    return request<Run>(`/workspaces/${workspaceId}/runs`, {
+      method: "POST",
+      body: JSON.stringify(runPayload),
+    });
+  }
 }
 
 export async function getRunArtifacts(runId: string): Promise<RunArtifacts> {
@@ -322,7 +1054,324 @@ export async function getRun(runId: string): Promise<Run> {
   return request<Run>(`/runs/${runId}`);
 }
 
+export async function getRunTimeline(runId: string): Promise<RunTimeline> {
+  return request<RunTimeline>(`/runs/${runId}/timeline`);
+}
+
+export async function getRunTraceView(runId: string): Promise<RunTraceView> {
+  return request<RunTraceView>(`/runs/${runId}/trace-view`);
+}
+
+export async function getRunTraceBundle(runId: string): Promise<TraceBundleReport> {
+  return request<TraceBundleReport>(`/runs/${runId}/trace-bundle`);
+}
+
+export async function getRunTraceBundleState(runId: string): Promise<TraceBundleState> {
+  return request<TraceBundleState>(`/runs/${runId}/trace-bundle/state`);
+}
+
+export async function getRunProtocol(runId: string): Promise<RunProtocolReport> {
+  return request<RunProtocolReport>(`/runs/${runId}/protocol`);
+}
+
+function journalQuery(params: { after_sequence?: number; limit?: number } = {}): string {
+  const search = new URLSearchParams();
+  if (params.after_sequence !== undefined) search.set("after_sequence", String(params.after_sequence));
+  if (params.limit !== undefined) search.set("limit", String(params.limit));
+  const suffix = search.toString();
+  return suffix ? `?${suffix}` : "";
+}
+
+export async function getRunEventsV2(runId: string, params: { after_sequence?: number; limit?: number } = {}): Promise<EventJournalPage> {
+  return request<EventJournalPage>(`/runs/${runId}/events-v2${journalQuery(params)}`);
+}
+
+export async function getRunJournalState(runId: string): Promise<RunJournalState> {
+  return request<RunJournalState>(`/runs/${runId}/journal/state`);
+}
+
+export async function getThreadEventsV2(threadId: string, params: { after_sequence?: number; limit?: number } = {}): Promise<EventJournalPage> {
+  return request<EventJournalPage>(`/threads/${threadId}/events-v2${journalQuery(params)}`);
+}
+
+export async function getThreadJournalState(threadId: string): Promise<ThreadJournalState> {
+  return request<ThreadJournalState>(`/threads/${threadId}/journal/state`);
+}
+
+export async function getEventJournalPayload(payloadRef: string): Promise<EventJournalPayload> {
+  return request<EventJournalPayload>(`/event-payloads/${encodeURIComponent(payloadRef)}`);
+}
+
+export async function getRunBookmarks(runId: string): Promise<RunBookmarksReport> {
+  return request<RunBookmarksReport>(`/runs/${runId}/bookmarks`);
+}
+
+export async function getRunTasks(runId: string): Promise<RunTaskReport> {
+  return request<RunTaskReport>(`/runs/${runId}/tasks`);
+}
+
+export async function listBackgroundTasks(params: { workspace_id?: string; run_id?: string; status?: string } = {}): Promise<{ schema: string; status: string; items: BackgroundTask[] }> {
+  const search = new URLSearchParams();
+  if (params.workspace_id) search.set("workspace_id", params.workspace_id);
+  if (params.run_id) search.set("run_id", params.run_id);
+  if (params.status) search.set("status", params.status);
+  const suffix = search.toString() ? `?${search.toString()}` : "";
+  return request(`/tasks${suffix}`);
+}
+
+export async function getBackgroundTask(taskId: string): Promise<BackgroundTask> {
+  return request<BackgroundTask>(`/tasks/${taskId}`);
+}
+
+export async function createBackgroundTask(payload: {
+  workspace_id: string;
+  type: string;
+  title?: string;
+  run_id?: string | null;
+  parent_task_id?: string | null;
+  input?: Record<string, unknown>;
+  owner?: string;
+  max_attempts?: number;
+  auto_start?: boolean;
+}): Promise<BackgroundTask> {
+  return request<BackgroundTask>("/tasks", { method: "POST", body: JSON.stringify(payload) });
+}
+
+export async function updateBackgroundTask(taskId: string, payload: { title?: string; status?: string; metadata?: Record<string, unknown> }): Promise<BackgroundTask> {
+  return request<BackgroundTask>(`/tasks/${taskId}`, { method: "PATCH", body: JSON.stringify(payload) });
+}
+
+export async function stopBackgroundTask(taskId: string): Promise<BackgroundTask> {
+  return request<BackgroundTask>(`/tasks/${taskId}/stop`, { method: "POST" });
+}
+
+export async function retryBackgroundTask(taskId: string): Promise<BackgroundTask> {
+  return request<BackgroundTask>(`/tasks/${taskId}/retry`, { method: "POST" });
+}
+
+export async function requeueBackgroundTask(taskId: string): Promise<BackgroundTask> {
+  return request<BackgroundTask>(`/tasks/${taskId}/requeue`, { method: "POST" });
+}
+
+export async function getBackgroundTaskOutput(taskId: string, cursor = 0, limit = 100): Promise<BackgroundTaskOutput> {
+  return request<BackgroundTaskOutput>(`/tasks/${taskId}/output?cursor=${cursor}&limit=${limit}`);
+}
+
+export async function getRunGate(runId: string): Promise<RunGateReport> {
+  return request<RunGateReport>(`/runs/${runId}/gate`);
+}
+
+export async function getRunFinalReport(runId: string): Promise<RunFinalReport> {
+  return request<RunFinalReport>(`/runs/${runId}/final-report`);
+}
+
+export async function getRunRepairSignatures(runId: string): Promise<RunRepairSignatures> {
+  return request<RunRepairSignatures>(`/runs/${runId}/repair-signatures`);
+}
+
+export async function getRunRepairCases(runId: string): Promise<RunRepairCases> {
+  return request<RunRepairCases>(`/runs/${runId}/repair-cases`);
+}
+
+export async function getRunRepairCaseAttempts(runId: string, caseId: string): Promise<RepairAttemptsReport> {
+  return request<RepairAttemptsReport>(`/runs/${runId}/repair-cases/${encodeURIComponent(caseId)}/attempts`);
+}
+
+export async function retryRunRepairCase(runId: string, caseId: string): Promise<Record<string, unknown>> {
+  return request(`/runs/${runId}/repair-cases/${encodeURIComponent(caseId)}/retry`, { method: "POST" });
+}
+
+export async function resumeRun(runId: string): Promise<Run> {
+  return request<Run>(`/runs/${runId}/resume`, { method: "POST" });
+}
+
+export async function getRunApprovals(runId: string): Promise<{ run_id: string; items: ApprovalRecord[] }> {
+  return request<{ run_id: string; items: ApprovalRecord[] }>(`/runs/${runId}/approvals`);
+}
+
+export async function approveRunApproval(runId: string, approvalId: string): Promise<ApprovalRecord> {
+  return request<ApprovalRecord>(`/runs/${runId}/approvals/${approvalId}/approve`, { method: "POST" });
+}
+
+export async function rejectRunApproval(runId: string, approvalId: string): Promise<ApprovalRecord> {
+  return request<ApprovalRecord>(`/runs/${runId}/approvals/${approvalId}/reject`, { method: "POST" });
+}
+
+export async function stageRunFiles(runId: string, files: string[]): Promise<StagedApplyState> {
+  return request<StagedApplyState>(`/runs/${runId}/stage/files`, {
+    method: "POST",
+    body: JSON.stringify({ files }),
+  });
+}
+
+export async function discardRunFiles(runId: string, files: string[]): Promise<Record<string, unknown>> {
+  return request<Record<string, unknown>>(`/runs/${runId}/discard/files`, {
+    method: "POST",
+    body: JSON.stringify({ files }),
+  });
+}
+
+export async function applyStagedRun(runId: string): Promise<Run> {
+  return request<Run>(`/runs/${runId}/apply/staged`, { method: "POST" });
+}
+
+export async function compactRun(runId: string): Promise<Record<string, unknown>> {
+  return request<Record<string, unknown>>(`/runs/${runId}/compact`, { method: "POST" });
+}
+
+export async function getRunCompaction(runId: string): Promise<RunCompactionReport> {
+  return request<RunCompactionReport>(`/runs/${runId}/compaction`);
+}
+
+export async function getRunCompactionBoundaries(runId: string): Promise<RunCompactionBoundaries> {
+  return request<RunCompactionBoundaries>(`/runs/${runId}/compaction/boundaries`);
+}
+
+export async function getRunMicrocompact(runId: string, digest: string): Promise<Record<string, unknown>> {
+  return request<Record<string, unknown>>(`/runs/${runId}/microcompact/${digest}`);
+}
+
+export async function getRunPostCompactMessage(runId: string, boundaryId: string): Promise<Record<string, unknown>> {
+  return request<Record<string, unknown>>(`/runs/${runId}/compaction/post-message/${boundaryId}`);
+}
+
+export async function startReviewFix(runId: string): Promise<Run> {
+  return request<Run>(`/runs/${runId}/review/fix`, { method: "POST" });
+}
+
+export async function getDoctorReport(): Promise<DoctorReport> {
+  return request<DoctorReport>("/doctor");
+}
+
+export async function getRunWorkers(runId: string): Promise<WorkerReport> {
+  return request<WorkerReport>(`/runs/${runId}/workers`);
+}
+
+export async function getRunWorkerContext(runId: string, workerId: string): Promise<Record<string, unknown>> {
+  return request<Record<string, unknown>>(`/runs/${runId}/workers/${encodeURIComponent(workerId)}/context`);
+}
+
+export async function getRunWorkerMemory(runId: string, workerId: string): Promise<Record<string, unknown>> {
+  return request<Record<string, unknown>>(`/runs/${runId}/workers/${encodeURIComponent(workerId)}/memory`);
+}
+
+export async function getRunWorkerOutput(runId: string, workerId: string): Promise<Record<string, unknown>> {
+  return request<Record<string, unknown>>(`/runs/${runId}/workers/${encodeURIComponent(workerId)}/output`);
+}
+
+export async function getRunWorkerMergeDecision(runId: string): Promise<Record<string, unknown>> {
+  return request<Record<string, unknown>>(`/runs/${runId}/workers/merge-decision`);
+}
+
+export async function getRunReview(runId: string): Promise<ReviewReport> {
+  return request<ReviewReport>(`/runs/${runId}/review`);
+}
+
+export async function getRunTestMatrix(runId: string): Promise<TestMatrixReport> {
+  return request<TestMatrixReport>(`/runs/${runId}/test-matrix`);
+}
+
+export async function getRunPromptContract(runId: string): Promise<PromptContractReport> {
+  return request<PromptContractReport>(`/runs/${runId}/prompt-contract`);
+}
+
+export async function getRunMiniAppContract(runId: string): Promise<MiniAppContractReport> {
+  return request<MiniAppContractReport>(`/runs/${runId}/miniapp-contract`);
+}
+
+export async function getRunAcceptanceScenarios(runId: string): Promise<GeneratedReport> {
+  return request<GeneratedReport>(`/runs/${runId}/acceptance-scenarios`);
+}
+
+export async function getRunVisualQa(runId: string): Promise<GeneratedReport> {
+  return request<GeneratedReport>(`/runs/${runId}/visual-qa`);
+}
+
+export async function getRunTraceReducer(runId: string): Promise<GeneratedReport> {
+  return request<GeneratedReport>(`/runs/${runId}/trace-reducer`);
+}
+
+export async function extractRunMemory(runId: string): Promise<GeneratedReport> {
+  return request<GeneratedReport>(`/runs/${runId}/memory/extract`, { method: "POST" });
+}
+
+export async function getWorkspaceMemoryPipeline(workspaceId: string): Promise<MemoryPipelineReport> {
+  return request<MemoryPipelineReport>(`/workspaces/${workspaceId}/memory/pipeline`);
+}
+
+export async function consolidateWorkspaceMemory(workspaceId: string): Promise<WorkspaceMemory> {
+  return request<WorkspaceMemory>(`/workspaces/${workspaceId}/memory/consolidate`, { method: "POST" });
+}
+
+export async function getProjectInstructions(): Promise<GeneratedReport> {
+  return request<GeneratedReport>("/system/project-instructions");
+}
+
+export async function getWorkerRoles(): Promise<GeneratedReport> {
+  return request<GeneratedReport>("/system/worker-roles");
+}
+
+export async function getSlashCommands(): Promise<SlashCommandList> {
+  return request<SlashCommandList>("/slash-commands");
+}
+
+export async function resolveSlashCommand(commandId: string, prompt?: string): Promise<GeneratedReport> {
+  return request<GeneratedReport>(`/slash-commands/${commandId}/resolve`, {
+    method: "POST",
+    body: JSON.stringify({ prompt }),
+  });
+}
+
+export async function getWorkspaceMagicDoc(workspaceId: string): Promise<GeneratedReport> {
+  return request<GeneratedReport>(`/workspaces/${workspaceId}/magic-docs/product-architecture`);
+}
+
+export async function updateWorkspaceMagicDoc(workspaceId: string): Promise<GeneratedReport> {
+  return request<GeneratedReport>(`/workspaces/${workspaceId}/magic-docs/product-architecture`, { method: "POST" });
+}
+
+export async function getRunState(runId: string): Promise<RunStateReport> {
+  return request<RunStateReport>(`/runs/${runId}/state`);
+}
+
+export async function getWorkspaceMemory(workspaceId: string): Promise<WorkspaceMemory> {
+  return request<WorkspaceMemory>(`/workspaces/${workspaceId}/memory`);
+}
+
+export async function searchWorkspaceFiles(workspaceId: string, query: string, runId?: string): Promise<FileSearchResult> {
+  const params = new URLSearchParams({ q: query });
+  if (runId) {
+    params.set("run_id", runId);
+  }
+  return request<FileSearchResult>(`/workspaces/${workspaceId}/files/search?${params.toString()}`);
+}
+
+export async function getLspDiagnostics(workspaceId: string, runId?: string, options?: { changedOnly?: boolean; files?: string[] }): Promise<LspDiagnosticsReport> {
+  const params = new URLSearchParams();
+  if (runId) {
+    params.set("run_id", runId);
+  }
+  if (options?.changedOnly) {
+    params.set("changed_only", "true");
+  }
+  if (options?.files?.length) {
+    params.set("files", options.files.join(","));
+  }
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  return request<LspDiagnosticsReport>(`/workspaces/${workspaceId}/diagnostics/lsp${suffix}`);
+}
+
 export async function stopRun(runId: string): Promise<Run> {
+  const ref = runTurnRefs.get(runId);
+  if (ref) {
+    try {
+      await rpcClient.call("turn/interrupt", { thread_id: ref.threadId, turn_id: ref.turnId });
+    } catch (error) {
+      if (!isRpcConnectionError(error)) {
+        throw error;
+      }
+    }
+  }
   return request<Run>(`/runs/${runId}/stop`, {
     method: "POST",
   });
@@ -344,20 +1393,20 @@ export async function discardRun(runId: string): Promise<Run> {
   });
 }
 
-export async function rebuildPreview(workspaceId: string): Promise<void> {
-  await request(`/workspaces/${workspaceId}/preview/rebuild`, {
+export async function rebuildPreview(workspaceId: string): Promise<PreviewRuntimeInfo> {
+  return request<PreviewRuntimeInfo>(`/workspaces/${workspaceId}/preview/rebuild`, {
     method: "POST",
   });
 }
 
-export async function startPreview(workspaceId: string): Promise<void> {
-  await request(`/workspaces/${workspaceId}/preview/start`, {
+export async function startPreview(workspaceId: string): Promise<PreviewRuntimeInfo> {
+  return request<PreviewRuntimeInfo>(`/workspaces/${workspaceId}/preview/start`, {
     method: "POST",
   });
 }
 
-export async function ensurePreview(workspaceId: string): Promise<void> {
-  await request(`/workspaces/${workspaceId}/preview/ensure`, {
+export async function ensurePreview(workspaceId: string): Promise<PreviewRuntimeInfo> {
+  return request<PreviewRuntimeInfo>(`/workspaces/${workspaceId}/preview/ensure`, {
     method: "POST",
   });
 }
@@ -370,4 +1419,59 @@ export async function rollbackRun(runId: string): Promise<Run> {
 
 export async function getWorkspaceLogs(workspaceId: string): Promise<WorkspaceLogs> {
   return request<WorkspaceLogs>(`/workspaces/${workspaceId}/logs`);
+}
+
+export function subscribeRpcNotifications(handler: RpcNotificationHandler): () => void {
+  return rpcClient.subscribe(handler);
+}
+
+export async function execWorkspaceCommand(payload: {
+  workspace_id: string;
+  command: string;
+  thread_id?: string;
+  turn_id?: string;
+  timeout?: number;
+  approval_id?: string;
+  preset?: string;
+}): Promise<Record<string, unknown>> {
+  return rpcClient.call("command/exec", payload);
+}
+
+export async function writeExecStdin(processId: string, data: string): Promise<Record<string, unknown>> {
+  return rpcClient.call("command/exec/write", { process_id: processId, data });
+}
+
+export async function resizeExec(processId: string, cols: number, rows: number): Promise<Record<string, unknown>> {
+  return rpcClient.call("command/exec/resize", { process_id: processId, cols, rows });
+}
+
+export async function terminateExec(processId: string): Promise<Record<string, unknown>> {
+  return rpcClient.call("command/exec/terminate", { process_id: processId });
+}
+
+export async function readExecOutput(processId: string, stream: "stdout" | "stderr" = "stdout"): Promise<Record<string, unknown>> {
+  return rpcClient.call("command/exec/read", { process_id: processId, stream });
+}
+
+export async function listThreads(workspaceId: string): Promise<AgentThread[]> {
+  const page = await rpcClient.call<{ items: AgentThread[]; next_cursor?: string | null }>("thread/list", { workspace_id: workspaceId });
+  return page.items;
+}
+
+export async function readThread(threadId: string): Promise<{ thread: AgentThread; turns: AgentTurn[]; items: AgentItem[] }> {
+  return rpcClient.call("thread/read", { thread_id: threadId });
+}
+
+async function getOrCreateWorkspaceThread(workspaceId: string): Promise<string> {
+  const cached = workspaceThreadIds.get(workspaceId);
+  if (cached) {
+    return cached;
+  }
+  const existing = await listThreads(workspaceId);
+  const thread = existing[0] ?? await rpcClient.call<AgentThread>("thread/start", {
+    workspace_id: workspaceId,
+    title: "Mini-app generation",
+  });
+  workspaceThreadIds.set(workspaceId, thread.thread_id);
+  return thread.thread_id;
 }

@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "generate:api": "mkdir -p src/lib/generated && (cd ../backend && python3 -m app.openapi_export --output /tmp/grounded-platform-openapi.json) && openapi-typescript /tmp/grounded-platform-openapi.json -o src/lib/generated/openapi-types.ts",
     "build": "tsc -b && vite build",
     "preview": "vite preview"
   },
@@ -22,6 +23,7 @@
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",
+    "openapi-typescript": "^7.13.0",
     "typescript": "^5.7.2",
     "vite": "^6.0.7"
   }

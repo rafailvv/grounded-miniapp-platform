@@ -1,0 +1,17 @@
+miniapp/__pycache__/
+miniapp/**/__pycache__/
+backend/**/*.pyc
+backend/**/*.pyo
+miniapp/.pytest_cache/
+miniapp/.mypy_cache/
+miniapp/.ruff_cache/
+backend/app/generated/*.db
+backend/app/generated/*.sqlite
+backend/app/generated/*.sqlite3
+miniapp/app/generated/*.db
+miniapp/app/generated/*.sqlite
+miniapp/app/generated/*.sqlite3
+miniapp/.coverage
+miniapp/coverage/
+
+.DS_Store

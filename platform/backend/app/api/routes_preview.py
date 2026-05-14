@@ -9,6 +9,26 @@ from app.services.container import ServiceContainer
 router = APIRouter(tags=["preview"])
 
 
+def _flatten_service_logs(logs_by_service: dict[str, list[str]]) -> list[str]:
+    return [
+        line
+        for service, lines in logs_by_service.items()
+        for line in ([f"=== {service} ==="] + lines + [""])
+    ]
+
+
+def _local_preview_logs(preview_logs: list[str], api_log: list[str]) -> dict[str, list[str]]:
+    lines = [line for line in api_log[-160:] if str(line).strip()]
+    if lines:
+        return {"local-preview": lines}
+    runtime_lines = [
+        line
+        for line in preview_logs[-80:]
+        if str(line).strip() and ("uvicorn" in line or "health" in line or "runtime" in line or "Preview" in line)
+    ]
+    return {"local-preview": runtime_lines} if runtime_lines else {}
+
+
 @router.post("/workspaces/{workspace_id}/preview/start")
 def start_preview(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> dict:
     return container.preview_service.ensure_started(workspace_id).model_dump(mode="json")
@@ -21,7 +41,7 @@ def ensure_preview(workspace_id: str, container: ServiceContainer = Depends(get_
 
 @router.post("/workspaces/{workspace_id}/preview/rebuild")
 def rebuild_preview(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> dict:
-    return container.preview_service.rebuild_async(workspace_id).model_dump(mode="json")
+    return container.preview_service.rebuild_async(workspace_id, force=True).model_dump(mode="json")
 
 
 @router.post("/workspaces/{workspace_id}/preview/reset")
@@ -31,7 +51,7 @@ def reset_preview(workspace_id: str, container: ServiceContainer = Depends(get_c
 
 @router.get("/workspaces/{workspace_id}/preview/url")
 def get_preview_url(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, object]:
-    preview = container.preview_service.peek(workspace_id)
+    preview = container.preview_service.get(workspace_id)
     return {
         "url": preview.url,
         "role_urls": container.preview_service.role_urls_from_preview(preview),
@@ -50,29 +70,32 @@ def get_preview_logs(workspace_id: str, container: ServiceContainer = Depends(ge
     preview = container.preview_service.peek(workspace_id)
     container_logs: dict[str, list[str]] = {}
     if preview.runtime_mode == "docker" and preview.proxy_port is not None:
-        source_dir = (
-            container.workspace_service.draft_source_dir(workspace_id, preview.draft_run_id)
-            if preview.draft_run_id and container.workspace_service.draft_exists(workspace_id, preview.draft_run_id)
-            else container.workspace_service.source_dir(workspace_id)
-        )
-        container_logs = container.runtime_manager.collect_container_logs(workspace_id, source_dir, preview.proxy_port)
+        try:
+            source_dir = container.workspace_service.source_dir(workspace_id)
+            container_logs = container.runtime_manager.collect_container_logs(workspace_id, source_dir, preview.proxy_port)
+        except Exception as exc:
+            container_logs = {"preview_runtime": [f"Unable to collect preview container logs: {exc}"]}
+    elif preview.runtime_mode == "local":
+        api_log = container.workspace_log_service.read_lines(workspace_id, kind="api")
+        container_logs = _local_preview_logs(preview.logs, api_log)
     return {"logs": preview.logs, "mini_app_logs": container_logs}
 
 
 @router.get("/workspaces/{workspace_id}/logs")
 def get_workspace_logs(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, object]:
-    job = container.generation_service.latest_job_for_workspace(workspace_id)
+    job = container.workspace_code_agent_runtime.latest_job_for_workspace(workspace_id)
     preview = container.preview_service.peek(workspace_id)
     platform_log = container.workspace_log_service.read_lines(workspace_id, kind="platform")
     api_log = container.workspace_log_service.read_lines(workspace_id, kind="api")
     container_logs: dict[str, list[str]] = {}
     if preview.runtime_mode == "docker" and preview.proxy_port is not None:
-        source_dir = (
-            container.workspace_service.draft_source_dir(workspace_id, preview.draft_run_id)
-            if preview.draft_run_id and container.workspace_service.draft_exists(workspace_id, preview.draft_run_id)
-            else container.workspace_service.source_dir(workspace_id)
-        )
-        container_logs = container.runtime_manager.collect_container_logs(workspace_id, source_dir, preview.proxy_port)
+        try:
+            source_dir = container.workspace_service.source_dir(workspace_id)
+            container_logs = container.runtime_manager.collect_container_logs(workspace_id, source_dir, preview.proxy_port)
+        except Exception as exc:
+            container_logs = {"preview_runtime": [f"Unable to collect preview container logs: {exc}"]}
+    elif preview.runtime_mode == "local":
+        container_logs = _local_preview_logs(preview.logs, api_log)
     workspace_event_lines = [
         (
             f"- [{event.created_at.strftime('%Y-%m-%d %H:%M:%S')}] "
@@ -86,23 +109,14 @@ def get_workspace_logs(workspace_id: str, container: ServiceContainer = Depends(
         *(["", "=== platform.log ===", *platform_log] if platform_log else []),
         *(["", "=== api.log ===", *api_log] if api_log else []),
     ]
-    mini_app_logs = [
-        line
-        for service, lines in container_logs.items()
-        for line in ([f"=== {service} ==="] + lines + [""])
-    ]
-    validation = container.generation_service.current_report(workspace_id, "validation")
-    assumptions = container.generation_service.current_report(workspace_id, "assumptions")
-    traceability = container.generation_service.current_report(workspace_id, "traceability")
-    spec = container.generation_service.current_report(workspace_id, "spec")
-    iterations = container.generation_service.current_report(workspace_id, "iterations")
-    candidate_diff = container.generation_service.current_report(workspace_id, "candidate_diff")
-    check_results = container.generation_service.current_report(workspace_id, "check_results")
-    trace = container.generation_service.current_report(workspace_id, "trace")
-    fix_case = container.generation_service.current_report(workspace_id, "fix_case")
-    fix_attempts = container.generation_service.current_report(workspace_id, "fix_attempts")
-    scope_expansions = container.generation_service.current_report(workspace_id, "scope_expansions")
-    fix_runtime = container.generation_service.current_report(workspace_id, "fix_runtime")
+    mini_app_logs = _flatten_service_logs(container_logs)
+    validation = container.workspace_code_agent_runtime.current_report(workspace_id, "validation")
+    iterations = container.workspace_code_agent_runtime.current_report(workspace_id, "iterations")
+    candidate_diff = container.workspace_code_agent_runtime.current_report(workspace_id, "candidate_diff")
+    check_results = container.workspace_code_agent_runtime.current_report(workspace_id, "check_results")
+    trace = container.workspace_code_agent_runtime.current_report(workspace_id, "trace")
+    fix_case = container.workspace_code_agent_runtime.current_report(workspace_id, "fix_case")
+    fix_runtime = container.workspace_code_agent_runtime.current_report(workspace_id, "fix_runtime")
 
     return {
         "workspace_id": workspace_id,
@@ -124,21 +138,11 @@ def get_workspace_logs(workspace_id: str, container: ServiceContainer = Depends(
         "reports": {
             "trace": trace,
             "validation": validation,
-            "assumptions": assumptions,
-            "traceability": traceability,
             "iterations": iterations,
             "candidate_diff": candidate_diff,
             "check_results": check_results,
             "fix_case": fix_case,
-            "fix_attempts": fix_attempts,
-            "scope_expansions": scope_expansions,
             "fix_runtime": fix_runtime,
-            "spec_summary": {
-                "product_goal": spec.get("product_goal") if spec else None,
-                "actors": len(spec.get("actors", [])) if spec else 0,
-                "flows": len(spec.get("user_flows", [])) if spec else 0,
-                "api_requirements": len(spec.get("api_requirements", [])) if spec else 0,
-            },
         },
     }
 
@@ -151,11 +155,8 @@ def render_preview(
     container: ServiceContainer = Depends(get_container),
 ) -> HTMLResponse:
     try:
-        source_dir = (
-            container.workspace_service.draft_source_dir(workspace_id, run_id)
-            if run_id and container.workspace_service.draft_exists(workspace_id, run_id)
-            else container.workspace_service.source_dir(workspace_id)
-        )
+        del run_id
+        source_dir = container.workspace_service.source_dir(workspace_id)
         html = container.preview_service.render_html(workspace_id, source_dir, role)
     except (KeyError, FileNotFoundError) as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

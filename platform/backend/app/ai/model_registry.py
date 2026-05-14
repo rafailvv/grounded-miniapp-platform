@@ -1,67 +1,196 @@
+from __future__ import annotations
+
+import os
+
+from app.models.common import GenerationMode
+
+
+CODEX_MINI_MODEL = os.getenv("OPENAI_CODE_MINI_MODEL", "gpt-5.4-mini")
+CODEX_MAX_MODEL = os.getenv("OPENAI_CODE_MAX_MODEL", "gpt-5.4-mini")
+FAST_CODE_MODEL = os.getenv("OPENAI_CODE_FAST_MODEL", CODEX_MINI_MODEL)
+BALANCED_CODE_MODEL = os.getenv("OPENAI_CODE_BALANCED_MODEL", CODEX_MINI_MODEL)
+QUALITY_CODE_MODEL = os.getenv("OPENAI_CODE_QUALITY_MODEL", CODEX_MINI_MODEL)
+SUMMARY_MODEL = os.getenv("OPENAI_CODE_SUMMARY_MODEL", CODEX_MINI_MODEL)
+REPAIR_MODEL = os.getenv("OPENAI_CODE_REPAIR_MODEL", CODEX_MINI_MODEL)
+
 TASK_PROFILES = {
     "openai_code_fast": {
         "label": "OpenAI Code Fast",
         "provider": "openai",
         "description": "Default iterative coding profile tuned for lower cost while keeping solid general coding quality.",
         "routing": {
-            "spec_analysis": "gpt-5.4-mini",
-            "ir_codegen": "gpt-5.2-codex",
-            "code_plan": "gpt-5.4-mini",
-            "code_edit": "gpt-5.2-codex",
-            "repair": "gpt-5.2-codex",
-            "summarize": "gpt-5.4-mini",
-            "cheap_task": "gpt-5-mini",
+            "agent_turn": FAST_CODE_MODEL,
+            "code_edit": FAST_CODE_MODEL,
+            "repair": REPAIR_MODEL,
+            "summarize": SUMMARY_MODEL,
+            "cheap_task": SUMMARY_MODEL,
         },
         "default": True,
     },
     "research_balanced": {
         "label": "Research Balanced",
         "provider": "openai",
-        "description": "Balanced profile for grounded artifact generation with lower-cost reasoning and edit steps.",
+        "description": "Balanced profile for iterative code-agent generation and repair.",
         "routing": {
-            "spec_analysis": "gpt-5.4-mini",
-            "ir_codegen": "gpt-5.2-codex",
-            "code_plan": "gpt-5.4-mini",
-            "code_edit": "gpt-5.2-codex",
-            "repair": "gpt-5.2-codex",
-            "summarize": "gpt-5.4-mini",
-            "cheap_task": "gpt-5-mini",
+            "agent_turn": BALANCED_CODE_MODEL,
+            "code_edit": BALANCED_CODE_MODEL,
+            "repair": REPAIR_MODEL,
+            "summarize": SUMMARY_MODEL,
+            "cheap_task": SUMMARY_MODEL,
+        },
+        "default": False,
+    },
+    "openai_code_quality": {
+        "label": "OpenAI Code Quality",
+        "provider": "openai",
+        "description": "Highest-confidence profile for iterative code-agent generation and repair.",
+        "routing": {
+            "agent_turn": QUALITY_CODE_MODEL,
+            "code_edit": QUALITY_CODE_MODEL,
+            "repair": REPAIR_MODEL,
+            "summarize": SUMMARY_MODEL,
+            "cheap_task": SUMMARY_MODEL,
         },
         "default": False,
     },
 }
 
+MODEL_CAPABILITIES = {
+    CODEX_MINI_MODEL: {
+        "provider": "openai",
+        "context_window": int(os.getenv("OPENAI_CODE_MINI_CONTEXT_WINDOW", "1000000")),
+        "supports_tools": True,
+        "supports_structured_output": True,
+        "supports_reasoning": True,
+        "cost_tier": "low",
+        "roles": ["agent_turn", "code_edit", "repair", "summarize", "cheap_task"],
+    },
+    CODEX_MAX_MODEL: {
+        "provider": "openai",
+        "context_window": int(os.getenv("OPENAI_CODE_MAX_CONTEXT_WINDOW", "1000000")),
+        "supports_tools": True,
+        "supports_structured_output": True,
+        "supports_reasoning": True,
+        "cost_tier": "high",
+        "roles": ["agent_turn", "code_edit", "repair"],
+    },
+    "text-embedding-3-large": {
+        "provider": "openai",
+        "context_window": 8191,
+        "supports_tools": False,
+        "supports_structured_output": False,
+        "supports_reasoning": False,
+        "cost_tier": "embedding",
+        "roles": ["embedding"],
+    },
+}
+
+PROVIDER_REGISTRY = {
+    "openai": {
+        "enabled_env": "OPENAI_API_KEY",
+        "base_url_env": "OPENAI_BASE_URL",
+        "models": sorted(MODEL_CAPABILITIES),
+    },
+}
+
 MODEL_REGISTRY = {
-    "spec_analysis": {
-        "primary": TASK_PROFILES["openai_code_fast"]["routing"]["spec_analysis"],
-        "fallback": TASK_PROFILES["research_balanced"]["routing"]["spec_analysis"],
-    },
-    "ir_codegen": {
-        "primary": TASK_PROFILES["openai_code_fast"]["routing"]["ir_codegen"],
-        "fallback": TASK_PROFILES["research_balanced"]["routing"]["ir_codegen"],
-    },
-    "code_plan": {
-        "primary": TASK_PROFILES["openai_code_fast"]["routing"]["code_plan"],
-        "fallback": TASK_PROFILES["research_balanced"]["routing"]["code_plan"],
+    "agent_turn": {
+        "primary": TASK_PROFILES["research_balanced"]["routing"]["agent_turn"],
     },
     "code_edit": {
-        "primary": TASK_PROFILES["openai_code_fast"]["routing"]["code_edit"],
-        "fallback": TASK_PROFILES["research_balanced"]["routing"]["code_edit"],
+        "primary": TASK_PROFILES["research_balanced"]["routing"]["code_edit"],
     },
     "repair": {
-        "primary": TASK_PROFILES["openai_code_fast"]["routing"]["repair"],
-        "fallback": TASK_PROFILES["research_balanced"]["routing"]["repair"],
+        "primary": TASK_PROFILES["research_balanced"]["routing"]["repair"],
     },
     "summarize": {
-        "primary": TASK_PROFILES["openai_code_fast"]["routing"]["summarize"],
-        "fallback": TASK_PROFILES["research_balanced"]["routing"]["summarize"],
+        "primary": TASK_PROFILES["research_balanced"]["routing"]["summarize"],
     },
     "cheap_task": {
-        "primary": TASK_PROFILES["openai_code_fast"]["routing"]["cheap_task"],
-        "fallback": "gpt-5-mini",
+        "primary": TASK_PROFILES["research_balanced"]["routing"]["cheap_task"],
     },
     "embedding": {
         "primary": "text-embedding-3-large",
-        "fallback": "text-embedding-3-large",
     },
 }
+
+DEFAULT_PROFILE_BY_MODE = {
+    GenerationMode.FAST: "openai_code_fast",
+    GenerationMode.BALANCED: "research_balanced",
+    GenerationMode.QUALITY: "openai_code_quality",
+    GenerationMode.BASIC: "openai_code_fast",
+}
+
+
+def default_profile_for_generation_mode(generation_mode: GenerationMode | str | None) -> str:
+    if generation_mode is None:
+        return DEFAULT_PROFILE_BY_MODE[GenerationMode.BALANCED]
+    mode = generation_mode if isinstance(generation_mode, GenerationMode) else GenerationMode(str(generation_mode))
+    return DEFAULT_PROFILE_BY_MODE.get(mode, DEFAULT_PROFILE_BY_MODE[GenerationMode.BALANCED])
+
+
+def resolve_model_profile(requested_profile: str | None, generation_mode: GenerationMode | str | None) -> str:
+    normalized = str(requested_profile or "").strip()
+    default_profile = default_profile_for_generation_mode(generation_mode)
+    mode = generation_mode if isinstance(generation_mode, GenerationMode) else GenerationMode(str(generation_mode or GenerationMode.BALANCED.value))
+    if mode == GenerationMode.FAST:
+        return default_profile
+    if not normalized or normalized not in TASK_PROFILES:
+        return default_profile
+    if mode == GenerationMode.BALANCED and normalized == "openai_code_fast":
+        return default_profile
+    if mode == GenerationMode.QUALITY and normalized in {"openai_code_fast", "research_balanced"}:
+        return default_profile
+    if mode in {GenerationMode.FAST, GenerationMode.BASIC} and normalized == "openai_code_quality":
+        return default_profile
+    return normalized
+
+
+def routing_for_profile(*, model_profile: str | None, generation_mode: GenerationMode | str | None) -> dict[str, str]:
+    profile_name = resolve_model_profile(model_profile, generation_mode)
+    profile = TASK_PROFILES.get(profile_name) or TASK_PROFILES[default_profile_for_generation_mode(generation_mode)]
+    return dict(profile.get("routing") or {})
+
+
+def model_capabilities(model: str) -> dict[str, object]:
+    name = str(model or "").strip()
+    capabilities = dict(MODEL_CAPABILITIES.get(name) or {})
+    if not capabilities:
+        capabilities = {
+            "provider": "openai",
+            "context_window": 128000,
+            "supports_tools": name.startswith("gpt-"),
+            "supports_structured_output": name.startswith("gpt-"),
+            "supports_reasoning": name.startswith("gpt-5"),
+            "cost_tier": "unknown",
+            "roles": [],
+        }
+    capabilities["model"] = name
+    return capabilities
+
+
+def provider_routing_table() -> dict[str, object]:
+    profiles = {}
+    for profile_name, profile in TASK_PROFILES.items():
+        routing = dict(profile.get("routing") or {})
+        profiles[profile_name] = {
+            "label": profile.get("label"),
+            "provider": profile.get("provider"),
+            "default": profile.get("default"),
+            "routing": routing,
+            "capabilities": {role: model_capabilities(model) for role, model in routing.items()},
+        }
+    return {
+        "providers": PROVIDER_REGISTRY,
+        "profiles": profiles,
+    }
+
+
+def models_for_role(
+    role: str,
+    *,
+    model_profile: str | None,
+    generation_mode: GenerationMode | str | None,
+) -> str:
+    routing = routing_for_profile(model_profile=model_profile, generation_mode=generation_mode)
+    return str(routing.get(role) or MODEL_REGISTRY[role]["primary"])

@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 
 from app.api.deps import get_container
 from app.models.domain import CreateRunRequest, RunRecord
 from app.services.container import ServiceContainer
 
 router = APIRouter(tags=["runs"])
+
+
+class ProcessStdinRequest(BaseModel):
+    data: str
 
 
 @router.post("/workspaces/{workspace_id}/runs", response_model=RunRecord)
@@ -103,3 +108,45 @@ def rollback_run(run_id: str, container: ServiceContainer = Depends(get_containe
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/runs/{run_id}/processes/{process_id}/stdin")
+def write_process_stdin(
+    run_id: str,
+    process_id: str,
+    request: ProcessStdinRequest,
+    container: ServiceContainer = Depends(get_container),
+) -> dict:
+    try:
+        return container.run_service.write_process_stdin(run_id, process_id, request.data)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/runs/{run_id}/processes/{process_id}/terminate")
+def terminate_process(run_id: str, process_id: str, container: ServiceContainer = Depends(get_container)) -> dict:
+    try:
+        return container.run_service.terminate_process(run_id, process_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/runs/{run_id}/processes/{process_id}/output")
+def read_process_output(
+    run_id: str,
+    process_id: str,
+    stream: str = "stdout",
+    start: int | None = None,
+    end: int | None = None,
+    container: ServiceContainer = Depends(get_container),
+) -> dict:
+    try:
+        return container.run_service.read_process_output(
+            run_id,
+            process_id,
+            stream=stream,
+            start=start,
+            end=end,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc

@@ -20,3 +20,4 @@ runtime/templates/base-miniapp/frontend/vite.config.d.ts
 data/
 !data/.gitkeep
 scripts/
+docs/

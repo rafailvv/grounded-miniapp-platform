@@ -1,14 +1,24 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Literal
 
 from app.core.config import Settings
+from app.models.common import StrictModel
 from app.models.domain import DocumentChunkRecord, DocumentRecord
-from app.models.grounded_spec import DocRef
 from app.repositories.state_store import StateStore
 from app.services.code_index_service import CodeIndexService
 from app.services.platform_adapters import get_platform_adapter
+
+
+class DocumentReference(StrictModel):
+    doc_ref_id: str
+    source_type: Literal["project_doc", "platform_doc", "user_prompt", "codebase", "openapi", "assumption"]
+    file_path: str
+    chunk_id: str
+    section_title: str
+    snippet: str
+    relevance: float
 
 
 class DocumentIntelligenceService:
@@ -52,14 +62,13 @@ class DocumentIntelligenceService:
         prompt: str,
         target_platform: str,
         limit: int = 8,
-    ) -> list[DocRef]:
-        query_terms = self._tokenize(prompt)
-        refs: list[DocRef] = []
+    ) -> list[DocumentReference]:
+        refs: list[DocumentReference] = []
         workspace_documents = self.list_documents(workspace_id)
         if workspace_documents:
             self.code_index_service.index_documents(workspace_id, workspace_documents)
         for document in workspace_documents:
-            refs.extend(self._refs_from_document(document, query_terms))
+            refs.extend(self._refs_from_document(document))
 
         retrieval = self.code_index_service.retrieve(
             workspace_id=workspace_id,
@@ -69,7 +78,7 @@ class DocumentIntelligenceService:
         )
         for item in retrieval["code"][: max(2, limit // 3)]:  # type: ignore[index]
             refs.append(
-                DocRef(
+                DocumentReference(
                     doc_ref_id=f"{item['chunk_id']}",
                     source_type="codebase",
                     file_path=str(item["path"]),
@@ -79,11 +88,11 @@ class DocumentIntelligenceService:
                     relevance=float(item.get("score") or 0.0),
                 )
             )
-        refs.extend(self._refs_from_bundled_dir(self.settings.template_dir / "docs", "project_doc", query_terms))
+        refs.extend(self._refs_from_bundled_dir(self.settings.template_dir / "docs", "project_doc"))
         adapter = get_platform_adapter(target_platform)
-        refs.extend(self._refs_from_bundled_dir(self.settings.runtime_dir / "platform-docs" / adapter.doc_dir_name, "platform_doc", query_terms))
+        refs.extend(self._refs_from_bundled_dir(self.settings.runtime_dir / "platform-docs" / adapter.doc_dir_name, "platform_doc"))
         refs.append(
-            DocRef(
+            DocumentReference(
                 doc_ref_id="prompt-source",
                 source_type="user_prompt",
                 file_path="prompt",
@@ -107,22 +116,19 @@ class DocumentIntelligenceService:
             issues.append(f"Bundled platform corpus is missing for {target_platform}.")
         return issues
 
-    def _refs_from_document(self, document: DocumentRecord, query_terms: set[str]) -> list[DocRef]:
-        refs: list[DocRef] = []
+    def _refs_from_document(self, document: DocumentRecord) -> list[DocumentReference]:
+        refs: list[DocumentReference] = []
         chunks = document.chunks or self._chunk_document(document.content)
-        for chunk in chunks:
-            score = self._score(chunk.content, query_terms)
-            if score <= 0:
-                continue
+        for index, chunk in enumerate(chunks):
             refs.append(
-                DocRef(
+                DocumentReference(
                     doc_ref_id=f"{document.document_id}:{chunk.chunk_id}",
                     source_type=document.source_type,
                     file_path=document.file_path,
                     chunk_id=chunk.chunk_id,
                     section_title=chunk.section_title,
                     snippet=chunk.content[:280],
-                    relevance=score,
+                    relevance=max(0.1, 0.8 - index * 0.02),
                 )
             )
         return refs
@@ -131,26 +137,22 @@ class DocumentIntelligenceService:
         self,
         directory: Path,
         source_type: str,
-        query_terms: set[str],
-    ) -> list[DocRef]:
-        refs: list[DocRef] = []
+    ) -> list[DocumentReference]:
+        refs: list[DocumentReference] = []
         for file_path in sorted(directory.rglob("*")):
             if not file_path.is_file():
                 continue
             content = file_path.read_text(encoding="utf-8")
-            for chunk in self._chunk_document(content):
-                score = self._score(chunk.content, query_terms)
-                if score <= 0:
-                    continue
+            for index, chunk in enumerate(self._chunk_document(content)):
                 refs.append(
-                    DocRef(
+                    DocumentReference(
                         doc_ref_id=f"{source_type}:{file_path.name}:{chunk.chunk_id}",
                         source_type=source_type,  # type: ignore[arg-type]
                         file_path=str(file_path.relative_to(self.settings.repo_root)),
                         chunk_id=chunk.chunk_id,
                         section_title=chunk.section_title,
                         snippet=chunk.content[:280],
-                        relevance=score,
+                        relevance=max(0.05, 0.4 - index * 0.01),
                     )
                 )
         return refs
@@ -177,14 +179,3 @@ class DocumentIntelligenceService:
     def _section_title(section: str) -> str:
         first_line = section.splitlines()[0].strip()
         return first_line.lstrip("# ").strip()[:80]
-
-    @staticmethod
-    def _tokenize(text: str) -> set[str]:
-        return {token.lower() for token in text.replace("/", " ").replace("_", " ").split() if len(token) > 2}
-
-    def _score(self, content: str, query_terms: set[str]) -> float:
-        content_terms = self._tokenize(content)
-        if not content_terms:
-            return 0.0
-        overlap = len(content_terms & query_terms)
-        return overlap / max(len(query_terms), 1)

@@ -24,7 +24,14 @@ def create_workspace(
         path=str(container.settings.workspaces_dir / "pending"),
     )
     workspace.path = str(container.settings.workspaces_dir / workspace.workspace_id)
-    return container.workspace_service.create_workspace(workspace)
+    workspace = container.workspace_service.create_workspace(workspace)
+    workspace = container.workspace_service.clone_template(workspace.workspace_id)
+    threading.Thread(
+        target=container.code_index_service.index_workspace,
+        args=(workspace, container.workspace_service.source_dir(workspace.workspace_id)),
+        daemon=True,
+    ).start()
+    return workspace
 
 
 @router.get("/workspaces", response_model=list[WorkspaceRecord])
@@ -40,28 +47,6 @@ def get_workspace(workspace_id: str, container: ServiceContainer = Depends(get_c
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.post("/workspaces/{workspace_id}/clone-template", response_model=WorkspaceRecord)
-def clone_template(
-    workspace_id: str,
-    container: ServiceContainer = Depends(get_container),
-) -> WorkspaceRecord:
-    try:
-        workspace = container.workspace_service.clone_template(workspace_id)
-        threading.Thread(
-            target=container.code_index_service.index_workspace,
-            args=(workspace, container.workspace_service.source_dir(workspace_id)),
-            daemon=True,
-        ).start()
-        threading.Thread(
-            target=container.preview_service.ensure_started,
-            args=(workspace_id,),
-            daemon=True,
-        ).start()
-        return workspace
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-
 @router.post("/workspaces/{workspace_id}/reset", response_model=WorkspaceRecord)
 def reset_workspace(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> WorkspaceRecord:
     try:
@@ -69,11 +54,6 @@ def reset_workspace(workspace_id: str, container: ServiceContainer = Depends(get
         threading.Thread(
             target=container.code_index_service.index_workspace,
             args=(workspace, container.workspace_service.source_dir(workspace_id)),
-            daemon=True,
-        ).start()
-        threading.Thread(
-            target=container.preview_service.ensure_started,
-            args=(workspace_id,),
             daemon=True,
         ).start()
         return workspace
@@ -121,11 +101,8 @@ def index_status(workspace_id: str, container: ServiceContainer = Depends(get_co
 @router.delete("/workspaces/{workspace_id}")
 def delete_workspace(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, str]:
     try:
-        try:
-            container.preview_service.reset(workspace_id)
-        except Exception:
-            pass
+        container.preview_service.destroy_workspace_runtime(workspace_id)
         container.workspace_service.delete_workspace(workspace_id)
-        return {"deleted": workspace_id}
+        return {"deleted": workspace_id, "preview_cleanup": "completed"}
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

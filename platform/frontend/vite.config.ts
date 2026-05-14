@@ -3,7 +3,7 @@ import react from "@vitejs/plugin-react";
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), "");
-  const proxyTarget = env.VITE_API_PROXY_TARGET || "http://localhost:8000";
+  const proxyTarget = env.VITE_API_PROXY_TARGET || "http://127.0.0.1:8010";
 
   return {
     plugins: [react()],
@@ -18,6 +18,11 @@ export default defineConfig(({ mode }) => {
         "/preview": {
           target: proxyTarget,
           changeOrigin: true,
+        },
+        "/rpc": {
+          target: proxyTarget,
+          changeOrigin: true,
+          ws: true,
         },
       },
     },

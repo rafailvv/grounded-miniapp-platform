@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi import HTTPException
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import (
@@ -13,12 +15,14 @@ from app.api import (
     routes_documents,
     routes_export,
     routes_files,
-    routes_generation,
     routes_preview,
+    routes_rpc,
     routes_runs,
     routes_validation,
+    routes_workbench,
     routes_workspaces,
 )
+from app.api.errors import http_exception_handler, unhandled_exception_handler, validation_exception_handler
 from app.services.container import build_container
 
 
@@ -41,6 +45,9 @@ def create_app(*, repo_root: Path | None = None, data_dir: Path | None = None) -
         description="Research-first grounded mini-app generation platform.",
     )
     app.state.container = build_container(repo_root=repo_root, data_dir=data_dir)
+    app.add_exception_handler(HTTPException, http_exception_handler)
+    app.add_exception_handler(RequestValidationError, validation_exception_handler)
+    app.add_exception_handler(Exception, unhandled_exception_handler)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -55,7 +62,7 @@ def create_app(*, repo_root: Path | None = None, data_dir: Path | None = None) -
 
     @app.get("/system/configuration")
     def system_configuration() -> dict[str, object]:
-        llm = app.state.container.openrouter_client.configuration()
+        llm = app.state.container.openai_client.configuration()
         return {
             "llm": {
                 "enabled": llm["enabled"],
@@ -76,12 +83,13 @@ def create_app(*, repo_root: Path | None = None, data_dir: Path | None = None) -
     app.include_router(routes_workspaces.router)
     app.include_router(routes_documents.router)
     app.include_router(routes_chat.router)
-    app.include_router(routes_generation.router)
     app.include_router(routes_runs.router)
     app.include_router(routes_validation.router)
     app.include_router(routes_files.router)
     app.include_router(routes_preview.router)
+    app.include_router(routes_rpc.router)
     app.include_router(routes_export.router)
+    app.include_router(routes_workbench.router)
     return app
 
 

@@ -1,0 +1,159 @@
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+STATIC_DIR = BASE_DIR / "static"
+GENERATED_DIR = BASE_DIR / "generated"
+ROUTE_MANIFEST_PATH = GENERATED_DIR / "route_manifest.json"
+ROLES = ("client", "specialist", "manager")
+
+
+def load_route_manifest() -> dict:
+    if not ROUTE_MANIFEST_PATH.exists():
+        return {}
+    try:
+        return json.loads(ROUTE_MANIFEST_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def canonicalize_role_path(role: str, actual_path: str) -> str:
+    normalized = str(actual_path or "").strip() or f"/{role}"
+    if normalized != "/" and normalized.endswith("/"):
+        normalized = normalized.rstrip("/")
+    if normalized == f"/{role}/root":
+        return f"/{role}"
+    return normalized or f"/{role}"
+
+
+def normalize_declared_page_path(file_path: str) -> Path:
+    normalized_file_path = str(file_path or "").replace("\\", "/")
+    if normalized_file_path.startswith("miniapp/app/"):
+        relative_path = normalized_file_path.removeprefix("miniapp/app/")
+        primary = BASE_DIR / relative_path
+        if primary.exists():
+            return primary
+        return BASE_DIR.parent / relative_path
+    if normalized_file_path.startswith("app/"):
+        relative_path = normalized_file_path.removeprefix("app/")
+        primary = BASE_DIR / relative_path
+        if primary.exists():
+            return primary
+        return BASE_DIR.parent / relative_path
+    return BASE_DIR / normalized_file_path
+
+
+def route_matches(pattern: str, actual: str) -> bool:
+    normalized_pattern = re.sub(r"\{[^/]+\}", "[^/]+", pattern)
+    normalized_pattern = re.sub(r":[^/]+", "[^/]+", normalized_pattern)
+    return re.fullmatch(normalized_pattern, actual) is not None
+
+
+def normalize_manifest_role_route(role: str, route_path: str) -> str:
+    route_path = str(route_path or "").strip()
+    if not route_path or route_path in {"root", "index", "/"}:
+        return f"/{role}"
+    if route_path.startswith("/"):
+        return route_path.rstrip("/") or f"/{role}"
+    return f"/{role}/{route_path}".rstrip("/")
+
+
+def resolve_declared_page_file(role: str, actual_path: str) -> Path | None:
+    actual_path = canonicalize_role_path(role, actual_path)
+    route_manifest = load_route_manifest()
+    top_level_routes = route_manifest.get("routes") if isinstance(route_manifest, dict) else {}
+    if isinstance(top_level_routes, dict):
+        for route_path, file_path in top_level_routes.items():
+            route_path = str(route_path or "").strip()
+            file_path = str(file_path or "").strip()
+            if not route_path or not file_path:
+                continue
+            if not route_matches(route_path, actual_path):
+                continue
+            resolved = normalize_declared_page_path(file_path)
+            if resolved.exists():
+                return resolved
+    roles_manifest = route_manifest.get("roles") or {}
+    if isinstance(roles_manifest, dict):
+        for route_path, file_path in roles_manifest.items():
+            if not isinstance(file_path, str):
+                continue
+            route_path = str(route_path or "").strip()
+            file_path = str(file_path or "").strip()
+            if not route_path or not file_path:
+                continue
+            if not route_matches(route_path, actual_path):
+                continue
+            resolved = normalize_declared_page_path(file_path)
+            if resolved.exists():
+                return resolved
+    role_payload = (
+        roles_manifest.get(role)
+        or roles_manifest.get(f"/{role}")
+        or {}
+    )
+    route_map = role_payload.get("routes") if isinstance(role_payload, dict) else {}
+    if not isinstance(route_map, dict) and isinstance(role_payload, dict):
+        route_map = {
+            str(route_path): str(file_path)
+            for route_path, file_path in role_payload.items()
+            if isinstance(file_path, str) and str(route_path) not in {"pages", "routes"}
+        }
+    if isinstance(route_map, dict):
+        for route_path, file_path in route_map.items():
+            route_path = normalize_manifest_role_route(role, str(route_path or "").strip())
+            file_path = str(file_path or "").strip()
+            if not route_path or not file_path:
+                continue
+            if not route_matches(route_path, actual_path):
+                continue
+            resolved = normalize_declared_page_path(file_path)
+            if resolved.exists():
+                return resolved
+    pages = (role_payload.get("pages") if isinstance(role_payload, dict) else []) or []
+    for page in pages:
+        if not isinstance(page, dict):
+            continue
+        route_path = str(page.get("route_path") or "").strip()
+        file_path = str(page.get("file_path") or "").strip()
+        if not route_path or not file_path:
+            continue
+        if not route_matches(route_path, actual_path):
+            continue
+        resolved = normalize_declared_page_path(file_path)
+        if resolved.exists():
+            return resolved
+    return None
+
+
+def resolve_filesystem_role_page(role: str, actual_path: str) -> Path | None:
+    actual_path = canonicalize_role_path(role, actual_path)
+    if actual_path == f"/{role}":
+        page_file = STATIC_DIR / role / "index.html"
+        return page_file if page_file.exists() else None
+    slug_parts = [segment for segment in actual_path.removeprefix(f"/{role}").split("/") if segment]
+    if len(slug_parts) == 1:
+        page_file = STATIC_DIR / role / slug_parts[0] / "index.html"
+        return page_file if page_file.exists() else None
+    if len(slug_parts) >= 2:
+        detail_page = STATIC_DIR / role / f"{slug_parts[0]}_detail" / "index.html"
+        if detail_page.exists():
+            return detail_page
+    return None
+
+
+def resolve_role_page(role: str, actual_path: str) -> Path:
+    if role not in ROLES:
+        raise KeyError(role)
+    actual_path = canonicalize_role_path(role, actual_path)
+    declared_page = resolve_declared_page_file(role, actual_path)
+    if declared_page is not None:
+        return declared_page
+    filesystem_page = resolve_filesystem_role_page(role, actual_path)
+    if filesystem_page is not None:
+        return filesystem_page
+    raise KeyError(actual_path)

@@ -19,23 +19,12 @@ class ValidationIssue(StrictModel):
     severity: Literal["low", "medium", "high", "critical"]
     location: str
     blocking: bool = True
-
-
-class GroundedSpecValidatorResult(StrictModel):
-    valid: bool
-    blocking: bool
-    issues: list[ValidationIssue] = Field(default_factory=list)
-
-
-class AppIRValidatorResult(StrictModel):
-    valid: bool
-    blocking: bool
-    issues: list[ValidationIssue] = Field(default_factory=list)
+    repair_recipe: dict[str, Any] | None = None
 
 
 class PatchOperationModel(StrictModel):
     operation_id: str
-    op: Literal["create", "update", "delete"]
+    op: Literal["create", "update", "delete", "patch"]
     file_path: str
     content: str | None = None
     diff: str | None = None
@@ -74,14 +63,6 @@ class ApplyPatchResult(StrictModel):
     applied_at: datetime = Field(default_factory=utc_now)
 
 
-class ArtifactPlanModel(StrictModel):
-    plan_id: str
-    workspace_id: str
-    summary: str
-    operations: list[PatchOperationModel]
-    patch_envelope: PatchEnvelope | None = None
-
-
 class TraceabilityReportEntry(StrictModel):
     trace_id: str
     source_ref: str
@@ -95,3 +76,17 @@ class TraceabilityReportModel(StrictModel):
     report_id: str
     workspace_id: str
     entries: list[TraceabilityReportEntry]
+
+
+ExecutionClass = Literal["shell_app"]
+PreviewFailureKind = Literal["address_pool_exhausted", "container_name_conflict", "network_conflict", "compose_start_failure", "unknown"]
+RunOutcomeKind = Literal["applied", "warnings", "blocked_generation", "blocked_preview_infra", "noop_generation_failure"]
+
+
+class PreviewInfraDiagnostics(StrictModel):
+    failure_kind: PreviewFailureKind = "unknown"
+    retry_count: int = 0
+    cleanup_attempted: bool = False
+    reused_existing_runtime: bool = False
+    cooldown_until: datetime | None = None
+    last_error: str | None = None

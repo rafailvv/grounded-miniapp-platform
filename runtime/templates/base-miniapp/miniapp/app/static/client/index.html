@@ -3,32 +3,14 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Client</title>
+    <title>Mini App</title>
+    <link rel="stylesheet" href="/static/shared/base.css" />
     <link rel="stylesheet" href="/static/client/styles.css" />
   </head>
-  <body>
-    <main class="page-shell">
-      <section class="page">
-        <a class="card-link" href="/client/profile" aria-label="Open client profile">
-          <article class="card">
-            <div class="avatar-wrap" id="profile-avatar"></div>
-            <div class="info">
-              <span class="caption">Personal workspace</span>
-              <strong class="name" id="profile-name"></strong>
-              <span class="role">Client</span>
-            </div>
-            <span class="chevron" aria-hidden="true">›</span>
-          </article>
-        </a>
-
-        <section class="feature-block">
-          <div class="feature-content">
-            <span class="feature-title">Client workspace</span>
-          </div>
-        </section>
-      </section>
-    </main>
-    <script src="/static/preview-bridge.js" defer></script>
+  <body data-role="client">
+    <main id="app" class="page-shell" data-role="client"></main>
+    <script src="/static/preview_bridge.js" defer></script>
+    <script src="/static/shared/app_helpers.js" defer></script>
     <script src="/static/client/app.js" defer></script>
   </body>
-  </html>
+</html>

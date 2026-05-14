@@ -15,15 +15,34 @@ services:
       PREVIEW_RUNTIME_MODE: ${PREVIEW_RUNTIME_MODE}
       PREVIEW_PORT_BASE: ${PREVIEW_PORT_BASE}
       PREVIEW_START_TIMEOUT_SEC: ${PREVIEW_START_TIMEOUT_SEC}
+      LLM_RETRY_MAX_ATTEMPTS: ${LLM_RETRY_MAX_ATTEMPTS}
+      LLM_RETRY_BASE_DELAY_MS: ${LLM_RETRY_BASE_DELAY_MS}
+      LLM_RETRY_MAX_DELAY_MS: ${LLM_RETRY_MAX_DELAY_MS}
       PLATFORM_DATA_DIR: /workspace/data
       PLATFORM_HOST_DATA_DIR: ${PLATFORM_DATA_DIR}
       OPENAI_API_KEY: ${OPENAI_API_KEY}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL}
+      OPENAI_CONNECT_TIMEOUT_SEC: ${OPENAI_CONNECT_TIMEOUT_SEC}
+      OPENAI_READ_TIMEOUT_SEC: ${OPENAI_READ_TIMEOUT_SEC}
+      OPENAI_WRITE_TIMEOUT_SEC: ${OPENAI_WRITE_TIMEOUT_SEC}
+      OPENAI_POOL_TIMEOUT_SEC: ${OPENAI_POOL_TIMEOUT_SEC}
+      OPENAI_CODE_MINI_MODEL: ${OPENAI_CODE_MINI_MODEL}
+      OPENAI_CODE_MAX_MODEL: ${OPENAI_CODE_MAX_MODEL}
+      OPENAI_CODE_FAST_MODEL: ${OPENAI_CODE_FAST_MODEL}
+      OPENAI_CODE_BALANCED_MODEL: ${OPENAI_CODE_BALANCED_MODEL}
+      OPENAI_CODE_QUALITY_MODEL: ${OPENAI_CODE_QUALITY_MODEL}
+      OPENAI_CODE_SUMMARY_MODEL: ${OPENAI_CODE_SUMMARY_MODEL}
+      OPENAI_CODE_REPAIR_MODEL: ${OPENAI_CODE_REPAIR_MODEL}
     command: >
-      sh -c "apt-get update &&
-             apt-get install -y --no-install-recommends docker.io docker-compose git nodejs npm &&
+      sh -c "if ! command -v docker >/dev/null || ! command -v node >/dev/null || ! command -v npm >/dev/null; then
+               apt-get update &&
+               apt-get install -y --no-install-recommends docker.io docker-compose git nodejs npm &&
+               rm -rf /var/lib/apt/lists/*;
+             fi &&
              rm -rf /var/lib/apt/lists/* &&
              pip install -e . &&
+             (python -c \"from pathlib import Path; import sys; sys.exit(0 if any(Path('/root/.cache/ms-playwright').glob('chromium_headless_shell-*')) else 1)\" ||
+              python -m playwright install --with-deps chromium) &&
              uvicorn app.main:app --host 0.0.0.0 --port 8000"
     ports:
       - "${PLATFORM_BACKEND_PORT}:8000"
@@ -36,8 +55,11 @@ services:
     environment:
       VITE_PLATFORM_NAME: ${VITE_PLATFORM_NAME}
       VITE_API_PROXY_TARGET: http://platform-backend:8000
+    depends_on:
+      - platform-backend
     command: >
       sh -c "npm install &&
+             node -e \"const http=require('node:http'); const url='http://platform-backend:8000/health'; const wait=()=>http.get(url,res=>{res.resume(); if(res.statusCode===200){process.exit(0)} setTimeout(wait,2000)}).on('error',()=>setTimeout(wait,2000)); wait();\" &&
              npm run dev -- --host 0.0.0.0 --port 5173"
     ports:
       - "${PLATFORM_FRONTEND_PORT}:5173"

@@ -13,6 +13,22 @@ import {
   getRun,
   ensureWorkspace,
   getRunArtifacts,
+  getRunTimeline,
+  getRunTraceView,
+  getRunTraceBundle,
+  getRunProtocol,
+  getRunCompaction,
+  getRunCompactionBoundaries,
+  getRunTasks,
+  getRunRepairCases,
+  getDoctorReport,
+  getRunWorkers,
+  getRunReview,
+  getRunTestMatrix,
+  getRunPromptContract,
+  getRunMiniAppContract,
+  getWorkspaceMemory,
+  getLspDiagnostics,
   getWorkspaceLogs,
   listRuns,
   listWorkspaces,
@@ -21,13 +37,46 @@ import {
   rollbackRun,
   ensurePreview,
   stopRun,
+  compactRun,
+  searchWorkspaceFiles,
+  subscribeRpcNotifications,
   request,
   Run,
   RunArtifacts,
+  RunTimeline,
+  RunTraceView,
+  TraceBundleReport,
+  RunProtocolReport,
+  RunCompactionReport,
+  RunCompactionBoundaries,
+  RunTaskReport,
+  RunRepairCases,
+  FileSearchResult,
+  LspDiagnosticsReport,
+  CommandPaletteAction,
+  TestMatrixReport,
+  PromptContractReport,
+  MiniAppContractReport,
+  DoctorReport,
+  WorkerReport,
+  ReviewReport,
+  WorkspaceMemory,
   SystemConfiguration,
   WorkspaceLogs,
   Workspace,
 } from "./lib/api";
+import { CommandPalette } from "./components/CommandPalette";
+import { ChecksPanel } from "./components/ChecksPanel";
+import { DoctorPanel } from "./components/DoctorPanel";
+import { FileSearchPanel } from "./components/FileSearchPanel";
+import { LspDiagnosticsPanel } from "./components/LspDiagnosticsPanel";
+import { MemoryPanel } from "./components/MemoryPanel";
+import { ReviewPanel } from "./components/ReviewPanel";
+import { TaskLanePanel } from "./components/TaskLanePanel";
+import { TimelinePanel } from "./components/TimelinePanel";
+import { TracePanel } from "./components/TracePanel";
+import { WorkbenchTabs } from "./components/WorkbenchTabs";
+import { WorkerLanesPanel } from "./components/WorkerLanesPanel";
 import "./styles/app.css";
 
 type FileEntry = {
@@ -53,8 +102,16 @@ type PreviewInfo = {
   last_error?: string | null;
 };
 
+type PreviewHistoryState = {
+  entries: string[];
+  index: number;
+  pendingPath: string | null;
+  pendingIndex: number | null;
+};
+
 type RunComposerMode = "generate" | "fix";
 type UserGenerationMode = "fast" | "balanced" | "quality";
+type WorkbenchTab = "preview" | "timeline" | "tasks" | "trace" | "code" | "diff" | "logs" | "workers" | "review" | "checks" | "doctor" | "memory" | "search" | "lsp";
 
 type FixErrorContext = {
   raw_error: string;
@@ -66,6 +123,7 @@ type RunProgressDisplayMap = Record<string, number>;
 
 const ROLE_ORDER = ["client", "specialist", "manager"] as const;
 type RoleKey = (typeof ROLE_ORDER)[number];
+const PRIMARY_WORKBENCH_TABS = ["preview", "timeline", "code", "diff", "logs"] as const;
 
 const PREVIEW_BOOT_ROLES: Record<RoleKey, boolean> = {
   client: true,
@@ -112,19 +170,73 @@ function buildFixPrefill(run: Run): { prompt: string; context: FixErrorContext }
   };
 }
 
+function isAutoRepairPrompt(prompt: string | null | undefined): boolean {
+  const normalized = (prompt ?? "").trim().replace(/\s+/g, " ").toLowerCase();
+  return normalized === "analyze the reported failure and apply the smallest safe fix.";
+}
+
+function displayRunPrompt(run: Run): string {
+  if (!isAutoRepairPrompt(run.prompt)) {
+    return run.prompt;
+  }
+  return (
+    run.error_context?.raw_error?.trim() ||
+    run.handoff_from_failed_generate?.prompt?.trim() ||
+    run.handoff_from_failed_generate?.error_context?.raw_error?.trim() ||
+    run.failure_reason?.trim() ||
+    run.root_cause_summary?.trim() ||
+    run.prompt
+  );
+}
+
 function getRoleRootPreviewPath(role: RoleKey): string {
   return `/${role}`;
 }
 
+function normalizeRolePreviewPath(role: RoleKey, path: string | undefined): string {
+  const normalized = path?.trim();
+  if (!normalized || normalized === ROOT_PREVIEW_PATH) {
+    return getRoleRootPreviewPath(role);
+  }
+  return normalized;
+}
+
 function isRoleAtRootPreviewPath(role: RoleKey, path: string | undefined): boolean {
-  const normalized = path || ROOT_PREVIEW_PATH;
-  return normalized === ROOT_PREVIEW_PATH || normalized === getRoleRootPreviewPath(role);
+  return normalizeRolePreviewPath(role, path) === getRoleRootPreviewPath(role);
+}
+
+function buildRolePreviewFrameId(role: RoleKey, cycle: number): string {
+  return `${role}:${cycle}`;
+}
+
+function extractPreviewFrameId(value: string | null | undefined): string | null {
+  if (!value) {
+    return null;
+  }
+  try {
+    const url = new URL(value, window.location.origin);
+    const frameId = url.searchParams.get("preview_frame_id");
+    return frameId && frameId.trim() ? frameId.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+function createPreviewHistoryState(role: RoleKey): PreviewHistoryState {
+  const root = getRoleRootPreviewPath(role);
+  return {
+    entries: [root],
+    index: 0,
+    pendingPath: null,
+    pendingIndex: null,
+  };
 }
 
 function buildRolePreviewSrc(baseUrl: string, role: RoleKey, roleUrl: string | undefined, cycle: number): string {
   const rawUrl = roleUrl ?? `${baseUrl}/${role}`;
   const separator = rawUrl.includes("?") ? "&" : "?";
-  return `${rawUrl}${separator}preview_cycle=${cycle}`;
+  const frameId = encodeURIComponent(buildRolePreviewFrameId(role, cycle));
+  return `${rawUrl}${separator}preview_cycle=${cycle}&preview_frame_id=${frameId}`;
 }
 
 function editorLanguageForPath(path: string): { label: string; extensions: Extension[] } {
@@ -158,8 +270,11 @@ function isSupportedEditorPath(path: string): boolean {
   );
 }
 
-const PREVIEW_BOOT_POLL_ATTEMPTS = 45;
+const PREVIEW_BOOT_POLL_ATTEMPTS = 130;
 const PREVIEW_BOOT_POLL_INTERVAL_MS = 1000;
+const PREVIEW_FRAME_SOFT_CLEAR_MS = 6500;
+const PREVIEW_FRAME_LOAD_TIMEOUT_MS = 25000;
+const PREVIEW_STUCK_REBUILD_ATTEMPT = 18;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
@@ -176,12 +291,26 @@ function formatTimestamp(value?: string): string {
   return date.toLocaleString();
 }
 
-function clampText(value: string, maxLength = 180): string {
-  const normalized = value.replace(/\s+/g, " ").trim();
-  if (normalized.length <= maxLength) {
-    return normalized;
+function pluralize(count: number, singular: string, plural = `${singular}s`): string {
+  return `${count} ${count === 1 ? singular : plural}`;
+}
+
+function toPositiveInteger(value: unknown): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return 0;
   }
-  return `${normalized.slice(0, maxLength - 1).trimEnd()}…`;
+  return Math.round(parsed);
+}
+
+function formatCompactTokenCount(value: number): string {
+  if (value >= 1_000_000) {
+    return `${(value / 1_000_000).toFixed(1).replace(/\.0$/, "")}m`;
+  }
+  if (value >= 1_000) {
+    return `${(value / 1_000).toFixed(1).replace(/\.0$/, "")}k`;
+  }
+  return String(value);
 }
 
 function asRecordArray(value: unknown): Array<Record<string, unknown>> {
@@ -210,13 +339,73 @@ function formatRoleScope(scope?: RoleKey[] | unknown): string {
   return normalizedScope.map((role) => ROLE_LABELS[role]).join(", ");
 }
 
+function isCompletedGenerateRun(run?: Run | null): boolean {
+  if (!run) {
+    return false;
+  }
+  return run.mode !== "fix" && run.status === "completed" && (run.apply_status === "applied" || run.apply_status === "noop");
+}
+
 type RunIterationView = {
   iteration_id: string;
   assistant_message: string;
-  operations: Array<{ file_path: string; operation: string }>;
+  file_changes: Array<{ file_path: string; operation: string }>;
   role_scope: RoleKey[];
   created_at?: string;
 };
+
+type AgentActivityView = {
+  type: string;
+  message: string;
+  created_at?: string;
+  batch_id?: string;
+  worker?: string;
+  worker_id?: string;
+  owner_scope?: string;
+  tool_use_id?: string;
+  phase?: string;
+  elapsed_ms?: number;
+  artifact_ref?: string;
+  summary?: string;
+  duration_ms?: number;
+  status?: string;
+  hook?: string;
+  semantic_status?: string;
+};
+
+function normalizeAgentActivityEvents(events: unknown): AgentActivityView[] {
+  if (!Array.isArray(events)) {
+    return [];
+  }
+  return events.flatMap((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      return [];
+    }
+    const record = item as Record<string, unknown>;
+    const type = typeof record.type === "string" && record.type ? record.type : "activity";
+    const message = typeof record.message === "string" && record.message ? record.message : type.replace(/_/g, " ");
+    return [
+      {
+        type,
+        message,
+        created_at: typeof record.created_at === "string" ? record.created_at : undefined,
+        batch_id: typeof record.batch_id === "string" ? record.batch_id : undefined,
+        worker: typeof record.worker === "string" ? record.worker : undefined,
+        worker_id: typeof record.worker_id === "string" ? record.worker_id : undefined,
+        owner_scope: typeof record.owner_scope === "string" ? record.owner_scope : undefined,
+        tool_use_id: typeof record.tool_use_id === "string" ? record.tool_use_id : undefined,
+        phase: typeof record.phase === "string" ? record.phase : undefined,
+        elapsed_ms: typeof record.elapsed_ms === "number" ? record.elapsed_ms : undefined,
+        artifact_ref: typeof record.artifact_ref === "string" ? record.artifact_ref : undefined,
+        summary: typeof record.summary === "string" ? record.summary : undefined,
+        duration_ms: typeof record.duration_ms === "number" ? record.duration_ms : undefined,
+        status: typeof record.status === "string" ? record.status : undefined,
+        hook: typeof record.hook === "string" ? record.hook : undefined,
+        semantic_status: typeof record.semantic_status === "string" ? record.semantic_status : undefined,
+      },
+    ];
+  });
+}
 
 function normalizeRunIterations(iterations: unknown): RunIterationView[] {
   if (!Array.isArray(iterations)) {
@@ -228,7 +417,7 @@ function normalizeRunIterations(iterations: unknown): RunIterationView[] {
         {
           iteration_id: `timeline-${index}`,
           assistant_message: iteration,
-          operations: [],
+          file_changes: [],
           role_scope: [],
           created_at: undefined,
         },
@@ -238,7 +427,8 @@ function normalizeRunIterations(iterations: unknown): RunIterationView[] {
       return [];
     }
     const record = iteration as Record<string, unknown>;
-    const operations = asRecordArray(record.operations).flatMap((operation) => {
+    const rawFileChanges = asRecordArray(record.file_changes);
+    const fileChanges = rawFileChanges.flatMap((operation) => {
       const filePath = typeof operation.file_path === "string" ? operation.file_path : "";
       const operationName = typeof operation.operation === "string" ? operation.operation : "";
       if (!filePath && !operationName) {
@@ -258,7 +448,7 @@ function normalizeRunIterations(iterations: unknown): RunIterationView[] {
             : typeof record.message === "string"
               ? record.message
               : "",
-        operations,
+        file_changes: fileChanges,
         role_scope: normalizeRoleScope(record.role_scope),
         created_at: typeof record.created_at === "string" ? record.created_at : undefined,
       },
@@ -356,7 +546,7 @@ function displayRunStatus(run: Run | null): string {
     return "blocked";
   }
   if (run.status === "awaiting_approval") {
-    return "awaiting_approval";
+    return "blocked";
   }
   if (run.status === "completed") {
     return "completed";
@@ -373,39 +563,154 @@ function displayFixPhase(run: Run, phase?: string | null): string {
   return phase ?? run.current_fix_phase ?? "n/a";
 }
 
+const RUN_STAGE_LABELS: Record<string, string> = {
+  agent_turn: "Planning code edit",
+  agent_turn_started: "Planning code edit",
+  running_checks: "Running checks",
+  build_started: "Validating app",
+  frontend_build_started: "Checking frontend",
+  backend_compile_started: "Checking backend",
+  checks_completed: "Checks completed",
+  patch_apply_started: "Applying patch",
+  patch_apply_completed: "Patch applied",
+  repair_iteration: "Reading more context",
+  apply_started: "Applying to workspace",
+  apply_completed: "Applied to workspace",
+  job_started: "Starting code agent",
+  job_completed: "Complete",
+  job_failed: "Failed",
+};
+
+function displayRunStage(run: Run): string {
+  const raw = (run.current_stage || "").trim();
+  if (!raw) {
+    return "Starting";
+  }
+  const normalized = raw.toLowerCase();
+  if (RUN_STAGE_LABELS[normalized]) {
+    return RUN_STAGE_LABELS[normalized];
+  }
+  if (/^[a-z_]+$/.test(normalized)) {
+    return normalized
+      .split("_")
+      .filter(Boolean)
+      .map((part) => `${part.charAt(0).toUpperCase()}${part.slice(1)}`)
+      .join(" ");
+  }
+  return raw;
+}
+
+function runProgressStage(run: Run): string {
+  const stage = displayRunStage(run);
+  const parts = [stage];
+  const stageLower = stage.toLowerCase();
+  if (displayRunStatus(run) === "running" && !stageLower.includes("file")) {
+    const fileCount = run.touched_files.length;
+    if (fileCount > 0) {
+      parts.push(pluralize(fileCount, "file"));
+    } else if (run.iteration_count > 0) {
+      parts.push(pluralize(run.iteration_count, "turn"));
+    }
+  }
+  return parts.join(" · ");
+}
+
+function runFilesSummary(run: Run): string {
+  return pluralize(run.touched_files.length, "file");
+}
+
+type TokenUsageKey = "input_tokens" | "output_tokens" | "reasoning_tokens" | "total_tokens" | "turn_count";
+
+function tokenUsageInteger(usage: NonNullable<Run["token_usage"]>, key: TokenUsageKey): number | null {
+  const raw: unknown = usage[key];
+  if (raw === undefined || raw === null || raw === "") {
+    return null;
+  }
+  const parsed = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return null;
+  }
+  return Math.round(parsed);
+}
+
+function runTokenUsageValue(run: Run, key: TokenUsageKey): string {
+  const usage = run.token_usage;
+  if (!usage) {
+    return "n/a";
+  }
+  const value = tokenUsageInteger(usage, key);
+  if (key === "total_tokens" && (value === null || value === 0)) {
+    const inputTokens = tokenUsageInteger(usage, "input_tokens");
+    const outputTokens = tokenUsageInteger(usage, "output_tokens");
+    if (inputTokens !== null || outputTokens !== null) {
+      return formatCompactTokenCount((inputTokens ?? 0) + (outputTokens ?? 0));
+    }
+  }
+  return value !== null ? formatCompactTokenCount(value) : "n/a";
+}
+
+function roleCoverageStatus(run: Run, role: RoleKey): string {
+  return qualityStatusFromEntry(run.role_coverage?.[role]) || "n/a";
+}
+
+function generatedTestStatus(run: Run, key: string): string {
+  return qualityStatusFromEntry(run.generated_tests?.[key]) || "n/a";
+}
+
 function progressCeilingForRun(run: Run): number {
-  const stage = (run.current_stage || "").toLowerCase();
+  const stage = displayRunStage(run).toLowerCase();
   if (run.status === "completed" || run.status === "failed" || run.status === "blocked" || run.status === "awaiting_approval") {
     return 100;
   }
-  if (stage.includes("retrieving context")) {
-    return 28;
+  if (stage.includes("starting")) {
+    return 10;
   }
-  if (stage.includes("building grounded spec")) {
-    return 48;
+  if (stage.includes("checking workspace") || stage.includes("baseline") || stage.includes("validating workspace")) {
+    return 18;
   }
-  if (stage.includes("planning code changes")) {
-    return 68;
+  if (
+    stage.includes("planning code edit") ||
+    stage.includes("reading context") ||
+    stage.includes("requested") ||
+    stage.includes("no file edits") ||
+    stage.includes("correcting edit contract")
+  ) {
+    return 38;
   }
-  if (stage.includes("editing draft files")) {
-    return 84;
+  if (stage.includes("prepared")) {
+    return 50;
   }
-  if (stage.includes("repairing draft")) {
-    return 89;
+  if (stage.includes("applying patch")) {
+    return 58;
   }
-  if (stage.includes("running validation and build")) {
-    return 95;
+  if (stage.includes("patch applied")) {
+    return 72;
   }
-  if (stage.includes("refreshing preview")) {
-    return 99;
+  if (stage.includes("running final") || stage.includes("validating generated") || stage.includes("building generated") || stage.includes("checking frontend") || stage.includes("checking backend")) {
+    return 88;
   }
-  return Math.min(96, Math.max(18, (run.progress_percent || 0) + 8));
+  if (stage.includes("applying to workspace") || stage.includes("finalizing apply")) {
+    return 94;
+  }
+  if (stage.includes("preview")) {
+    return 96;
+  }
+  return Math.min(42, Math.max(18, (run.progress_percent || 0) + 4));
+}
+
+function actualProgressForRun(run: Run): number {
+  const actual = Math.max(0, Math.min(100, run.progress_percent || 0));
+  const status = displayRunStatus(run);
+  if (["completed", "failed", "blocked", "rolled_back", "awaiting_approval"].includes(status)) {
+    return actual;
+  }
+  return Math.min(actual, progressCeilingForRun(run));
 }
 
 function nextVisualProgress(current: number, run: Run): number {
-  const actual = Math.max(0, Math.min(100, run.progress_percent || 0));
+  const actual = actualProgressForRun(run);
   const status = displayRunStatus(run);
-  const stage = (run.current_stage || "").toLowerCase();
+  const stage = displayRunStage(run).toLowerCase();
   if (["completed", "failed", "blocked", "rolled_back", "awaiting_approval"].includes(status)) {
     return actual;
   }
@@ -413,10 +718,9 @@ function nextVisualProgress(current: number, run: Run): number {
   const floor = Math.max(actual, 4);
   const ceiling = Math.max(floor, progressCeilingForRun(run));
   const isEarlyPhase =
-    stage.includes("retrieving context") ||
-    stage.includes("building grounded spec") ||
-    stage.includes("spec") ||
-    stage.includes("starting");
+    stage.includes("starting") ||
+    stage.includes("checking workspace") ||
+    stage.includes("baseline");
   if (current < actual) {
     const catchUpStep = isEarlyPhase
       ? Math.max(0.55, (actual - current) * 0.18)
@@ -424,26 +728,24 @@ function nextVisualProgress(current: number, run: Run): number {
     return Math.min(actual, current + catchUpStep);
   }
   if (current >= ceiling) {
-    return current;
+    return Math.max(ceiling, current - 1.4);
   }
 
   let driftStep = 0.18;
-  if (stage.includes("retrieving context")) {
+  if (stage.includes("starting") || stage.includes("checking workspace")) {
     driftStep = 0.08;
-  } else if (stage.includes("building grounded spec") || stage.includes("spec")) {
+  } else if (stage.includes("planning code edit") || stage.includes("reading context")) {
     driftStep = 0.1;
-  } else if (stage.includes("planning")) {
-    driftStep = 0.16;
-  } else if (stage.includes("editing")) {
+  } else if (stage.includes("applying patch")) {
     driftStep = 0.2;
-  } else if (stage.includes("validation") || stage.includes("preview")) {
+  } else if (stage.includes("checks") || stage.includes("validating") || stage.includes("building") || stage.includes("preview")) {
     driftStep = 0.12;
   }
   return Math.min(ceiling, current + driftStep);
 }
 
 function displayProgressForRun(run: Run, progressDisplay: RunProgressDisplayMap): number {
-  const actual = Math.max(0, Math.min(100, run.progress_percent || 0));
+  const actual = actualProgressForRun(run);
   const visual = progressDisplay[run.run_id];
   if (visual === undefined) {
     return Math.max(4, actual);
@@ -455,6 +757,33 @@ function displayProgressForRun(run: Run, progressDisplay: RunProgressDisplayMap)
     return actual;
   }
   return Math.max(actual, Math.min(100, Math.round(visual)));
+}
+
+function runModeTitle(run: Run): string {
+  const generationMode = run.generation_mode && run.generation_mode !== "basic"
+    ? `${run.generation_mode.charAt(0).toUpperCase()}${run.generation_mode.slice(1)}`
+    : "Balanced";
+  return run.mode === "fix" ? `Repair · ${generationMode}` : `Generate · ${generationMode}`;
+}
+
+function runTimelineTitle(run: Run): string {
+  return runModeTitle(run);
+}
+
+function runTimelineDescription(run: Run): string {
+  return displayRunPrompt(run);
+}
+
+function runTimelineMeta(run: Run): string {
+  return formatTimestamp(run.created_at);
+}
+
+function qualityStatusFromEntry(entry: unknown): string {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+    return "";
+  }
+  const status = (entry as Record<string, unknown>).status;
+  return typeof status === "string" ? status : "";
 }
 
 function ensureChildrenMap(node: FileTreeNode): Map<string, FileTreeNode> {
@@ -831,12 +1160,33 @@ export default function App() {
   const [runDetailsOpen, setRunDetailsOpen] = useState(false);
   const [runArtifacts, setRunArtifacts] = useState<RunArtifacts | null>(null);
   const [diffLoading, setDiffLoading] = useState(false);
-  const [fallbackDiffText, setFallbackDiffText] = useState("");
-  const [fallbackDiffRunId, setFallbackDiffRunId] = useState("");
-  const [fallbackDiffSource, setFallbackDiffSource] = useState<"" | "run" | "workspace">("");
+  const [secondaryDiffText, setSecondaryDiffText] = useState("");
+  const [secondaryDiffRunId, setSecondaryDiffRunId] = useState("");
+  const [secondaryDiffSource, setSecondaryDiffSource] = useState<"" | "run" | "workspace">("");
   const [workspaceLogs, setWorkspaceLogs] = useState<WorkspaceLogs | null>(null);
+  const [execStreamLines, setExecStreamLines] = useState<string[]>([]);
   const [selectedLogSection, setSelectedLogSection] = useState<"mini-app" | "workspace">("mini-app");
-  const [activeTab, setActiveTab] = useState<"preview" | "code" | "diff" | "logs">("preview");
+  const [activeTab, setActiveTab] = useState<WorkbenchTab>("preview");
+  const [runTimeline, setRunTimeline] = useState<RunTimeline | null>(null);
+  const [runTraceView, setRunTraceView] = useState<RunTraceView | null>(null);
+  const [runTraceBundle, setRunTraceBundle] = useState<TraceBundleReport | null>(null);
+  const [runProtocol, setRunProtocol] = useState<RunProtocolReport | null>(null);
+  const [runCompaction, setRunCompaction] = useState<RunCompactionReport | null>(null);
+  const [runCompactionBoundaries, setRunCompactionBoundaries] = useState<RunCompactionBoundaries | null>(null);
+  const [runTaskReport, setRunTaskReport] = useState<RunTaskReport | null>(null);
+  const [runRepairCases, setRunRepairCases] = useState<RunRepairCases | null>(null);
+  const [doctorReport, setDoctorReport] = useState<DoctorReport | null>(null);
+  const [workerReport, setWorkerReport] = useState<WorkerReport | null>(null);
+  const [reviewReport, setReviewReport] = useState<ReviewReport | null>(null);
+  const [testMatrixReport, setTestMatrixReport] = useState<TestMatrixReport | null>(null);
+  const [promptContractReport, setPromptContractReport] = useState<PromptContractReport | null>(null);
+  const [miniAppContractReport, setMiniAppContractReport] = useState<MiniAppContractReport | null>(null);
+  const [workspaceMemory, setWorkspaceMemory] = useState<WorkspaceMemory | null>(null);
+  const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+  const [fileSearchQuery, setFileSearchQuery] = useState("");
+  const [fileSearchResult, setFileSearchResult] = useState<FileSearchResult | null>(null);
+  const [lspDiagnosticsReport, setLspDiagnosticsReport] = useState<LspDiagnosticsReport | null>(null);
+  const [selectedJumpLine, setSelectedJumpLine] = useState<number | null>(null);
   const [files, setFiles] = useState<FileEntry[]>([]);
   const [selectedPath, setSelectedPath] = useState("");
   const [fileContent, setFileContent] = useState("");
@@ -872,11 +1222,18 @@ export default function App() {
   const [stoppingRunId, setStoppingRunId] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [statusMessage, setStatusMessage] = useState("");
   const previewTimeoutsRef = useRef<Record<string, number | undefined>>({});
+  const previewSoftTimeoutsRef = useRef<Record<string, number | undefined>>({});
   const previewFrameRefs = useRef<Record<RoleKey, HTMLIFrameElement | null>>({
     client: null,
     specialist: null,
     manager: null,
+  });
+  const previewHistoryRef = useRef<Record<RoleKey, PreviewHistoryState>>({
+    client: createPreviewHistoryState("client"),
+    specialist: createPreviewHistoryState("specialist"),
+    manager: createPreviewHistoryState("manager"),
   });
   const activeWorkspaceIdRef = useRef("");
 
@@ -893,9 +1250,26 @@ export default function App() {
       if (!role) {
         return;
       }
+      const currentFrameId = extractPreviewFrameId(previewFrameRefs.current[role]?.src);
+      if (typeof payload.frameId === "string" && currentFrameId && payload.frameId !== currentFrameId) {
+        return;
+      }
+      const nextPath = normalizeRolePreviewPath(role, typeof payload.path === "string" ? payload.path : ROOT_PREVIEW_PATH);
+      const history = previewHistoryRef.current[role];
+      if (history.pendingPath && nextPath === history.pendingPath && history.pendingIndex !== null) {
+        history.index = history.pendingIndex;
+        history.pendingPath = null;
+        history.pendingIndex = null;
+      } else if (history.entries[history.index] !== nextPath) {
+        history.entries = history.entries.slice(0, history.index + 1);
+        history.entries.push(nextPath);
+        history.index = history.entries.length - 1;
+        history.pendingPath = null;
+        history.pendingIndex = null;
+      }
       setRolePreviewPath((current) => ({
         ...current,
-        [role]: typeof payload.path === "string" && payload.path ? payload.path : ROOT_PREVIEW_PATH,
+        [role]: nextPath,
       }));
     }
 
@@ -960,9 +1334,16 @@ export default function App() {
     void (async () => {
       await refreshWorkspaceState(workspace.workspace_id);
       try {
-        await ensurePreview(workspace.workspace_id);
-      } catch {
-        // Preview bootstrap is best-effort; polling and rebuild fallback will handle late startup.
+        const preview = await ensurePreview(workspace.workspace_id);
+        if (preview.status === "error") {
+          setPreviewStatus("error");
+          setError(preview.last_error ? `Preview runtime failed: ${preview.last_error}` : "Preview runtime failed to start.");
+          return;
+        }
+      } catch (err) {
+        setPreviewStatus("error");
+        setError(err instanceof Error ? err.message : "Preview runtime failed to start.");
+        return;
       }
       void pollPreviewUntilReady(workspace.workspace_id);
     })();
@@ -1002,25 +1383,25 @@ export default function App() {
   useEffect(() => {
     const activeRunId = selectedRunId || runs[0]?.run_id || "";
     if (!activeRunId) {
-      setFallbackDiffText("");
-      setFallbackDiffRunId("");
-      setFallbackDiffSource("");
+      setSecondaryDiffText("");
+      setSecondaryDiffRunId("");
+      setSecondaryDiffSource("");
       setDiffLoading(false);
       return;
     }
-    const primaryDiff = `${runArtifacts?.candidate_diff ?? runArtifacts?.diff ?? ""}`.trim();
+    const primaryDiff = `${runArtifacts?.diff ?? ""}`.trim();
     if (primaryDiff) {
-      setFallbackDiffText("");
-      setFallbackDiffRunId("");
-      setFallbackDiffSource("");
+      setSecondaryDiffText("");
+      setSecondaryDiffRunId("");
+      setSecondaryDiffSource("");
       setDiffLoading(false);
       return;
     }
     const activeIndex = runs.findIndex((item) => item.run_id === activeRunId);
     if (activeIndex === -1) {
-      setFallbackDiffText("");
-      setFallbackDiffRunId("");
-      setFallbackDiffSource("");
+      setSecondaryDiffText("");
+      setSecondaryDiffRunId("");
+      setSecondaryDiffSource("");
       setDiffLoading(false);
       return;
     }
@@ -1034,14 +1415,14 @@ export default function App() {
         }
         try {
           const artifacts = await getRunArtifacts(previousRun.run_id);
-          const previousDiff = `${artifacts?.candidate_diff ?? artifacts?.diff ?? ""}`.trim();
+          const previousDiff = `${artifacts?.diff ?? ""}`.trim();
           if (!previousDiff) {
             continue;
           }
           if (!cancelled) {
-            setFallbackDiffText(previousDiff);
-            setFallbackDiffRunId(previousRun.run_id);
-            setFallbackDiffSource("run");
+            setSecondaryDiffText(previousDiff);
+            setSecondaryDiffRunId(previousRun.run_id);
+            setSecondaryDiffSource("run");
             setDiffLoading(false);
           }
           return;
@@ -1055,9 +1436,9 @@ export default function App() {
           const workspaceDiff = `${workspaceDiffPayload?.diff ?? ""}`.trim();
           if (workspaceDiff) {
             if (!cancelled) {
-              setFallbackDiffText(workspaceDiff);
-              setFallbackDiffRunId("");
-              setFallbackDiffSource("workspace");
+              setSecondaryDiffText(workspaceDiff);
+              setSecondaryDiffRunId("");
+              setSecondaryDiffSource("workspace");
               setDiffLoading(false);
             }
             return;
@@ -1067,9 +1448,9 @@ export default function App() {
         }
       }
       if (!cancelled) {
-        setFallbackDiffText("");
-        setFallbackDiffRunId("");
-        setFallbackDiffSource("");
+        setSecondaryDiffText("");
+        setSecondaryDiffRunId("");
+        setSecondaryDiffSource("");
         setDiffLoading(false);
       }
     })();
@@ -1077,7 +1458,184 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [runs, runArtifacts?.candidate_diff, runArtifacts?.diff, selectedRunId, workspace?.workspace_id]);
+  }, [runs, runArtifacts?.diff, selectedRunId, workspace?.workspace_id]);
+
+  useEffect(() => {
+    const activeRunId = selectedRunId || runs[0]?.run_id || "";
+    if (!activeRunId) {
+      setRunTimeline(null);
+      setRunTraceView(null);
+      setRunTraceBundle(null);
+      setRunProtocol(null);
+      setRunCompaction(null);
+      setRunCompactionBoundaries(null);
+      setRunTaskReport(null);
+      setRunRepairCases(null);
+      setWorkerReport(null);
+      setReviewReport(null);
+      setTestMatrixReport(null);
+      setPromptContractReport(null);
+      setMiniAppContractReport(null);
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      try {
+        const [timeline, traceView, traceBundle, protocol, compaction, compactionBoundaries, tasks, repairCases, workers, review, matrix, contract, miniappContract] = await Promise.all([
+          getRunTimeline(activeRunId),
+          getRunTraceView(activeRunId),
+          getRunTraceBundle(activeRunId),
+          getRunProtocol(activeRunId),
+          getRunCompaction(activeRunId),
+          getRunCompactionBoundaries(activeRunId),
+          getRunTasks(activeRunId),
+          getRunRepairCases(activeRunId),
+          getRunWorkers(activeRunId),
+          getRunReview(activeRunId),
+          getRunTestMatrix(activeRunId),
+          getRunPromptContract(activeRunId),
+          getRunMiniAppContract(activeRunId),
+        ]);
+        if (!cancelled) {
+          setRunTimeline(timeline);
+          setRunTraceView(traceView);
+          setRunTraceBundle(traceBundle);
+          setRunProtocol(protocol);
+          setRunCompaction(compaction);
+          setRunCompactionBoundaries(compactionBoundaries);
+          setRunTaskReport(tasks);
+          setRunRepairCases(repairCases);
+          setWorkerReport(workers);
+          setReviewReport(review);
+          setTestMatrixReport(matrix);
+          setPromptContractReport(contract);
+          setMiniAppContractReport(miniappContract);
+        }
+      } catch {
+        if (!cancelled) {
+          setRunTimeline(null);
+          setRunTraceView(null);
+          setRunTraceBundle(null);
+          setRunTaskReport(null);
+          setRunRepairCases(null);
+          setWorkerReport(null);
+          setReviewReport(null);
+          setTestMatrixReport(null);
+          setPromptContractReport(null);
+          setMiniAppContractReport(null);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [runs, selectedRunId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (activeTab === "doctor") {
+      void getDoctorReport()
+        .then((report) => {
+          if (!cancelled) {
+            setDoctorReport(report);
+          }
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setDoctorReport(null);
+          }
+        });
+    }
+    if (activeTab === "memory" && workspace?.workspace_id) {
+      void getWorkspaceMemory(workspace.workspace_id)
+        .then((memory) => {
+          if (!cancelled) {
+            setWorkspaceMemory(memory);
+          }
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setWorkspaceMemory(null);
+          }
+        });
+    }
+    if (activeTab === "lsp" && workspace?.workspace_id) {
+      const activeRun = runs.find((item) => item.run_id === selectedRunId);
+      const runId = activeRun?.draft_ready || activeRun?.status === "awaiting_approval" ? activeRun.run_id : "";
+      void getLspDiagnostics(workspace.workspace_id, runId || undefined, { changedOnly: Boolean(runId) })
+        .then((report) => {
+          if (!cancelled) {
+            setLspDiagnosticsReport(report);
+          }
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setLspDiagnosticsReport(null);
+          }
+        });
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab, runs, selectedRunId, workspace?.workspace_id]);
+
+  useEffect(() => {
+    if (activeTab !== "search" || !workspace?.workspace_id || !fileSearchQuery.trim()) {
+      setFileSearchResult(null);
+      return;
+    }
+    const activeRun = runs.find((item) => item.run_id === selectedRunId);
+    const runId = activeRun?.draft_ready || activeRun?.status === "awaiting_approval" ? activeRun.run_id : "";
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      void searchWorkspaceFiles(workspace.workspace_id, fileSearchQuery, runId || undefined)
+        .then((result) => {
+          if (!cancelled) {
+            setFileSearchResult(result);
+          }
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setFileSearchResult(null);
+          }
+        });
+    }, 180);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [activeTab, fileSearchQuery, runs, selectedRunId, workspace?.workspace_id]);
+
+  useEffect(() => {
+    function handleWorkbenchKeydown(event: KeyboardEvent) {
+      const modifier = event.metaKey || event.ctrlKey;
+      if (!modifier) {
+        return;
+      }
+      const key = event.key.toLowerCase();
+      if (key === "k") {
+        event.preventDefault();
+        setCommandPaletteOpen(true);
+      } else if (key === "s") {
+        event.preventDefault();
+        void handleSaveFile();
+      } else if (key === "r") {
+        event.preventDefault();
+        void handleRefreshPreview();
+      } else if (key === "d") {
+        event.preventDefault();
+        setActiveTab("diff");
+      } else if (key === "t") {
+        event.preventDefault();
+        setActiveTab("timeline");
+      } else if (key === "p") {
+        event.preventDefault();
+        setActiveTab("search");
+      }
+    }
+    window.addEventListener("keydown", handleWorkbenchKeydown);
+    return () => window.removeEventListener("keydown", handleWorkbenchKeydown);
+  }, [selectedPath, fileContent, originalFileContent, workspace?.workspace_id, previewBooting]);
 
   useEffect(() => {
     if (!workspace) {
@@ -1106,6 +1664,11 @@ export default function App() {
   useEffect(() => {
     return () => {
       Object.values(previewTimeoutsRef.current).forEach((timeoutId) => {
+        if (timeoutId) {
+          window.clearTimeout(timeoutId);
+        }
+      });
+      Object.values(previewSoftTimeoutsRef.current).forEach((timeoutId) => {
         if (timeoutId) {
           window.clearTimeout(timeoutId);
         }
@@ -1199,22 +1762,39 @@ export default function App() {
     [runs],
   );
   const draftContextRunId = selectedRun?.draft_ready || selectedRun?.status === "awaiting_approval" ? selectedRun.run_id : "";
-  const primaryDiffText = runArtifacts?.candidate_diff ?? runArtifacts?.diff ?? "";
-  const diffText = primaryDiffText || fallbackDiffText;
+  const commandPaletteActions = useMemo<CommandPaletteAction[]>(
+    () => [
+      { id: "generate", label: "Generate", description: "Run the current prompt", disabled: loading || !workspace || !prompt.trim() },
+      { id: "fix", label: "Fix selected run", description: "Start a repair run from the active run", disabled: loading || !workspace || !selectedRun },
+      { id: "rebuild-preview", label: "Rebuild preview", description: "Restart the live preview", disabled: !workspace || previewBooting },
+      { id: "rollback", label: "Rollback", description: "Rollback the selected run", disabled: !selectedRun || selectedRun.rolled_back },
+      { id: "export-zip", label: "Export zip", description: "Download a workspace archive", disabled: !workspace },
+      { id: "export-patch", label: "Export patch", description: "Open the diff for export", disabled: !selectedRun },
+      { id: "inspect-diff", label: "Inspect diff", description: "Open the diff tab", disabled: !selectedRun },
+      { id: "run-checks", label: "Run checks", description: "Open test matrix and prompt contract", disabled: !selectedRun },
+      { id: "run-doctor", label: "Run doctor", description: "Open diagnostics", disabled: false },
+      { id: "compact", label: "Compact", description: "Compact selected run context", disabled: !selectedRun },
+      { id: "review", label: "Review", description: "Open code review mode", disabled: !selectedRun },
+      { id: "file-search", label: "File search", description: "Search files and content", disabled: !workspace },
+    ],
+    [loading, previewBooting, prompt, selectedRun, workspace],
+  );
+  const primaryDiffText = runArtifacts?.diff ?? "";
+  const diffText = primaryDiffText || secondaryDiffText;
   const diffSourceLabel = !primaryDiffText.trim()
-    ? fallbackDiffSource === "run" && fallbackDiffRunId
-      ? `Patch review • showing previous run ${fallbackDiffRunId.slice(-8)}`
-      : fallbackDiffSource === "workspace"
+    ? secondaryDiffSource === "run" && secondaryDiffRunId
+      ? `Patch review • showing previous run ${secondaryDiffRunId.slice(-8)}`
+      : secondaryDiffSource === "workspace"
         ? "Patch review • showing live workspace diff"
         : undefined
     : undefined;
   const showGlobalLoader = initializing || creatingWorkspace || (workspaceTransitioning && !workspace);
   const runDetailSummary =
-    runArtifacts?.final_summary ??
     runArtifacts?.job?.summary ??
     selectedRun?.summary ??
     selectedRun?.failure_reason ??
     "";
+  const completedGenerateRun = isCompletedGenerateRun(selectedRun);
   const failureAnalysis = runArtifacts?.failure_analysis ?? (selectedRun
     ? {
         mode: selectedRun.mode,
@@ -1229,19 +1809,27 @@ export default function App() {
         current_exit_code: selectedRun.current_exit_code,
       }
     : null);
-  const fixAttemptItems = asRecordArray(runArtifacts?.fix_attempts?.items ?? selectedRun?.fix_attempts);
-  const scopeExpansionItems = asRecordArray(runArtifacts?.scope_expansions?.items ?? selectedRun?.scope_expansions);
+  const displayIterations = completedGenerateRun ? [] : normalizeRunIterations(runArtifacts?.iterations);
+  const displayActivityEvents = normalizeAgentActivityEvents(
+    runArtifacts?.agent_activity_events?.length ? runArtifacts.agent_activity_events : selectedRun?.agent_activity_events,
+  ).slice(-12);
+  const filesSectionTitle =
+    completedGenerateRun && selectedRun?.intent === "create"
+      ? "Created files"
+      : completedGenerateRun
+        ? "Result files"
+        : "Files";
   const fixCase = runArtifacts?.fix_case ?? workspaceLogs?.reports?.fix_case ?? null;
-  const composerTitle = selectedRunMode === "fix" ? "fixbug Input" : "Task Input";
+  const composerTitle = selectedRunMode === "fix" ? "Repair Input" : "Task Input";
   const composerHelp =
     selectedRunMode === "fix"
-      ? "Paste the failing build log, preview error, stack trace, or API mismatch. The system will analyze the error and apply the smallest safe fixbug."
-      : "Describe what to build or change. Use fixbug mode when you want targeted error repair instead of broad generation.";
+      ? "Paste the failing build log, preview error, stack trace, or API mismatch. The agent will analyze the error and apply the smallest safe repair."
+      : "Describe what to build or change. Use repair mode when you want targeted error repair instead of broad generation.";
   const composerPlaceholder =
     selectedRunMode === "fix"
       ? "Paste the exact error or log, for example: Docker preview rebuild failed... or a TypeScript traceback."
-      : "Describe the change you want to build. Switch to fixbug mode for build failures, preview issues, or stack traces.";
-  const effectiveGenerationMode: UserGenerationMode = selectedRunMode === "fix" ? "balanced" : selectedGenerationMode;
+      : "Describe the change you want to build. Switch to repair mode for build failures, preview issues, or stack traces.";
+  const effectiveGenerationMode: UserGenerationMode = selectedGenerationMode;
   const previewErrorMessage = useMemo(
     () => extractPreviewErrorMessage(workspaceLogs?.preview?.logs ?? runArtifacts?.preview?.logs ?? []),
     [runArtifacts?.preview?.logs, workspaceLogs?.preview?.logs],
@@ -1252,9 +1840,28 @@ export default function App() {
   }, [workspaceLogs?.preview?.mini_app_logs]);
   const workspaceLogLines = useMemo(() => {
     const lines = workspaceLogs?.workspace_logs ?? [];
-    return lines.length ? lines : ["No workspace logs yet."];
-  }, [workspaceLogs?.workspace_logs]);
+    const combined = [...lines, ...execStreamLines];
+    return combined.length ? combined : ["No workspace logs yet."];
+  }, [execStreamLines, workspaceLogs?.workspace_logs]);
   const activeLogLines = selectedLogSection === "mini-app" ? miniAppLogLines : workspaceLogLines;
+
+  useEffect(() => {
+    return subscribeRpcNotifications((message) => {
+      const method = String(message.method || "");
+      if (!method.startsWith("command/exec/")) {
+        return;
+      }
+      const payload = (message.params || {}) as Record<string, unknown>;
+      const processId = String(payload.process_id || "");
+      const status = String(payload.status || method.split("/").pop() || "event");
+      const stream = String(payload.stream || "");
+      const text = typeof payload.text === "string" ? payload.text : "";
+      const line = text
+        ? `[exec ${processId} ${stream}] ${text.replace(/\n$/, "")}`
+        : `[exec ${processId}] ${status}`;
+      setExecStreamLines((current) => [...current.slice(-199), line]);
+    });
+  }, []);
 
   useEffect(() => {
     if (!workspace || activeRunIds.length === 0) {
@@ -1315,7 +1922,7 @@ export default function App() {
     setRunProgressDisplay((current) => {
       const next: RunProgressDisplayMap = {};
       runs.forEach((run) => {
-        const actual = Math.max(0, Math.min(100, run.progress_percent || 0));
+        const actual = actualProgressForRun(run);
         const existing = current[run.run_id];
         if (existing === undefined) {
           next[run.run_id] = Math.max(4, actual);
@@ -1329,7 +1936,7 @@ export default function App() {
           next[run.run_id] = actual;
           return;
         }
-        next[run.run_id] = Math.max(existing, actual);
+        next[run.run_id] = actual < existing ? Math.max(actual, existing - 2) : actual;
       });
       return next;
     });
@@ -1430,6 +2037,7 @@ export default function App() {
           setRolePreviewUrls(previewPayload.role_urls ?? {});
           setPreviewStatus(previewPayload.status ?? "");
           setPreviewCycle((current) => current + 1);
+          resetPreviewHistory();
           setPreviewLoading({ ...PREVIEW_BOOT_ROLES });
           setPreviewFailed({
             client: false,
@@ -1499,6 +2107,7 @@ export default function App() {
           setPreviewUrl(preview.url);
           setRolePreviewUrls(preview.role_urls ?? {});
           setPreviewCycle((current) => current + 1);
+          resetPreviewHistory();
           setPreviewLoading({ ...PREVIEW_BOOT_ROLES });
           setPreviewFailed({
             client: false,
@@ -1510,17 +2119,28 @@ export default function App() {
         }
 
         if (preview.status === "error") {
-          setPreviewStatus("starting");
-          try {
-            await ensurePreview(workspaceId);
-          } catch {
-            // If ensure also fails, keep current error state and surface logs.
-          }
-          await sleep(PREVIEW_BOOT_POLL_INTERVAL_MS);
-          continue;
+          setPreviewStatus("error");
+          setPreviewUrl("");
+          setRolePreviewUrls({});
+          setPreviewBooting(false);
+          setPreviewLoading({
+            client: false,
+            specialist: false,
+            manager: false,
+          });
+          setPreviewFailed({
+            client: true,
+            specialist: true,
+            manager: true,
+          });
+          setError(preview.last_error ? `Preview runtime failed: ${preview.last_error}` : "Preview runtime failed to start.");
+          return;
         }
 
-        if (!rebuildTriggered && attempt >= 2 && (preview.status === "stopped" || !preview.status)) {
+        const previewLooksStuck =
+          !preview.url &&
+          (preview.status === "starting" || preview.status === "stopped" || preview.status === "running" || !preview.status);
+        if (!rebuildTriggered && ((attempt >= 2 && (preview.status === "stopped" || !preview.status)) || (attempt >= PREVIEW_STUCK_REBUILD_ATTEMPT && previewLooksStuck))) {
           rebuildTriggered = true;
           try {
             await rebuildPreview(workspaceId);
@@ -1557,6 +2177,7 @@ export default function App() {
     }
     setLoading(true);
     setError("");
+    setStatusMessage("");
     setPreviewBooting(true);
     try {
       const trimmedPrompt = prompt.trim();
@@ -1564,10 +2185,7 @@ export default function App() {
         selectedRunMode === "fix"
           ? {
               mode: "fix" as const,
-              prompt:
-                trimmedPrompt.length > 180
-                  ? "Analyze the reported failure and apply the smallest safe fix."
-                  : trimmedPrompt,
+              prompt: trimmedPrompt,
               error_context: {
                 raw_error: fixErrorContext?.raw_error?.trim() || trimmedPrompt,
                 source: fixErrorContext?.source ?? inferFixSource(trimmedPrompt),
@@ -1586,6 +2204,10 @@ export default function App() {
         model_profile: systemConfig?.default_coding_profile ?? systemConfig?.defaults.model_profile ?? "openai_code_fast",
         generation_mode: effectiveGenerationMode,
       });
+      setPrompt(DEFAULT_PROMPT);
+      if (selectedRunMode === "fix") {
+        setFixErrorContext(null);
+      }
       setRuns((current) => [run, ...current.filter((item) => item.run_id !== run.run_id)]);
       setSelectedRunId(run.run_id);
       setRunArtifacts(null);
@@ -1614,24 +2236,26 @@ export default function App() {
     const handoff = buildFixPrefill(run);
     setLoading(true);
     setError("");
+    setStatusMessage("");
     setPreviewBooting(true);
     try {
+      const fixPrompt = handoff.prompt.trim() || "Analyze the reported failure and apply the smallest safe fix.";
       const nextRun = await createRun(workspace.workspace_id, {
-        prompt: handoff.prompt.length > 180 ? "Analyze the reported failure and apply the smallest safe fix." : handoff.prompt,
+        prompt: fixPrompt,
         mode: "fix",
         intent: "auto",
         apply_strategy: "staged_auto_apply",
         target_role_scope: run.target_role_scope.length ? run.target_role_scope : activeRoleScope,
         model_profile: run.model_profile || systemConfig?.default_coding_profile || systemConfig?.defaults.model_profile || "openai_code_fast",
-        generation_mode: "balanced",
+        generation_mode: selectedGenerationMode,
         target_platform: "telegram_mini_app",
         preview_profile: "telegram_mock",
         resume_from_run_id: run.run_id,
         error_context: handoff.context,
       });
       setSelectedRunMode("fix");
-      setPrompt(handoff.prompt);
-      setFixErrorContext(handoff.context);
+      setPrompt(DEFAULT_PROMPT);
+      setFixErrorContext(null);
       setRuns((current) => [nextRun, ...current.filter((item) => item.run_id !== nextRun.run_id)]);
       setSelectedRunId(nextRun.run_id);
       setRunArtifacts(null);
@@ -1639,14 +2263,14 @@ export default function App() {
       setActiveTab("preview");
       void pollRunUntilSettled(workspace.workspace_id, nextRun.run_id);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to start fixbug run.");
+      setError(err instanceof Error ? err.message : "Failed to start repair run.");
     } finally {
       setPreviewBooting(false);
       setLoading(false);
     }
   }
 
-  async function handleSelectFile(path: string) {
+  async function handleSelectFile(path: string, line?: number) {
     if (!workspace) {
       return;
     }
@@ -1654,6 +2278,7 @@ export default function App() {
       setSelectedPath(path);
       setFileContent("");
       setOriginalFileContent("");
+      setSelectedJumpLine(line || null);
       setActiveTab("code");
       return;
     }
@@ -1666,10 +2291,12 @@ export default function App() {
       setSelectedPath(path);
       setFileContent(payload.content);
       setOriginalFileContent(payload.content);
+      setSelectedJumpLine(line || null);
     } catch {
       setSelectedPath(path);
       setFileContent("");
       setOriginalFileContent("");
+      setSelectedJumpLine(line || null);
     }
     setActiveTab("code");
   }
@@ -1741,6 +2368,99 @@ export default function App() {
       await refreshWorkspaceState(workspace.workspace_id, selectedRunId);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to save file.");
+    }
+  }
+
+  async function refreshWorkbenchPanels(runId: string) {
+    try {
+      const [timeline, traceView, traceBundle, protocol, compaction, compactionBoundaries, tasks, repairCases, workers, review] = await Promise.all([
+        getRunTimeline(runId),
+        getRunTraceView(runId),
+        getRunTraceBundle(runId),
+        getRunProtocol(runId),
+        getRunCompaction(runId),
+        getRunCompactionBoundaries(runId),
+        getRunTasks(runId),
+        getRunRepairCases(runId),
+        getRunWorkers(runId),
+        getRunReview(runId),
+      ]);
+      setRunTimeline(timeline);
+      setRunTraceView(traceView);
+      setRunTraceBundle(traceBundle);
+      setRunProtocol(protocol);
+      setRunCompaction(compaction);
+      setRunCompactionBoundaries(compactionBoundaries);
+      setRunTaskReport(tasks);
+      setRunRepairCases(repairCases);
+      setWorkerReport(workers);
+      setReviewReport(review);
+      setTestMatrixReport(await getRunTestMatrix(runId));
+      setPromptContractReport(await getRunPromptContract(runId));
+      setMiniAppContractReport(await getRunMiniAppContract(runId));
+    } catch {
+      // Keep the current panel data if one derived endpoint is temporarily unavailable.
+    }
+  }
+
+  async function handleCommandPaletteAction(actionId: string) {
+    setCommandPaletteOpen(false);
+    if (actionId === "generate") {
+      const form = document.querySelector<HTMLFormElement>(".composer-form");
+      form?.requestSubmit();
+      return;
+    }
+    if (actionId === "fix" && selectedRun) {
+      await handleRunFix(selectedRun);
+      return;
+    }
+    if (actionId === "rebuild-preview") {
+      await handleRefreshPreview();
+      return;
+    }
+    if (actionId === "rollback" && selectedRun) {
+      await handleRollbackRun(selectedRun.run_id);
+      return;
+    }
+    if (actionId === "export-zip" && workspace) {
+      const exportRef = await request<{ export_id: string }>(`/workspaces/${workspace.workspace_id}/export/zip`, { method: "POST" });
+      window.location.href = `/api/exports/${exportRef.export_id}/download`;
+      return;
+    }
+    if (actionId === "export-patch" && workspace) {
+      const exportRef = await request<{ export_id: string }>(`/workspaces/${workspace.workspace_id}/export/git-patch`, { method: "POST" });
+      window.location.href = `/api/exports/${exportRef.export_id}/download`;
+      return;
+    }
+    if (actionId === "inspect-diff") {
+      setActiveTab("diff");
+      return;
+    }
+    if (actionId === "run-checks" && selectedRun) {
+      setTestMatrixReport(await getRunTestMatrix(selectedRun.run_id));
+      setPromptContractReport(await getRunPromptContract(selectedRun.run_id));
+      setMiniAppContractReport(await getRunMiniAppContract(selectedRun.run_id));
+      setActiveTab("checks");
+      return;
+    }
+    if (actionId === "run-doctor") {
+      setActiveTab("doctor");
+      setDoctorReport(await getDoctorReport());
+      return;
+    }
+    if (actionId === "compact" && selectedRun) {
+      await compactRun(selectedRun.run_id);
+      await refreshWorkbenchPanels(selectedRun.run_id);
+      setActiveTab("timeline");
+      return;
+    }
+    if (actionId === "review" && selectedRun) {
+      setReviewReport(await getRunReview(selectedRun.run_id));
+      setActiveTab("review");
+      return;
+    }
+    if (actionId === "file-search") {
+      setActiveTab("search");
     }
   }
 
@@ -1823,6 +2543,7 @@ export default function App() {
       specialist: ROOT_PREVIEW_PATH,
       manager: ROOT_PREVIEW_PATH,
     });
+    resetPreviewHistory();
     setPreviewBooting(false);
   }
 
@@ -1843,6 +2564,7 @@ export default function App() {
       specialist: ROOT_PREVIEW_PATH,
       manager: ROOT_PREVIEW_PATH,
     });
+    resetPreviewHistory();
     setPreviewBooting(true);
   }
 
@@ -1898,10 +2620,19 @@ export default function App() {
     if (existing) {
       window.clearTimeout(existing);
     }
+    const existingSoft = previewSoftTimeoutsRef.current[role];
+    if (existingSoft) {
+      window.clearTimeout(existingSoft);
+    }
+    previewSoftTimeoutsRef.current[role] = window.setTimeout(() => {
+      previewSoftTimeoutsRef.current[role] = undefined;
+      setPreviewLoading((current) => (current[role] ? { ...current, [role]: false } : current));
+    }, PREVIEW_FRAME_SOFT_CLEAR_MS);
     previewTimeoutsRef.current[role] = window.setTimeout(() => {
-      setPreviewLoading((current) => ({ ...current, [role]: false }));
-      setPreviewFailed((current) => ({ ...current, [role]: true }));
-    }, 12000);
+      previewTimeoutsRef.current[role] = undefined;
+      setPreviewLoading((current) => (current[role] ? { ...current, [role]: false } : current));
+      setPreviewFailed((current) => (current[role] ? { ...current, [role]: false } : current));
+    }, PREVIEW_FRAME_LOAD_TIMEOUT_MS);
   }
 
   function clearPreviewTimeout(role: RoleKey) {
@@ -1910,14 +2641,32 @@ export default function App() {
       window.clearTimeout(existing);
       previewTimeoutsRef.current[role] = undefined;
     }
+    const existingSoft = previewSoftTimeoutsRef.current[role];
+    if (existingSoft) {
+      window.clearTimeout(existingSoft);
+      previewSoftTimeoutsRef.current[role] = undefined;
+    }
   }
 
-  function sendPreviewCommand(role: RoleKey, command: "back" | "close" | "refresh") {
+  function resetPreviewHistory(role?: RoleKey) {
+    if (role) {
+      previewHistoryRef.current[role] = createPreviewHistoryState(role);
+      return;
+    }
+    ROLE_ORDER.forEach((candidate) => {
+      previewHistoryRef.current[candidate] = createPreviewHistoryState(candidate);
+    });
+  }
+
+  function sendPreviewCommand(role: RoleKey, command: "back" | "close" | "refresh" | "navigate", path?: string) {
+    const frameId = extractPreviewFrameId(previewFrameRefs.current[role]?.src);
     previewFrameRefs.current[role]?.contentWindow?.postMessage(
       {
         type: "runtime-preview-command",
         command,
         role,
+        frameId,
+        path,
       },
       "*",
     );
@@ -1928,7 +2677,15 @@ export default function App() {
       sendPreviewCommand(role, "close");
       return;
     }
-    sendPreviewCommand(role, "back");
+    const history = previewHistoryRef.current[role];
+    if (history.index <= 0) {
+      sendPreviewCommand(role, "close");
+      return;
+    }
+    const targetPath = history.entries[history.index - 1] ?? getRoleRootPreviewPath(role);
+    history.pendingPath = targetPath;
+    history.pendingIndex = Math.max(0, history.index - 1);
+    sendPreviewCommand(role, "navigate", targetPath);
   }
 
   function handleMockupRefresh(role: RoleKey) {
@@ -1950,6 +2707,7 @@ export default function App() {
           setPreviewUrl(preview.url ?? "");
           setRolePreviewUrls(preview.role_urls ?? {});
           setPreviewCycle((current) => current + 1);
+          resetPreviewHistory();
           setPreviewFailed({
             client: false,
             specialist: false,
@@ -2016,8 +2774,10 @@ export default function App() {
       return;
     }
     clearPreviewTimeout(role);
+    resetPreviewHistory(role);
     setPreviewFailed((current) => ({ ...current, [role]: false }));
     setPreviewLoading((current) => ({ ...current, [role]: true }));
+    setRolePreviewPath((current) => ({ ...current, [role]: getRoleRootPreviewPath(role) }));
     setRolePreviewCycle((current) => ({ ...current, [role]: (current[role] ?? 0) + 1 }));
     armPreviewTimeout(role);
   }
@@ -2066,6 +2826,12 @@ export default function App() {
       <div
         className={`run-details-backdrop ${runDetailsOpen ? "is-open" : ""}`}
         onClick={() => setRunDetailsOpen(false)}
+      />
+      <CommandPalette
+        open={commandPaletteOpen}
+        actions={commandPaletteActions}
+        onRun={(actionId) => void handleCommandPaletteAction(actionId)}
+        onClose={() => setCommandPaletteOpen(false)}
       />
       <aside className={`workspace-drawer ${workspaceDrawerOpen ? "is-open" : ""}`} aria-hidden={!workspaceDrawerOpen}>
         <div className="workspace-drawer-head">
@@ -2167,8 +2933,86 @@ export default function App() {
             </div>
 
             <section className="run-detail-section">
+              <h4>Token usage</h4>
+              <div className="run-details-grid">
+                <div className="run-detail-card">
+                  <span>Total</span>
+                  <strong>{runTokenUsageValue(selectedRun, "total_tokens")}</strong>
+                </div>
+                <div className="run-detail-card">
+                  <span>Input</span>
+                  <strong>{runTokenUsageValue(selectedRun, "input_tokens")}</strong>
+                </div>
+                <div className="run-detail-card">
+                  <span>Output</span>
+                  <strong>{runTokenUsageValue(selectedRun, "output_tokens")}</strong>
+                </div>
+                <div className="run-detail-card">
+                  <span>Reasoning</span>
+                  <strong>{runTokenUsageValue(selectedRun, "reasoning_tokens")}</strong>
+                </div>
+                <div className="run-detail-card">
+                  <span>Turns</span>
+                  <strong>{runTokenUsageValue(selectedRun, "turn_count")}</strong>
+                </div>
+              </div>
+            </section>
+
+            <section className="run-detail-section">
+              <h4>Agent activity</h4>
+              {displayActivityEvents.length ? (
+                <div className="run-detail-list compact">
+                  {displayActivityEvents.map((event, index) => (
+                    <div key={`${event.type}-${event.created_at ?? index}`} className="run-detail-item">
+                      <div className="run-detail-item-top">
+                        <strong>{event.type.replace(/_/g, " ")}</strong>
+                        <span>{event.created_at ? formatTimestamp(event.created_at) : ""}</span>
+                      </div>
+                      <p>{event.message}</p>
+                      {(event.summary || event.status || event.worker || event.duration_ms !== undefined) && (
+                        <small className="muted">
+                          {[event.summary, event.status, event.worker, event.owner_scope, event.duration_ms !== undefined ? `${event.duration_ms} ms` : ""]
+                            .filter(Boolean)
+                            .join(" · ")}
+                        </small>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="muted">No agent activity recorded yet.</p>
+              )}
+            </section>
+
+            <section className="run-detail-section">
+              <h4>Role coverage</h4>
+              <div className="run-details-grid">
+                {ROLE_ORDER.map((role) => (
+                  <div key={role} className="run-detail-card">
+                    <span>{ROLE_LABELS[role]}</span>
+                    <strong>{roleCoverageStatus(selectedRun, role)}</strong>
+                  </div>
+                ))}
+              </div>
+            </section>
+
+            <section className="run-detail-section">
+              <h4>Generated tests</h4>
+              <div className="run-details-grid">
+                <div className="run-detail-card">
+                  <span>Python tests</span>
+                  <strong>{generatedTestStatus(selectedRun, "generated_app_python_tests")}</strong>
+                </div>
+                <div className="run-detail-card">
+                  <span>JS tests</span>
+                  <strong>{generatedTestStatus(selectedRun, "generated_app_js_tests")}</strong>
+                </div>
+              </div>
+            </section>
+
+            <section className="run-detail-section">
               <h4>Prompt</h4>
-              <pre className="json-block">{selectedRun.prompt}</pre>
+              <pre className="json-block">{displayRunPrompt(selectedRun)}</pre>
             </section>
 
             {runDetailSummary ? (
@@ -2178,19 +3022,19 @@ export default function App() {
               </section>
             ) : null}
 
-            {selectedRun.failure_reason ? (
+            {selectedRun.failure_reason && !completedGenerateRun ? (
               <section className="run-detail-section">
                 <h4>Failure reason</h4>
                 <p>{selectedRun.failure_reason}</p>
                 {selectedRun.status !== "completed" ? (
                   <button type="button" className="ghost-action" onClick={() => void handleRunFix(selectedRun)}>
-                    Open In fixbug Mode
+                    Open In Repair Mode
                   </button>
                 ) : null}
               </section>
             ) : null}
 
-            {failureAnalysis?.failure_class || failureAnalysis?.root_cause_summary || failureAnalysis?.fix_targets?.length ? (
+            {!completedGenerateRun && (failureAnalysis?.failure_class || failureAnalysis?.root_cause_summary || failureAnalysis?.fix_targets?.length) ? (
               <section className="run-detail-section">
                 <h4>Error analysis</h4>
                 <div className="run-details-grid">
@@ -2207,12 +3051,12 @@ export default function App() {
                     <strong>{failureAnalysis.failure_signature ?? selectedRun.failure_signature ?? "n/a"}</strong>
                   </div>
                   <div className="run-detail-card">
-                    <span>fixbug phase</span>
+                    <span>Repair phase</span>
                     <strong>{displayFixPhase(selectedRun, failureAnalysis.current_fix_phase ?? selectedRun.current_fix_phase)}</strong>
                   </div>
                   <div className="run-detail-card">
-                    <span>Repair attempts</span>
-                    <strong>{fixAttemptItems.length || selectedRun.repair_iterations?.length || 0}</strong>
+                    <span>Repair turns</span>
+                    <strong>{selectedRun.repair_iterations?.length || 0}</strong>
                   </div>
                   <div className="run-detail-card">
                     <span>Exit code</span>
@@ -2235,44 +3079,10 @@ export default function App() {
               </section>
             ) : null}
 
-            {selectedRun.mode === "fix" ? (
+            {selectedRun.mode === "fix" && fixCase ? (
               <section className="run-detail-section">
-                <h4>fixbug attempts</h4>
-                {fixAttemptItems.length ? (
-                  <div className="run-detail-list">
-                    {fixAttemptItems.map((attempt, index) => {
-                      const commands = asStringArray(attempt["commands"]);
-                      const filesChanged = asStringArray(attempt["files_changed"]);
-                      return (
-                        <div key={`${String(attempt["fix_attempt_id"] ?? "attempt")}-${index}`} className="run-detail-item">
-                          <div className="run-detail-item-top">
-                            <strong>Attempt {String(attempt["attempt"] ?? index + 1)}</strong>
-                            <span>{String(attempt["result"] ?? "patched")}</span>
-                          </div>
-                          {attempt["diagnosis"] ? <p>{String(attempt["diagnosis"])}</p> : null}
-                          {attempt["failure_signature"] ? <p>Signature: {String(attempt["failure_signature"])}</p> : null}
-                          {commands.length ? <p>Commands: {commands.join(" · ")}</p> : null}
-                          {filesChanged.length ? <p>Files changed: {filesChanged.join(", ")}</p> : null}
-                          {attempt["expected_verification"] ? <p>Expected verification: {String(attempt["expected_verification"])}</p> : null}
-                        </div>
-                      );
-                    })}
-                  </div>
-                ) : (
-                  <p className="muted">No fix attempts recorded yet.</p>
-                )}
-                {scopeExpansionItems.length ? (
-                  <div className="run-detail-list">
-                    {scopeExpansionItems.map((item, index) => (
-                      <div key={`scope-expansion-${index}`} className="run-detail-item">
-                        <strong>Scope expansion {String(item["attempt"] ?? index + 1)}</strong>
-                        <p>{asStringArray(item["files"]).join(", ") || "No files recorded."}</p>
-                        {item["reason"] ? <p>{String(item["reason"])}</p> : null}
-                      </div>
-                    ))}
-                  </div>
-                ) : null}
-                {fixCase ? <pre className="json-block">{JSON.stringify(fixCase, null, 2)}</pre> : null}
+                <h4>Repair context</h4>
+                <pre className="json-block">{JSON.stringify(fixCase, null, 2)}</pre>
               </section>
             ) : null}
 
@@ -2307,7 +3117,7 @@ export default function App() {
             </section>
 
             <section className="run-detail-section">
-              <h4>Files</h4>
+              <h4>{filesSectionTitle}</h4>
               {selectedRun.touched_files.length ? (
                 <div className="run-detail-list">
                   {selectedRun.touched_files.map((filePath) => (
@@ -2321,20 +3131,21 @@ export default function App() {
               )}
             </section>
 
-            <section className="run-detail-section">
-              <h4>Iterations</h4>
-              {normalizeRunIterations(runArtifacts?.iterations).length ? (
+            {!completedGenerateRun ? (
+              <section className="run-detail-section">
+                <h4>Iterations</h4>
+                {displayIterations.length ? (
                 <div className="run-detail-list">
-                  {normalizeRunIterations(runArtifacts?.iterations).map((iteration) => (
+                  {displayIterations.map((iteration) => (
                     <div key={iteration.iteration_id} className="run-detail-item">
                       <div className="run-detail-item-top">
                         <strong>{formatTimestamp(iteration.created_at)}</strong>
                         <span>{formatRoleScope(iteration.role_scope)}</span>
                       </div>
                       <p>{iteration.assistant_message}</p>
-                      {iteration.operations.length ? (
+                      {iteration.file_changes.length ? (
                         <p>
-                          {iteration.operations.map((operation) => `${operation.operation} ${operation.file_path}`).join(", ")}
+                          {iteration.file_changes.map((operation) => `${operation.operation} ${operation.file_path}`).join(", ")}
                         </p>
                       ) : null}
                     </div>
@@ -2343,7 +3154,8 @@ export default function App() {
               ) : (
                 <p className="muted">No iteration details recorded yet.</p>
               )}
-            </section>
+              </section>
+            ) : null}
           </div>
         ) : (
           <div className="run-details-body">
@@ -2413,10 +3225,9 @@ export default function App() {
                 className={`composer-mode-pill ${selectedRunMode === "fix" ? "is-active" : ""}`}
                 onClick={() => {
                   setSelectedRunMode("fix");
-                  setSelectedGenerationMode("balanced");
                 }}
               >
-                fixbug
+                repair
               </button>
             </div>
             <label className="composer-field">
@@ -2463,7 +3274,6 @@ export default function App() {
               <span>Generation mode</span>
               <select
                 value={effectiveGenerationMode}
-                disabled={selectedRunMode === "fix"}
                 onChange={(event) => setSelectedGenerationMode(event.target.value as UserGenerationMode)}
               >
                 <option value="fast">Fast</option>
@@ -2478,6 +3288,7 @@ export default function App() {
           </form>
 
           {error ? <p className="error">{error}</p> : null}
+          {statusMessage ? <p className="status-message">{statusMessage}</p> : null}
 
           <div className="runs-panel">
             <div className="runs-panel-head">
@@ -2509,24 +3320,28 @@ export default function App() {
                         onClick={() => openRunDetails(run.run_id)}
                       >
                         <div className="run-card-top">
-                          <strong>{run.intent.replaceAll("_", " ")}</strong>
+                          <strong>{runTimelineTitle(run)}</strong>
                           <span className={`run-status ${runStatus === "rolled_back" ? "rolled-back" : runStatus}`}>
                             {runStatus}
                           </span>
                         </div>
-                        <p className="run-card-copy">{clampText(run.prompt, 120)}</p>
                         <div className="run-progress">
                           <div className="run-progress-bar">
                             <div className="run-progress-fill" style={{ width: `${visualProgress}%` }} />
                           </div>
                           <div className="run-progress-meta">
-                            <span>{run.current_stage}</span>
+                            <span>{runProgressStage(run)}</span>
                             <span>{visualProgress}%</span>
                           </div>
                         </div>
                         <div className="run-card-meta">
-                          <span>{formatTimestamp(run.created_at)}</span>
-                          <span>{run.touched_files.length} files</span>
+                          <span className="run-card-meta-copy" title={runTimelineDescription(run)}>
+                            {runTimelineDescription(run)}
+                          </span>
+                          <span className="run-card-meta-side">
+                            <span className="run-card-meta-time">{runTimelineMeta(run)}</span>
+                            <span className="run-card-meta-files">{runFilesSummary(run)}</span>
+                          </span>
                         </div>
                       </button>
                       {run.status === "completed" || canStopRun || run.status === "failed" || run.status === "blocked" ? (
@@ -2583,13 +3398,11 @@ export default function App() {
                   Preview stays live while each run exposes a draft diff, editable files, and logs.
                 </p>
               </header>
-              <div className="tabs">
-                {(["preview", "code", "diff", "logs"] as const).map((tab) => (
-                  <button key={tab} type="button" className={tab === activeTab ? "active" : ""} onClick={() => setActiveTab(tab)}>
-                    {tab}
-                  </button>
-                ))}
-              </div>
+              <WorkbenchTabs
+                tabs={PRIMARY_WORKBENCH_TABS}
+                activeTab={activeTab}
+                onChange={setActiveTab}
+              />
             </div>
             <div className="preview-toolbar-actions">
               <button type="button" className="ghost-action" onClick={handleRefreshPreview} disabled={!workspace || previewBooting}>
@@ -2622,6 +3435,7 @@ export default function App() {
                   </div>
                   {selectedPath && editorSupportsFile ? (
                     <div className="editor-actions">
+                      {selectedJumpLine ? <span className="editor-jump-ref">Line {selectedJumpLine}</span> : null}
                       <button type="button" onClick={handleSaveFile} disabled={!editorIsDirty}>
                         Save
                       </button>
@@ -2658,14 +3472,24 @@ export default function App() {
             <DiffViewer text={diffText || ""} sourceLabel={diffSourceLabel} isLoading={diffLoading} />
           ) : null}
 
+          {activeTab === "timeline" ? (
+            <div className="workbench-stack">
+              <TimelinePanel timeline={runTimeline} />
+            </div>
+          ) : null}
+
+          {activeTab === "trace" ? (
+            <TracePanel trace={runTraceView} traceBundle={runTraceBundle} protocol={runProtocol} compaction={runCompaction} compactionBoundaries={runCompactionBoundaries} repairCases={runRepairCases} />
+          ) : null}
+
+          {activeTab === "tasks" ? (
+            <TaskLanePanel taskReport={runTaskReport} />
+          ) : null}
+
           {activeTab === "preview" ? (
             <div className="preview-grid">
               {ROLE_ORDER.map((role) => (
                 <div key={role} className="preview-column">
-                  <div className="preview-heading">
-                    <strong>{role}</strong>
-                    <span>{previewRuntimeMode || "runtime"} preview</span>
-                  </div>
                   <div className="phone-shell">
                     <div className="mockup-topbar">
                       <button
@@ -2856,6 +3680,50 @@ export default function App() {
                 </div>
               </div>
             </div>
+          ) : null}
+
+          {activeTab === "workers" ? (
+            <WorkerLanesPanel workerReport={workerReport} />
+          ) : null}
+
+          {activeTab === "review" ? (
+            <ReviewPanel review={reviewReport} />
+          ) : null}
+
+          {activeTab === "checks" ? (
+            <ChecksPanel matrix={testMatrixReport} promptContract={promptContractReport} miniappContract={miniAppContractReport} previewRuntimeMode={previewRuntimeMode} />
+          ) : null}
+
+          {activeTab === "doctor" ? (
+            <DoctorPanel report={doctorReport} />
+          ) : null}
+
+          {activeTab === "memory" ? (
+            <MemoryPanel memory={workspaceMemory} formatTimestamp={formatTimestamp} />
+          ) : null}
+
+          {activeTab === "search" ? (
+            <FileSearchPanel
+              query={fileSearchQuery}
+              result={fileSearchResult}
+              onQueryChange={setFileSearchQuery}
+              onSelectFile={(path) => void handleSelectFile(path)}
+            />
+          ) : null}
+
+          {activeTab === "lsp" ? (
+            <LspDiagnosticsPanel
+              report={lspDiagnosticsReport}
+              onJumpToLine={(path, line) => void handleSelectFile(path, line)}
+              onRefresh={() => {
+                if (!workspace?.workspace_id) {
+                  return;
+                }
+                void getLspDiagnostics(workspace.workspace_id, draftContextRunId || undefined, { changedOnly: Boolean(draftContextRunId) })
+                  .then(setLspDiagnosticsReport)
+                  .catch(() => setLspDiagnosticsReport(null));
+              }}
+            />
           ) : null}
         </section>
         </div>

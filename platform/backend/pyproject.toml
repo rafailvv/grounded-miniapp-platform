@@ -10,9 +10,14 @@ requires-python = ">=3.12"
 dependencies = [
   "fastapi>=0.104,<1.0",
   "httpx>=0.25,<1.0",
+  "playwright>=1.45,<2.0",
   "pydantic>=2.12,<3.0",
   "uvicorn>=0.24,<1.0",
 ]
+
+[project.scripts]
+grounded = "app.cli:main"
+grounded-openapi = "app.openapi_export:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
