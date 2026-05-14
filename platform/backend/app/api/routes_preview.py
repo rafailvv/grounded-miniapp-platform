@@ -9,6 +9,26 @@ from app.services.container import ServiceContainer
 router = APIRouter(tags=["preview"])
 
 
+def _flatten_service_logs(logs_by_service: dict[str, list[str]]) -> list[str]:
+    return [
+        line
+        for service, lines in logs_by_service.items()
+        for line in ([f"=== {service} ==="] + lines + [""])
+    ]
+
+
+def _local_preview_logs(preview_logs: list[str], api_log: list[str]) -> dict[str, list[str]]:
+    lines = [line for line in api_log[-160:] if str(line).strip()]
+    if lines:
+        return {"local-preview": lines}
+    runtime_lines = [
+        line
+        for line in preview_logs[-80:]
+        if str(line).strip() and ("uvicorn" in line or "health" in line or "runtime" in line or "Preview" in line)
+    ]
+    return {"local-preview": runtime_lines} if runtime_lines else {}
+
+
 @router.post("/workspaces/{workspace_id}/preview/start")
 def start_preview(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> dict:
     return container.preview_service.ensure_started(workspace_id).model_dump(mode="json")
@@ -55,6 +75,9 @@ def get_preview_logs(workspace_id: str, container: ServiceContainer = Depends(ge
             container_logs = container.runtime_manager.collect_container_logs(workspace_id, source_dir, preview.proxy_port)
         except Exception as exc:
             container_logs = {"preview_runtime": [f"Unable to collect preview container logs: {exc}"]}
+    elif preview.runtime_mode == "local":
+        api_log = container.workspace_log_service.read_lines(workspace_id, kind="api")
+        container_logs = _local_preview_logs(preview.logs, api_log)
     return {"logs": preview.logs, "mini_app_logs": container_logs}
 
 
@@ -71,6 +94,8 @@ def get_workspace_logs(workspace_id: str, container: ServiceContainer = Depends(
             container_logs = container.runtime_manager.collect_container_logs(workspace_id, source_dir, preview.proxy_port)
         except Exception as exc:
             container_logs = {"preview_runtime": [f"Unable to collect preview container logs: {exc}"]}
+    elif preview.runtime_mode == "local":
+        container_logs = _local_preview_logs(preview.logs, api_log)
     workspace_event_lines = [
         (
             f"- [{event.created_at.strftime('%Y-%m-%d %H:%M:%S')}] "
@@ -84,11 +109,7 @@ def get_workspace_logs(workspace_id: str, container: ServiceContainer = Depends(
         *(["", "=== platform.log ===", *platform_log] if platform_log else []),
         *(["", "=== api.log ===", *api_log] if api_log else []),
     ]
-    mini_app_logs = [
-        line
-        for service, lines in container_logs.items()
-        for line in ([f"=== {service} ==="] + lines + [""])
-    ]
+    mini_app_logs = _flatten_service_logs(container_logs)
     validation = container.workspace_code_agent_runtime.current_report(workspace_id, "validation")
     iterations = container.workspace_code_agent_runtime.current_report(workspace_id, "iterations")
     candidate_diff = container.workspace_code_agent_runtime.current_report(workspace_id, "candidate_diff")
