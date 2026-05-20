@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 import threading
 import time
@@ -353,7 +354,7 @@ class ThreadService:
     def exec_command(self, *, workspace_id: str, command: str, thread_id: str | None = None, turn_id: str | None = None, timeout: int = 30, approval_id: str | None = None, preset: str = "safe_auto") -> dict[str, Any]:
         linked_run_id = self._get_turn(turn_id).linked_run_id if turn_id else None
         source_dir = self.workspace_service.source_dir(workspace_id)
-        evaluation = self.exec_policy_service.evaluate_command(command, preset=preset, root=source_dir)
+        evaluation = self.exec_policy_service.evaluate_command(command, preset=preset, root=source_dir, workspace_id=workspace_id)
         decision = evaluation.get("decision") if isinstance(evaluation.get("decision"), dict) else {}
         approval = evaluation.get("approval") if isinstance(evaluation.get("approval"), dict) else {}
         if linked_run_id:
@@ -381,15 +382,22 @@ class ThreadService:
                         "created_at": self._now().isoformat(),
                     },
                 )
-        if decision.get("action") != "allow":
+        if decision.get("action") == "forbidden":
             raise ValueError(f"Command rejected by policy: {decision.get('reason')}")
         if approval.get("required"):
             if not approval_id or not linked_run_id or not self._run_approval_status(linked_run_id, approval_id) == "approved":
                 raise ValueError(f"Command requires approval: {approval.get('approval_id')}")
+        runtime_decision = self.exec_policy_service.policy.decide(command)
+        if decision.get("action") == "prompt" and approval_id:
+            runtime_decision = replace(
+                runtime_decision,
+                action="allow",
+                reason=f"Approved command permission {approval_id}: {runtime_decision.reason}",
+            )
         payload = self.exec_runtime_service.start(
             workspace_id=workspace_id,
             command=command,
-            decision=self.exec_policy_service.policy.decide(command),
+            decision=runtime_decision,
             policy_evaluation=evaluation,
             thread_id=thread_id,
             turn_id=turn_id,

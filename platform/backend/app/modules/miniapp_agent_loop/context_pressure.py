@@ -2,15 +2,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
-from typing import Any
+from typing import Any, Callable
 
 from app.models.context_pressure import (
     CompactBoundaryWarning,
+    ContextPhaseBudget,
     ContextPressureRecommendation,
     ContextPressureSection,
     ContextPressureSnapshot,
     FileReadHint,
     MicrocompactCandidate,
+    StalePathReference,
 )
 
 
@@ -185,6 +187,9 @@ class AgentContextPressureAnalyzer:
             microcompact_candidates=microcompact_candidates,
             compact_boundary=compact_boundary,
             compact_recommended=bool(recommendations),
+            stale_path_refs=self._stale_path_refs_from_payload(parsed),
+            phase_budgets=self._phase_budgets_from_payload(parsed),
+            token_cost_budget=self._token_cost_budget_from_payload(parsed),
         )
         return snapshot.model_dump(mode="json", by_alias=True)
 
@@ -193,6 +198,8 @@ class AgentContextPressureAnalyzer:
         transcript: dict[str, Any] | None,
         *,
         current_file_contexts: dict[str, Any] | None = None,
+        path_exists: Callable[[str], bool | None] | None = None,
+        find_similar_path: Callable[[str], str | None] | None = None,
     ) -> dict[str, Any]:
         """Detect Claude-style duplicate file read pressure from tool trace.
 
@@ -204,9 +211,10 @@ class AgentContextPressureAnalyzer:
         if not isinstance(events, list):
             events = []
         read_counts: dict[str, int] = {}
+        read_sequences: dict[str, int] = {}
         seen_tool_ids: set[str] = set()
 
-        def record_read(tool: str, targets: Any, tool_use_id: str = "") -> None:
+        def record_read(tool: str, targets: Any, tool_use_id: str = "", sequence: int = 0) -> None:
             if tool_use_id and tool_use_id in seen_tool_ids:
                 return
             if tool_use_id:
@@ -220,12 +228,14 @@ class AgentContextPressureAnalyzer:
                 if not path:
                     continue
                 read_counts[path] = read_counts.get(path, 0) + 1
+                read_sequences[path] = max(read_sequences.get(path, 0), int(sequence or 0))
 
         for event in events:
             if not isinstance(event, dict):
                 continue
             payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
             event_type = str(event.get("event_type") or "")
+            sequence = int(event.get("sequence") or 0)
             if event_type == "model_turn":
                 for call in payload.get("tool_calls") or []:
                     if isinstance(call, dict):
@@ -233,6 +243,7 @@ class AgentContextPressureAnalyzer:
                             str(call.get("tool") or ""),
                             call.get("targets"),
                             str(call.get("tool_use_id") or ""),
+                            sequence,
                         )
             elif event_type == "tool_call":
                 arguments = payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {}
@@ -240,6 +251,7 @@ class AgentContextPressureAnalyzer:
                     str(payload.get("tool") or arguments.get("tool") or ""),
                     arguments.get("targets") or payload.get("targets"),
                     str(payload.get("tool_use_id") or ""),
+                    sequence,
                 )
 
         current_file_contexts = current_file_contexts or {}
@@ -288,10 +300,47 @@ class AgentContextPressureAnalyzer:
                     "paths": [item["path"] for item in duplicates[:8]],
                 }
             )
+        stale_path_refs: list[StalePathReference] = []
+        if path_exists is not None:
+            for path, count in sorted(read_counts.items(), key=lambda item: (-item[1], item[0])):
+                try:
+                    exists = path_exists(path)
+                except Exception:
+                    exists = None
+                if exists is not False:
+                    continue
+                suggestion = None
+                if find_similar_path is not None:
+                    try:
+                        suggestion = find_similar_path(path)
+                    except Exception:
+                        suggestion = None
+                stale_path_refs.append(
+                    StalePathReference(
+                        path=path,
+                        source="transcript.read_files",
+                        reason="missing_in_workspace",
+                        read_count=int(count),
+                        last_sequence=read_sequences.get(path) or None,
+                        suggested_path=suggestion,
+                    )
+                )
+            if stale_path_refs:
+                suggestions.append(
+                    {
+                        "kind": "stale_path_refs",
+                        "code": "refresh_stale_path_refs",
+                        "message": "Some referenced files no longer exist in the active draft; resolve the current path before reading or patching.",
+                        "section": "transcript",
+                        "tokens": 0,
+                        "paths": [item.path for item in stale_path_refs[:8]],
+                    }
+                )
         return {
             "duplicate_file_reads": duplicates[:20],
             "duplicate_read_token_estimate": duplicate_token_estimate,
             "avoid_reread_files": [item.model_dump(mode="json") for item in avoid_reread_files],
+            "stale_path_refs": [item.model_dump(mode="json") for item in stale_path_refs[:20]],
             "suggestions": suggestions,
             "compact_recommended": bool(suggestions),
         }
@@ -342,6 +391,63 @@ class AgentContextPressureAnalyzer:
             )
         return candidates[:20]
 
+    def _stale_path_refs_from_payload(self, parsed: dict[str, Any]) -> list[StalePathReference]:
+        raw = parsed.get("stale_path_refs")
+        if not isinstance(raw, list):
+            raw = ((parsed.get("context_pressure") or {}).get("stale_path_refs") if isinstance(parsed.get("context_pressure"), dict) else [])
+        refs: list[StalePathReference] = []
+        for item in (raw if isinstance(raw, list) else []):
+            if not isinstance(item, dict) or not str(item.get("path") or "").strip():
+                continue
+            try:
+                refs.append(StalePathReference.model_validate(item))
+            except Exception:
+                refs.append(
+                    StalePathReference(
+                        path=str(item.get("path") or ""),
+                        source=str(item.get("source") or "payload"),
+                        reason=str(item.get("reason") or "stale_reference"),
+                        suggested_path=str(item.get("suggested_path") or "") or None,
+                    )
+                )
+        return refs[:20]
+
+    def _phase_budgets_from_payload(self, parsed: dict[str, Any]) -> list[ContextPhaseBudget]:
+        raw = parsed.get("phase_budgets") or parsed.get("phase_budget")
+        if isinstance(raw, dict):
+            raw = raw.get("phases")
+        if not isinstance(raw, list):
+            return []
+        budgets: list[ContextPhaseBudget] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            phase = str(item.get("phase") or item.get("id") or "").strip()
+            if not phase:
+                continue
+            try:
+                budgets.append(ContextPhaseBudget.model_validate({**item, "phase": phase}))
+            except Exception:
+                budgets.append(
+                    ContextPhaseBudget(
+                        phase=phase,
+                        status=str(item.get("status") or "pending"),
+                        token_budget=self._safe_int(item.get("token_budget")),
+                        tokens_used=self._safe_int(item.get("tokens_used") or item.get("tokens_used_estimate")),
+                        token_ratio=self._safe_float(item.get("token_ratio")),
+                        cost_budget_usd=self._safe_float(item.get("cost_budget_usd")),
+                        estimated_cost_usd=self._safe_float(item.get("estimated_cost_usd")),
+                    )
+                )
+        return budgets[:20]
+
+    def _token_cost_budget_from_payload(self, parsed: dict[str, Any]) -> dict[str, Any]:
+        for key in ("token_cost_budget", "phase_budget"):
+            value = parsed.get(key)
+            if isinstance(value, dict):
+                return value
+        return {}
+
     @staticmethod
     def _section_label(key: str) -> str:
         return {
@@ -375,6 +481,20 @@ class AgentContextPressureAnalyzer:
             "compact_memory_context": "compact_memory",
             "avoid_reread_files": "avoid_reread_files",
         }.get(code, "review_context")
+
+    @staticmethod
+    def _safe_int(value: Any) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _safe_float(value: Any) -> float:
+        try:
+            return float(value or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
 
     @staticmethod
     def _item_label(item: Any, *, index: int) -> str:

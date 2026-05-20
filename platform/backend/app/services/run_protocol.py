@@ -249,6 +249,20 @@ class RunProtocolService:
         index["items"] = items
         index["updated_at"] = utc_iso()
         self.store.upsert("reports", self._bookmark_key(run_id), index)
+        if self.event_journal_service is not None:
+            try:
+                self.event_journal_service.append_run(
+                    workspace_id=workspace_id,
+                    run_id=run_id,
+                    event_type="protocol.bookmark_created",
+                    actor="system",
+                    payload=bookmark,
+                    summary="Run protocol bookmark created.",
+                    source_ref=str(bookmark.get("bookmark_id") or ""),
+                    idempotency_key=f"protocol.bookmark:{bookmark.get('bookmark_id')}",
+                )
+            except Exception:
+                pass
         return bookmark
 
     def bookmarks(self, run_id: str) -> dict[str, Any]:

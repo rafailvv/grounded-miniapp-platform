@@ -3,12 +3,15 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import json
 import threading
+import time
 from typing import Any
 
 from app.models.domain import BackgroundTaskRecord, CreateRunRequest
+from app.modules.miniapp_agent_loop.lsp_tools import LspToolService
 from app.repositories.state_store import StateStore
 from app.services.check_runner import CheckRunner
 from app.services.memory_pipeline import WorkspaceMemoryPipeline
+from app.services.pr_babysitter import PrBabysitterService
 from app.services.repair_cases import RepairCaseService
 from app.services.workspace.preview_service import PreviewService
 from app.services.workspace.run_service import RunService
@@ -26,6 +29,14 @@ def _now_iso() -> str:
     return _now().isoformat()
 
 
+def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return min(maximum, max(minimum, parsed))
+
+
 class BackgroundTaskService:
     def __init__(
         self,
@@ -35,12 +46,14 @@ class BackgroundTaskService:
         run_service: RunService,
         preview_service: PreviewService,
         check_runner: CheckRunner,
+        pr_babysitter_service: PrBabysitterService | None = None,
     ) -> None:
         self.store = store
         self.workspace_service = workspace_service
         self.run_service = run_service
         self.preview_service = preview_service
         self.check_runner = check_runner
+        self.pr_babysitter_service = pr_babysitter_service
         self._workers: dict[str, threading.Thread] = {}
 
     def create_task(
@@ -247,10 +260,14 @@ class BackgroundTaskService:
             return self._repair_failed_run(task)
         if task.type == "browser_verify":
             return self._browser_verify(task)
+        if task.type == "lsp_diagnostics":
+            return self._lsp_diagnostics(task)
         if task.type == "memory_consolidate":
             return self._memory_consolidate(task)
         if task.type == "preview_rebuild":
             return self._preview_rebuild(task)
+        if task.type == "pr_ci_babysit":
+            return self._pr_ci_babysit(task)
         if task.type == "worker_branch":
             return {
                 "summary": "Worker branch task recorded; execution is controlled by the run worker branch gate.",
@@ -330,6 +347,52 @@ class BackgroundTaskService:
         self.store.upsert("reports", ref, record.model_dump(mode="json"))
         return {"summary": f"Browser/check verification {record.status}.", "check_ref": ref, "check_status": record.status}
 
+    def _lsp_diagnostics(self, task: BackgroundTaskRecord) -> dict[str, Any]:
+        run_id = str(task.run_id or task.input.get("run_id") or "").strip() or None
+        files = [str(item).strip() for item in (task.input.get("files") or []) if str(item or "").strip()]
+        changed_only = bool(task.input.get("changed_only"))
+        source_dir = (
+            self.workspace_service.draft_source_dir(task.workspace_id, run_id)
+            if run_id and self.workspace_service.draft_exists(task.workspace_id, run_id)
+            else self.workspace_service.source_dir(task.workspace_id)
+        )
+        changed_files: list[str] = []
+        if run_id:
+            try:
+                changed_files = self._paths_from_diff(self.workspace_service.diff(task.workspace_id, run_id=run_id))
+            except KeyError:
+                changed_files = []
+        self._append_output(task.task_id, "progress", "LSP diagnostics started.", {"run_id": run_id, "changed_only": changed_only, "files": files})
+        report = LspToolService.diagnostics(
+            root=source_dir,
+            targets=files or None,
+            changed_files=changed_files,
+            changed_only=changed_only,
+            progress_callback=lambda phase, payload: self._append_output(task.task_id, "diagnostic_stream", f"LSP phase {phase}: {payload.get('status')}", payload),
+        )
+        route_graph = LspToolService.route_graph(root=source_dir, targets=files or None)
+        payload = {
+            **report,
+            "workspace_id": task.workspace_id,
+            "run_id": run_id,
+            "sources": sorted({str(item.get("source") or "unknown") for item in report.get("items") or []} or {"none"}),
+            "symbols": LspToolService.symbol_context(root=source_dir, query="", targets=files or None).get("items", []),
+            "route_graph": route_graph,
+            "async_task_id": task.task_id,
+        }
+        ref = f"lsp_diagnostics:{task.workspace_id}:{run_id or 'source'}"
+        task_ref = f"lsp_diagnostics_task:{task.task_id}"
+        self.store.upsert("reports", ref, payload)
+        self.store.upsert("reports", task_ref, payload)
+        return {
+            "summary": f"LSP diagnostics {payload.get('status')}.",
+            "diagnostics_ref": ref,
+            "task_diagnostics_ref": task_ref,
+            "diagnostics_status": payload.get("status"),
+            "error_count": payload.get("error_count", 0),
+            "warning_count": payload.get("warning_count", 0),
+        }
+
     def _memory_consolidate(self, task: BackgroundTaskRecord) -> dict[str, Any]:
         stage1 = [
             payload
@@ -371,6 +434,84 @@ class BackgroundTaskService:
         preview = self.preview_service.rebuild(task.workspace_id, source_dir=source_dir, draft_run_id=draft_run_id)
         return {"summary": f"Preview rebuild {preview.status}.", "preview_id": preview.preview_id, "preview_status": preview.status, "preview_url": preview.url}
 
+    def _pr_ci_babysit(self, task: BackgroundTaskRecord) -> dict[str, Any]:
+        if self.pr_babysitter_service is None:
+            raise ValueError("PR babysitter service is unavailable.")
+        ref = f"pr_babysitter_task:{task.task_id}"
+        max_polls = _bounded_int(task.input.get("max_polls"), default=30, minimum=1, maximum=720)
+        poll_value = task.input.get("poll_seconds")
+        if poll_value is None:
+            poll_value = task.input.get("poll_interval_seconds")
+        poll_seconds = _bounded_int(poll_value, default=60, minimum=0, maximum=3600)
+        stop_when_ready = bool(task.input.get("stop_when_ready"))
+        stop_actions = {"stop_pr_closed", "stop_user_help_required", "stop_exhausted_retries"}
+        report: dict[str, Any] | None = None
+        history: list[dict[str, Any]] = []
+        terminal_reason: str | None = None
+
+        for poll_index in range(max_polls):
+            if self._stop_requested(task.task_id):
+                terminal_reason = "stop_requested"
+                break
+            report = self.pr_babysitter_service.snapshot(
+                workspace_id=task.workspace_id,
+                pr=str(task.input.get("pr") or "auto"),
+                repo=str(task.input.get("repo") or "").strip() or None,
+                run_id=task.run_id or str(task.input.get("run_id") or "").strip() or None,
+                export_id=str(task.input.get("export_id") or "").strip() or None,
+                max_flaky_retries=int(task.input.get("max_flaky_retries") or 3),
+                retry_failed_now=bool(task.input.get("retry_failed_now") or task.input.get("auto_retry")),
+            )
+            actions = [str(action) for action in (report.get("actions") or [])]
+            history.append(
+                {
+                    "poll": poll_index + 1,
+                    "status": report.get("status"),
+                    "actions": actions,
+                    "checks": report.get("checks") or {},
+                    "pr": report.get("pr") or {},
+                    "updated_at": report.get("updated_at"),
+                }
+            )
+            self.store.upsert("reports", ref, {**report, "task_id": task.task_id, "poll": poll_index + 1, "max_polls": max_polls, "watch_history": history})
+            self._append_output(
+                task.task_id,
+                "pr_snapshot",
+                f"PR babysitter poll {poll_index + 1}/{max_polls}: {report.get('status')}.",
+                {"report_ref": ref, "actions": actions, "checks": report.get("checks") or {}, "pr": report.get("pr") or {}, "poll": poll_index + 1, "max_polls": max_polls},
+            )
+            action_set = set(actions)
+            terminal = sorted(action_set & stop_actions)
+            if terminal:
+                terminal_reason = terminal[0]
+                break
+            if stop_when_ready and "ready_to_merge" in action_set:
+                terminal_reason = "ready_to_merge"
+                break
+            if poll_index + 1 >= max_polls:
+                terminal_reason = "poll_horizon_reached"
+                break
+            self._append_output(task.task_id, "progress", "PR babysitter waiting for next poll.", {"poll_seconds": poll_seconds, "next_poll": poll_index + 2})
+            deadline = time.monotonic() + poll_seconds
+            while time.monotonic() < deadline:
+                if self._stop_requested(task.task_id):
+                    terminal_reason = "stop_requested"
+                    break
+                time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+            if terminal_reason == "stop_requested":
+                break
+
+        if report is None:
+            raise ValueError("PR babysitter stopped before collecting a snapshot.")
+        watch = {"polls_completed": len(history), "max_polls": max_polls, "poll_seconds": poll_seconds, "terminal_reason": terminal_reason or "unknown"}
+        return {
+            "summary": f"PR babysitter {report.get('status')} ({watch['terminal_reason']}).",
+            "pr_babysitter_ref": ref,
+            "actions": report.get("actions") or [],
+            "pr": report.get("pr") or {},
+            "watch": watch,
+        }
+
     def _cancel(self, task: BackgroundTaskRecord, message: str) -> None:
         task.status = "cancelled"
         task.output_summary = message
@@ -405,13 +546,27 @@ class BackgroundTaskService:
         self.store.upsert("reports", key, output)
 
     @staticmethod
+    def _paths_from_diff(diff: str) -> list[str]:
+        paths: list[str] = []
+        for line in str(diff or "").splitlines():
+            if line.startswith("diff --git "):
+                parts = line.split()
+                if len(parts) >= 4:
+                    paths.append(parts[3][2:] if parts[3].startswith("b/") else parts[3])
+            elif line.startswith("+++ b/"):
+                paths.append(line[6:])
+        return list(dict.fromkeys(paths))
+
+    @staticmethod
     def _default_title(task_type: str) -> str:
         labels = {
             "generate_product": "Generate product",
             "repair_failed_run": "Repair failed run",
             "browser_verify": "Browser verification",
+            "lsp_diagnostics": "LSP diagnostics",
             "memory_consolidate": "Consolidate memory",
             "worker_branch": "Worker branch",
             "preview_rebuild": "Preview rebuild",
+            "pr_ci_babysit": "PR/CI babysitter",
         }
         return labels.get(task_type, str(task_type or "Background task"))

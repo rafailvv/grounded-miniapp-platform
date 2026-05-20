@@ -23,6 +23,9 @@ import {
   getRunOutputArtifacts,
   getRunTasks,
   getRunRepairCases,
+  getRunGate,
+  getRunBrowserProof,
+  executeSlashCommand,
   getWorkspaceObservability,
   getDoctorReport,
   getRunWorkers,
@@ -57,6 +60,8 @@ import {
   OutputArtifactIndex,
   RunTaskReport,
   RunRepairCases,
+  RunGateReport,
+  BrowserProofReport,
   ObservabilityReport,
   FileSearchResult,
   LspDiagnosticsReport,
@@ -148,6 +153,19 @@ const ROLE_LABELS: Record<RoleKey, string> = {
 
 const DEFAULT_PROMPT = "";
 const ROOT_PREVIEW_PATH = "/";
+const PRODUCT_SLASH_COMMANDS = new Set(["generate", "fix", "polish", "add-flow", "review", "acceptance", "deploy", "babysit-pr", "docs"]);
+
+function parseProductSlashCommand(value: string): { commandId: string; detail: string } | null {
+  const match = value.trim().match(/^\/([a-z-]+)(?:\s+([\s\S]*))?$/i);
+  if (!match) {
+    return null;
+  }
+  const commandId = match[1].toLowerCase();
+  if (!PRODUCT_SLASH_COMMANDS.has(commandId)) {
+    return null;
+  }
+  return { commandId, detail: (match[2] || "").trim() };
+}
 
 function inferFixSource(rawError: string): FixErrorContext["source"] {
   const lowered = rawError.toLowerCase();
@@ -1227,6 +1245,8 @@ export default function App() {
   const [runOutputArtifacts, setRunOutputArtifacts] = useState<OutputArtifactIndex | null>(null);
   const [runTaskReport, setRunTaskReport] = useState<RunTaskReport | null>(null);
   const [runRepairCases, setRunRepairCases] = useState<RunRepairCases | null>(null);
+  const [runGateReport, setRunGateReport] = useState<RunGateReport | null>(null);
+  const [runBrowserProof, setRunBrowserProof] = useState<BrowserProofReport | null>(null);
   const [observabilityReport, setObservabilityReport] = useState<ObservabilityReport | null>(null);
   const [doctorReport, setDoctorReport] = useState<DoctorReport | null>(null);
   const [workerReport, setWorkerReport] = useState<WorkerReport | null>(null);
@@ -1527,6 +1547,8 @@ export default function App() {
       setRunOutputArtifacts(null);
       setRunTaskReport(null);
       setRunRepairCases(null);
+      setRunGateReport(null);
+      setRunBrowserProof(null);
       setWorkerReport(null);
       setReviewReport(null);
       setPromptSuggestions(null);
@@ -1538,7 +1560,7 @@ export default function App() {
     let cancelled = false;
     void (async () => {
       try {
-        const [timeline, traceView, traceBundle, protocol, compaction, contextPressure, compactionBoundaries, outputArtifacts, tasks, repairCases, workers, review, suggestions, matrix, contract, miniappContract] = await Promise.all([
+        const [timeline, traceView, traceBundle, protocol, compaction, contextPressure, compactionBoundaries, outputArtifacts, tasks, repairCases, gate, browserProof, workers, review, suggestions, matrix, contract, miniappContract] = await Promise.all([
           getRunTimeline(activeRunId),
           getRunTraceView(activeRunId),
           getRunTraceBundle(activeRunId),
@@ -1549,6 +1571,8 @@ export default function App() {
           getRunOutputArtifacts(activeRunId),
           getRunTasks(activeRunId),
           getRunRepairCases(activeRunId),
+          getRunGate(activeRunId),
+          getRunBrowserProof(activeRunId),
           getRunWorkers(activeRunId),
           getRunReview(activeRunId),
           getRunPromptSuggestions(activeRunId),
@@ -1567,6 +1591,8 @@ export default function App() {
           setRunOutputArtifacts(outputArtifacts);
           setRunTaskReport(tasks);
           setRunRepairCases(repairCases);
+          setRunGateReport(gate);
+          setRunBrowserProof(browserProof);
           setWorkerReport(workers);
           setReviewReport(review);
           setPromptSuggestions(suggestions);
@@ -1581,6 +1607,8 @@ export default function App() {
           setRunTraceBundle(null);
           setRunTaskReport(null);
           setRunRepairCases(null);
+          setRunGateReport(null);
+          setRunBrowserProof(null);
           setWorkerReport(null);
           setReviewReport(null);
           setPromptSuggestions(null);
@@ -1834,20 +1862,17 @@ export default function App() {
   const draftContextRunId = selectedRun?.draft_ready || selectedRun?.status === "awaiting_approval" ? selectedRun.run_id : "";
   const commandPaletteActions = useMemo<CommandPaletteAction[]>(
     () => [
-      { id: "generate", label: "Generate", description: "Run the current prompt", disabled: loading || !workspace || !prompt.trim() },
-      { id: "fix", label: "Fix selected run", description: "Start a repair run from the active run", disabled: loading || !workspace || !selectedRun },
-      { id: "rebuild-preview", label: "Rebuild preview", description: "Restart the live preview", disabled: !workspace || previewBooting },
-      { id: "rollback", label: "Rollback", description: "Rollback the selected run", disabled: !selectedRun || selectedRun.rolled_back },
-      { id: "export-zip", label: "Export zip", description: "Download a workspace archive", disabled: !workspace },
-      { id: "export-patch", label: "Export patch", description: "Open the diff for export", disabled: !selectedRun },
-      { id: "inspect-diff", label: "Inspect diff", description: "Open the diff tab", disabled: !selectedRun },
-      { id: "run-checks", label: "Run checks", description: "Open test matrix and prompt contract", disabled: !selectedRun },
-      { id: "run-doctor", label: "Run doctor", description: "Open diagnostics", disabled: false },
-      { id: "compact", label: "Compact", description: "Compact selected run context", disabled: !selectedRun },
-      { id: "review", label: "Review", description: "Open code review mode", disabled: !selectedRun },
-      { id: "file-search", label: "File search", description: "Search files and content", disabled: !workspace },
+      { id: "slash:generate", label: "/generate", description: "Create the app from the current prompt", disabled: loading || !workspace || !prompt.trim() },
+      { id: "slash:fix", label: "/fix", description: "Repair the latest failed acceptance gate", disabled: loading || !workspace || !runs.length },
+      { id: "slash:polish", label: "/polish", description: "Improve mobile UI without changing behavior", disabled: loading || !workspace },
+      { id: "slash:add-flow", label: "/add-flow", description: "Add the current prompt as a new scenario", disabled: loading || !workspace || !prompt.trim() },
+      { id: "slash:review", label: "/review", description: "Find product risks and proof gaps", disabled: loading || !workspace || !runs.length },
+      { id: "slash:acceptance", label: "/acceptance", description: "Run proof: API, data, UI, roles, mobile, tests", disabled: loading || !workspace || !runs.length },
+      { id: "slash:deploy", label: "/deploy", description: "Prepare deploy bundle after green gate", disabled: loading || !workspace },
+      { id: "slash:babysit-pr", label: "/babysit-pr", description: "Watch exported app PR CI and review feedback", disabled: loading || !workspace },
+      { id: "slash:docs", label: "/docs", description: "Update product architecture docs", disabled: loading || !workspace },
     ],
-    [loading, previewBooting, prompt, selectedRun, workspace],
+    [loading, prompt, runs.length, workspace],
   );
   const primaryDiffText = runArtifacts?.diff ?? "";
   const diffText = primaryDiffText || secondaryDiffText;
@@ -2257,6 +2282,11 @@ export default function App() {
       setError("Enter a prompt describing the change you want.");
       return;
     }
+    const slashCommand = parseProductSlashCommand(prompt);
+    if (slashCommand) {
+      await handleExecuteSlashCommand(slashCommand.commandId, slashCommand.detail);
+      return;
+    }
     setLoading(true);
     setError("");
     setStatusMessage("");
@@ -2354,6 +2384,79 @@ export default function App() {
       void pollRunUntilSettled(workspace.workspace_id, nextRun.run_id);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to start repair run.");
+    } finally {
+      setPreviewBooting(false);
+      setLoading(false);
+    }
+  }
+
+  async function handleExecuteSlashCommand(commandId: string, detail = "") {
+    if (!workspace || loading) {
+      return;
+    }
+    setLoading(true);
+    setError("");
+    setStatusMessage("");
+    if (["generate", "fix", "polish", "add-flow"].includes(commandId)) {
+      setPreviewBooting(true);
+    }
+    try {
+      const commandPrompt = detail || (["generate", "add-flow"].includes(commandId) ? prompt.trim() : "");
+      const execution = await executeSlashCommand(commandId, {
+        workspace_id: workspace.workspace_id,
+        run_id: selectedRun?.run_id,
+        prompt: commandPrompt,
+        target_role_scope: activeRoleScope,
+        model_profile: selectedRun?.model_profile || systemConfig?.default_coding_profile || systemConfig?.defaults.model_profile || "openai_code_fast",
+        generation_mode: selectedGenerationMode,
+      });
+      const launchedRun = execution.run && typeof execution.run === "object" && "run_id" in execution.run ? execution.run : null;
+      if (launchedRun) {
+        setRuns((current) => [launchedRun, ...current.filter((item) => item.run_id !== launchedRun.run_id)]);
+        setSelectedRunId(launchedRun.run_id);
+        setRunArtifacts(null);
+        setPrompt(DEFAULT_PROMPT);
+        setFixErrorContext(null);
+        await refreshWorkspaceState(workspace.workspace_id, launchedRun.run_id);
+        setActiveTab("preview");
+        void pollRunUntilSettled(workspace.workspace_id, launchedRun.run_id);
+        return;
+      }
+      if (commandId === "review" && execution.report) {
+        setReviewReport(execution.report as ReviewReport);
+        setActiveTab("review");
+      } else if (commandId === "acceptance" && execution.report) {
+        const report = execution.report as Record<string, unknown>;
+        if (report.test_matrix) {
+          setTestMatrixReport(report.test_matrix as TestMatrixReport);
+        }
+        if (report.browser_proof) {
+          setRunBrowserProof(report.browser_proof as BrowserProofReport);
+        }
+        if (report.gate) {
+          setRunGateReport(report.gate as RunGateReport);
+        }
+        setActiveTab("checks");
+      } else if (commandId === "deploy") {
+        const exportId = String((execution.exports?.deploy_bundle || {}).export_id || "");
+        setStatusMessage(exportId ? `Deploy bundle prepared: ${exportId}` : "Deploy preparation blocked. Check readiness blockers.");
+        if (execution.status === "blocked" && execution.report && selectedRun) {
+          setRunGateReport((execution.report as Record<string, unknown>).gate as RunGateReport);
+          setActiveTab("checks");
+        }
+      } else if (commandId === "babysit-pr") {
+        const taskId = String((execution.task as Record<string, unknown> | undefined)?.task_id || "");
+        setStatusMessage(taskId ? `PR babysitter started: ${taskId}` : "PR babysitter snapshot queued.");
+        setActiveTab("tasks");
+      } else if (commandId === "docs") {
+        setStatusMessage("Product architecture docs updated.");
+        setActiveTab("trace");
+      }
+      if (selectedRun) {
+        await refreshWorkbenchPanels(selectedRun.run_id);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : `Failed to execute /${commandId}.`);
     } finally {
       setPreviewBooting(false);
       setLoading(false);
@@ -2463,7 +2566,7 @@ export default function App() {
 
   async function refreshWorkbenchPanels(runId: string) {
     try {
-      const [timeline, traceView, traceBundle, protocol, compaction, contextPressure, compactionBoundaries, outputArtifacts, tasks, repairCases, workers, review] = await Promise.all([
+      const [timeline, traceView, traceBundle, protocol, compaction, contextPressure, compactionBoundaries, outputArtifacts, tasks, repairCases, gate, browserProof, workers, review] = await Promise.all([
         getRunTimeline(runId),
         getRunTraceView(runId),
         getRunTraceBundle(runId),
@@ -2474,6 +2577,8 @@ export default function App() {
         getRunOutputArtifacts(runId),
         getRunTasks(runId),
         getRunRepairCases(runId),
+        getRunGate(runId),
+        getRunBrowserProof(runId),
         getRunWorkers(runId),
         getRunReview(runId),
       ]);
@@ -2487,6 +2592,8 @@ export default function App() {
       setRunOutputArtifacts(outputArtifacts);
       setRunTaskReport(tasks);
       setRunRepairCases(repairCases);
+      setRunGateReport(gate);
+      setRunBrowserProof(browserProof);
       setWorkerReport(workers);
       setReviewReport(review);
       setTestMatrixReport(await getRunTestMatrix(runId));
@@ -2499,6 +2606,11 @@ export default function App() {
 
   async function handleCommandPaletteAction(actionId: string) {
     setCommandPaletteOpen(false);
+    if (actionId.startsWith("slash:")) {
+      const commandId = actionId.slice("slash:".length);
+      await handleExecuteSlashCommand(commandId, ["generate", "add-flow"].includes(commandId) ? prompt.trim() : "");
+      return;
+    }
     if (actionId === "generate") {
       const form = document.querySelector<HTMLFormElement>(".composer-form");
       form?.requestSubmit();
@@ -2534,6 +2646,8 @@ export default function App() {
       setTestMatrixReport(await getRunTestMatrix(selectedRun.run_id));
       setPromptContractReport(await getRunPromptContract(selectedRun.run_id));
       setMiniAppContractReport(await getRunMiniAppContract(selectedRun.run_id));
+      setRunGateReport(await getRunGate(selectedRun.run_id));
+      setRunBrowserProof(await getRunBrowserProof(selectedRun.run_id));
       setActiveTab("checks");
       return;
     }
@@ -3809,7 +3923,7 @@ export default function App() {
           ) : null}
 
           {activeTab === "checks" ? (
-            <ChecksPanel matrix={testMatrixReport} promptContract={promptContractReport} miniappContract={miniAppContractReport} previewRuntimeMode={previewRuntimeMode} />
+            <ChecksPanel matrix={testMatrixReport} promptContract={promptContractReport} miniappContract={miniAppContractReport} gate={runGateReport} browserProof={runBrowserProof} previewRuntimeMode={previewRuntimeMode} />
           ) : null}
 
           {activeTab === "doctor" ? (

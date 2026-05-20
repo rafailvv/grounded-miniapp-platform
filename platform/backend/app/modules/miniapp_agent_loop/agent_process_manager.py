@@ -827,6 +827,7 @@ class AgentProcessManager:
         return {
             "action": decision.action,
             "reason": decision.reason,
+            "safety_class": decision.safety_class,
             "normalized_command": decision.normalized_command,
             "argv": list(decision.argv),
             "resolved_argv": list(decision.resolved_argv or decision.argv),

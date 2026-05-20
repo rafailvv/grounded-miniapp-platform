@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -7,6 +8,8 @@ from fastapi.testclient import TestClient
 
 from app.main import create_app
 from app.openapi_export import export_openapi
+from app.models.protocol import ProtocolEnvelopeV1, ProtocolEnvelopeV2
+from app.services.app_protocol import APP_PROTOCOL_SCHEMA_ROOT, app_protocol_json_schemas, app_protocol_manifest
 
 
 def _response_schema_refs(openapi: dict[str, Any], path: str, method: str) -> set[str]:
@@ -33,6 +36,8 @@ def test_openapi_keeps_typed_workbench_response_models(tmp_path: Path) -> None:
     openapi = TestClient(app).get("/openapi.json").json()
 
     expected = {
+        ("/system/app-protocol", "get"): "AppProtocolManifest",
+        ("/system/app-protocol/schemas", "get"): "ProtocolSchemaCatalog",
         ("/runs/{run_id}/events-v2", "get"): "EventJournalPage",
         ("/runs/{run_id}/journal/state", "get"): "RunJournalState",
         ("/threads/{thread_id}/events-v2", "get"): "EventJournalPage",
@@ -59,8 +64,21 @@ def test_schema_manifest_and_generated_types_contract_stay_in_sync(tmp_path: Pat
 
     assert manifest["schema"] == "grounded.system_schema.v1"
     assert manifest["openapi_url"] == "/openapi.json"
+    assert manifest["app_protocol_url"] == "/system/app-protocol"
+    assert manifest["app_protocol_schema_url"] == "/system/app-protocol/schemas"
+    assert manifest["app_protocol_fixture_root"] == "platform/backend/app/schemas/app_protocol"
     assert manifest["generated_types_path"] == "platform/frontend/src/lib/generated/openapi-types.ts"
     for model_name in {
+        "AppProtocolManifest",
+        "ProtocolSchemaCatalog",
+        "ProtocolEnvelopeV1",
+        "ProtocolEnvelopeV2",
+        "ProtocolRunState",
+        "ProtocolTurnState",
+        "ProtocolToolCallState",
+        "ProtocolApprovalState",
+        "ProtocolEventState",
+        "ProtocolWorkerUpdate",
         "ToolEnvelope",
         "RunEventsReport",
         "GateReport",
@@ -75,6 +93,52 @@ def test_schema_manifest_and_generated_types_contract_stay_in_sync(tmp_path: Pat
     }:
         assert model_name in manifest_names
         assert model_name in component_names
+
+
+def test_app_protocol_manifest_covers_core_subjects_and_legacy_endpoints(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    protocol = TestClient(app).get("/system/app-protocol").json()
+
+    assert protocol["schema"] == "grounded.app_protocol.manifest.v1"
+    assert protocol["current_version"] == "v2"
+    assert protocol["supported_versions"] == ["v1", "v2"]
+    assert protocol["endpoint_refs"]["openapi"] == "/openapi.json"
+
+    subjects = {item["subject"]: item for item in protocol["subjects"]}
+    assert set(subjects) == {"run", "turn", "tool_call", "approval", "event", "worker_update"}
+    assert "/runs/{run_id}/protocol" in subjects["run"]["legacy_endpoints"]
+    assert "/threads/{thread_id}" in subjects["turn"]["legacy_endpoints"]
+    assert "/runs/{run_id}/tool-events" in subjects["tool_call"]["legacy_endpoints"]
+    assert "/runs/{run_id}/approvals" in subjects["approval"]["legacy_endpoints"]
+    assert "/runs/{run_id}/events-v2" in subjects["event"]["legacy_endpoints"]
+    assert "/runs/{run_id}/workers" in subjects["worker_update"]["legacy_endpoints"]
+
+
+def test_app_protocol_schema_fixtures_match_generated_models() -> None:
+    generated = app_protocol_json_schemas()
+    assert generated
+
+    for name, schema in generated.items():
+        fixture_name = ""
+        for char_index, char in enumerate(name):
+            if char.isupper() and char_index > 0:
+                fixture_name += "_"
+            fixture_name += char.lower()
+        fixture = APP_PROTOCOL_SCHEMA_ROOT / f"{fixture_name}.schema.json"
+        assert fixture.exists(), f"Missing protocol fixture for {name}"
+        assert json.loads(fixture.read_text(encoding="utf-8")) == schema
+
+
+def test_protocol_v2_envelope_is_additive_over_v1() -> None:
+    v1_fields = {field.alias or name for name, field in ProtocolEnvelopeV1.model_fields.items()}
+    v2_fields = {field.alias or name for name, field in ProtocolEnvelopeV2.model_fields.items()}
+    assert v1_fields <= v2_fields
+
+    manifest = app_protocol_manifest().model_dump(mode="json", by_alias=True)
+    version_specs = {item["version"]: item for item in manifest["versions"]}
+    assert version_specs["v1"]["status"] == "supported"
+    assert version_specs["v2"]["status"] == "current"
+    assert "additive" in manifest["compatibility_policy"]
 
 
 def test_legacy_doctor_shape_remains_additive(tmp_path: Path) -> None:

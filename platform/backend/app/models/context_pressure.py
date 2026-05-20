@@ -47,6 +47,27 @@ class FileReadHint(StrictModel):
     recommendation: str = "Use cached file context/current diff; re-read only after mutation or for a precise missing range."
 
 
+class StalePathReference(StrictModel):
+    path: str
+    source: str = "transcript"
+    reason: str = "missing_in_workspace"
+    read_count: int = 0
+    last_sequence: int | None = None
+    suggested_path: str | None = None
+    action: str = "refresh_path_reference"
+
+
+class ContextPhaseBudget(StrictModel):
+    phase: str
+    status: str = "pending"
+    token_budget: int = 0
+    tokens_used: int = 0
+    token_ratio: float = 0.0
+    cost_budget_usd: float = 0.0
+    estimated_cost_usd: float = 0.0
+    action: str = "stay_within_phase_budget"
+
+
 class CompactBoundaryWarning(StrictModel):
     recommended: bool = False
     pressure_ratio: float = 0.0
@@ -67,6 +88,9 @@ class ContextPressureSnapshot(StrictModel):
     suggestions: list[dict[str, Any]] = Field(default_factory=list)
     microcompact_candidates: list[MicrocompactCandidate] = Field(default_factory=list)
     avoid_reread_files: list[FileReadHint] = Field(default_factory=list)
+    stale_path_refs: list[StalePathReference] = Field(default_factory=list)
+    phase_budgets: list[ContextPhaseBudget] = Field(default_factory=list)
+    token_cost_budget: dict[str, Any] = Field(default_factory=dict)
     duplicate_file_reads: list[dict[str, Any]] = Field(default_factory=list)
     duplicate_read_token_estimate: int = 0
     compact_boundary: CompactBoundaryWarning = Field(default_factory=CompactBoundaryWarning)
@@ -87,5 +111,8 @@ class ContextPressureReport(StrictModel):
     recommendations: list[ContextPressureRecommendation] = Field(default_factory=list)
     microcompact_candidates: list[MicrocompactCandidate] = Field(default_factory=list)
     avoid_reread_files: list[FileReadHint] = Field(default_factory=list)
+    stale_path_refs: list[StalePathReference] = Field(default_factory=list)
+    phase_budgets: list[ContextPhaseBudget] = Field(default_factory=list)
+    token_cost_budget: dict[str, Any] = Field(default_factory=dict)
     compact_boundary: CompactBoundaryWarning = Field(default_factory=CompactBoundaryWarning)
     updated_at: str | None = None

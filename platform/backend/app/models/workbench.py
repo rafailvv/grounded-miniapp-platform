@@ -7,6 +7,18 @@ from pydantic import ConfigDict, Field
 from app.models.common import StrictModel
 from app.models.event_journal import EventJournalPage, EventJournalPayload, RunEventV2, RunJournalState, ThreadEventV2, ThreadJournalState
 from app.models.observability import ObservabilityReport
+from app.models.protocol import (
+    AppProtocolManifest,
+    ProtocolApprovalState,
+    ProtocolEnvelopeV1,
+    ProtocolEnvelopeV2,
+    ProtocolEventState,
+    ProtocolRunState,
+    ProtocolSchemaCatalog,
+    ProtocolToolCallState,
+    ProtocolTurnState,
+    ProtocolWorkerUpdate,
+)
 from app.models.webhooks import WebhookDeliveryReport, WebhookListReport, WebhookSubscription
 
 
@@ -140,6 +152,59 @@ class RunBookmarksReport(WorkbenchApiModel):
     items: list[RunBookmark] = Field(default_factory=list)
 
 
+class RunEventReplayReport(WorkbenchApiModel):
+    schema_: str = Field(default="grounded.run_event_replay.v1", alias="schema")
+    run_id: str
+    workspace_id: str | None = None
+    status: str = "ok"
+    replay_cursor: int = 0
+    event_count: int = 0
+    latest_status: str | None = None
+    latest_stage: str | None = None
+    blocking: bool = False
+    run: dict[str, Any] = Field(default_factory=dict)
+    journal_state: dict[str, Any] = Field(default_factory=dict)
+    event_page: dict[str, Any] = Field(default_factory=dict)
+    protocol: dict[str, Any] = Field(default_factory=dict)
+    bookmarks: list[RunBookmark] = Field(default_factory=list)
+    failure_point: dict[str, Any] = Field(default_factory=dict)
+    resume: dict[str, Any] = Field(default_factory=dict)
+    replay_refs: dict[str, Any] = Field(default_factory=dict)
+
+
+class RunCompareReport(WorkbenchApiModel):
+    schema_: str = Field(default="grounded.run_compare.v1", alias="schema")
+    status: str = "ok"
+    base_run_id: str
+    target_run_id: str
+    workspace_id: str | None = None
+    lineage: dict[str, Any] = Field(default_factory=dict)
+    field_changes: list[dict[str, Any]] = Field(default_factory=list)
+    file_delta: dict[str, Any] = Field(default_factory=dict)
+    check_delta: dict[str, Any] = Field(default_factory=dict)
+    readiness_delta: dict[str, Any] = Field(default_factory=dict)
+    failure_delta: dict[str, Any] = Field(default_factory=dict)
+    refs: dict[str, Any] = Field(default_factory=dict)
+
+
+class RpcMethodSpec(WorkbenchApiModel):
+    method: str
+    transport: str = "websocket"
+    params_schema: dict[str, Any] = Field(default_factory=dict)
+    result_schema: str | None = None
+    idempotent: bool = False
+    description: str = ""
+
+
+class RpcProtocolReport(WorkbenchApiModel):
+    schema_: str = Field(default="grounded.rpc_protocol.v1", alias="schema")
+    status: str = "ok"
+    jsonrpc: str = "2.0"
+    endpoint: str = "/rpc"
+    capabilities: dict[str, Any] = Field(default_factory=dict)
+    methods: list[RpcMethodSpec] = Field(default_factory=list)
+
+
 class RunEventsReport(WorkbenchApiModel):
     schema_: str = Field(default="grounded.run_events.v1", alias="schema")
     run_id: str
@@ -248,6 +313,11 @@ class RepairCase(WorkbenchApiModel):
     issue_code: str | None = None
     severity: str | None = None
     likely_cause: str | None = None
+    failed_check: str | None = None
+    likely_files: list[str] = Field(default_factory=list)
+    broken_surface: dict[str, Any] = Field(default_factory=dict)
+    post_fix_proof: dict[str, Any] = Field(default_factory=dict)
+    repair_packet: dict[str, Any] = Field(default_factory=dict)
     target_files: list[str] = Field(default_factory=list)
     forbidden_files: list[str] = Field(default_factory=list)
     required_next_tool: str | None = None
@@ -291,6 +361,28 @@ class GateIssue(WorkbenchApiModel):
     evidence: dict[str, Any] = Field(default_factory=dict)
 
 
+class ProductReadinessCheck(WorkbenchApiModel):
+    key: str
+    label: str
+    status: str
+    required: bool = True
+    check: str | None = None
+    details: str | None = None
+    evidence: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProductReadinessResult(WorkbenchApiModel):
+    schema_: str = Field(default="grounded.product_readiness.v1", alias="schema")
+    status: str
+    acceptance_required: bool = True
+    required_checks: list[ProductReadinessCheck] = Field(default_factory=list)
+    checklist: list[ProductReadinessCheck] = Field(default_factory=list)
+    evidence: dict[str, Any] = Field(default_factory=dict)
+    blocking_reasons: list[GateIssue] = Field(default_factory=list)
+    repair_case_ids: list[str] = Field(default_factory=list)
+    next_forced_action: dict[str, Any] = Field(default_factory=dict)
+
+
 class GateReport(WorkbenchApiModel):
     run_id: str
     workspace_id: str
@@ -305,6 +397,8 @@ class GateReport(WorkbenchApiModel):
     requirements: dict[str, Any] = Field(default_factory=dict)
     artifact_refs: dict[str, str | None] = Field(default_factory=dict)
     run_state: dict[str, Any] = Field(default_factory=dict)
+    product_readiness: ProductReadinessResult | None = None
+    requirement_traceability: dict[str, Any] = Field(default_factory=dict)
 
 
 class SchemaModelRef(WorkbenchApiModel):
@@ -313,6 +407,16 @@ class SchemaModelRef(WorkbenchApiModel):
 
 
 class SystemSchemaShapes(WorkbenchApiModel):
+    app_protocol_manifest: AppProtocolManifest | None = None
+    protocol_schema_catalog: ProtocolSchemaCatalog | None = None
+    protocol_envelope_v1: ProtocolEnvelopeV1 | None = None
+    protocol_envelope_v2: ProtocolEnvelopeV2 | None = None
+    protocol_run_state: ProtocolRunState | None = None
+    protocol_turn_state: ProtocolTurnState | None = None
+    protocol_tool_call_state: ProtocolToolCallState | None = None
+    protocol_approval_state: ProtocolApprovalState | None = None
+    protocol_event_state: ProtocolEventState | None = None
+    protocol_worker_update: ProtocolWorkerUpdate | None = None
     artifact_ref: ArtifactRef | None = None
     check_result: CheckResult | None = None
     run_event: RunEvent | None = None
@@ -328,6 +432,7 @@ class SystemSchemaShapes(WorkbenchApiModel):
     thread_journal_state: ThreadJournalState | None = None
     tool_envelope: ToolEnvelope | None = None
     gate_report: GateReport | None = None
+    product_readiness_result: ProductReadinessResult | None = None
     repair_case: RepairCase | None = None
     trace_state: TraceState | None = None
 
@@ -336,12 +441,25 @@ class SystemSchemaManifest(WorkbenchApiModel):
     schema_: str = Field(default="grounded.system_schema.v1", alias="schema")
     status: str = "ok"
     openapi_url: str = "/openapi.json"
+    app_protocol_url: str = "/system/app-protocol"
+    app_protocol_schema_url: str = "/system/app-protocol/schemas"
+    app_protocol_fixture_root: str = "platform/backend/app/schemas/app_protocol"
     generated_types_path: str = "platform/frontend/src/lib/generated/openapi-types.ts"
     models: list[SchemaModelRef] = Field(default_factory=list)
     model_shapes: SystemSchemaShapes | None = None
 
 
 SYSTEM_SCHEMA_MODEL_REFS: tuple[SchemaModelRef, ...] = (
+    SchemaModelRef(name="AppProtocolManifest", purpose="Versioned app protocol manifest for runs, turns, tools, approvals, events, and workers."),
+    SchemaModelRef(name="ProtocolSchemaCatalog", purpose="JSON Schema fixture catalog for the app protocol."),
+    SchemaModelRef(name="ProtocolEnvelopeV1", purpose="Stable v1 compatibility envelope."),
+    SchemaModelRef(name="ProtocolEnvelopeV2", purpose="Current additive protocol envelope."),
+    SchemaModelRef(name="ProtocolRunState", purpose="Versioned run lifecycle payload."),
+    SchemaModelRef(name="ProtocolTurnState", purpose="Versioned turn lifecycle payload."),
+    SchemaModelRef(name="ProtocolToolCallState", purpose="Versioned tool-call lifecycle payload."),
+    SchemaModelRef(name="ProtocolApprovalState", purpose="Versioned approval request payload."),
+    SchemaModelRef(name="ProtocolEventState", purpose="Versioned event journal payload."),
+    SchemaModelRef(name="ProtocolWorkerUpdate", purpose="Versioned worker update payload."),
     SchemaModelRef(name="RunEvent", purpose="Append-only run event wrapper."),
     SchemaModelRef(name="RunEventV2", purpose="Append-only run journal event with payload ref."),
     SchemaModelRef(name="ThreadEventV2", purpose="Append-only thread journal event with payload ref."),
@@ -351,8 +469,12 @@ SYSTEM_SCHEMA_MODEL_REFS: tuple[SchemaModelRef, ...] = (
     SchemaModelRef(name="ThreadJournalState", purpose="Reduced thread state reconstructed from v2 journal."),
     SchemaModelRef(name="ToolEnvelope", purpose="Canonical workbench tool-call envelope."),
     SchemaModelRef(name="ToolEventsReport", purpose="Run tool event report."),
+    SchemaModelRef(name="ProductReadinessResult", purpose="Strict production acceptance proof result."),
     SchemaModelRef(name="RunEventsReport", purpose="Run event report."),
     SchemaModelRef(name="RunProtocolReport", purpose="Run protocol event report."),
+    SchemaModelRef(name="RunEventReplayReport", purpose="Replay artifact reconstructed from typed journal, protocol events, and bookmarks."),
+    SchemaModelRef(name="RunCompareReport", purpose="Run-to-run diff for fork/resume/version comparison."),
+    SchemaModelRef(name="RpcProtocolReport", purpose="Typed JSON-RPC method and capability manifest."),
     SchemaModelRef(name="RunTimelineReport", purpose="Run timeline report."),
     SchemaModelRef(name="RunTraceViewReport", purpose="Run trace view report."),
     SchemaModelRef(name="TraceBundleReport", purpose="Trace bundle report."),

@@ -2524,6 +2524,10 @@ class CheckRunner:
             *[str(item.get("message") or item) for item in mobile_report.get("findings") or []],
         ]
         proof_passed = bool(proof.get("passed"))
+        network_errors = [str(item) for item in proof.get("network_errors") or [] if str(item).strip()]
+        if network_errors:
+            logs.append(f"Browser network errors observed: {network_errors[0]}")
+            proof_passed = False
         mobile_passed = str(mobile_report.get("status") or "") != "failed"
         diagnostics = {
             "workflow_kind": contract.get("workflow_kind") or "create",
@@ -2538,8 +2542,17 @@ class CheckRunner:
             "created_marker": proof.get("created_marker") or proof.get("created_state_marker"),
             "updated_marker": proof.get("updated_marker") or proof.get("updated_state_marker"),
             "console_errors": proof.get("console_errors") or [],
+            "network_errors": network_errors,
+            "network_logs": proof.get("network_logs") or network_errors,
             "visible_errors": proof.get("visible_errors") or [],
             "screenshots": proof.get("screenshots") or [],
+            "screenshot_before": proof.get("screenshot_before"),
+            "screenshot_after": proof.get("screenshot_after"),
+            "playwright_scenario": proof.get("playwright_scenario") or {},
+            "failed_step_context": proof.get("failed_step_context") or {},
+            "dom_selector": proof.get("dom_selector") or proof.get("failed_selector"),
+            "mobile_viewport": proof.get("mobile_viewport") or {"width": 390, "height": 844},
+            "console_logs": proof.get("console_logs") or proof.get("console_errors") or [],
             "api_before": proof.get("api_before"),
             "api_after": proof.get("api_after"),
             "failed_step": proof.get("failed_step"),
@@ -2609,6 +2622,7 @@ class CheckRunner:
             "base_url": preview_url.rstrip("/"),
             "api_paths": api_paths,
             "routes_by_role": routes_by_role,
+            "mobile_viewport": {"width": 390, "height": 844},
             "role_flow": {
                 "source_roles": source_roles,
                 "update_roles": update_roles,
@@ -2692,6 +2706,7 @@ PAYLOAD = json.loads(sys.argv[1] or "{}")
 BASE_URL = str(PAYLOAD.get("base_url") or "").rstrip("/")
 ROUTES_BY_ROLE = PAYLOAD.get("routes_by_role") or {}
 REQUESTED_API_PATHS = [str(path) for path in PAYLOAD.get("api_paths") or [] if str(path).startswith("/api/")]
+MOBILE_VIEWPORT = PAYLOAD.get("mobile_viewport") if isinstance(PAYLOAD.get("mobile_viewport"), dict) else {"width": 390, "height": 844}
 ROLE_FLOW = PAYLOAD.get("role_flow") or {}
 SOURCE_ROLES = [str(role) for role in ROLE_FLOW.get("source_roles") or [] if str(role) in ("client", "specialist", "manager")]
 UPDATE_ROLES = [str(role) for role in ROLE_FLOW.get("update_roles") or [] if str(role) in ("client", "specialist", "manager")]
@@ -2701,8 +2716,10 @@ SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 
 STEPS = []
 CONSOLE_ERRORS = []
+NETWORK_ERRORS = []
 VISIBLE_ERRORS = []
 SCREENSHOTS = []
+PLAYWRIGHT_SCENARIO = []
 OPENAPI = {}
 API_PATHS = []
 GET_API_PATHS = []
@@ -2720,25 +2737,130 @@ def emit(result):
 
 def safe_screenshot(page, label):
     try:
-        path = SCREENSHOT_DIR / f"{len(SCREENSHOTS) + 1:02d}-{label}.png"
+        safe_label = re.sub(r"[^a-z0-9_-]+", "-", str(label or "step").lower()).strip("-")[:80] or "step"
+        path = SCREENSHOT_DIR / f"{len(SCREENSHOTS) + 1:02d}-{safe_label}.png"
         page.screenshot(path=str(path), full_page=True)
         SCREENSHOTS.append(str(path))
+        return str(path)
     except Exception:
-        pass
+        return None
+
+
+def selector_for(locator):
+    try:
+        return locator.evaluate(
+            """el => {
+                if (!el) return "";
+                if (el.id) return "#" + CSS.escape(el.id);
+                const testId = el.getAttribute("data-testid") || el.getAttribute("data-test-id");
+                if (testId) return `[data-testid="${testId}"]`;
+                const name = el.getAttribute("name");
+                if (name) return `${el.tagName.toLowerCase()}[name="${name}"]`;
+                const role = el.getAttribute("role");
+                if (role) return `${el.tagName.toLowerCase()}[role="${role}"]`;
+                const parts = [];
+                let node = el;
+                while (node && node.nodeType === 1 && parts.length < 5) {
+                    let part = node.tagName.toLowerCase();
+                    const parent = node.parentElement;
+                    if (parent) {
+                        const siblings = Array.from(parent.children).filter(child => child.tagName === node.tagName);
+                        if (siblings.length > 1) part += `:nth-of-type(${siblings.indexOf(node) + 1})`;
+                    }
+                    parts.unshift(part);
+                    node = parent;
+                }
+                return parts.join(" > ");
+            }"""
+        )
+    except Exception:
+        return ""
+
+
+def record_scenario_step(action, route="", role="", selector="", screenshot_before=None, screenshot_after=None, status="passed", **extra):
+    item = {
+        "index": len(PLAYWRIGHT_SCENARIO) + 1,
+        "action": action,
+        "route": route,
+        "role": role,
+        "selector": selector,
+        "status": status,
+        "screenshot_before": screenshot_before,
+        "screenshot_after": screenshot_after,
+        "mobile_viewport": MOBILE_VIEWPORT,
+        "console_errors": CONSOLE_ERRORS[-5:],
+        "network_errors": NETWORK_ERRORS[-5:],
+        **{key: value for key, value in extra.items() if value not in (None, "", [])},
+    }
+    PLAYWRIGHT_SCENARIO.append(item)
+    return item
+
+
+def failed_context_for(step):
+    for item in reversed(PLAYWRIGHT_SCENARIO):
+        if item.get("action") == step:
+            return item
+    return PLAYWRIGHT_SCENARIO[-1] if PLAYWRIGHT_SCENARIO else {}
+
+
+def ignored_network_url(url):
+    lowered = str(url or "").lower()
+    return lowered.endswith("/favicon.ico") or "favicon" in lowered
+
+
+def request_failure_text(request):
+    try:
+        failure = request.failure
+    except Exception:
+        return "failed"
+    if isinstance(failure, dict):
+        return str(failure.get("errorText") or failure.get("error") or "failed")
+    return str(failure or "failed")
 
 
 def fail(step, message, page=None, **extra):
+    captured = safe_screenshot(page, step) if page is not None else None
+    failed_context = extra.get("failed_step_context") if isinstance(extra.get("failed_step_context"), dict) else failed_context_for(step)
+    screenshot_before = extra.get("screenshot_before") or failed_context.get("screenshot_before")
+    screenshot_after = extra.get("screenshot_after") or captured or failed_context.get("screenshot_after") or (SCREENSHOTS[-1] if SCREENSHOTS else None)
+    dom_selector = extra.get("failed_selector") or failed_context.get("selector")
     if page is not None:
-        safe_screenshot(page, step)
+        record_scenario_step(
+            step,
+            route=str(extra.get("failed_route") or failed_context.get("route") or ""),
+            role=str(extra.get("failed_role") or failed_context.get("role") or ""),
+            selector=str(dom_selector or ""),
+            screenshot_before=screenshot_before,
+            screenshot_after=screenshot_after,
+            status="failed",
+            message=message,
+        )
     result = {
         "passed": False,
         "failed_step": step,
         "logs": [message],
         "ui_steps": STEPS,
+        "playwright_scenario": {
+            "schema": "grounded.browser_playwright_scenario.v1",
+            "base_url": BASE_URL,
+            "mobile_viewport": MOBILE_VIEWPORT,
+            "source_roles": SOURCE_ROLES,
+            "update_roles": UPDATE_ROLES,
+            "observer_roles": OBSERVER_ROLES,
+            "steps": PLAYWRIGHT_SCENARIO,
+        },
+        "failed_step_context": failed_context,
+        "dom_selector": dom_selector,
+        "screenshot_before": screenshot_before,
+        "screenshot_after": screenshot_after,
+        "mobile_viewport": MOBILE_VIEWPORT,
         "created_marker": CREATED_MARKER,
         "updated_marker": UPDATED_MARKER,
         "manager_marker": MANAGER_MARKER,
         "console_errors": CONSOLE_ERRORS[-20:],
+        "console_logs": CONSOLE_ERRORS[-20:],
+        "network_errors": NETWORK_ERRORS[-20:],
+        "network_logs": NETWORK_ERRORS[-20:],
         "visible_errors": VISIBLE_ERRORS[-20:],
         "screenshots": SCREENSHOTS,
         "api_paths": API_PATHS,
@@ -2873,7 +2995,9 @@ def goto(page, route):
         page.wait_for_load_state("networkidle", timeout=4000)
     except PlaywrightTimeoutError:
         pass
-    STEPS.append({"action": "open", "route": route})
+    screenshot_after = safe_screenshot(page, f"open-{route.strip('/') or 'root'}")
+    STEPS.append({"action": "open", "route": route, "screenshot_after": screenshot_after, "mobile_viewport": MOBILE_VIEWPORT})
+    record_scenario_step("open", route=route, screenshot_after=screenshot_after)
 
 
 def body_text(page):
@@ -3021,6 +3145,8 @@ def submit_form(page, form, role, route, marker, purpose, created_id=None):
     for index in range(controls.count()):
         if fill_control(controls.nth(index), marker, purpose, created_id):
             filled += 1
+    selector = selector_for(form) or "form"
+    screenshot_before = safe_screenshot(page, f"{role}-{purpose}-before")
     submit = form.locator("button[type=submit], input[type=submit], button:not([type]), button")
     try:
         if submit.count():
@@ -3034,7 +3160,9 @@ def submit_form(page, form, role, route, marker, purpose, created_id=None):
     except PlaywrightTimeoutError:
         pass
     page.wait_for_timeout(700)
-    STEPS.append({"action": f"{role}_{purpose}", "route": route, "filled_controls": filled})
+    screenshot_after = safe_screenshot(page, f"{role}-{purpose}-after")
+    STEPS.append({"action": f"{role}_{purpose}", "route": route, "filled_controls": filled, "selector": selector, "screenshot_before": screenshot_before, "screenshot_after": screenshot_after, "mobile_viewport": MOBILE_VIEWPORT})
+    record_scenario_step(f"{role}_{purpose}", route=route, role=role, selector=selector, screenshot_before=screenshot_before, screenshot_after=screenshot_after, filled_controls=filled)
     return filled
 
 
@@ -3064,13 +3192,17 @@ def click_update_button(page, scope, role, route):
         if not (data_id or data_action or patterns.search(text)):
             continue
         try:
+            selector = selector_for(button)
+            screenshot_before = safe_screenshot(page, f"{role}-button-update-before")
             button.click(timeout=2500)
             try:
                 page.wait_for_load_state("networkidle", timeout=5000)
             except PlaywrightTimeoutError:
                 pass
             page.wait_for_timeout(700)
-            STEPS.append({"action": f"{role}_button_update", "route": route, "text": text[:80]})
+            screenshot_after = safe_screenshot(page, f"{role}-button-update-after")
+            STEPS.append({"action": f"{role}_button_update", "route": route, "text": text[:80], "selector": selector, "screenshot_before": screenshot_before, "screenshot_after": screenshot_after, "mobile_viewport": MOBILE_VIEWPORT})
+            record_scenario_step(f"{role}_button_update", route=route, role=role, selector=selector, screenshot_before=screenshot_before, screenshot_after=screenshot_after, text=text[:80])
             return True
         except Exception:
             continue
@@ -3311,8 +3443,19 @@ def run_flow(page):
         "observer_roles": OBSERVER_ROLES,
         "created_api_path": created_path,
         "console_errors": CONSOLE_ERRORS[-20:],
+        "network_errors": NETWORK_ERRORS[-20:],
         "visible_errors": VISIBLE_ERRORS[-20:],
         "screenshots": SCREENSHOTS,
+        "playwright_scenario": {
+            "schema": "grounded.browser_playwright_scenario.v1",
+            "base_url": BASE_URL,
+            "mobile_viewport": MOBILE_VIEWPORT,
+            "source_roles": SOURCE_ROLES,
+            "update_roles": UPDATE_ROLES,
+            "observer_roles": OBSERVER_ROLES,
+            "steps": PLAYWRIGHT_SCENARIO,
+        },
+        "mobile_viewport": MOBILE_VIEWPORT,
         "api_paths": API_PATHS,
         "get_api_paths": GET_API_PATHS,
         "api_before": API_BEFORE,
@@ -3328,10 +3471,12 @@ try:
             browser = playwright.chromium.launch(headless=True)
         except Exception as exc:
             fail("browser_infra_unavailable", f"Chromium could not be launched for Playwright browser proof: {exc}", infra_unavailable=True)
-        context = browser.new_context(viewport={"width": 390, "height": 844}, is_mobile=True)
+        context = browser.new_context(viewport={"width": int(MOBILE_VIEWPORT.get("width") or 390), "height": int(MOBILE_VIEWPORT.get("height") or 844)}, is_mobile=True)
         page = context.new_page()
         page.on("console", lambda msg: CONSOLE_ERRORS.append(f"{msg.type}: {msg.text}") if msg.type == "error" and "favicon" not in msg.text.lower() else None)
         page.on("pageerror", lambda exc: CONSOLE_ERRORS.append(f"pageerror: {exc}"))
+        page.on("requestfailed", lambda request: NETWORK_ERRORS.append(f"{request.method} {request.url}: {request_failure_text(request)}") if not ignored_network_url(request.url) else None)
+        page.on("response", lambda response: NETWORK_ERRORS.append(f"{response.status} {response.url}") if response.status >= 400 and not ignored_network_url(response.url) else None)
         try:
             run_flow(page)
         finally:
@@ -3349,8 +3494,19 @@ except Exception as exc:
         "updated_marker": UPDATED_MARKER,
         "manager_marker": MANAGER_MARKER,
         "console_errors": CONSOLE_ERRORS[-20:],
+        "network_errors": NETWORK_ERRORS[-20:],
         "visible_errors": VISIBLE_ERRORS[-20:],
         "screenshots": SCREENSHOTS,
+        "playwright_scenario": {
+            "schema": "grounded.browser_playwright_scenario.v1",
+            "base_url": BASE_URL,
+            "mobile_viewport": MOBILE_VIEWPORT,
+            "source_roles": SOURCE_ROLES,
+            "update_roles": UPDATE_ROLES,
+            "observer_roles": OBSERVER_ROLES,
+            "steps": PLAYWRIGHT_SCENARIO,
+        },
+        "mobile_viewport": MOBILE_VIEWPORT,
         "api_paths": API_PATHS,
         "get_api_paths": GET_API_PATHS,
         "source_roles": SOURCE_ROLES,

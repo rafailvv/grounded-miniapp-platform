@@ -31,9 +31,9 @@ from app.modules.miniapp_agent_loop.agent_tool_runtime import (
 from app.services.tool_protocol import (
     TOOL_INPUT_SCHEMAS,
     canonical_tool_name,
-    default_tool_risk,
     structured_tool_error,
     tool_envelope,
+    tool_protocol_spec,
 )
 from app.services.workspace.service import WorkspaceService
 
@@ -78,6 +78,13 @@ NORMALIZED_INPUT_KEYS = {
     "domain",
     "intent",
     "capability",
+    "question",
+    "choices",
+    "items",
+    "prompt",
+    "generation_mode",
+    "contract_id",
+    "allowed_file_graph",
 }
 MUTATING_MODEL_TOOLS = {"apply_patch_to_draft", "write_file", "edit_file_exact"}
 EXECUTABLE_MODEL_TOOLS = {
@@ -118,6 +125,7 @@ class ToolRouterContext:
     forced_allowed_tools: set[str] | None = None
     output_spill_writer: Callable[[str, dict[str, Any]], dict[str, Any] | None] | None = None
     output_artifact_writer: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None
+    denied_action_writer: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None
     max_parallel_read_tools: int = 6
 
 
@@ -137,10 +145,12 @@ class ToolRouteDecision:
     reason: str
     kind: str
     risk: str
+    approval_class: str
     concurrency_safe: bool
     timeout_seconds: int
     output_cap_chars: int
     sandbox_profile: str
+    artifact_spill_policy: str
     deferred: bool = False
     dynamic: bool = False
 
@@ -251,6 +261,13 @@ class ToolRouter:
             "domain": str(item.get("domain") or "").strip().lower(),
             "intent": str(item.get("intent") or "").strip(),
             "capability": str(item.get("capability") or "").strip(),
+            "question": str(item.get("question") or "").strip(),
+            "choices": item.get("choices") if isinstance(item.get("choices"), list) else [],
+            "items": item.get("items") if isinstance(item.get("items"), list) else [],
+            "prompt": str(item.get("prompt") or "").strip(),
+            "generation_mode": str(item.get("generation_mode") or "").strip(),
+            "contract_id": str(item.get("contract_id") or "").strip(),
+            "allowed_file_graph": item.get("allowed_file_graph") if isinstance(item.get("allowed_file_graph"), dict) else {},
         }
         return ToolCallRequest(
             tool=tool,
@@ -310,22 +327,27 @@ class ToolRouter:
             if spec is None:
                 continue
             canonical = canonical_tool_name(name)
+            protocol = tool_protocol_spec(canonical)
             tools.append(
                 {
                     "name": name,
                     "canonical": canonical,
                     "kind": spec.kind,
-                    "risk": default_tool_risk(canonical),
-                    "concurrency_safe": spec.concurrency_safe,
-                    "timeout_seconds": spec.timeout_seconds,
-                    "output_cap_chars": spec.output_cap_chars,
+                    "risk": protocol.risk,
+                    "approval_class": protocol.approval_class,
+                    "sandbox_profile": protocol.sandbox_profile,
+                    "concurrency_safe": protocol.concurrency_safe,
+                    "timeout_seconds": protocol.timeout_seconds,
+                    "output_cap_chars": protocol.output_cap_chars,
+                    "artifact_spill_policy": protocol.artifact_spill_policy,
                     "activity": spec.activity,
                     "progress_label": spec.progress_label,
                     "aliases": list(spec.aliases),
                     "mode_visibility": list(spec.mode_visibility),
-                    "dynamic": bool(spec.dynamic),
-                    "deferred": bool(spec.deferred or spec.kind == "mutating"),
-                    "input_schema": TOOL_INPUT_SCHEMAS.get(canonical, {}),
+                    "dynamic": bool(protocol.dynamic or spec.dynamic),
+                    "deferred": bool(protocol.deferred or spec.deferred or spec.kind == "mutating"),
+                    "input_schema": protocol.input_schema,
+                    "output_schema": protocol.output_schema,
                 }
             )
         return {
@@ -604,22 +626,24 @@ class ToolRouter:
     def _decide(self, request: ToolCallRequest) -> ToolRouteDecision:
         spec = AgentToolRegistry.spec(request.tool)
         canonical = request.canonical_tool
+        protocol = tool_protocol_spec(canonical)
         kind = spec.kind if spec is not None else "unknown"
         allowed_names = self.allowed_tool_names(mode=self.context.mode, forced_allowed=self.context.forced_allowed_tools)
         allowed = spec is not None and request.tool in allowed_names
         reason = "allowed" if allowed else f"{request.tool or canonical} is not allowed in {self.context.mode or 'default'} mode."
-        risk = default_tool_risk(canonical)
         return ToolRouteDecision(
             allowed=allowed,
             reason=reason,
             kind=kind,
-            risk=risk,
-            concurrency_safe=bool(spec.concurrency_safe if spec else False),
-            timeout_seconds=int(spec.timeout_seconds if spec else 25),
-            output_cap_chars=int(spec.output_cap_chars if spec else 6000),
-            sandbox_profile="agent_draft_write" if risk == "mutating" else "analysis_readonly",
-            deferred=kind == "mutating",
-            dynamic=bool(spec.dynamic if spec else False),
+            risk=protocol.risk,
+            approval_class=protocol.approval_class,
+            concurrency_safe=protocol.concurrency_safe,
+            timeout_seconds=protocol.timeout_seconds,
+            output_cap_chars=protocol.output_cap_chars,
+            sandbox_profile=protocol.sandbox_profile,
+            artifact_spill_policy=protocol.artifact_spill_policy,
+            deferred=bool(protocol.deferred or kind == "mutating"),
+            dynamic=bool(protocol.dynamic or (spec.dynamic if spec else False)),
         )
 
     def _schema_error(self, request: ToolCallRequest) -> dict[str, Any] | None:
@@ -1086,7 +1110,7 @@ class ToolRouter:
                     {"tool_use_id": request.tool_call_id, "process_id": process_id, "tool": request.tool, "command": command, **payload},
                 )
 
-        return {
+        result = {
             **run_workspace_command(
                 draft_source=self.context.draft_source,
                 command=command,
@@ -1100,6 +1124,27 @@ class ToolRouter:
             "reason": request.reason,
             "tool_use_id": request.tool_call_id,
         }
+        policy_decision = result.get("policy_decision") if isinstance(result.get("policy_decision"), dict) else {}
+        if (
+            self.context.denied_action_writer is not None
+            and (policy_decision.get("action") == "forbidden" or result.get("semantic_status") in {"blocked_by_policy", "blocked_by_sandbox"})
+        ):
+            artifact = self.context.denied_action_writer(
+                {
+                    "workspace_id": self.context.workspace_id,
+                    "run_id": self.context.run_id,
+                    "tool_call_id": request.tool_call_id,
+                    "tool": request.canonical_tool,
+                    "command": command,
+                    "process_id": process_id,
+                    "semantic_status": result.get("semantic_status"),
+                    "policy_decision": policy_decision,
+                    "error": result.get("error"),
+                }
+            )
+            if artifact:
+                result["denied_action_ref"] = artifact.get("ref") or artifact.get("denial_id")
+        return result
 
     def _flush_concurrent_batch(self, indexed_requests: list[tuple[int, ToolCallRequest]]) -> ToolRouterBatchResult:
         if not indexed_requests:
@@ -1224,12 +1269,13 @@ class ToolRouter:
         duration_ms: int | None = None,
         changed_files: list[str] | None = None,
     ) -> dict[str, Any]:
+        resolved_approval = self._approval_payload(decision, approval)
         return tool_envelope(
             tool=request.canonical_tool,
             input_payload=self._protocol_input(request),
             result=result or {},
             risk=decision.risk,  # type: ignore[arg-type]
-            approval=approval,
+            approval=resolved_approval,
             artifacts=artifacts,
             error=error,
             status=status,
@@ -1239,6 +1285,21 @@ class ToolRouter:
             duration_ms=duration_ms,
             changed_files=changed_files,
         )
+
+    @staticmethod
+    def _approval_payload(decision: ToolRouteDecision, override: dict[str, Any] | None) -> dict[str, Any]:
+        if override is not None:
+            payload = dict(override)
+            payload.setdefault("class", decision.approval_class)
+            payload.setdefault("policy", decision.reason)
+            return payload
+        if decision.approval_class == "policy":
+            return {"required": False, "status": "policy_checked", "class": "policy", "policy": decision.reason}
+        if decision.approval_class == "human":
+            return {"required": True, "status": "pending", "class": "human", "policy": decision.reason}
+        if decision.approval_class == "forbidden":
+            return {"required": True, "status": "rejected", "class": "forbidden", "policy": decision.reason}
+        return {"required": False, "status": "not_required", "class": "none"}
 
     @staticmethod
     def _model_result(request: ToolCallRequest, envelope: dict[str, Any], result: dict[str, Any]) -> dict[str, object]:
@@ -1257,7 +1318,11 @@ class ToolRouter:
         result: dict[str, Any],
     ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
         encoded = json.dumps(result, ensure_ascii=True, sort_keys=True, default=str)
-        if len(encoded) <= decision.output_cap_chars:
+        should_truncate = len(encoded) > decision.output_cap_chars
+        should_spill = decision.artifact_spill_policy == "always" or (
+            decision.artifact_spill_policy == "on_truncation" and should_truncate
+        )
+        if decision.artifact_spill_policy == "never" or not should_spill:
             return result, {"truncated": False}, []
         digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
         excerpt = encoded[: max(200, decision.output_cap_chars)]
@@ -1268,7 +1333,40 @@ class ToolRouter:
                 {"tool": request.canonical_tool, "sha256": digest, "result": result},
             )
             if artifact:
-                artifacts.append(artifact)
+                artifacts.append(self._tool_result_artifact_ref(artifact))
+        elif self.context.output_artifact_writer is not None:
+            artifact = self.context.output_artifact_writer(
+                {
+                    "process_id": f"tool:{request.tool_call_id}",
+                    "stream": "tool",
+                    "command": f"tool:{request.canonical_tool}",
+                    "content": encoded,
+                    "head_tail": _head_tail_payload(encoded, max_chars=decision.output_cap_chars),
+                    "semantic_status": "completed",
+                    "metadata": {
+                        "source": "tool_result_spill",
+                        "tool": request.canonical_tool,
+                        "model_tool": request.tool,
+                        "tool_call_id": request.tool_call_id,
+                        "sha256": digest,
+                    },
+                }
+            )
+            if artifact:
+                artifacts.append(self._tool_result_artifact_ref(artifact))
+        artifact_ref = str(artifacts[0].get("ref") or "") if artifacts else ""
+        if not should_truncate:
+            enriched = dict(result)
+            enriched["artifact_ref"] = artifact_ref
+            enriched["artifacts"] = artifacts
+            return enriched, {
+                "truncated": False,
+                "sha256": digest,
+                "original_chars": len(encoded),
+                "artifact_ref": artifact_ref,
+                "spilled": bool(artifacts),
+                "spill_policy": decision.artifact_spill_policy,
+            }, artifacts
         compacted = {
             "tool": str(result.get("tool") or request.tool),
             "tool_use_id": request.tool_call_id,
@@ -1276,8 +1374,27 @@ class ToolRouter:
             "excerpt": excerpt,
             "sha256": digest,
             "original_chars": len(encoded),
+            "artifact_ref": artifact_ref,
+            "artifacts": artifacts,
         }
-        return compacted, {"truncated": True, "sha256": digest, "excerpt_chars": len(excerpt), "original_chars": len(encoded)}, artifacts
+        return compacted, {
+            "truncated": True,
+            "sha256": digest,
+            "excerpt_chars": len(excerpt),
+            "original_chars": len(encoded),
+            "artifact_ref": artifact_ref,
+            "spilled": bool(artifacts),
+            "spill_policy": decision.artifact_spill_policy,
+        }, artifacts
+
+    @staticmethod
+    def _tool_result_artifact_ref(artifact: dict[str, Any]) -> dict[str, Any]:
+        return {
+            **artifact,
+            "kind": "tool_result",
+            "mime_type": "application/json",
+            "label": "Full tool result",
+        }
 
     def _visible_workspace_tree(self) -> list[dict[str, str]]:
         if self._workspace_tree is None:
@@ -1360,6 +1477,33 @@ def _json_type_matches(value: Any, expected: str) -> bool:
     if expected == "number":
         return isinstance(value, int | float) and not isinstance(value, bool)
     return True
+
+
+def _head_tail_payload(content: str, *, max_chars: int) -> dict[str, Any]:
+    text = str(content or "")
+    cap = max(200, int(max_chars or 6000))
+    if len(text) <= cap:
+        return {
+            "head": text,
+            "tail": "",
+            "excerpt": text,
+            "total_chars": len(text),
+            "omitted_chars": 0,
+            "chunk_count": 1 if text else 0,
+        }
+    head_chars = max(100, cap // 2)
+    tail_chars = max(100, cap - head_chars)
+    head = text[:head_chars]
+    tail = text[-tail_chars:]
+    omitted = max(0, len(text) - len(head) - len(tail))
+    return {
+        "head": head,
+        "tail": tail,
+        "excerpt": f"{head}\n...[omitted {omitted} chars]...\n{tail}",
+        "total_chars": len(text),
+        "omitted_chars": omitted,
+        "chunk_count": 1,
+    }
 
 
 def _is_safe_exact_path(file_path: str) -> bool:

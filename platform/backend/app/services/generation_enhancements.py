@@ -194,9 +194,9 @@ class SkillPackCatalog:
         mode = str(generation_mode or "").lower()
         defaults = {
             "fast": {"max_skills": 2, "max_body_chars": 350, "max_total_body_chars": 900},
-            "balanced": {"max_skills": 4, "max_body_chars": 550, "max_total_body_chars": 1800},
-            "quality": {"max_skills": 5, "max_body_chars": 800, "max_total_body_chars": 2800},
-        }.get(mode, {"max_skills": 4, "max_body_chars": 550, "max_total_body_chars": 1800})
+            "balanced": {"max_skills": 4, "max_body_chars": 550, "max_total_body_chars": 2600},
+            "quality": {"max_skills": 5, "max_body_chars": 800, "max_total_body_chars": 5200},
+        }.get(mode, {"max_skills": 4, "max_body_chars": 550, "max_total_body_chars": 2600})
         return {
             "max_skills": max(1, int(max_skills or defaults["max_skills"])),
             "max_body_chars": max(120, int(max_body_chars or defaults["max_body_chars"])),
@@ -308,19 +308,26 @@ class SlashCommandCatalog:
     """Workbench slash-command contract."""
 
     COMMANDS: tuple[dict[str, Any], ...] = (
-        {"id": "generate", "name": "/generate", "kind": "run", "description": "Create or extend the current product from the prompt.", "requires": ["workspace", "prompt"]},
-        {"id": "fix", "name": "/fix", "kind": "run", "description": "Repair a selected failing run using its failure context.", "requires": ["workspace", "run"]},
-        {"id": "polish", "name": "/polish", "kind": "run", "description": "Run a quality visual pass without changing product semantics.", "requires": ["workspace"]},
-        {"id": "review", "name": "/review", "kind": "analysis", "description": "Inspect a run for bugs, missing proof, and risky paths.", "requires": ["run"]},
-        {"id": "add-page", "name": "/add-page", "kind": "run", "description": "Add a prompt-derived routeable page to one or more roles.", "requires": ["workspace", "prompt"]},
-        {"id": "add-role-flow", "name": "/add-role-flow", "kind": "run", "description": "Add a connected workflow across role surfaces.", "requires": ["workspace", "prompt"]},
-        {"id": "doctor", "name": "/doctor", "kind": "diagnostic", "description": "Run platform diagnostics.", "requires": []},
-        {"id": "memory", "name": "/memory", "kind": "knowledge", "description": "View or save workspace memory.", "requires": ["workspace"]},
-        {"id": "rollback", "name": "/rollback", "kind": "safety", "description": "Rollback the selected applied run.", "requires": ["run"]},
-        {"id": "acceptance", "name": "/acceptance", "kind": "analysis", "description": "Show generated acceptance scenarios.", "requires": ["run"]},
-        {"id": "visual-qa", "name": "/visual-qa", "kind": "analysis", "description": "Show static and browser-derived visual QA.", "requires": ["run"]},
-        {"id": "docs", "name": "/docs", "kind": "knowledge", "description": "Regenerate the workspace Magic Doc.", "requires": ["workspace"]},
+        {"id": "generate", "name": "/generate", "kind": "workflow", "description": "Create a product app from the prompt and run production acceptance.", "requires": ["workspace", "prompt"], "workflow": "create_run"},
+        {"id": "fix", "name": "/fix", "kind": "workflow", "description": "Repair the latest blocked or failed run from its active repair packet.", "requires": ["workspace", "run"], "workflow": "repair_latest_failure"},
+        {"id": "polish", "name": "/polish", "kind": "workflow", "description": "Improve UI polish while preserving product semantics and acceptance proof.", "requires": ["workspace"], "workflow": "ui_polish_run"},
+        {"id": "add-flow", "name": "/add-flow", "kind": "workflow", "description": "Add a new end-to-end scenario across API, persistence, UI, roles, mobile, and tests.", "requires": ["workspace", "prompt"], "workflow": "add_product_flow"},
+        {"id": "review", "name": "/review", "kind": "workflow", "description": "Find product risks, proof gaps, stale tests, and apply blockers for a run.", "requires": ["run"], "workflow": "risk_review"},
+        {"id": "acceptance", "name": "/acceptance", "kind": "workflow", "description": "Run the acceptance proof loop and refresh readiness evidence.", "requires": ["run"], "workflow": "acceptance_proof"},
+        {"id": "deploy", "name": "/deploy", "kind": "workflow", "description": "Prepare deploy artifacts only after the production gate is green.", "requires": ["workspace"], "workflow": "deploy_bundle"},
+        {"id": "babysit-pr", "name": "/babysit-pr", "kind": "workflow", "description": "Watch exported app PR CI, reviews, flaky failures, and next repair/push actions.", "requires": ["workspace"], "workflow": "pr_ci_babysitter"},
+        {"id": "docs", "name": "/docs", "kind": "workflow", "description": "Regenerate and write product architecture documentation.", "requires": ["workspace"], "workflow": "product_architecture_docs"},
     )
+    ALIASES: dict[str, str] = {
+        "/add-page": "add-flow",
+        "add-page": "add-flow",
+        "/add-role-flow": "add-flow",
+        "add-role-flow": "add-flow",
+        "/visual-qa": "acceptance",
+        "visual-qa": "acceptance",
+        "/watch-pr": "babysit-pr",
+        "watch-pr": "babysit-pr",
+    }
 
     @classmethod
     def list(cls) -> dict[str, Any]:
@@ -328,7 +335,8 @@ class SlashCommandCatalog:
 
     @classmethod
     def resolve(cls, command_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-        command = next((item for item in cls.COMMANDS if item["id"] == command_id or item["name"] == command_id), None)
+        normalized = cls.normalize_id(command_id)
+        command = next((item for item in cls.COMMANDS if item["id"] == normalized or item["name"] == normalized), None)
         if command is None:
             raise KeyError(f"Slash command not found: {command_id}")
         payload = payload or {}
@@ -340,31 +348,40 @@ class SlashCommandCatalog:
             "created_at": _now(),
         }
 
+    @classmethod
+    def normalize_id(cls, command_id: str) -> str:
+        raw = str(command_id or "").strip()
+        lowered = raw.lower()
+        if lowered in cls.ALIASES:
+            return cls.ALIASES[lowered]
+        return lowered.removeprefix("/")
+
     @staticmethod
     def _ui_action(command_id: str) -> dict[str, Any]:
         mapping = {
-            "generate": {"type": "submit_composer"},
-            "fix": {"type": "start_fix_run"},
-            "review": {"type": "open_tab", "tab": "review"},
-            "doctor": {"type": "open_tab", "tab": "doctor"},
-            "memory": {"type": "open_tab", "tab": "memory"},
-            "acceptance": {"type": "open_report", "report": "acceptance_scenarios"},
-            "visual-qa": {"type": "open_report", "report": "visual_qa"},
-            "docs": {"type": "open_report", "report": "magic_doc"},
-            "rollback": {"type": "run_action", "action": "rollback"},
+            "generate": {"type": "execute_workflow", "workflow": "create_run"},
+            "fix": {"type": "execute_workflow", "workflow": "repair_latest_failure"},
+            "polish": {"type": "execute_workflow", "workflow": "ui_polish_run"},
+            "add-flow": {"type": "execute_workflow", "workflow": "add_product_flow"},
+            "review": {"type": "execute_workflow", "workflow": "risk_review", "tab": "review"},
+            "acceptance": {"type": "execute_workflow", "workflow": "acceptance_proof", "tab": "checks"},
+            "deploy": {"type": "execute_workflow", "workflow": "deploy_bundle"},
+            "docs": {"type": "execute_workflow", "workflow": "product_architecture_docs"},
         }
-        return mapping.get(command_id, {"type": "submit_composer_with_prompt"})
+        return mapping.get(SlashCommandCatalog.normalize_id(command_id), {"type": "execute_workflow"})
 
     @staticmethod
     def _prompt_template(command_id: str, payload: dict[str, Any]) -> str:
         detail = str(payload.get("prompt") or payload.get("detail") or "").strip()
         templates = {
             "polish": "Polish the current app visually. Preserve existing behavior and tests.",
-            "add-page": f"Add a routeable page: {detail}".strip(),
-            "add-role-flow": f"Add a connected role workflow: {detail}".strip(),
+            "add-flow": f"Add a connected product flow: {detail}".strip(),
             "fix": "Analyze the selected run failure and apply the smallest safe fix.",
+            "acceptance": "Run the full production acceptance proof loop and report exact blockers.",
+            "deploy": "Prepare deploy artifacts after the production readiness gate is green.",
+            "docs": "Update product architecture documentation from current routes, APIs, memory, and runs.",
         }
-        return templates.get(command_id, detail)
+        return templates.get(SlashCommandCatalog.normalize_id(command_id), detail)
 
 
 class WorkerRoleCatalog:

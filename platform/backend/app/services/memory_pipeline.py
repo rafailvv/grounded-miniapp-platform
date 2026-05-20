@@ -70,7 +70,15 @@ def _parse_dt(value: object) -> datetime | None:
 
 
 def _tokens(value: object) -> set[str]:
-    return {token.lower() for token in TOKEN_PATTERN.findall(str(value or "")) if token.lower() not in STOP_WORDS}
+    tokens: set[str] = set()
+    for raw_token in TOKEN_PATTERN.findall(str(value or "")):
+        token = raw_token.lower()
+        if token in STOP_WORDS:
+            continue
+        tokens.add(token)
+        if token.endswith("s") and len(token) > 4:
+            tokens.add(token[:-1])
+    return tokens
 
 
 class WorkspaceMemoryPipeline:

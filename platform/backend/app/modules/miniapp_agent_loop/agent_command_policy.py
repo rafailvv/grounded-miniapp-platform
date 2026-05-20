@@ -10,6 +10,7 @@ from typing import Any, Literal
 
 
 CommandPolicyAction = Literal["allow", "prompt", "forbidden"]
+CommandSafetyClass = Literal["read_only", "workspace_write", "destructive", "network", "unknown"]
 
 
 @dataclass(frozen=True)
@@ -68,6 +69,7 @@ class CommandPolicyDecision:
     network_policy: dict[str, Any] = field(default_factory=dict)
     resolved_argv: tuple[str, ...] = ()
     matched_amendments: tuple[dict[str, Any], ...] = ()
+    safety_class: CommandSafetyClass = "unknown"
 
     @property
     def allowed(self) -> bool:
@@ -145,6 +147,7 @@ class AgentCommandPolicy:
         "ls",
         "find",
         "git",
+        "cat",
         "bash",
         "sh",
     }
@@ -339,11 +342,11 @@ class AgentCommandPolicy:
                 examples=(CommandPolicyExample("node --check miniapp/app/static/client/app.js", "allow"),),
             ),
             CommandPolicyRule(
-                prefixes=(("rg",), ("sed",), ("ls",)),
+                prefixes=(("rg",), ("sed",), ("ls",), ("cat",)),
                 action="allow",
                 reason="Read-only workspace inspection commands are allowed.",
                 rule_id="builtin_read_only_inspection",
-                examples=(CommandPolicyExample("rg api miniapp/app", "allow"),),
+                examples=(CommandPolicyExample("rg api miniapp/app", "allow"), CommandPolicyExample("cat miniapp/app/main.py", "allow")),
             ),
             CommandPolicyRule(
                 prefixes=(
@@ -605,11 +608,12 @@ class AgentCommandPolicy:
                     for rule in matched_rules
                     if rule.source != "builtin"
                 ),
+                safety_class=self._safety_class_for_args(args=tuple(args), action=selected.action, network_policy=network_policy),
             )
         return self._blocked_decision(
             command=command,
             normalized=normalized,
-            reason="Only diagnostic commands are allowed: python -m unittest, python -m py_compile, node --test, node --check, rg, sed, ls, find, and read-only git.",
+            reason="Only diagnostic commands are allowed: python -m unittest, python -m py_compile, node --test, node --check, rg, sed, ls, cat, find, and read-only git.",
             code="no_matching_allow_rule",
             args=tuple(args),
             cwd_policy=cwd_policy,
@@ -727,6 +731,7 @@ class AgentCommandPolicy:
             blocked_syntax=self._blocked_syntax_payload(code, reason),
             network_policy=network_policy or self._default_network_policy(),
             resolved_argv=resolved_argv,
+            safety_class=self._safety_class_for_args(args=args, action="forbidden", network_policy=network_policy, blocked_code=code),
         )
 
     @staticmethod
@@ -744,6 +749,7 @@ class AgentCommandPolicy:
             executable_resolution=executable_resolution,
             network_policy=network_policy,
             resolved_argv=resolved_argv,
+            safety_class=AgentCommandPolicy._safety_class_for_args(args=decision.argv, action=decision.action, network_policy=network_policy, blocked_code=(decision.blocked_syntax or {}).get("code")),
         )
 
     def _resolve_executable(self, raw: str) -> dict[str, Any]:
@@ -967,6 +973,42 @@ class AgentCommandPolicy:
                 tuple(args),
                 ("find",),
                 cwd_policy,
+                safety_class="read_only",
+            )
+        if executable == "cat":
+            if len(normalized_args) < 2:
+                return CommandPolicyDecision(
+                    "forbidden",
+                    "cat requires at least one explicit workspace file path.",
+                    command,
+                    normalized,
+                    tuple(args),
+                    ("cat",),
+                    cwd_policy,
+                    safety_class="read_only",
+                )
+            safe_flags = {"-n", "-b", "-s", "-t", "-e", "-a", "--number", "--number-nonblank", "--squeeze-blank", "--show-tabs", "--show-ends", "--show-all"}
+            unsafe_flags = [arg for arg in normalized_args[1:] if arg.startswith("-") and arg not in safe_flags]
+            if unsafe_flags:
+                return CommandPolicyDecision(
+                    "forbidden",
+                    "cat options are limited to read-only display flags.",
+                    command,
+                    normalized,
+                    tuple(args),
+                    ("cat",),
+                    cwd_policy,
+                    safety_class="read_only",
+                )
+            return CommandPolicyDecision(
+                "allow",
+                "Read-only cat diagnostics are allowed for explicit workspace files.",
+                command,
+                normalized,
+                tuple(args),
+                ("cat",),
+                cwd_policy,
+                safety_class="read_only",
             )
         return None
 
@@ -980,7 +1022,7 @@ class AgentCommandPolicy:
         cwd_policy: str,
     ) -> CommandPolicyDecision:
         if len(normalized_args) < 2:
-            return CommandPolicyDecision("forbidden", "Git command must specify a read-only subcommand.", command, normalized, tuple(args), ("git",), cwd_policy)
+            return CommandPolicyDecision("forbidden", "Git command must specify a read-only subcommand.", command, normalized, tuple(args), ("git",), cwd_policy, safety_class="unknown")
         first = normalized_args[1]
         if first.startswith("-"):
             return CommandPolicyDecision(
@@ -991,6 +1033,7 @@ class AgentCommandPolicy:
                 tuple(args),
                 ("git",),
                 cwd_policy,
+                safety_class="unknown",
             )
         for arg in normalized_args[1:]:
             if arg in self._UNSAFE_GIT_GLOBAL_OPTIONS or any(arg.startswith(f"{option}=") for option in self._UNSAFE_GIT_GLOBAL_OPTIONS):
@@ -1002,6 +1045,7 @@ class AgentCommandPolicy:
                     tuple(args),
                     ("git",),
                     cwd_policy,
+                    safety_class="workspace_write",
                 )
             if arg in self._UNSAFE_GIT_FLAGS or any(arg.startswith(f"{option}=") for option in self._UNSAFE_GIT_FLAGS):
                 return CommandPolicyDecision(
@@ -1012,6 +1056,7 @@ class AgentCommandPolicy:
                     tuple(args),
                     ("git", first),
                     cwd_policy,
+                    safety_class="workspace_write",
                 )
         if first not in self._SAFE_GIT_SUBCOMMANDS:
             return CommandPolicyDecision(
@@ -1022,6 +1067,7 @@ class AgentCommandPolicy:
                 tuple(args),
                 ("git", first),
                 cwd_policy,
+                safety_class="unknown",
             )
         return CommandPolicyDecision(
             "allow",
@@ -1031,7 +1077,42 @@ class AgentCommandPolicy:
             tuple(args),
             ("git", first),
             cwd_policy,
+            safety_class="read_only",
         )
+
+    @staticmethod
+    def _safety_class_for_args(
+        *,
+        args: tuple[str, ...],
+        action: CommandPolicyAction,
+        network_policy: dict[str, Any] | None = None,
+        blocked_code: str | None = None,
+    ) -> CommandSafetyClass:
+        del action
+        normalized = [str(item).lower() for item in args]
+        executable = Path(normalized[0]).name if normalized else ""
+        code = str(blocked_code or "")
+        if (network_policy or {}).get("blocked") or executable in AgentCommandPolicy._NETWORK_EXECUTABLES:
+            return "network"
+        if executable in {"npm", "pnpm", "yarn"} and len(normalized) > 1 and normalized[1] in AgentCommandPolicy._PACKAGE_NETWORK_SUBCOMMANDS:
+            return "network"
+        if executable in {"pip", "pip3"} and len(normalized) > 1 and normalized[1] in AgentCommandPolicy._PIP_NETWORK_SUBCOMMANDS:
+            return "network"
+        if executable in {"rm", "rmdir", "docker", "apt", "apt-get", "brew"}:
+            return "destructive"
+        if executable == "git" and len(normalized) > 1 and normalized[1] in {"reset", "clean"}:
+            return "destructive"
+        if executable == "find" and any(arg == "-delete" for arg in normalized[1:]):
+            return "destructive"
+        if code in {"sed_in_place", "mutating_filesystem"} or executable in {"mv", "cp", "chmod", "chown", "tee", "touch", "mkdir"}:
+            return "workspace_write"
+        if executable == "git" and any(arg == "--output" or arg.startswith("--output=") for arg in normalized[1:]):
+            return "workspace_write"
+        if executable in {"rg", "sed", "ls", "cat", "find", "python", "python3", "node"}:
+            return "read_only"
+        if executable == "git" and len(normalized) > 1 and normalized[1] in AgentCommandPolicy._SAFE_GIT_SUBCOMMANDS:
+            return "read_only"
+        return "unknown"
 
     def validation_examples(self) -> list[dict[str, str]]:
         examples: list[dict[str, str]] = []
@@ -1072,6 +1153,7 @@ class AgentCommandPolicy:
                 "allowed_forms": ["SimpleCommand", "cd miniapp && SimpleCommand", "bash|sh -lc SimpleCommand"],
                 "forbidden_executables": sorted(self._FORBIDDEN_EXECUTABLES),
                 "network_mode": "blocked_by_default",
+                "safety_classes": ["read_only", "workspace_write", "destructive", "network", "unknown"],
             },
             "rules": [
                 {

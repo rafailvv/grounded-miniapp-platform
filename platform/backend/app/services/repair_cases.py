@@ -9,6 +9,7 @@ from typing import Any
 from app.models.domain import CreateRunRequest, RunRecord
 from app.repositories.state_store import StateStore
 from app.services.event_journal import EventJournalService
+from app.services.repair_catalog import RepairCatalog
 
 
 REPAIR_CASE_SCHEMA = "grounded.repair_case.v1"
@@ -131,13 +132,18 @@ class RepairPromptBuilder:
         forbidden_files = list(case.get("forbidden_files") or [])
         sections = {
             "failure": failure,
+            "failed_check": case.get("failed_check") or "",
+            "broken_surface": case.get("broken_surface") or {},
             "evidence": case.get("evidence") or {},
             "target_files": target_files,
+            "likely_files": case.get("likely_files") or target_files,
             "forbidden_files": forbidden_files,
             "first_tool": first_tool,
             "allowed_edit_slice": case.get("allowed_edit_slice") or target_files,
             "next_action": case.get("next_action") or {},
             "expected_proof": case.get("expected_proof") or [],
+            "post_fix_proof": case.get("post_fix_proof") or {},
+            "repair_packet": case.get("repair_packet") or {},
             "retry_policy": case.get("retry_policy") or {},
         }
         return {
@@ -149,11 +155,16 @@ class RepairPromptBuilder:
             "likely_cause": case.get("likely_cause") or case.get("likely_root_cause") or "",
             "evidence": sections["evidence"],
             "target_files": target_files,
+            "likely_files": sections["likely_files"],
+            "failed_check": sections["failed_check"],
+            "broken_surface": sections["broken_surface"],
             "forbidden_files": forbidden_files,
             "first_tool": first_tool,
             "allowed_edit_slice": sections["allowed_edit_slice"],
             "next_action": sections["next_action"],
             "expected_proof": sections["expected_proof"],
+            "post_fix_proof": sections["post_fix_proof"],
+            "repair_packet": sections["repair_packet"],
             "retry_policy": sections["retry_policy"],
             "attempt_count": len(case.get("attempts") or []),
             "forbidden_repeat_action": case.get("forbidden_repeat_action") or "Do not repeat a patch/action already recorded as failed for this case.",
@@ -472,12 +483,21 @@ class RepairCaseService:
         source: str,
         trace_state: dict[str, Any] | None,
     ) -> dict[str, Any]:
+        packet = RepairCatalog.enrich_packet(packet)
         signature = str(packet.get("failure_signature") or packet.get("signature") or packet.get("code") or "repair.uncatalogued_repair_case")
         target_files = list(dict.fromkeys([*list(packet.get("target_files") or []), *_paths_from_any(packet.get("evidence"))]))[:16]
+        if not target_files:
+            target_files = list(packet.get("likely_files") or [])[:16]
         case_id = f"rc_{_json_sha({'signature': signature, 'target_files': target_files, 'check': packet.get('verification_check')})[:12]}"
         failure_class = str(packet.get("failure_class") or packet.get("verification_check") or source or "repair")
+        repair_packet = dict(packet.get("repair_packet") or {})
+        failed_check = str(packet.get("failed_check") or packet.get("verification_check") or failure_class)
+        likely_files = list(packet.get("likely_files") or target_files)
+        broken_surface = dict(packet.get("broken_surface") or {})
+        post_fix_proof = dict(packet.get("post_fix_proof") or {})
         evidence = {
             "packet": packet,
+            "repair_packet": repair_packet,
             "browser_replay": cls._browser_replay(packet),
             "api_replay": cls._api_replay(packet),
             "trace": {
@@ -501,6 +521,11 @@ class RepairCaseService:
             "issue_code": str(packet.get("issue_code") or packet.get("code") or "uncatalogued_repair_case"),
             "severity": str(packet.get("severity") or "medium"),
             "likely_cause": str(packet.get("likely_root_cause") or packet.get("instruction") or "Repair requires evidence-driven triage."),
+            "failed_check": failed_check,
+            "likely_files": likely_files,
+            "broken_surface": broken_surface,
+            "post_fix_proof": post_fix_proof,
+            "repair_packet": repair_packet,
             "target_files": target_files,
             "forbidden_files": list(packet.get("forbidden_target_files") or []),
             "required_next_tool": str(packet.get("required_next_tool") or retry_policy.get("first_tool") or "read_files"),
@@ -528,8 +553,17 @@ class RepairCaseService:
         verification_check = ""
         if expected_proof and isinstance(expected_proof[0], dict):
             verification_check = str(expected_proof[0].get("value") or "")
+        evidence = case.get("evidence") if isinstance(case.get("evidence"), dict) else {}
+        browser_replay = evidence.get("browser_replay") if isinstance(evidence.get("browser_replay"), dict) else {}
         attempt_count = len(case.get("attempts") or [])
-        if attempt_count >= 3:
+        if browser_replay.get("replay_plan"):
+            action = "reproduce_browser_step_first"
+            instruction = (
+                "Before patching, replay exactly the failed Playwright step from browser_replay.replay_plan at the recorded mobile viewport. "
+                "Patch only the connected selector/route/API slice, rerun the same failed step, then rerun the full browser proof."
+            )
+            first_tool = "read_files"
+        elif attempt_count >= 3:
             action = "fresh_context_repair"
             instruction = (
                 "Stop broad retry. Re-read only the target files, compare the latest failed proof against the last attempt, "
@@ -547,6 +581,11 @@ class RepairCaseService:
             "target_files": target_files[:12],
             "forbidden_files": list(case.get("forbidden_files") or [])[:12],
             "verification_check": verification_check,
+            "failed_check": case.get("failed_check") or verification_check,
+            "broken_surface": case.get("broken_surface") or {},
+            "post_fix_proof": case.get("post_fix_proof") or {},
+            "browser_replay": browser_replay,
+            "replay_first": bool(browser_replay.get("replay_plan")),
             "instruction": instruction,
             "attempt_count": attempt_count,
             "retry_policy_id": str(retry_policy.get("policy_id") or case.get("retry_policy") or "evidence_driven_repair_case"),
@@ -570,6 +609,24 @@ class RepairCaseService:
 
     @staticmethod
     def _expected_proof(packet: dict[str, Any]) -> list[dict[str, str]]:
+        post_fix = packet.get("post_fix_proof") if isinstance(packet.get("post_fix_proof"), dict) else {}
+        if post_fix:
+            items: list[dict[str, str]] = []
+            check = str(post_fix.get("check") or packet.get("verification_check") or "")
+            if check:
+                items.append(
+                    {
+                        "kind": "check",
+                        "value": check,
+                        "command": str(post_fix.get("command") or packet.get("verification_command") or "run_checks"),
+                        "expected": str(post_fix.get("expected") or packet.get("expected_proof") or check),
+                    }
+                )
+            for value in post_fix.get("evidence_required") or []:
+                if str(value or "").strip():
+                    items.append({"kind": "evidence", "value": str(value)})
+            if items:
+                return items
         proof = packet.get("expected_proof") or packet.get("verification_check") or "rerun failing check successfully"
         if isinstance(proof, list):
             return [{"kind": "check", "value": str(item)} for item in proof]
@@ -578,8 +635,35 @@ class RepairCaseService:
     @staticmethod
     def _browser_replay(packet: dict[str, Any]) -> dict[str, Any]:
         evidence = packet.get("evidence") if isinstance(packet.get("evidence"), dict) else {}
-        candidates = [evidence, evidence.get("diagnostics") if isinstance(evidence, dict) else {}, evidence.get("source_issue") if isinstance(evidence, dict) else {}]
-        keys = ("role", "url", "step", "selector", "expected_marker", "actual_marker", "dom_excerpt", "console_errors", "network_errors", "screenshot_ref", "proof_ref")
+        packet_payload = packet.get("packet") if isinstance(packet.get("packet"), dict) else {}
+        candidates = [packet, packet_payload, evidence, evidence.get("diagnostics") if isinstance(evidence, dict) else {}, evidence.get("source_issue") if isinstance(evidence, dict) else {}]
+        keys = (
+            "role",
+            "url",
+            "step",
+            "failed_step",
+            "failed_role",
+            "failed_route",
+            "selector",
+            "failed_selector",
+            "dom_selector",
+            "expected_marker",
+            "actual_marker",
+            "dom_excerpt",
+            "console_errors",
+            "console_logs",
+            "network_errors",
+            "network_logs",
+            "screenshot_ref",
+            "screenshot_before",
+            "screenshot_after",
+            "screenshots",
+            "mobile_viewport",
+            "playwright_scenario",
+            "failed_step_context",
+            "replay_plan",
+            "proof_ref",
+        )
         replay = {key: value.get(key) for value in candidates if isinstance(value, dict) for key in keys if value.get(key)}
         return replay
 

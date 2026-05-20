@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from pathlib import Path
 from types import SimpleNamespace
@@ -36,7 +37,7 @@ from app.modules.miniapp_agent_loop.repair_packets import RepairTransitionPolicy
 from app.modules.miniapp_agent_loop.rollout_trace import RolloutTraceRecorder
 from app.modules.miniapp_agent_loop.semantic_tools import semantic_scan
 from app.modules.miniapp_agent_loop.agent_tool_runtime import validate_workspace_command
-from app.services.tool_protocol import TOOL_RISK_DEFAULTS
+from app.services.tool_protocol import TOOL_EXECUTION_DEFAULTS, TOOL_RISK_DEFAULTS, tool_registry_contract
 from app.modules.miniapp_agent_loop.turn_diff_tracker import AgentTurnDiffTracker
 from app.modules.miniapp_agent_loop.types import AgentTurnPlan
 from app.modules.miniapp_agent_loop.guardian_review import GuardianReview
@@ -513,6 +514,86 @@ def test_lsp_tool_service_symbol_reference_and_route_context(tmp_path: Path) -> 
     assert route_graph["schema"] == "grounded.lsp_route_graph.v1"
     assert route_graph["summary"]["missing_edge_count"] == 0
     assert any(edge["status"] == "resolved" for edge in route_graph["edges"])
+
+
+def test_lsp_tool_service_uses_real_tool_outputs_and_tsserver_protocol(tmp_path: Path, monkeypatch) -> None:
+    bin_dir = tmp_path / "bin"
+    app_dir = tmp_path / "miniapp" / "app"
+    static_dir = app_dir / "static" / "client"
+    bin_dir.mkdir()
+    static_dir.mkdir(parents=True)
+    (app_dir / "main.py").write_text("def ok():\n    return True\n", encoding="utf-8")
+    (static_dir / "app.ts").write_text("const value: string = 1;\n", encoding="utf-8")
+    (tmp_path / "tsconfig.json").write_text('{"compilerOptions":{"noEmit":true,"strict":true},"include":["miniapp/app/static/**/*.ts"]}\n', encoding="utf-8")
+
+    def fake_tool(name: str, body: str) -> None:
+        path = bin_dir / name
+        path.write_text("#!/usr/bin/env python3\n" + body, encoding="utf-8")
+        path.chmod(0o755)
+
+    fake_tool(
+        "ruff",
+        "import json, sys\n"
+        "print(json.dumps([{'filename':'miniapp/app/main.py','location':{'row':1,'column':5},'code':'F401','message':'unused import'}]))\n"
+        "sys.exit(1)\n",
+    )
+    fake_tool(
+        "pyright",
+        "import json, pathlib, sys\n"
+        "root = pathlib.Path.cwd()\n"
+        "print(json.dumps({'generalDiagnostics':[{'file':str(root/'miniapp/app/main.py'),'range':{'start':{'line':0,'character':0}},'severity':'error','message':'unknown symbol','rule':'reportUnknownVariableType'}]}))\n"
+        "sys.exit(1)\n",
+    )
+    fake_tool(
+        "tsc",
+        "import sys\n"
+        "print('miniapp/app/static/client/app.ts(1,7): error TS2322: Type number is not assignable to string')\n"
+        "sys.exit(2)\n",
+    )
+    fake_tool(
+        "tsserver",
+        "import json, sys\n"
+        "payload = {'seq':1,'type':'response','command':'semanticDiagnosticsSync','request_seq':4,'success':True,'body':[{'start':{'line':1,'offset':7},'text':'Type mismatch','code':2322,'category':'error'}]}\n"
+        "raw = json.dumps(payload).encode()\n"
+        "sys.stdout.buffer.write(f'Content-Length: {len(raw)}\\r\\n\\r\\n'.encode() + raw)\n",
+    )
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    report = LspToolService.diagnostics(root=tmp_path)
+    sources = {item["source"] for item in report["items"]}
+
+    assert {"ruff", "pyright", "tsc", "tsserver"}.issubset(sources)
+    assert report["tool_status"]["ruff"]["status"] == "failed"
+    assert report["tool_status"]["pyright"]["status"] == "failed"
+    assert report["tool_status"]["tsc"]["status"] == "failed"
+    assert report["tool_status"]["tsserver"]["status"] == "failed"
+
+
+def test_lsp_tool_service_detects_api_method_mismatch_and_route_definitions(tmp_path: Path) -> None:
+    routes = tmp_path / "miniapp" / "app" / "routes"
+    client = tmp_path / "miniapp" / "app" / "static" / "client"
+    routes.mkdir(parents=True)
+    client.mkdir(parents=True)
+    (routes / "api.py").write_text(
+        "from fastapi import APIRouter\n"
+        "router = APIRouter(prefix='/api/items')\n"
+        "@router.get('')\n"
+        "def list_items():\n"
+        "    return []\n",
+        encoding="utf-8",
+    )
+    (client / "app.js").write_text("async function save() { return fetch('/api/items', { method: 'POST' }); }\n", encoding="utf-8")
+
+    diagnostics = LspToolService.diagnostics(root=tmp_path, include_optional_tools=False)
+    definition = LspToolService.definition(root=tmp_path, symbol="/api/items")
+    refs = LspToolService.find_references(root=tmp_path, symbol="/api/items")
+    route_graph = LspToolService.route_graph(root=tmp_path)
+
+    assert any(item["source"] == "api_route_static" and item["code"] == "method_mismatch" for item in diagnostics["items"])
+    assert definition["items"][0]["kind"] == "api_route"
+    assert any(item["path"].endswith("client/app.js") for item in refs["items"])
+    assert route_graph["summary"]["api_mismatch_count"] == 1
+    assert route_graph["edges"][0]["status"] == "method_mismatch"
 
 
 def test_lsp_agent_tools_are_model_visible_aliases_with_canonical_protocol() -> None:
@@ -1258,7 +1339,13 @@ class _RouterWorkspace:
         return ""
 
 
-def _router_context(tmp_path: Path, *, mode: str = "default", hook_manager: AgentHookManager | None = None) -> ToolRouterContext:
+def _router_context(
+    tmp_path: Path,
+    *,
+    mode: str = "default",
+    hook_manager: AgentHookManager | None = None,
+    output_artifact_writer=None,
+) -> ToolRouterContext:
     root = tmp_path
     (root / "miniapp/app/static/client").mkdir(parents=True, exist_ok=True)
     (root / "miniapp/app/static/client/app.js").write_text("console.log('ok');\n", encoding="utf-8")
@@ -1285,7 +1372,28 @@ def _router_context(tmp_path: Path, *, mode: str = "default", hook_manager: Agen
         execute_checks=execute_checks,
         hook_manager=hook_manager,
         mode=mode,
+        output_artifact_writer=output_artifact_writer,
     )
+
+
+def test_tool_registry_contract_exposes_governed_canonical_specs() -> None:
+    contract = tool_registry_contract()
+    tools = {item["canonical"]: item for item in contract["tools"]}
+
+    assert contract["schema"] == "grounded.tool_registry_contract.v2"
+    assert contract["alias_index"]["run_command"] == "shell.exec"
+    for spec in tools.values():
+        assert spec["input_schema"]["type"] == "object"
+        assert spec["output_schema"]["type"] == "object"
+        assert spec["risk"] in {"safe", "read_only", "mutating", "network", "destructive", "forbidden", "unknown"}
+        assert spec["approval_class"] in {"none", "policy", "human", "forbidden"}
+        assert isinstance(spec["concurrency_safe"], bool)
+        assert spec["timeout_seconds"] > 0
+        assert spec["output_cap_chars"] > 0
+        assert spec["artifact_spill_policy"] in {"never", "on_truncation", "always"}
+    assert "read_files" in tools["file.read"]["aliases"]
+    assert tools["shell.exec"]["approval_class"] == "policy"
+    assert tools["file.write"]["approval_class"] == "human"
 
 
 def test_tool_router_normalizes_alias_and_returns_typed_envelope(tmp_path: Path) -> None:
@@ -1309,6 +1417,45 @@ def test_tool_router_normalizes_alias_and_returns_typed_envelope(tmp_path: Path)
     assert envelope["tool_call_id"] == "read_1"  # type: ignore[index]
     assert envelope["tool"] == "file.read"  # type: ignore[index]
     assert envelope["status"] == "completed"  # type: ignore[index]
+    assert envelope["approval"]["class"] == "none"  # type: ignore[index]
+
+
+def test_tool_router_spills_large_result_to_output_artifact_writer(tmp_path: Path, monkeypatch) -> None:
+    for index in range(40):
+        target = tmp_path / f"miniapp/app/static/client/generated/very-long-component-name-{index}.js"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(f"console.log({index});\n", encoding="utf-8")
+    monkeypatch.setitem(
+        TOOL_EXECUTION_DEFAULTS,
+        "file.list",
+        {**TOOL_EXECUTION_DEFAULTS["file.list"], "output_cap_chars": 260},
+    )
+    written: list[dict[str, object]] = []
+
+    def writer(payload: dict[str, object]) -> dict[str, object] | None:
+        written.append(payload)
+        return {
+            "ref": "exec_output:ws_router:run_router:tool:list_1:tool:abc",
+            "artifact_id": "tool:list_1:tool:abc",
+            "stream": payload["stream"],
+            "sha256": "abc",
+            "chars": len(str(payload.get("content") or "")),
+            "omitted_chars": (payload.get("head_tail") or {}).get("omitted_chars") if isinstance(payload.get("head_tail"), dict) else 0,
+            "truncated_full": False,
+        }
+
+    router = ToolRouter(_router_context(tmp_path, output_artifact_writer=writer))
+    result = router.route_batch([{"tool": "list_files", "tool_use_id": "list_1", "reason": "inventory"}])
+    payload = result.model_results[1]
+    envelope = payload["envelope"]
+
+    assert envelope["truncation"]["truncated"] is True  # type: ignore[index]
+    assert envelope["truncation"]["spilled"] is True  # type: ignore[index]
+    assert envelope["artifacts"][0]["kind"] == "tool_result"  # type: ignore[index]
+    assert payload["artifact_ref"] == "exec_output:ws_router:run_router:tool:list_1:tool:abc"
+    assert written[0]["stream"] == "tool"
+    assert written[0]["metadata"]["tool"] == "file.list"  # type: ignore[index]
+    assert "very-long-component-name" in str(written[0]["content"])
 
 
 def test_tool_router_schema_validation_reports_extra_and_missing_args(tmp_path: Path) -> None:
@@ -2309,16 +2456,20 @@ def test_safe_diagnostic_commands_are_scoped() -> None:
 
 def test_command_policy_returns_typed_decisions() -> None:
     allowed = decide_workspace_command("python -m py_compile miniapp/app/main.py")
+    cat_read = decide_workspace_command("cat miniapp/app/main.py")
     miniapp_cwd = decide_workspace_command("cd miniapp && node --check tests/generated_app.test.mjs")
     denied = decide_workspace_command("npm install")
     examples = DEFAULT_COMMAND_POLICY.validation_examples()
 
     assert allowed.allowed is True
     assert allowed.action == "allow"
+    assert cat_read.allowed is True
+    assert cat_read.safety_class == "read_only"
     assert miniapp_cwd.allowed is True
     assert miniapp_cwd.cwd_policy == "miniapp"
     assert denied.allowed is False
     assert denied.action == "forbidden"
+    assert denied.safety_class == "network"
     assert all(item["status"] == "passed" for item in examples)
 
 
@@ -2475,6 +2626,41 @@ def test_context_pressure_detects_duplicate_reads_from_transcript() -> None:
     assert pressure["suggestions"][0]["kind"] == "avoid_duplicate_reads"
     assert pressure["suggestions"][0]["code"] == "avoid_reread_files"
     assert pressure["avoid_reread_files"][0]["path"] == "miniapp/app/main.py"
+
+
+def test_context_pressure_detects_stale_paths_and_phase_budget_payload() -> None:
+    payload_pressure = AgentContextPressureAnalyzer().analyze_payload(
+        {
+            "phase_budget": {
+                "schema": "grounded.phase_token_cost_budget.v1",
+                "phases": [{"phase": "editing", "status": "active", "token_budget": 1000, "tokens_used": 850}],
+            },
+            "stale_path_refs": [{"path": "miniapp/app/old.py", "suggested_path": "miniapp/app/main.py"}],
+        }
+    )
+    transcript_pressure = AgentContextPressureAnalyzer().analyze_transcript(
+        {
+            "events": [
+                {
+                    "sequence": 7,
+                    "event_type": "tool_call",
+                    "payload": {
+                        "tool_use_id": "read_old",
+                        "tool": "read_files",
+                        "arguments": {"targets": ["miniapp/app/old.py"]},
+                    },
+                }
+            ]
+        },
+        path_exists=lambda path: False if path == "miniapp/app/old.py" else True,
+        find_similar_path=lambda path: "miniapp/app/main.py" if path == "miniapp/app/old.py" else None,
+    )
+
+    assert payload_pressure["phase_budgets"][0]["phase"] == "editing"
+    assert payload_pressure["stale_path_refs"][0]["suggested_path"] == "miniapp/app/main.py"
+    assert transcript_pressure["stale_path_refs"][0]["last_sequence"] == 7
+    assert transcript_pressure["stale_path_refs"][0]["suggested_path"] == "miniapp/app/main.py"
+    assert transcript_pressure["suggestions"][0]["code"] == "refresh_stale_path_refs"
 
 
 def test_hook_manager_records_lifecycle_events() -> None:
@@ -2651,6 +2837,37 @@ def test_worker_manager_rejects_forbidden_worker_paths() -> None:
 
     assert report["ok"] is False
     assert report["forbidden"][0]["path"] == "miniapp/app/static/manager/app.js"  # type: ignore[index]
+    assert report["conflict_report"]["forbidden_count"] == 1  # type: ignore[index]
+
+
+def test_worker_manager_reports_disjoint_write_scopes() -> None:
+    default_report = AgentWorkerManager.write_scope_report()
+    overlapping_report = AgentWorkerManager.write_scope_report(
+        [
+            {
+                "worker_id": "client_surface_worker",
+                "branch_role": "writer",
+                "owner_scope": "client",
+                "ownership": {"allowed_paths": ["miniapp/app/static/client"], "forbidden_paths": [], "exclusive_write": True},
+            },
+            {
+                "worker_id": "client_child_worker",
+                "branch_role": "writer",
+                "owner_scope": "client child",
+                "ownership": {"allowed_paths": ["miniapp/app/static/client/details"], "forbidden_paths": [], "exclusive_write": True},
+            },
+            {
+                "worker_id": "mobile_polish_worker",
+                "branch_role": "verifier",
+                "ownership": {"allowed_paths": ["miniapp/app/static/client"], "exclusive_write": False},
+            },
+        ]
+    )
+
+    assert default_report["status"] == "passed"
+    assert default_report["disjoint"] is True
+    assert overlapping_report["status"] == "conflict"
+    assert overlapping_report["overlaps"][0]["left_worker"] == "client_surface_worker"  # type: ignore[index]
 
 
 def test_worker_manager_maps_serial_coordinator_edits_to_path_owner() -> None:
@@ -2929,7 +3146,11 @@ def test_worker_runtime_prepares_isolated_drafts_and_merge_reports(tmp_path: Pat
     assert Path(prepared["workers"][0]["source_dir"]).exists()  # type: ignore[index]
     assert prepared["workers"][0]["agent_loop_ref"] == "worker_agent_loop:run_1:client_surface_worker"  # type: ignore[index]
     assert prepared["workers"][0]["branch_policy"] == "isolated_draft_writer"  # type: ignore[index]
+    assert prepared["workers"][0]["write_scope"]["allowed_paths"] == ["miniapp/app/static/client"]  # type: ignore[index]
+    assert prepared["write_scope_report"]["status"] == "passed"  # type: ignore[index]
     assert report["status"] == "conflict"
+    assert report["conflict_report"]["blocked_paths"] == ["miniapp/app/static/client/app.js"]
+    assert report["post_merge_verifier"]["status"] == "blocked_until_conflicts_resolved"
 
     branch_results = runtime.record_branch_results(
         "run_1",
@@ -2993,6 +3214,8 @@ def test_worker_runtime_prepares_workspace_branch_run_ids(tmp_path: Path) -> Non
     assert prepared["isolation"] == "workspace_draft_clone_per_worker"
     assert worker["branch_run_id"] == "run_main__worker__client_surface_worker"
     assert worker["base_run_id"] == "run_main"
+    assert worker["branch_kind"] == "workspace_draft_clone"
+    assert worker["merge_base_ref"] == "coordinator_draft:ws:run_main"
     assert Path(worker["source_dir"], "miniapp/app/static/client/app.js").exists()
 
 
@@ -3138,6 +3361,7 @@ def test_guardian_review_emits_blocker_findings_before_apply(tmp_path: Path) -> 
     target.parent.mkdir(parents=True)
     target.write_text(
         "const mockData = [{ name: 'John Doe' }];\n"
+        "const accessToken = 'sk_live_1234567890abcdef';\n"
         "export function render() { document.body.innerText = mockData[0].name; }\n",
         encoding="utf-8",
     )
@@ -3146,7 +3370,7 @@ def test_guardian_review_emits_blocker_findings_before_apply(tmp_path: Path) -> 
         run_id="run_1",
         changed_files=["miniapp/app/static/client/app.js"],
         results=[
-            RunCheckResult(name="api_workflow_smoke", status="passed", details="ok", command="api"),
+            RunCheckResult(name="api_workflow_smoke", status="skipped", details="not rerun", command="api"),
             RunCheckResult(
                 name="browser_flow_smoke",
                 status="passed",
@@ -3172,16 +3396,45 @@ def test_guardian_review_emits_blocker_findings_before_apply(tmp_path: Path) -> 
         implementation_plan={"primary_entities": ["task"]},
         target_role_scope=["client", "specialist", "manager"],
         intent="create",
+        review_context={
+            "diff": "\n".join(
+                [
+                    "diff --git a/miniapp/app/routes/api.py b/miniapp/app/routes/api.py",
+                    "-@router.post('/api/tasks')",
+                    *["+bulk change" for _ in range(3010)],
+                ]
+            ),
+            "token_usage": {"total_tokens": 170000, "context_window_remaining": 4000},
+            "context_pressure": {"status": "critical"},
+        },
     ).model_dump(mode="json", by_alias=True)
 
     codes = {finding["code"] for finding in report["findings"]}
+    checklist = {item["key"]: item for item in report["checklist"]}
     assert report["schema"] == "grounded.guardian_review.v1"
     assert report["status"] == "failed"
+    assert report["final_review_gate"]["schema"] == "grounded.final_review_gate.v1"
+    assert report["final_review_gate"]["status"] == "failed"
     assert "guardian.seeded_mock_data.mock_or_seed_named_data" in codes
+    assert "guardian.security_privacy.hardcoded_secret" in codes
+    assert "guardian.breaking_changes.removed_api_route_without_api_proof" in codes
+    assert "guardian.changed_size_risk.large_candidate_delta" in codes
+    assert "guardian.context_bloat.context_pressure_critical" in codes
     assert "guardian.mobile_overflow" in codes
     assert "guardian.role_workflow_missing_browser_roles" in codes
     assert "guardian.missing_acceptance_tests" in codes
     assert "guardian.weak_persistence_missing_browser_marker" in codes
+    assert {
+        "breaking_changes",
+        "missing_tests",
+        "product_readiness",
+        "mobile_overflow",
+        "stale_mock_data",
+        "context_bloat",
+        "changed_size_risk",
+        "security_privacy",
+    }.issubset(checklist)
+    assert all(checklist[key]["status"] == "failed" for key in checklist)
 
 
 def test_check_orchestrator_selects_full_create_gate() -> None:
@@ -3214,7 +3467,26 @@ def test_browser_replay_extracts_failed_step_packet() -> None:
                     "failed_step": "client_submit",
                     "failed_selector": "#main-form",
                     "failed_route": "/client",
+                    "dom_selector": "form#main-form",
+                    "screenshot_before": "/tmp/before.png",
+                    "screenshot_after": "/tmp/after.png",
+                    "mobile_viewport": {"width": 390, "height": 844},
+                    "network_errors": ["500 /api/items"],
                     "console_errors": ["ReferenceError"],
+                    "playwright_scenario": {
+                        "schema": "grounded.browser_playwright_scenario.v1",
+                        "mobile_viewport": {"width": 390, "height": 844},
+                        "steps": [
+                            {"action": "open", "route": "/client", "screenshot_after": "/tmp/open.png"},
+                            {
+                                "action": "client_submit",
+                                "route": "/client",
+                                "selector": "form#main-form",
+                                "screenshot_before": "/tmp/before.png",
+                                "screenshot_after": "/tmp/after.png",
+                            },
+                        ],
+                    },
                 },
             )
         ],
@@ -3226,8 +3498,24 @@ def test_browser_replay_extracts_failed_step_packet() -> None:
     packet = BrowserProofReplay.failed_step_packet(execution)
 
     assert packet is not None
+    assert packet["schema"] == "grounded.browser_replay_packet.v2"
     assert packet["failed_step"] == "client_submit"
+    assert packet["dom_selector"] == "form#main-form"
+    assert packet["screenshot_before"] == "/tmp/before.png"
+    assert packet["screenshot_after"] == "/tmp/after.png"
+    assert packet["network_errors"] == ["500 /api/items"]
+    assert packet["replay_plan"]["first_action"] == "reproduce_failed_step"
+    assert packet["replay_plan"]["scenario_step"]["selector"] == "form#main-form"
     assert BrowserProofReplay.should_rerun_step_first(packet) is True
+
+
+def test_browser_flow_script_compiles_with_replay_capture() -> None:
+    script = CheckRunner._real_browser_ui_flow_python_script()
+
+    compile(script, "<browser-proof-script>", "exec")
+    assert "grounded.browser_playwright_scenario.v1" in script
+    assert "screenshot_before" in script
+    assert "MOBILE_VIEWPORT" in script
 
 
 def test_process_recovery_marks_running_processes_stale() -> None:
@@ -3370,11 +3658,16 @@ def test_command_policy_handles_shell_git_rg_and_find_parser_invariants() -> Non
     assert decide_workspace_command("bash -lc 'rg api miniapp/app > out.txt'").action == "forbidden"
     assert decide_workspace_command("bash -lc 'bash -lc \"rg api miniapp/app\"'").action == "forbidden"
     assert decide_workspace_command("git status --short").action == "allow"
-    assert decide_workspace_command("git diff --output out.patch").action == "forbidden"
+    git_write = decide_workspace_command("git diff --output out.patch")
+    assert git_write.action == "forbidden"
+    assert git_write.safety_class == "workspace_write"
     assert decide_workspace_command("git -c core.pager=cat status").action == "forbidden"
     assert decide_workspace_command("rg --pre tool miniapp/app").action == "forbidden"
     assert decide_workspace_command("find miniapp/app -type f").action == "allow"
     assert decide_workspace_command("find miniapp/app -exec rm {} ;").action == "forbidden"
+    find_delete = decide_workspace_command("find miniapp/app -delete")
+    assert find_delete.action == "forbidden"
+    assert find_delete.safety_class == "destructive"
 
 
 def test_command_policy_blocks_shell_bypass_executables_and_ast_forms() -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Literal
 from uuid import uuid4
@@ -10,7 +11,45 @@ from app.models.workbench import ToolEnvelope
 TOOL_PROTOCOL_VERSION = "grounded.tool.v2"
 
 ToolRisk = Literal["safe", "read_only", "mutating", "network", "destructive", "forbidden", "unknown"]
+ToolApprovalClass = Literal["none", "policy", "human", "forbidden"]
+ToolArtifactSpillPolicy = Literal["never", "on_truncation", "always"]
 SandboxProfile = Literal["analysis_readonly", "agent_draft_write", "source_apply_gate", "developer_bypass", "analysis_only", "agent_draft", "apply_gate"]
+
+
+@dataclass(frozen=True)
+class ToolProtocolSpec:
+    canonical: str
+    version: str
+    aliases: tuple[str, ...]
+    risk: ToolRisk
+    approval_class: ToolApprovalClass
+    sandbox_profile: str
+    concurrency_safe: bool
+    timeout_seconds: int
+    output_cap_chars: int
+    artifact_spill_policy: ToolArtifactSpillPolicy
+    input_schema: dict[str, Any]
+    output_schema: dict[str, Any]
+    deferred: bool = False
+    dynamic: bool = False
+
+    def as_contract(self) -> dict[str, Any]:
+        return {
+            "canonical": self.canonical,
+            "version": self.version,
+            "aliases": list(self.aliases),
+            "risk": self.risk,
+            "approval_class": self.approval_class,
+            "sandbox_profile": self.sandbox_profile,
+            "concurrency_safe": self.concurrency_safe,
+            "timeout_seconds": self.timeout_seconds,
+            "output_cap_chars": self.output_cap_chars,
+            "artifact_spill_policy": self.artifact_spill_policy,
+            "deferred": self.deferred,
+            "dynamic": self.dynamic,
+            "input_schema": self.input_schema,
+            "output_schema": self.output_schema,
+        }
 
 
 CANONICAL_TOOL_ALIASES: dict[str, str] = {
@@ -82,6 +121,39 @@ TOOL_RISK_DEFAULTS: dict[str, ToolRisk] = {
     "review.start": "read_only",
 }
 
+TOOL_EXECUTION_DEFAULTS: dict[str, dict[str, Any]] = {
+    "file.list": {"concurrency_safe": True, "timeout_seconds": 25, "output_cap_chars": 6000},
+    "file.read": {"concurrency_safe": True, "timeout_seconds": 25, "output_cap_chars": 9000},
+    "artifact.read": {"concurrency_safe": True, "timeout_seconds": 25, "output_cap_chars": 12000},
+    "search.grep": {"concurrency_safe": True, "timeout_seconds": 25, "output_cap_chars": 6000},
+    "semantic.scan": {"concurrency_safe": True, "timeout_seconds": 25, "output_cap_chars": 12000},
+    "tool.search": {"concurrency_safe": True, "timeout_seconds": 25, "output_cap_chars": 9000},
+    "lsp.diagnostics": {"concurrency_safe": True, "timeout_seconds": 25, "output_cap_chars": 12000},
+    "lsp.symbol_context": {"concurrency_safe": True, "timeout_seconds": 25, "output_cap_chars": 10000},
+    "lsp.definition": {"concurrency_safe": True, "timeout_seconds": 25, "output_cap_chars": 8000},
+    "lsp.find_references": {"concurrency_safe": True, "timeout_seconds": 25, "output_cap_chars": 10000},
+    "lsp.route_graph": {"concurrency_safe": True, "timeout_seconds": 25, "output_cap_chars": 14000},
+    "lsp.route_static_context": {"concurrency_safe": True, "timeout_seconds": 25, "output_cap_chars": 12000},
+    "diff.inspect": {"concurrency_safe": True, "timeout_seconds": 25, "output_cap_chars": 12000},
+    "checks.run": {"concurrency_safe": False, "timeout_seconds": 120, "output_cap_chars": 10000, "approval_class": "policy"},
+    "browser.verify": {
+        "concurrency_safe": False,
+        "timeout_seconds": 180,
+        "output_cap_chars": 14000,
+        "approval_class": "policy",
+        "dynamic": True,
+    },
+    "shell.exec": {"concurrency_safe": True, "timeout_seconds": 30, "output_cap_chars": 6000, "approval_class": "policy"},
+    "file.write": {"concurrency_safe": False, "timeout_seconds": 25, "output_cap_chars": 6000, "approval_class": "human", "deferred": True},
+    "file.edit": {"concurrency_safe": False, "timeout_seconds": 25, "output_cap_chars": 6000, "approval_class": "human", "deferred": True},
+    "patch.apply": {"concurrency_safe": False, "timeout_seconds": 25, "output_cap_chars": 6000, "approval_class": "human", "deferred": True},
+    "contract.compile": {"concurrency_safe": False, "timeout_seconds": 25, "output_cap_chars": 6000},
+    "registry.sync": {"concurrency_safe": False, "timeout_seconds": 25, "output_cap_chars": 6000, "approval_class": "human", "deferred": True},
+    "todo.write": {"concurrency_safe": False, "timeout_seconds": 25, "output_cap_chars": 6000},
+    "user.ask": {"concurrency_safe": False, "timeout_seconds": 25, "output_cap_chars": 6000},
+    "review.start": {"concurrency_safe": False, "timeout_seconds": 120, "output_cap_chars": 10000, "approval_class": "policy"},
+}
+
 
 def canonical_tool_name(tool: object) -> str:
     raw = str(tool or "").strip().lower()
@@ -92,21 +164,73 @@ def default_tool_risk(tool: object) -> ToolRisk:
     return TOOL_RISK_DEFAULTS.get(canonical_tool_name(tool), "unknown")
 
 
+def default_tool_approval_class(tool: object) -> ToolApprovalClass:
+    canonical = canonical_tool_name(tool)
+    risk = default_tool_risk(canonical)
+    if risk == "forbidden":
+        return "forbidden"
+    configured = TOOL_EXECUTION_DEFAULTS.get(canonical, {}).get("approval_class")
+    if configured in {"none", "policy", "human", "forbidden"}:
+        return configured  # type: ignore[return-value]
+    if risk in {"mutating", "destructive"}:
+        return "human"
+    if risk == "network":
+        return "policy"
+    return "none"
+
+
+def default_tool_sandbox_profile(tool: object) -> str:
+    canonical = canonical_tool_name(tool)
+    risk = default_tool_risk(canonical)
+    configured = TOOL_EXECUTION_DEFAULTS.get(canonical, {}).get("sandbox_profile")
+    if isinstance(configured, str) and configured:
+        return configured
+    if risk in {"mutating", "destructive"}:
+        return "agent_draft_write"
+    if risk == "forbidden":
+        return "analysis_only"
+    return "analysis_readonly"
+
+
+def tool_protocol_spec(tool: object) -> ToolProtocolSpec:
+    canonical = canonical_tool_name(tool)
+    configured = TOOL_EXECUTION_DEFAULTS.get(canonical, {})
+    risk = default_tool_risk(canonical)
+    spill_policy = configured.get("artifact_spill_policy") or ("never" if risk in {"safe", "forbidden"} else "on_truncation")
+    if spill_policy not in {"never", "on_truncation", "always"}:
+        spill_policy = "on_truncation"
+    return ToolProtocolSpec(
+        canonical=canonical,
+        version=TOOL_PROTOCOL_VERSION,
+        aliases=tuple(sorted(alias for alias, target in CANONICAL_TOOL_ALIASES.items() if target == canonical and alias != canonical)),
+        risk=risk,
+        approval_class=default_tool_approval_class(canonical),
+        sandbox_profile=default_tool_sandbox_profile(canonical),
+        concurrency_safe=bool(configured.get("concurrency_safe", False)),
+        timeout_seconds=int(configured.get("timeout_seconds") or 25),
+        output_cap_chars=int(configured.get("output_cap_chars") or 6000),
+        artifact_spill_policy=spill_policy,  # type: ignore[arg-type]
+        input_schema=TOOL_INPUT_SCHEMAS.get(canonical, {}),
+        output_schema=TOOL_OUTPUT_SCHEMAS.get(canonical, {}),
+        deferred=bool(configured.get("deferred") or risk in {"mutating", "destructive"}),
+        dynamic=bool(configured.get("dynamic")),
+    )
+
+
 def tool_registry_contract() -> dict[str, Any]:
-    tools = []
-    for alias, canonical in sorted(CANONICAL_TOOL_ALIASES.items()):
-        tools.append(
-            {
-                "alias": alias,
-                "canonical": canonical,
-                "version": TOOL_PROTOCOL_VERSION,
-                "risk": TOOL_RISK_DEFAULTS.get(canonical, "unknown"),
-                "input_schema": TOOL_INPUT_SCHEMAS.get(canonical, {}),
-                "output_schema": TOOL_OUTPUT_SCHEMAS.get(canonical, {}),
-            }
-        )
+    canonical_tools = sorted(
+        set(CANONICAL_TOOL_ALIASES.values())
+        | set(TOOL_RISK_DEFAULTS)
+        | set(TOOL_INPUT_SCHEMAS)
+        | set(TOOL_OUTPUT_SCHEMAS)
+        | set(TOOL_EXECUTION_DEFAULTS)
+    )
+    tools = [tool_protocol_spec(canonical).as_contract() for canonical in canonical_tools]
     return {
         "tool_protocol_version": TOOL_PROTOCOL_VERSION,
+        "schema": "grounded.tool_registry_contract.v2",
+        "alias_index": dict(sorted(CANONICAL_TOOL_ALIASES.items())),
+        "compatibility_policy": "Canonical tool contracts are additive within grounded.tool.v2; legacy aliases must resolve to a canonical tool without changing input/output schemas.",
         "envelope_fields": [
             "tool_call_id",
             "tool",
@@ -146,6 +270,15 @@ def tool_registry_contract() -> dict[str, Any]:
             "mime_type": "application/json",
             "size_bytes": 0,
         },
+        "governance_fields": [
+            "risk",
+            "approval_class",
+            "sandbox_profile",
+            "concurrency_safe",
+            "timeout_seconds",
+            "output_cap_chars",
+            "artifact_spill_policy",
+        ],
         "tools": tools,
     }
 
@@ -373,12 +506,53 @@ TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
             "allowed_file_graph": {"type": "object"},
         },
     },
+    "todo.write": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["items"],
+        "properties": {
+            "workspace_id": {"type": "string"},
+            "run_id": {"type": "string"},
+            "items": {"type": "array", "items": {"type": "object"}},
+            "reason": {"type": "string"},
+        },
+    },
+    "user.ask": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["question"],
+        "properties": {
+            "workspace_id": {"type": "string"},
+            "run_id": {"type": "string"},
+            "question": {"type": "string"},
+            "choices": {"type": "array", "items": {"type": "string"}},
+            "reason": {"type": "string"},
+        },
+    },
+    "review.start": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "workspace_id": {"type": "string"},
+            "run_id": {"type": "string"},
+            "targets": {"type": "array", "items": {"type": "string"}},
+            "reason": {"type": "string"},
+        },
+    },
 }
 
 TOOL_OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
+    "file.list": {"type": "object", "required": ["paths"]},
+    "file.read": {"type": "object", "required": ["files"]},
+    "artifact.read": {"type": "object", "required": ["artifact_ref", "found"]},
+    "search.grep": {"type": "object", "required": ["pattern", "matches"]},
+    "semantic.scan": {"type": "object", "required": ["graph"]},
+    "diff.inspect": {"type": "object", "required": ["paths", "diff"]},
+    "shell.exec": {"type": "object", "required": ["process_id", "success"]},
+    "browser.verify": {"type": "object", "required": ["workflow_results", "preview"]},
     "contract.compile": {"type": "object", "required": ["contract", "allowed_file_graph"]},
     "registry.sync": {"type": "object", "required": ["snapshot", "regenerated_files", "repair_recipes"]},
-    "checks.run": {"type": "object", "required": ["status", "results"]},
+    "checks.run": {"type": "object", "required": ["preview", "failed_checks"]},
     "tool.search": {"type": "object", "required": ["items", "summary"]},
     "lsp.diagnostics": {"type": "object", "required": ["status", "items"]},
     "lsp.symbol_context": {"type": "object", "required": ["items"]},
@@ -386,9 +560,12 @@ TOOL_OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
     "lsp.find_references": {"type": "object", "required": ["items"]},
     "lsp.route_graph": {"type": "object", "required": ["nodes", "edges"]},
     "lsp.route_static_context": {"type": "object", "required": ["routes", "frontend_api_refs"]},
-    "patch.apply": {"type": "object", "required": ["status", "changed_files"]},
-    "file.write": {"type": "object", "required": ["status", "file_path"]},
-    "file.edit": {"type": "object", "required": ["status", "file_path"]},
+    "patch.apply": {"type": "object", "required": ["status", "deferred_changes"]},
+    "file.write": {"type": "object", "required": ["status", "deferred_changes"]},
+    "file.edit": {"type": "object", "required": ["status", "deferred_changes"]},
+    "todo.write": {"type": "object", "required": ["status", "items"]},
+    "user.ask": {"type": "object", "required": ["status", "question"]},
+    "review.start": {"type": "object", "required": ["status", "findings"]},
 }
 
 
@@ -432,6 +609,8 @@ def tool_envelope(
             "retryable": bool(error.get("retryable") or False),
             "details": error.get("details") or {},
         }
+    approval_payload = dict(approval or {"required": False, "status": "not_required"})
+    approval_payload.setdefault("class", default_tool_approval_class(canonical))
     payload = {
         "tool_call_id": tool_call_id or f"tool_{uuid4().hex}",
         "tool": canonical,
@@ -439,9 +618,9 @@ def tool_envelope(
         "status": resolved_status,
         "input": input_payload or {},
         "risk": risk or default_tool_risk(canonical),
-        "approval": approval or {"required": False, "status": "not_required"},
-        "approval_id": (approval or {}).get("approval_id") if isinstance(approval, dict) else None,
-        "sandbox_profile": sandbox_profile or ("agent_draft_write" if default_tool_risk(canonical) == "mutating" else "analysis_readonly"),
+        "approval": approval_payload,
+        "approval_id": approval_payload.get("approval_id"),
+        "sandbox_profile": sandbox_profile or default_tool_sandbox_profile(canonical),
         "progress": progress or [],
         "result": result or {},
         "artifacts": artifacts or [],

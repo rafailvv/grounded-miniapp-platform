@@ -12,6 +12,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
+from uuid import uuid4
 
 from app.ai.model_registry import models_for_role, resolve_model_profile
 from app.ai.openai_client import OpenAIClient
@@ -217,6 +218,7 @@ class WorkspaceCodeAgentRuntime:
             process_manager=self.process_manager,
             read_artifact=lambda ref: self.store.get("reports", ref),
             output_artifact_writer=self._store_command_output_artifact,
+            denied_action_writer=self._store_denied_action,
         )
         self.context_pack_builder = context_pack_builder
         self.platform_db = platform_db
@@ -1377,11 +1379,33 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         if worker_drafts.get("enabled"):
             for worker in worker_drafts.get("workers") or []:
                 if isinstance(worker, dict):
+                    worker_id = canonical_worker_id(str(worker.get("worker_id") or ""))
+                    refs = worker_refs(workspace_id, artifact_run_id, worker_id)
+                    output = self.store.get("reports", refs["output_ref"])
+                    if isinstance(output, dict):
+                        self._store_report(
+                            refs["output_ref"],
+                            {
+                                **output,
+                                "branch_run_id": worker.get("branch_run_id"),
+                                "branch_source_dir": worker.get("source_dir"),
+                                "branch_kind": worker.get("branch_kind"),
+                                "write_scope": worker.get("write_scope") or output.get("ownership") or {},
+                                "merge_base_ref": worker.get("merge_base_ref"),
+                                "worker_drafts_ref": job.worker_drafts_ref,
+                            },
+                        )
                     self._append_event(
                         job,
                         "worker_started",
                         f"Prepared isolated worker draft for {worker.get('worker_id')}.",
-                        {"worker_id": worker.get("worker_id"), "owner_scope": worker.get("owner_scope"), "artifact_ref": job.worker_drafts_ref},
+                        {
+                            "worker_id": worker.get("worker_id"),
+                            "branch_run_id": worker.get("branch_run_id"),
+                            "owner_scope": worker.get("owner_scope"),
+                            "write_scope": worker.get("write_scope") or {},
+                            "artifact_ref": job.worker_drafts_ref,
+                        },
                     )
         self._append_activity(
             job,
@@ -2202,6 +2226,11 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                 target_role_scope=role_scope,
                 intent=str(request.intent or ""),
                 source="runtime_verifier",
+                review_context={
+                    "diff": self.workspace_service.diff(workspace_id, run_id=run_id),
+                    "token_usage": dict(job.token_usage or {}),
+                    "run": {"run_id": run_id, "workspace_id": workspace_id, "generation_mode": str(request.generation_mode or "")},
+                },
             ).model_dump(mode="json", by_alias=True)
             guardian_ref = f"guardian_review:{workspace_id}:{artifact_run_id}"
             self._store_report(guardian_ref, guardian_report)
@@ -2244,9 +2273,9 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                 report["browser_replay_ref"] = browser_replay_ref
                 report["browser_replay_packet"] = browser_replay_packet
                 scratchpad.set_next_action(
-                    action="repair failed browser step, rerun that step, then rerun full proof",
+                    action="reproduce failed browser step first, repair it, rerun that step, then rerun full proof",
                     reason="browser_proof_failed",
-                    payload={"browser_replay_ref": browser_replay_ref, "packet": browser_replay_packet},
+                    payload={"browser_replay_ref": browser_replay_ref, "packet": browser_replay_packet, "replay_first": True, "replay_plan": browser_replay_packet.get("replay_plan") or {}},
                 )
                 job.repair_issue_signatures.append(
                     {
@@ -2773,6 +2802,24 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             "updated_at": utc_now().isoformat(),
         }
         self._store_report(refs["output_ref"], payload)
+        merge_ref = f"worker_manager_merge_decision:{workspace_id}:{artifact_run_id}"
+        merge_decision = self.store.get("reports", merge_ref)
+        if isinstance(merge_decision, dict):
+            self._store_report(
+                merge_ref,
+                {
+                    **merge_decision,
+                    "post_merge_verifier": {
+                        **(merge_decision.get("post_merge_verifier") if isinstance(merge_decision.get("post_merge_verifier"), dict) else {}),
+                        "worker_id": worker_id,
+                        "status": status,
+                        "required": True,
+                        "proof_refs": [verification_report_ref, browser_step_ref],
+                        "output_ref": refs["output_ref"],
+                        "updated_at": utc_now().isoformat(),
+                    },
+                },
+            )
         task_id = str(payload.get("task_id") or "")
         if task_id:
             self._append_worker_task_output(task_id, status, payload["summary"], {"worker_id": canonical, "output_ref": refs["output_ref"], "branch_ref": branch_ref})
@@ -2898,6 +2945,22 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                 source="worker_merge",
                 trace_state=self.store.get("reports", f"trace_reducer:{workspace_id}:{artifact_run_id}") or {},
             )
+        conflict_report = merge_report.get("conflict_report")
+        if not isinstance(conflict_report, dict):
+            conflict_report = (merge_report.get("ownership") or {}).get("conflict_report") if isinstance(merge_report.get("ownership"), dict) else {}
+        post_merge_verifier = {
+            "worker_id": "mobile_polish_worker",
+            "status": (
+                "planned_after_merge"
+                if status in {"ready", "merged", "partial"}
+                else "blocked_until_merge"
+                if status in {"conflict", "rejected"}
+                else "deferred"
+            ),
+            "required": status in {"ready", "merged", "partial"},
+            "branch_policy": AgentWorkerManager.branch_policy("mobile_polish_worker"),
+            "proof_refs": [],
+        }
         payload = {
             "schema": "grounded.worker_manager_merge_decision.v1",
             "branch_schema": "grounded.worker_branch_plan.v2",
@@ -2907,11 +2970,13 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             "status": status,
             "decisions": decisions,
             "merge_report": merge_report,
+            "conflict_report": conflict_report if isinstance(conflict_report, dict) else {},
             "apply_result": apply_result or {},
             "repair_packets": repair_packets,
             "repair_cases_ref": RepairCaseService.index_ref(run_id) if repair_packets else None,
             "repair_cases": repair_cases if repair_packets else {},
             "repair_worker": self._repair_worker_packet_from_decisions(run_id=run_id, decisions=decisions),
+            "post_merge_verifier": post_merge_verifier,
             "created_at": utc_now().isoformat(),
         }
         ref = f"worker_manager_merge_decision:{workspace_id}:{artifact_run_id}"
@@ -4614,17 +4679,38 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                     "failed_role",
                     "failed_route",
                     "failed_selector",
+                    "dom_selector",
                     "action",
                     "console_errors",
+                    "console_logs",
+                    "network_errors",
+                    "network_logs",
                     "visible_errors",
                     "api_before",
                     "api_after",
                     "ui_steps",
+                    "playwright_scenario",
+                    "failed_step_context",
+                    "screenshot_before",
+                    "screenshot_after",
+                    "mobile_viewport",
                     "mobile_overflow",
                     "screenshots",
                 )
                 if key in diagnostics
             }
+            replay_packet = BrowserProofReplay.failed_step_packet(execution)
+            if replay_packet:
+                packet["browser_replay"] = WorkspaceCodeAgentRuntime._compact_jsonish(
+                    replay_packet,
+                    max_chars=1600,
+                    max_items=8,
+                )
+                packet["replay_plan"] = WorkspaceCodeAgentRuntime._compact_jsonish(
+                    replay_packet.get("replay_plan") or {},
+                    max_chars=1100,
+                    max_items=8,
+                )
             packet["details"] = truncate_tool_text(str(result.details or ""), max_chars=500)
             packet["logs"] = [truncate_tool_text(str(line), max_chars=500) for line in result.logs[-3:]]
             packet["repair_scope"] = (
@@ -4644,6 +4730,8 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         return (
             "Focused browser-proof repair: fix only the failing real UI step "
             f"{failed_step!r} for role {failed_role!r} on route {failed_route!r} selector {failed_selector!r}. "
+            "First reproduce that exact recorded Playwright step at the packet's mobile viewport using replay_plan.scenario_step, "
+            "then patch and rerun the same step before the full browser proof. "
             "Patch the smallest relevant role UI/JS/CSS slice so the browser action changes persisted state, "
             "the affected role renders it after reload, and downstream roles observe it. "
             "Do not rebuild worker branches, add product templates, or rewrite unrelated files."
@@ -5117,9 +5205,12 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             payload = {"raw_prompt": prompt_payload}
         artifact_run_id = run_id or job.job_id
         pressure = self.context_pressure.analyze_payload(payload)
+        draft_source = self.workspace_service.draft_source_dir(workspace_id, run_id) if run_id else None
         transcript_pressure = self.context_pressure.analyze_transcript(
             self.transcript_store.snapshot(artifact_run_id),
             current_file_contexts=payload.get("file_contexts") if isinstance(payload.get("file_contexts"), dict) else {},
+            path_exists=(lambda relative_path: self._draft_relative_path_exists(draft_source, relative_path)) if draft_source is not None else None,
+            find_similar_path=(lambda relative_path: self._find_similar_draft_path(draft_source, relative_path)) if draft_source is not None else None,
         )
         if transcript_pressure.get("duplicate_file_reads"):
             pressure["duplicate_file_reads"] = transcript_pressure.get("duplicate_file_reads")
@@ -5129,6 +5220,8 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         ]
         if transcript_pressure.get("avoid_reread_files"):
             pressure["avoid_reread_files"] = transcript_pressure.get("avoid_reread_files")
+        if transcript_pressure.get("stale_path_refs"):
+            pressure["stale_path_refs"] = transcript_pressure.get("stale_path_refs")
         if transcript_suggestions:
             pressure["suggestions"] = [
                 *[item for item in pressure.get("suggestions") or [] if isinstance(item, dict)],
@@ -5151,6 +5244,27 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                 ],
             ]
             pressure["compact_recommended"] = True
+        stale_refs = [item for item in pressure.get("stale_path_refs") or [] if isinstance(item, dict)]
+        if stale_refs:
+            existing_codes = {str(item.get("code") or "") for item in pressure.get("recommendations") or [] if isinstance(item, dict)}
+            if "refresh_stale_path_refs" not in existing_codes:
+                pressure["recommendations"] = [
+                    *[item for item in pressure.get("recommendations") or [] if isinstance(item, dict)],
+                    {
+                        "code": "refresh_stale_path_refs",
+                        "message": "Resolve stale file paths against the active draft before reading or patching them.",
+                        "section": "transcript",
+                        "severity": "warning",
+                        "tokens": 0,
+                        "action": "refresh_path_reference",
+                        "paths": [str(item.get("path") or "") for item in stale_refs[:8] if str(item.get("path") or "").strip()],
+                        "metadata": {"stale_path_refs": stale_refs[:8]},
+                    },
+                ]
+            pressure["compact_recommended"] = True
+        phase_budget = self._context_phase_budget(job)
+        pressure["phase_budgets"] = phase_budget.get("phases") or []
+        pressure["token_cost_budget"] = phase_budget
         pressure.update({"attempt": attempt, "tool_round": tool_round, "created_at": datetime.now(timezone.utc).isoformat()})
         self.context_pressure_history.setdefault(artifact_run_id, []).append(pressure)
         job.context_pressure_ref = job.context_pressure_ref or f"context_pressure:{workspace_id}:{artifact_run_id}"
@@ -5169,6 +5283,9 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             "recommendations": pressure.get("recommendations"),
             "microcompact_candidates": pressure.get("microcompact_candidates"),
             "avoid_reread_files": pressure.get("avoid_reread_files"),
+            "stale_path_refs": pressure.get("stale_path_refs"),
+            "phase_budgets": pressure.get("phase_budgets"),
+            "token_cost_budget": pressure.get("token_cost_budget"),
             "compact_boundary": pressure.get("compact_boundary"),
             "duplicate_file_reads": pressure.get("duplicate_file_reads"),
         }
@@ -5210,6 +5327,91 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         return json.dumps(payload, ensure_ascii=False)
 
     @staticmethod
+    def _draft_relative_path_exists(draft_source: Path, relative_path: str) -> bool | None:
+        normalized = WorkspaceCodeAgentRuntime._strip_leading_dot_slash(str(relative_path or "").replace("\\", "/"))
+        if not normalized or normalized.startswith(("/", "~")) or ".." in normalized.split("/"):
+            return None
+        if not normalized.startswith("miniapp/") and normalized not in {"README.md", "package.json", "pyproject.toml"}:
+            return None
+        try:
+            return (draft_source / normalized).exists()
+        except OSError:
+            return None
+
+    @staticmethod
+    def _context_phase_budget(job: JobRecord) -> dict[str, Any]:
+        token_limit = WorkspaceCodeAgentRuntime._safe_int((job.completion_budget or {}).get("token_limit") or (job.budget_status or {}).get("token_limit"))
+        total_tokens = WorkspaceCodeAgentRuntime._safe_int((job.token_usage or {}).get("total_tokens") or (job.budget_status or {}).get("total_tokens"))
+        estimated_cost = WorkspaceCodeAgentRuntime._safe_float(
+            (job.token_usage or {}).get("estimated_cost_usd")
+            or (job.token_usage or {}).get("cost_usd")
+            or (job.token_usage or {}).get("cost")
+        )
+        cost_budget = WorkspaceCodeAgentRuntime._safe_float((job.completion_budget or {}).get("cost_limit_usd") or (job.budget_status or {}).get("cost_limit_usd"))
+        phase_ids = [
+            str(item.get("id") or item.get("phase") or "").strip()
+            for item in (job.orchestration_phases or [])
+            if isinstance(item, dict) and str(item.get("id") or item.get("phase") or "").strip()
+        ]
+        if not phase_ids:
+            phase_ids = ["planning", "reading", "editing", "checking", "browser_verifying", "repairing"]
+        weights = WorkspaceCodeAgentRuntime._phase_budget_weights(phase_ids)
+        current_phase = str(job.current_fix_phase or (job.budget_status or {}).get("current_phase") or "").strip()
+        consumed = 0
+        phases: list[dict[str, Any]] = []
+        for index, phase in enumerate(phase_ids):
+            weight = weights.get(phase, 1.0 / max(1, len(phase_ids)))
+            phase_token_budget = int(token_limit * weight) if token_limit else 0
+            if total_tokens and token_limit:
+                if phase == current_phase or (not current_phase and index == 0):
+                    used = max(0, total_tokens - consumed)
+                elif consumed + phase_token_budget <= total_tokens:
+                    used = phase_token_budget
+                else:
+                    used = max(0, total_tokens - consumed)
+                consumed += used
+            else:
+                used = 0
+            phases.append(
+                {
+                    "phase": phase,
+                    "status": "active" if current_phase and phase == current_phase else "completed" if used else "pending",
+                    "token_budget": phase_token_budget,
+                    "tokens_used": used,
+                    "token_ratio": round(used / phase_token_budget, 4) if phase_token_budget else 0.0,
+                    "cost_budget_usd": round(cost_budget * weight, 6) if cost_budget else 0.0,
+                    "estimated_cost_usd": round(estimated_cost * (used / total_tokens), 6) if estimated_cost and total_tokens else 0.0,
+                    "action": "compact_or_focus_scope" if phase_token_budget and used / max(1, phase_token_budget) >= 0.85 else "stay_within_phase_budget",
+                }
+            )
+        return {
+            "schema": "grounded.phase_token_cost_budget.v1",
+            "mode": (job.completion_budget or {}).get("mode") or (job.budget_status or {}).get("mode"),
+            "current_phase": current_phase or None,
+            "total_token_budget": token_limit,
+            "total_tokens_used": total_tokens,
+            "total_token_ratio": round(total_tokens / token_limit, 4) if token_limit else 0.0,
+            "cost_budget_usd": cost_budget,
+            "estimated_cost_usd": estimated_cost,
+            "phases": phases,
+        }
+
+    @staticmethod
+    def _phase_budget_weights(phase_ids: list[str]) -> dict[str, float]:
+        defaults = {
+            "planning": 0.10,
+            "reading": 0.12,
+            "editing": 0.32,
+            "checking": 0.14,
+            "browser_verifying": 0.12,
+            "repairing": 0.16,
+            "completed": 0.04,
+        }
+        weights = {phase: defaults.get(phase, 1.0) for phase in phase_ids}
+        total = sum(weights.values()) or 1.0
+        return {phase: value / total for phase, value in weights.items()}
+
+    @staticmethod
     def _context_pressure_report(*, workspace_id: str, run_id: str, items: list[dict[str, Any]]) -> dict[str, Any]:
         latest = items[-1] if items else None
         payload = {
@@ -5223,6 +5425,9 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             "recommendations": (latest or {}).get("recommendations") or [],
             "microcompact_candidates": (latest or {}).get("microcompact_candidates") or [],
             "avoid_reread_files": (latest or {}).get("avoid_reread_files") or [],
+            "stale_path_refs": (latest or {}).get("stale_path_refs") or [],
+            "phase_budgets": (latest or {}).get("phase_budgets") or [],
+            "token_cost_budget": (latest or {}).get("token_cost_budget") or {},
             "compact_boundary": (latest or {}).get("compact_boundary") or {},
             "updated_at": (latest or {}).get("created_at"),
         }
@@ -5246,11 +5451,23 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                         for item in report.get("recommendations") or []
                         if isinstance(item, dict) and item.get("code")
                     ],
+                    "stale_path_refs": report.get("stale_path_refs") or [],
+                    "phase_budgets": report.get("phase_budgets") or [],
                 },
                 actor="system",
                 summary="Context pressure recorded.",
                 source_ref=f"context_pressure:{workspace_id}:{run_id}",
             )
+            if report.get("stale_path_refs"):
+                self.event_journal_service.append_run(
+                    workspace_id=workspace_id,
+                    run_id=run_id,
+                    event_type="context.stale_path_refs_detected",
+                    payload={"stale_path_refs": report.get("stale_path_refs") or []},
+                    actor="system",
+                    summary="Stale path references detected.",
+                    source_ref=f"context_pressure:{workspace_id}:{run_id}",
+                )
             if report.get("microcompact_candidates"):
                 self.event_journal_service.append_run(
                     workspace_id=workspace_id,
@@ -5347,6 +5564,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                 artifact_run_id,
                 reason=reason,
                 preserve_response_id=True,
+                preserved_tail=compact_payload.get("preserved_tail") if isinstance(compact_payload.get("preserved_tail"), dict) else None,
             )
             post_compact_message_ref = compact_payload.get("post_compact_message_ref")
             post_compact_message: dict[str, Any] | None = None
@@ -5962,6 +6180,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
     def _store_command_output_artifact(self, workspace_id: str, run_id: str, payload: dict[str, Any]) -> dict[str, Any] | None:
         if self.output_artifact_service is None:
             return None
+        metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
         return self.output_artifact_service.store_command_output(
             workspace_id=workspace_id,
             run_id=run_id,
@@ -5972,8 +6191,41 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             head_tail=payload.get("head_tail") if isinstance(payload.get("head_tail"), dict) else {},
             exit_code=payload.get("exit_code") if isinstance(payload.get("exit_code"), int) else None,
             semantic_status=str(payload.get("semantic_status") or "") or None,
-            metadata={"source": "agent_tool"},
+            metadata={"source": "agent_tool", **metadata},
         )
+
+    def _store_denied_action(self, workspace_id: str, run_id: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+        policy_decision = payload.get("policy_decision") if isinstance(payload.get("policy_decision"), dict) else {}
+        created_at = datetime.now(timezone.utc).isoformat()
+        command = str(payload.get("command") or "")
+        denial = {
+            "denial_id": f"deny_{uuid4().hex}",
+            "workspace_id": workspace_id,
+            "run_id": run_id,
+            "source": "coding_agent.run_command",
+            "tool_call_id": payload.get("tool_call_id"),
+            "tool": payload.get("tool"),
+            "process_id": payload.get("process_id"),
+            "command": command,
+            "action": policy_decision.get("action"),
+            "risk": policy_decision.get("risk"),
+            "safety_class": policy_decision.get("safety_class"),
+            "reason": policy_decision.get("reason") or payload.get("error") or "Command denied by policy.",
+            "matched_prefix": policy_decision.get("matched_prefix") or [],
+            "created_at": created_at,
+        }
+        key = f"permission_denials:{workspace_id}"
+        report = self.store.get("reports", key) or {
+            "schema": "grounded.permission_denials.v1",
+            "workspace_id": workspace_id,
+            "items": [],
+        }
+        items = [item for item in report.get("items") or [] if isinstance(item, dict)]
+        items.append(denial)
+        report["items"] = items[-250:]
+        report["updated_at"] = created_at
+        self.store.upsert("reports", key, report)
+        return {"ref": key, **denial}
 
     @staticmethod
     def _agent_turn_tuning(
@@ -6681,11 +6933,11 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             )
         self._store_report(
             job.context_pressure_ref,
-            {
-                "workspace_id": job.workspace_id,
-                "run_id": job.linked_run_id,
-                "items": self.context_pressure_history.get(artifact_run_id, []),
-            },
+            self._context_pressure_report(
+                workspace_id=job.workspace_id,
+                run_id=job.linked_run_id or artifact_run_id,
+                items=self.context_pressure_history.get(artifact_run_id, []),
+            ),
         )
         self._store_report(
             job.hook_trace_ref,
@@ -8177,9 +8429,16 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         return False
 
     @staticmethod
-    def _safe_int(value: Any, *, default: int) -> int:
+    def _safe_int(value: Any, *, default: int = 0) -> int:
         try:
             return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _safe_float(value: Any, *, default: float = 0.0) -> float:
+        try:
+            return float(value)
         except (TypeError, ValueError):
             return default
 

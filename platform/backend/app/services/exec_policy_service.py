@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import PurePosixPath
 from pathlib import Path
@@ -109,6 +110,7 @@ class ExecPolicyService:
             {
                 "tool_protocol_version": TOOL_PROTOCOL_VERSION,
                 "risk_model": ["safe", "read_only", "draft_write", "workspace_write", "network_limited", "dangerous_requires_approval", "forbidden", "unknown"],
+                "safety_model": ["read_only", "workspace_write", "destructive", "network", "unknown"],
                 "network_policy": {
                     "mode": "blocked_by_default",
                     "allowed": False,
@@ -134,13 +136,29 @@ class ExecPolicyService:
         )
         return payload
 
-    def evaluate_command(self, command: str, *, preset: str = "safe_auto", root: Path | None = None) -> dict[str, Any]:
+    def evaluate_command(
+        self,
+        command: str,
+        *,
+        preset: str = "safe_auto",
+        root: Path | None = None,
+        workspace_id: str | None = None,
+    ) -> dict[str, Any]:
         decision = self.policy.decide(command)
         risk = self._risk_for_decision(decision)
-        approval = self._approval_for_risk(risk, decision=decision, preset=preset)
+        command_fingerprint = self.command_fingerprint(command, workspace_id=workspace_id)
+        approval = self._approval_for_risk(
+            risk,
+            decision=decision,
+            preset=preset,
+            workspace_id=workspace_id,
+            command_fingerprint=command_fingerprint,
+        )
+        safety = self._safety_payload(decision)
         return {
             "tool_protocol_version": TOOL_PROTOCOL_VERSION,
             "command": self.redact(command),
+            "command_fingerprint": command_fingerprint,
             "argv": [self.redact(item) for item in decision.argv],
             "resolved_argv": [self.redact(item) for item in decision.resolved_argv],
             "resolved_executable": decision.executable_resolution,
@@ -150,6 +168,7 @@ class ExecPolicyService:
             "shell_parse": decision.parse_tree,
             "blocked_syntax": decision.blocked_syntax,
             "network_policy": decision.network_policy,
+            "safety": safety,
             "decision": self._decision_payload(decision, risk=risk),
             "approval": approval,
             "sandbox_summary": self.sandbox_summary(decision, risk=risk, preset=preset, root=root),
@@ -159,6 +178,11 @@ class ExecPolicyService:
                 "errors": list(self.policy_errors),
             },
         }
+
+    def command_fingerprint(self, command: str, *, workspace_id: str | None = None) -> str:
+        normalized = self.policy.decide(command).normalized_command
+        scope = str(workspace_id or "global")
+        return hashlib.sha256(f"{scope}\n{normalized}".encode("utf-8", errors="replace")).hexdigest()
 
     def doctor_check(self) -> dict[str, Any]:
         snapshot = self.snapshot()
@@ -258,23 +282,45 @@ class ExecPolicyService:
             redacted = pattern.sub(lambda match: f"{match.group(1)}=<redacted>" if match.lastindex and match.lastindex >= 2 else "<redacted-secret>", redacted)
         return redacted
 
-    def _approval_for_risk(self, risk: ToolRisk, *, decision: CommandPolicyDecision, preset: str) -> dict[str, Any]:
+    def _approval_for_risk(
+        self,
+        risk: ToolRisk,
+        *,
+        decision: CommandPolicyDecision,
+        preset: str,
+        workspace_id: str | None,
+        command_fingerprint: str,
+    ) -> dict[str, Any]:
         resolved_preset = preset if preset in APPROVAL_PRESETS else "safe_auto"
         if decision.action == "forbidden" or risk == "forbidden":
-            return {"required": False, "status": "blocked", "preset": resolved_preset, "approval_id": None}
-        required = False
+            return {
+                "required": False,
+                "status": "blocked",
+                "preset": resolved_preset,
+                "approval_id": None,
+                "scope": "workspace" if workspace_id else "global",
+                "workspace_id": workspace_id,
+                "command_fingerprint": command_fingerprint,
+            }
+        auto_approve = set(APPROVAL_PRESETS[resolved_preset]["auto_approve_risks"])
+        required = decision.action == "prompt" or (risk not in {"safe", "read_only"} and risk not in auto_approve)
+        approval_id = f"appr_ws_{command_fingerprint[:20]}" if required else None
         return {
             "required": required,
-            "status": "not_required",
+            "status": "pending" if required else "not_required",
             "preset": resolved_preset,
-            "approval_id": None,
-            "actions": [],
+            "approval_id": approval_id,
+            "scope": "workspace" if workspace_id else "global",
+            "workspace_id": workspace_id,
+            "command_fingerprint": command_fingerprint,
+            "actions": ["workspace_scoped_command"] if required else [],
         }
 
     def _decision_payload(self, decision: CommandPolicyDecision, *, risk: ToolRisk) -> dict[str, Any]:
         return {
             "action": decision.action,
             "risk": risk,
+            "safety_class": decision.safety_class,
             "reason": decision.reason,
             "normalized_command": self.redact(decision.normalized_command),
             "argv": [self.redact(item) for item in decision.argv],
@@ -289,6 +335,20 @@ class ExecPolicyService:
             "network_policy": decision.network_policy,
         }
 
+    @staticmethod
+    def _safety_payload(decision: CommandPolicyDecision) -> dict[str, Any]:
+        safety_class = decision.safety_class
+        return {
+            "class": safety_class,
+            "read_only": safety_class == "read_only",
+            "writes_workspace": safety_class == "workspace_write",
+            "destructive": safety_class == "destructive",
+            "network": safety_class == "network",
+            "requires_approval": decision.action == "prompt",
+            "denied": decision.action == "forbidden",
+            "reason": decision.reason,
+        }
+
     def _redact_rule(self, item: dict[str, Any]) -> dict[str, Any]:
         return {
             key: self.redact(value) if isinstance(value, str) else value
@@ -298,11 +358,23 @@ class ExecPolicyService:
     @staticmethod
     def _risk_for_decision(decision: CommandPolicyDecision) -> ToolRisk:
         if decision.action == "forbidden":
+            if decision.safety_class == "network":
+                return "network"
+            if decision.safety_class == "destructive":
+                return "destructive"
+            if decision.safety_class == "workspace_write":
+                return "mutating"
             return "forbidden"
         executable = PurePosixPath(decision.argv[0]).name.lower() if decision.argv else ""
         args = [str(arg).lower() for arg in decision.argv]
         matched_executable = str(decision.matched_prefix[0]).lower() if decision.matched_prefix else executable
-        if matched_executable in {"rg", "sed", "ls", "python", "python3", "node", "find"}:
+        if decision.safety_class == "workspace_write":
+            return "mutating"
+        if decision.safety_class == "destructive":
+            return "destructive"
+        if decision.safety_class == "network":
+            return "network"
+        if matched_executable in {"rg", "sed", "ls", "cat", "python", "python3", "node", "find"}:
             return "read_only"
         if matched_executable == "git" and decision.action == "allow":
             return "read_only"

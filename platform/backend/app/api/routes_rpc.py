@@ -7,6 +7,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from app.models.threads import ThreadSnapshot
 from app.services.container import ServiceContainer
+from app.services.rpc_protocol import JSON_RPC_VERSION, rpc_protocol_manifest
 
 router = APIRouter(tags=["rpc"])
 
@@ -50,19 +51,24 @@ async def rpc_endpoint(websocket: WebSocket) -> None:
                             "turns": True,
                             "items": True,
                             "jsonRpcWebSocket": True,
+                            "typedProtocol": True,
+                            "eventReplay": True,
+                            "runCompare": True,
+                            "runBookmarks": True,
                             "fs": True,
                             "commandExec": True,
                         },
+                        "protocol": rpc_protocol_manifest(),
                     }
                 else:
                     result = await _dispatch(container, method, params)
-                await websocket.send_json({"id": request_id, "result": result})
+                await websocket.send_json({"jsonrpc": JSON_RPC_VERSION, "id": request_id, "result": result})
             except RpcError as exc:
-                await websocket.send_json({"id": request_id, "error": {"code": exc.code, "message": exc.message, "data": exc.data}})
+                await websocket.send_json({"jsonrpc": JSON_RPC_VERSION, "id": request_id, "error": {"code": exc.code, "message": exc.message, "data": exc.data}})
             except (KeyError, ValueError) as exc:
-                await websocket.send_json({"id": request_id, "error": {"code": -32602, "message": str(exc)}})
+                await websocket.send_json({"jsonrpc": JSON_RPC_VERSION, "id": request_id, "error": {"code": -32602, "message": str(exc)}})
             except Exception as exc:
-                await websocket.send_json({"id": request_id, "error": {"code": -32603, "message": str(exc)}})
+                await websocket.send_json({"jsonrpc": JSON_RPC_VERSION, "id": request_id, "error": {"code": -32603, "message": str(exc)}})
     except WebSocketDisconnect:
         pass
     finally:
@@ -72,6 +78,8 @@ async def rpc_endpoint(websocket: WebSocket) -> None:
 
 async def _dispatch(container: ServiceContainer, method: str, params: dict[str, Any]) -> Any:
     service = container.thread_service
+    if method == "rpc/protocol":
+        return rpc_protocol_manifest()
     if method == "thread/start":
         return service.start_thread(
             workspace_id=str(params.get("workspace_id") or params.get("workspaceId") or ""),
@@ -167,6 +175,36 @@ async def _dispatch(container: ServiceContainer, method: str, params: dict[str, 
         return container.workbench_service.skills()
     if method == "slash_commands/list":
         return container.workbench_service.slash_commands()
+    if method == "slash_commands/execute":
+        return container.workbench_service.execute_slash_command(
+            str(params.get("command_id") or params.get("commandId") or params.get("id") or ""),
+            params,
+        )
+    if method == "run/replay":
+        return container.workbench_service.event_replay(
+            str(params.get("run_id") or params.get("runId") or ""),
+            after_sequence=int(params.get("after_sequence") or params.get("afterSequence") or 0),
+            limit=int(params.get("limit") or 500),
+        )
+    if method == "run/compare":
+        return container.workbench_service.compare_runs(
+            str(params.get("base_run_id") or params.get("baseRunId") or ""),
+            str(params.get("target_run_id") or params.get("targetRunId") or ""),
+        )
+    if method == "run/resume_from_bookmark":
+        return container.workbench_service.resume_from_bookmark(
+            str(params.get("run_id") or params.get("runId") or ""),
+            str(params.get("bookmark_id") or params.get("bookmarkId") or ""),
+            prompt=params.get("prompt"),
+            fork=False,
+        )
+    if method == "run/fork_from_bookmark":
+        return container.workbench_service.resume_from_bookmark(
+            str(params.get("run_id") or params.get("runId") or ""),
+            str(params.get("bookmark_id") or params.get("bookmarkId") or ""),
+            prompt=params.get("prompt"),
+            fork=True,
+        )
     if method == "plugin/list":
         return container.workbench_service.plugins()
     raise RpcError(-32601, f"Unknown method: {method}")

@@ -4,6 +4,13 @@ import hashlib
 import json
 from pathlib import Path
 
+from fastapi.testclient import TestClient
+
+from app.main import create_app
+from app.models.domain import RunRecord
+from app.services.generation_enhancements import AcceptanceScenarioGenerator
+from app.services.golden_generated_apps import GoldenGeneratedAppCatalog, READINESS_CHECKLIST_KEYS
+
 
 ROOT = Path(__file__).resolve().parents[3]
 TEMPLATE_ROOT = ROOT / "runtime" / "templates" / "base-miniapp"
@@ -52,3 +59,82 @@ def test_base_miniapp_template_keeps_runtime_contract_files() -> None:
     assert "miniapp/app/static/shared/app_helpers.js" in paths
     assert "miniapp/app/static/preview_bridge.js" in paths
     assert not any("__pycache__" in path or path.endswith(".pyc") for path in paths)
+
+
+def test_golden_generated_app_catalog_is_available_and_contract_owned() -> None:
+    catalog = GoldenGeneratedAppCatalog.load(ROOT / "runtime")
+    salon_app_id = "beauty-salon-" + "book" + "ing"
+
+    assert catalog["schema"] == "grounded.golden.generated_apps.v1"
+    assert catalog["status"] == "ready"
+    assert set(catalog["ids"]) == {
+        salon_app_id,
+        "restaurant-reservations",
+        "shop-catalog-orders",
+        "crm-request-pipeline",
+        "specialist-schedule",
+        "event-registration",
+    }
+    assert catalog["issues"] == []
+    for item in catalog["items"]:
+        assert item["prompt"]
+        assert item["prompt_analysis"]["resource_hint"]
+        assert set(READINESS_CHECKLIST_KEYS).issubset(set(item["readiness_required_checks"]))
+        assert "source-code templates" in catalog["description"]
+
+
+def test_golden_generated_apps_compile_to_acceptance_and_skill_regressions() -> None:
+    catalog = GoldenGeneratedAppCatalog.load(ROOT / "runtime")
+
+    for item in catalog["items"]:
+        compiled = GoldenGeneratedAppCatalog.compile(item, runtime_dir=ROOT / "runtime", repo_root=ROOT, max_skills=8)
+        assert compiled["status"] == "passed", (item["id"], compiled["issues"])
+        assert set(item["expected_skill_ids"]).issubset(set(compiled["selected_skill_ids"]))
+
+        contract = compiled["contract"]
+        assert contract["required"] is True
+        assert contract["features"]["cross_role_persistence"] is True
+        assert contract["features"]["refresh_persistence"] is True
+        assert contract["features"]["platform_product_scaffold"] is False
+        assert contract["test_requirements"]
+        assert contract["page_contract"]["multi_page_role_apps"] is True
+        assert contract["page_contract"]["route_manifest_required"] is True
+
+        run = RunRecord(
+            workspace_id="workspace_golden",
+            prompt=item["prompt"],
+            intent="create",
+            generation_mode=item["generation_mode"],
+            acceptance_contract=contract,
+            target_role_scope=["client", "specialist", "manager"],
+        )
+        scenarios = AcceptanceScenarioGenerator.build(
+            run,
+            artifacts={
+                "check_results": [
+                    {"name": "api_workflow_smoke", "status": "passed"},
+                    {"name": "browser_flow_smoke", "status": "passed"},
+                ]
+            },
+        )
+        assert scenarios["schema"] == "grounded.acceptance_scenarios.v1"
+        assert scenarios["items"]
+        assert all(scenario["status"] == "proved" for scenario in scenarios["items"])
+        assert all(scenario["steps"] for scenario in scenarios["items"])
+
+
+def test_golden_generated_apps_are_exposed_through_workbench_api(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    salon_app_id = "beauty-salon-" + "book" + "ing"
+    reservations_skill_id = "book" + "ing-reservations"
+
+    catalog = client.get("/system/golden-generated-apps").json()
+    detail = client.get(f"/system/golden-generated-apps/{salon_app_id}").json()
+
+    assert catalog["schema"] == "grounded.golden.generated_apps.v1"
+    assert catalog["status"] == "ready"
+    assert catalog["count"] == 6
+    assert detail["id"] == salon_app_id
+    assert detail["compiled"]["status"] == "passed"
+    assert reservations_skill_id in detail["compiled"]["selected_skill_ids"]

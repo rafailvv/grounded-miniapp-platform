@@ -1,0 +1,102 @@
+{
+  "$defs": {
+    "ProtocolSchemaFixture": {
+      "additionalProperties": false,
+      "properties": {
+        "json_schema": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Json Schema"
+        },
+        "model_name": {
+          "title": "Model Name",
+          "type": "string"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "schema_id": {
+          "title": "Schema Id",
+          "type": "string"
+        },
+        "version": {
+          "anyOf": [
+            {
+              "enum": [
+                "v1",
+                "v2"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "manifest",
+              "type": "string"
+            }
+          ],
+          "title": "Version"
+        }
+      },
+      "required": [
+        "name",
+        "model_name",
+        "version",
+        "schema_id",
+        "path"
+      ],
+      "title": "ProtocolSchemaFixture",
+      "type": "object"
+    }
+  },
+  "$id": "https://grounded.local/schemas/app_protocol/protocol_schema_catalog.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "fixture_root": {
+      "default": "platform/backend/app/schemas/app_protocol",
+      "title": "Fixture Root",
+      "type": "string"
+    },
+    "fixtures": {
+      "items": {
+        "$ref": "#/$defs/ProtocolSchemaFixture"
+      },
+      "title": "Fixtures",
+      "type": "array"
+    },
+    "generated_types_path": {
+      "default": "platform/frontend/src/lib/generated/openapi-types.ts",
+      "title": "Generated Types Path",
+      "type": "string"
+    },
+    "json_schema_draft": {
+      "default": "https://json-schema.org/draft/2020-12/schema",
+      "title": "Json Schema Draft",
+      "type": "string"
+    },
+    "schema": {
+      "default": "grounded.app_protocol.schema_catalog.v1",
+      "title": "Schema",
+      "type": "string"
+    },
+    "status": {
+      "default": "ok",
+      "title": "Status",
+      "type": "string"
+    }
+  },
+  "title": "ProtocolSchemaCatalog",
+  "type": "object"
+}

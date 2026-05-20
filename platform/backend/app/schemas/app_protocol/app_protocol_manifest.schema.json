@@ -1,0 +1,184 @@
+{
+  "$defs": {
+    "ProtocolSubjectSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "event_types": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Event Types",
+          "type": "array"
+        },
+        "legacy_endpoints": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Legacy Endpoints",
+          "type": "array"
+        },
+        "purpose": {
+          "title": "Purpose",
+          "type": "string"
+        },
+        "source_models": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Source Models",
+          "type": "array"
+        },
+        "subject": {
+          "enum": [
+            "run",
+            "turn",
+            "tool_call",
+            "approval",
+            "event",
+            "worker_update"
+          ],
+          "title": "Subject",
+          "type": "string"
+        },
+        "v1_payload_model": {
+          "title": "V1 Payload Model",
+          "type": "string"
+        },
+        "v2_payload_model": {
+          "title": "V2 Payload Model",
+          "type": "string"
+        }
+      },
+      "required": [
+        "subject",
+        "purpose",
+        "v1_payload_model",
+        "v2_payload_model"
+      ],
+      "title": "ProtocolSubjectSpec",
+      "type": "object"
+    },
+    "ProtocolVersionSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "compatibility": {
+          "title": "Compatibility",
+          "type": "string"
+        },
+        "envelope_model": {
+          "title": "Envelope Model",
+          "type": "string"
+        },
+        "status": {
+          "default": "supported",
+          "enum": [
+            "current",
+            "supported",
+            "deprecated"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "version": {
+          "enum": [
+            "v1",
+            "v2"
+          ],
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "envelope_model",
+        "compatibility"
+      ],
+      "title": "ProtocolVersionSpec",
+      "type": "object"
+    }
+  },
+  "$id": "https://grounded.local/schemas/app_protocol/app_protocol_manifest.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "compatibility_policy": {
+      "default": "v2 is additive over v1; v1 envelope fields remain stable and are never renamed.",
+      "title": "Compatibility Policy",
+      "type": "string"
+    },
+    "current_version": {
+      "const": "v2",
+      "default": "v2",
+      "title": "Current Version",
+      "type": "string"
+    },
+    "endpoint_refs": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "title": "Endpoint Refs",
+      "type": "object"
+    },
+    "envelope_models": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Envelope Models",
+      "type": "array"
+    },
+    "fixture_root": {
+      "default": "platform/backend/app/schemas/app_protocol",
+      "title": "Fixture Root",
+      "type": "string"
+    },
+    "generated_types_path": {
+      "default": "platform/frontend/src/lib/generated/openapi-types.ts",
+      "title": "Generated Types Path",
+      "type": "string"
+    },
+    "payload_models": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Payload Models",
+      "type": "array"
+    },
+    "schema": {
+      "default": "grounded.app_protocol.manifest.v1",
+      "title": "Schema",
+      "type": "string"
+    },
+    "status": {
+      "default": "ok",
+      "title": "Status",
+      "type": "string"
+    },
+    "subjects": {
+      "items": {
+        "$ref": "#/$defs/ProtocolSubjectSpec"
+      },
+      "title": "Subjects",
+      "type": "array"
+    },
+    "supported_versions": {
+      "items": {
+        "enum": [
+          "v1",
+          "v2"
+        ],
+        "type": "string"
+      },
+      "title": "Supported Versions",
+      "type": "array"
+    },
+    "versions": {
+      "items": {
+        "$ref": "#/$defs/ProtocolVersionSpec"
+      },
+      "title": "Versions",
+      "type": "array"
+    }
+  },
+  "title": "AppProtocolManifest",
+  "type": "object"
+}

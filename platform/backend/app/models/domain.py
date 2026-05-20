@@ -267,9 +267,11 @@ BackgroundTaskType = Literal[
     "generate_product",
     "repair_failed_run",
     "browser_verify",
+    "lsp_diagnostics",
     "memory_consolidate",
     "worker_branch",
     "preview_rebuild",
+    "pr_ci_babysit",
 ]
 BackgroundTaskStatus = Literal["queued", "running", "stopping", "completed", "failed", "blocked", "cancelled"]
 

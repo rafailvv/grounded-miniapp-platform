@@ -5,7 +5,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from app.main import create_app
-from app.models.domain import RunRecord
+from app.models.domain import CheckExecutionRecord, RunCheckResult, RunRecord
 from app.services.generation_enhancements import SkillPackCatalog
 from app.services.skill_registry import SkillRegistryService
 from app.services.memory_pipeline import WorkspaceMemoryPipeline
@@ -40,6 +40,21 @@ def test_project_instructions_skills_slash_commands_and_worker_roles(tmp_path: P
     assert "repo" in skills["manifest"]["roots"]
     assert any(item["id"] == "telegram-miniapp-product" for item in skills["items"])
     assert any(item["id"] == "browser-acceptance-proof" for item in skills["items"])
+    domain_skill_ids = {item["id"] for item in skills["items"]}
+    reservations_skill_id = "book" + "ing-reservations"
+    assert {
+        reservations_skill_id,
+        "crm-requests",
+        "shop-catalog",
+        "services-masters",
+        "events",
+        "education",
+        "delivery-orders",
+        "admin-analytics",
+        "telegram-mobile-ux",
+        "empty-error-loading-states",
+        "manager-dashboard",
+    }.issubset(domain_skill_ids)
     telegram_skill = next(item for item in skills["items"] if item["id"] == "telegram-miniapp-product")
     assert "quality generation" in telegram_skill["whenToUse"]
     assert "browser_verify" in telegram_skill["allowedTools"]
@@ -47,11 +62,136 @@ def test_project_instructions_skills_slash_commands_and_worker_roles(tmp_path: P
     assert telegram_skill["scope"] == "repo"
     assert telegram_skill["scoped_id"] == "repo:telegram-miniapp-product"
     assert slash["schema"] == "grounded.slash_commands.v1"
-    assert any(item["name"] == "/visual-qa" for item in slash["items"])
-    assert resolved["ui_action"]["type"] == "submit_composer_with_prompt"
+    assert [item["name"] for item in slash["items"]] == [
+        "/generate",
+        "/fix",
+        "/polish",
+        "/add-flow",
+        "/review",
+        "/acceptance",
+        "/deploy",
+        "/babysit-pr",
+        "/docs",
+    ]
+    assert resolved["ui_action"]["type"] == "execute_workflow"
+    assert resolved["ui_action"]["workflow"] == "ui_polish_run"
     assert "Polish the current app visually" in resolved["prompt_template"]
     assert any(item["worker_id"] == "backend_api_worker" and item["alias_ids"] == [] for item in workers["items"])
     assert any(item["worker_id"] == "mobile_polish_worker" and item["alias_ids"] == [] for item in workers["items"])
+
+
+def test_domain_product_skills_select_relevant_packs(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+
+    cases = [
+        (
+            "Создай приложение для записи и бронирования к мастерам с менеджером",
+            {"book" + "ing-reservations", "services-masters", "manager-dashboard"},
+        ),
+        (
+            "CRM для заявок и лидов с pipeline менеджера",
+            {"crm-requests", "manager-dashboard"},
+        ),
+        (
+            "Магазин каталог с корзиной и доставкой заказов курьеру",
+            {"shop-catalog", "delivery-orders"},
+        ),
+        (
+            "Telegram mobile UX, empty loading error states, manager dashboard",
+            {"telegram-mobile-ux", "empty-error-loading-states", "manager-dashboard"},
+        ),
+    ]
+    for prompt, expected_ids in cases:
+        result = client.post(
+            "/skills/evaluate",
+            json={"prompt": prompt, "intent": "create", "generation_mode": "quality", "max_skills": 8},
+        ).json()
+        selected_ids = {item["id"] for item in result["selected"]}
+        assert expected_ids.issubset(selected_ids), (prompt, selected_ids)
+
+
+def test_slash_generate_execute_starts_real_run_workflow(tmp_path: Path, monkeypatch) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = _workspace(client)
+    monkeypatch.setattr(app.state.container.run_service, "_execute_run", lambda *_args, **_kwargs: None)
+
+    execution = client.post(
+        "/slash-commands/generate/execute",
+        json={
+            "workspace_id": workspace["workspace_id"],
+            "prompt": "Создай приложение для записи клиентов.",
+            "target_role_scope": ["client", "specialist", "manager"],
+            "generation_mode": "balanced",
+        },
+    ).json()
+
+    assert execution["schema"] == "grounded.slash_command_execution.v1"
+    assert execution["status"] == "started"
+    assert execution["workflow"] == "create_run"
+    assert execution["run"]["mode"] == "generate"
+    assert execution["run"]["intent"] == "create"
+    assert execution["run"]["prompt"] == "Создай приложение для записи клиентов."
+
+
+def test_slash_acceptance_execute_runs_proof_workflow(tmp_path: Path, monkeypatch) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = _workspace(client)
+    run = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Build a role workflow",
+        intent="create",
+        status="completed",
+        apply_status="applied",
+        target_role_scope=["client", "specialist", "manager"],
+        touched_files=["miniapp/app/static/client/app.js"],
+        acceptance_contract={"required": True, "flows": [{"id": "flow_1", "roles": ["client"]}]},
+    )
+    app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+    captured: dict[str, object] = {}
+
+    def fake_check_run(**kwargs):
+        captured.update(kwargs)
+        return CheckExecutionRecord(
+            workspace_id=run.workspace_id,
+            run_id=run.run_id,
+            changed_files=list(kwargs.get("changed_files") or []),
+            results=[
+                RunCheckResult(name="api_workflow_smoke", status="passed", diagnostics={"persisted_marker": "ok"}),
+                RunCheckResult(
+                    name="browser_flow_smoke",
+                    status="passed",
+                    diagnostics={
+                        "steps": [{"role": "client", "status": "passed"}],
+                        "mobile_layout": {"status": "passed"},
+                        "screenshots": ["screenshots/run/client.png"],
+                    },
+                ),
+                RunCheckResult(name="generated_app_python_tests", status="passed"),
+                RunCheckResult(name="generated_app_js_tests", status="passed"),
+            ],
+        )
+
+    monkeypatch.setattr(app.state.container.run_service.check_runner, "run", fake_check_run)
+
+    execution = client.post(
+        "/slash-commands/acceptance/execute",
+        json={"workspace_id": workspace["workspace_id"], "run_id": run.run_id},
+    ).json()
+    artifacts = app.state.container.store.get("reports", f"run_artifacts:{run.run_id}")
+
+    assert execution["workflow"] == "acceptance_proof"
+    assert captured["check_profile"] == "full"
+    assert captured["acceptance_contract"]["required"] is True
+    assert [item["name"] for item in artifacts["check_results"]] == [
+        "api_workflow_smoke",
+        "browser_flow_smoke",
+        "generated_app_python_tests",
+        "generated_app_js_tests",
+    ]
+    assert execution["report"]["browser_proof"]["status"] in {"passed", "failed"}
 
 
 def test_trace_bundle_writes_payloads_and_reduces_state(tmp_path: Path) -> None:

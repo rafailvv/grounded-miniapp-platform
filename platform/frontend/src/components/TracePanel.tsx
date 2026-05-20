@@ -51,6 +51,15 @@ export function TracePanel({ trace, traceBundle, protocol, compaction, contextPr
   const avoidRereadFiles = (
     contextPressure?.avoid_reread_files || (pressureLatest.avoid_reread_files as Array<Record<string, unknown>> | undefined) || []
   ) as Array<Record<string, unknown>>;
+  const stalePathRefs = (
+    contextPressure?.stale_path_refs || (pressureLatest.stale_path_refs as Array<Record<string, unknown>> | undefined) || (compactionSections.stale_path_refs as Array<Record<string, unknown>> | undefined) || []
+  ) as Array<Record<string, unknown>>;
+  const phaseBudget = (
+    compaction?.phase_budget || compactionSections.phase_budget || contextPressure?.token_cost_budget || pressureLatest.token_cost_budget || {}
+  ) as Record<string, unknown>;
+  const phaseBudgetItems = ((phaseBudget.phases as Array<Record<string, unknown>> | undefined) || contextPressure?.phase_budgets || []) as Array<Record<string, unknown>>;
+  const preservedTail = (compaction?.preserved_tail || compactionSections.preserved_tail || {}) as Record<string, unknown>;
+  const preservedTailEvents = (preservedTail.events as Array<Record<string, unknown>> | undefined) || [];
   const compactBoundary = (contextPressure?.compact_boundary || pressureLatest.compact_boundary || {}) as Record<string, unknown>;
   const postCompactRef = compaction?.post_compact_message_ref || String(compaction?.refs?.post_compact_message_ref || "");
   const postCompactStatus = compaction?.post_compact_status || "missing";
@@ -59,6 +68,16 @@ export function TracePanel({ trace, traceBundle, protocol, compaction, contextPr
   const latestBookmark = protocol?.latest_bookmark || bookmarks[0];
   const cases: RunRepairCase[] = repairCases?.items || [];
   const activeCase: RunRepairCase | null = repairCases?.active_case || cases.find((item) => ["open", "failed_attempt", "blocked"].includes(item.status)) || null;
+  const activeSurface = (activeCase?.broken_surface || {}) as Record<string, unknown>;
+  const activePostFixProof = (activeCase?.post_fix_proof || {}) as Record<string, unknown>;
+  const proofRequirements = (activePostFixProof.evidence_required as string[] | undefined) || [];
+  const surfaceSummary = [
+    activeSurface.kind ? `kind=${String(activeSurface.kind)}` : "",
+    activeSurface.role ? `role=${String(activeSurface.role)}` : "",
+    activeSurface.route ? `route=${String(activeSurface.route)}` : "",
+    activeSurface.api_route ? `api=${String(activeSurface.api_route)}` : "",
+    activeSurface.selector ? `selector=${String(activeSurface.selector)}` : "",
+  ].filter(Boolean).join(" · ");
   const protocolCounts = protocolEvents.reduce<Record<string, number>>((acc, event) => {
     acc[event.type] = (acc[event.type] || 0) + 1;
     return acc;
@@ -221,6 +240,14 @@ export function TracePanel({ trace, traceBundle, protocol, compaction, contextPr
             <strong>{sectionCount}</strong>
             <span>sections</span>
           </div>
+          <div>
+            <strong>{preservedTailEvents.length}</strong>
+            <span>tail</span>
+          </div>
+          <div>
+            <strong>{phaseBudgetItems.length}</strong>
+            <span>phases</span>
+          </div>
         </div>
         {postCompactRef ? (
           <p className="muted">
@@ -250,6 +277,16 @@ export function TracePanel({ trace, traceBundle, protocol, compaction, contextPr
         ) : null}
         {(compactionSections.next_repair_action as Record<string, unknown> | undefined) ? (
           <p className="muted">Next repair: {String((compactionSections.next_repair_action as Record<string, unknown>).failure_signature || (compactionSections.next_repair_action as Record<string, unknown>).required_next_tool || "recorded")}</p>
+        ) : null}
+        {preservedTailEvents.length ? (
+          <div className="run-detail-list compact">
+            {preservedTailEvents.slice(-4).map((item, index) => (
+              <div className="run-detail-item" key={`preserved-tail-${String(item.sequence || index)}`}>
+                <strong>{String(item.event_type || "tail event")}</strong>
+                <span>{String(item.summary || item.tool || item.response_id || "")}</span>
+              </div>
+            ))}
+          </div>
         ) : null}
       </div>
       <div className="workbench-panel">
@@ -282,6 +319,10 @@ export function TracePanel({ trace, traceBundle, protocol, compaction, contextPr
             <strong>{compactBoundary.recommended ? "near" : "ok"}</strong>
             <span>boundary</span>
           </div>
+          <div>
+            <strong>{stalePathRefs.length}</strong>
+            <span>stale paths</span>
+          </div>
         </div>
         {pressureSections.length ? (
           <div className="run-detail-list compact">
@@ -307,7 +348,7 @@ export function TracePanel({ trace, traceBundle, protocol, compaction, contextPr
             ))}
           </div>
         ) : null}
-        {microcompactCandidates.length || avoidRereadFiles.length ? (
+        {microcompactCandidates.length || avoidRereadFiles.length || stalePathRefs.length ? (
           <div className="run-detail-list compact">
             {microcompactCandidates.slice(0, 3).map((item, index) => (
               <div className="run-detail-item" key={`pressure-micro-${index}`}>
@@ -319,6 +360,22 @@ export function TracePanel({ trace, traceBundle, protocol, compaction, contextPr
               <div className="run-detail-item" key={`pressure-file-${String(item.path)}`}>
                 <strong>avoid re-read</strong>
                 <span>{String(item.path || "")}</span>
+              </div>
+            ))}
+            {stalePathRefs.slice(0, 4).map((item) => (
+              <div className="run-detail-item" key={`stale-path-${String(item.path)}`}>
+                <strong>stale path</strong>
+                <span>{String(item.suggested_path || item.path || "")}</span>
+              </div>
+            ))}
+          </div>
+        ) : null}
+        {phaseBudgetItems.length ? (
+          <div className="run-detail-list compact">
+            {phaseBudgetItems.slice(0, 6).map((item) => (
+              <div className="run-detail-item" key={`phase-budget-${String(item.phase)}`}>
+                <strong>{String(item.phase || "phase")} · {String(item.status || "pending")}</strong>
+                <span>{String(item.tokens_used || 0)} / {String(item.token_budget || 0)} tokens</span>
               </div>
             ))}
           </div>
@@ -354,16 +411,44 @@ export function TracePanel({ trace, traceBundle, protocol, compaction, contextPr
               <strong>{activeCase.failure_class || activeCase.issue_code || activeCase.case_id}</strong>
               <span>{activeCase.likely_cause || activeCase.failure_signature || "evidence-driven repair case"}</span>
             </div>
+            <div className="run-detail-item">
+              <strong>failed check</strong>
+              <span>{activeCase.failed_check || activeCase.failure_class || "checks.run"}</span>
+            </div>
+            {surfaceSummary ? (
+              <div className="run-detail-item">
+                <strong>broken surface</strong>
+                <span>{surfaceSummary}</span>
+              </div>
+            ) : null}
+            {activeCase.likely_files?.slice(0, 4).map((file) => (
+              <div className="run-detail-item" key={`repair-likely-${file}`}>
+                <strong>likely file</strong>
+                <span>{file}</span>
+              </div>
+            ))}
             {activeCase.target_files?.slice(0, 4).map((file) => (
               <div className="run-detail-item" key={`repair-target-${file}`}>
                 <strong>target</strong>
                 <span>{file}</span>
               </div>
             ))}
+            {activePostFixProof.check ? (
+              <div className="run-detail-item">
+                <strong>post-fix proof</strong>
+                <span>{String(activePostFixProof.check)} · {String(activePostFixProof.command || "run_checks")}</span>
+              </div>
+            ) : null}
+            {proofRequirements.slice(0, 3).map((requirement) => (
+              <div className="run-detail-item" key={`repair-proof-required-${requirement}`}>
+                <strong>proof requires</strong>
+                <span>{requirement}</span>
+              </div>
+            ))}
             {activeCase.expected_proof?.slice(0, 3).map((proof, index) => (
               <div className="run-detail-item" key={`repair-proof-${index}`}>
-                <strong>{String(proof.type || "proof")}</strong>
-                <span>{String(proof.status || proof.check || proof.ref || "required")}</span>
+                <strong>{String(proof.type || proof.kind || "proof")}</strong>
+                <span>{String(proof.status || proof.check || proof.value || proof.ref || "required")}</span>
               </div>
             ))}
           </div>

@@ -36,6 +36,7 @@ from app.services.event_journal import EventJournalService
 from app.services.output_artifact_service import OutputArtifactService
 from app.services.model_manager import ModelManagerService
 from app.services.background_task_service import BackgroundTaskService
+from app.services.pr_babysitter import PrBabysitterService
 from app.services.run_compaction import RunCompactionService
 from app.services.run_protocol import RunProtocolService
 from app.services.repair_cases import RepairCaseService
@@ -60,6 +61,7 @@ class ServiceContainer:
         self.sandbox_service = SandboxService()
         self.hook_policy_service = HookPolicyService(self.store, self.settings.runtime_dir / "policies" / "agent_hooks.json")
         self.workspace_service = WorkspaceService(self.settings, self.store, self.workspace_log_service, sandbox_service=self.sandbox_service)
+        self.pr_babysitter_service = PrBabysitterService(store=self.store, workspace_service=self.workspace_service)
         self.code_index_service = CodeIndexService(self.settings, self.store)
         self.workspace_service.attach_code_index_service(self.code_index_service)
         self.document_service = DocumentIntelligenceService(self.settings, self.store, self.code_index_service)
@@ -129,6 +131,7 @@ class ServiceContainer:
             run_service=self.run_service,
             preview_service=self.preview_service,
             check_runner=self.check_runner,
+            pr_babysitter_service=self.pr_babysitter_service,
         )
         self.run_service.attach_background_task_service(self.background_task_service)
         self.workbench_service = WorkbenchService(
@@ -145,6 +148,7 @@ class ServiceContainer:
             repair_case_service=self.repair_case_service,
             event_journal_service=self.event_journal_service,
             output_artifact_service=self.output_artifact_service,
+            pr_babysitter_service=self.pr_babysitter_service,
         )
         self.thread_service = ThreadService(
             self.platform_db,

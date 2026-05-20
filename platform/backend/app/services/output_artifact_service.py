@@ -16,6 +16,33 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _head_tail(content: str, *, max_chars: int) -> dict[str, Any]:
+    text = str(content or "")
+    cap = max(200, int(max_chars or 6000))
+    if len(text) <= cap:
+        return {
+            "head": text,
+            "tail": "",
+            "excerpt": text,
+            "total_chars": len(text),
+            "omitted_chars": 0,
+            "chunk_count": 1 if text else 0,
+        }
+    head_chars = max(100, cap // 2)
+    tail_chars = max(100, cap - head_chars)
+    head = text[:head_chars]
+    tail = text[-tail_chars:]
+    omitted = max(0, len(text) - len(head) - len(tail))
+    return {
+        "head": head,
+        "tail": tail,
+        "excerpt": f"{head}\n...[omitted {omitted} chars]...\n{tail}",
+        "total_chars": len(text),
+        "omitted_chars": omitted,
+        "chunk_count": 1,
+    }
+
+
 class OutputArtifactService:
     """Persist full command/tool outputs while exposing bounded head/tail views."""
 
@@ -46,7 +73,7 @@ class OutputArtifactService:
     ) -> dict[str, Any] | None:
         if not content:
             return None
-        normalized_stream = stream if stream in {"stdout", "stderr"} else "stdout"
+        normalized_stream = stream if stream in {"stdout", "stderr", "combined", "tool"} else "stdout"
         raw = str(content)
         truncated_full = len(raw) > self.max_content_chars
         stored_content = raw[: self.max_content_chars]
@@ -82,6 +109,34 @@ class OutputArtifactService:
         self._journal_created(workspace_id=workspace_id, run_id=run_id, summary=summary, process_id=process_id)
         return summary
 
+    def store_tool_output(
+        self,
+        *,
+        workspace_id: str,
+        run_id: str,
+        tool_call_id: str,
+        tool: str,
+        content: str,
+        output_cap_chars: int = 6000,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        return self.store_command_output(
+            workspace_id=workspace_id,
+            run_id=run_id,
+            process_id=f"tool:{tool_call_id}",
+            stream="tool",
+            command=f"tool:{tool}",
+            content=content,
+            head_tail=_head_tail(content, max_chars=output_cap_chars),
+            semantic_status="completed",
+            metadata={
+                "source": "tool_result_spill",
+                "tool": tool,
+                "tool_call_id": tool_call_id,
+                **dict(metadata or {}),
+            },
+        )
+
     def list_run(self, run_id: str, *, workspace_id: str | None = None) -> dict[str, Any]:
         payload = self.store.get("reports", f"exec_outputs:{run_id}")
         if isinstance(payload, dict):
@@ -113,6 +168,7 @@ class OutputArtifactService:
         summary = OutputArtifactRef(
             ref=str(artifact["ref"]),
             artifact_id=str(artifact["artifact_id"]),
+            kind="tool_output" if artifact.get("stream") == "tool" else "exec_output",
             stream=artifact["stream"],
             sha256=str(artifact["sha256"]),
             chars=int(artifact.get("chars") or 0),

@@ -908,7 +908,7 @@ class RunService:
         changed_files: list[str] | None = None,
     ) -> dict[str, Any]:
         stored = self._stored_guardian_review(run)
-        if stored and source == "pre_apply_guardian" and stored.get("status") == "passed":
+        if stored and source != "pre_apply_guardian" and stored.get("status") == "passed":
             self.store.upsert("reports", f"guardian_review:{run.workspace_id}:{run.run_id}", stored)
             return stored
         artifacts = self.store.get("reports", f"run_artifacts:{run.run_id}")
@@ -947,6 +947,12 @@ class RunService:
             target_role_scope=run.target_role_scope,
             intent=run.intent,
             source="pre_apply_guardian",
+            review_context={
+                "run": run.model_dump(mode="json"),
+                "diff": str(artifacts.get("diff") or ""),
+                "token_usage": run.token_usage,
+                "context_pressure": self.store.get("reports", run.context_pressure_ref) if run.context_pressure_ref else {},
+            },
         ).model_dump(mode="json", by_alias=True)
         self.store.upsert("reports", f"guardian_review:{run.workspace_id}:{run.run_id}", report)
         return report
@@ -2550,7 +2556,12 @@ class RunService:
             or str(run.failure_signature or "").startswith("repair.no_progress:")
             or str(run.current_fix_phase or "") == "blocked_repair_continuation_needed"
         )
-        if not budget_exhausted and not repeated_no_progress:
+        reliability_gate_blocked = (
+            run.failure_class == "reliability_gate.blocked"
+            or str(run.failure_signature or "").startswith("reliability_gate.blocked:")
+            or str(run.current_stage or "") == "blocked by reliability gate"
+        )
+        if not budget_exhausted and not repeated_no_progress and not reliability_gate_blocked:
             return
         if self.store.get("reports", f"auto_repair_continuation:{run.run_id}"):
             return

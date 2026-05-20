@@ -204,11 +204,14 @@ class SkillRegistryService:
                 skipped.append({"id": skill_id, "scoped_id": scoped_id, "reason": "explicit_only", "source": skill.get("source")})
                 continue
             if policy in {"auto", "always"} or explicit:
-                for phrase in [str(item).lower() for item in cls.list_field(skill.get("whenToUse") or skill.get("activation"))]:
-                    if cls.phrase_matches(phrase, haystack):
-                        score += 3
-                        reasons.append("whenToUse")
-                        break
+                phrase_hits = [
+                    phrase
+                    for phrase in [str(item).lower() for item in cls.list_field(skill.get("whenToUse") or skill.get("activation"))]
+                    if cls.phrase_matches(phrase, haystack)
+                ]
+                if phrase_hits:
+                    score += min(9, len(phrase_hits) * 3)
+                    reasons.append("whenToUse")
                 for path_pattern in skill.get("paths") or []:
                     if any(cls.path_matches(str(path_pattern), str(path)) for path in paths or []):
                         score += 3
@@ -232,6 +235,9 @@ class SkillRegistryService:
                 if skill_id in {"mobile-ui-polish"} and (str(generation_mode or "").lower() == "quality" or "layout" in haystack or "overflow" in haystack):
                     score += 2
                     reasons.append("quality")
+                if skill_id in {"empty-error-loading-states"} and str(generation_mode or "").lower() == "quality":
+                    score += 4
+                    reasons.append("quality_states")
                 if skill_id in {"browser-acceptance-proof"} and (str(intent or "").lower() == "create" or "browser" in haystack or "final gate" in haystack):
                     score += 2
                     reasons.append("proof")
@@ -347,9 +353,9 @@ class SkillRegistryService:
         mode = str(generation_mode or "").lower()
         defaults = {
             "fast": {"max_skills": 2, "max_body_chars": 350, "max_total_body_chars": 900},
-            "balanced": {"max_skills": 4, "max_body_chars": 550, "max_total_body_chars": 1800},
-            "quality": {"max_skills": 5, "max_body_chars": 800, "max_total_body_chars": 2800},
-        }.get(mode, {"max_skills": 4, "max_body_chars": 550, "max_total_body_chars": 1800})
+            "balanced": {"max_skills": 4, "max_body_chars": 550, "max_total_body_chars": 2600},
+            "quality": {"max_skills": 5, "max_body_chars": 800, "max_total_body_chars": 5200},
+        }.get(mode, {"max_skills": 4, "max_body_chars": 550, "max_total_body_chars": 2600})
         return {
             "max_skills": max(1, int(max_skills or defaults["max_skills"])),
             "max_body_chars": max(120, int(max_body_chars or defaults["max_body_chars"])),
@@ -741,7 +747,7 @@ class SkillRegistryService:
         paths = " ".join(str(item).lower() for item in skill.get("paths") or [])
         if "mobile" in validation or "static/**/styles" in paths or skill_id == "mobile-ui-polish":
             return "mobile_polish"
-        if "api" in validation or "routes" in paths or skill_id == "fastapi-persistence":
+        if skill_id == "fastapi-persistence" or "api" in validation or "backend" in validation:
             return "persistence"
         if "repair" in skill_id or "failing_check" in validation:
             return "repair"

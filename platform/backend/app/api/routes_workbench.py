@@ -24,13 +24,18 @@ from app.models.webhooks import (
     WebhookUpdateRequest,
 )
 from app.models.workbench import (
+    AppProtocolManifest,
     GateReport,
+    ProtocolSchemaCatalog,
     RepairAttemptsReport,
     RepairCase,
     RepairCasesReport,
     RunBookmarksReport,
+    RunCompareReport,
+    RunEventReplayReport,
     RunEventsReport,
     RunProtocolReport,
+    RpcProtocolReport,
     RunTimelineReport,
     RunTraceViewReport,
     SystemSchemaManifest,
@@ -40,6 +45,7 @@ from app.models.workbench import (
     system_schema_manifest,
 )
 from app.services.container import ServiceContainer
+from app.services.app_protocol import app_protocol_manifest, app_protocol_schema_catalog
 from app.services.run_protocol import RunProtocolConflict
 from app.services.tool_protocol import tool_registry_contract
 from app.modules.miniapp_agent_loop.tool_router import ToolRouter
@@ -103,6 +109,11 @@ class PermissionRuleRequest(BaseModel):
 class SlashCommandResolveRequest(BaseModel):
     prompt: str | None = None
     detail: str | None = None
+    workspace_id: str | None = None
+    run_id: str | None = None
+    target_role_scope: list[str] = Field(default_factory=list)
+    model_profile: str | None = None
+    generation_mode: str | None = None
     metadata: dict[str, Any] = {}
 
 
@@ -127,6 +138,27 @@ class BackgroundTaskUpdateRequest(BaseModel):
     title: str | None = None
     status: str | None = None
     metadata: dict[str, Any] | None = None
+
+
+class PrBabysitterRequest(BaseModel):
+    pr: str = "auto"
+    repo: str | None = None
+    run_id: str | None = None
+    export_id: str | None = None
+    max_flaky_retries: int = 3
+    retry_failed_now: bool = False
+    auto_retry: bool = False
+    auto_start: bool = True
+    max_polls: int = 30
+    poll_seconds: int = 60
+    stop_when_ready: bool = False
+    max_attempts: int = 1
+
+
+class LspDiagnosticsAsyncRequest(BaseModel):
+    run_id: str | None = None
+    changed_only: bool = False
+    files: list[str] = Field(default_factory=list)
 
 
 @router.get("/system/policies/exec")
@@ -160,6 +192,34 @@ def get_project_instructions(container: ServiceContainer = Depends(get_container
     return container.workbench_service.project_instructions()
 
 
+@router.get("/system/rpc-protocol", response_model=RpcProtocolReport)
+def get_rpc_protocol(container: ServiceContainer = Depends(get_container)) -> RpcProtocolReport:
+    return container.workbench_service.rpc_protocol()
+
+
+@router.get("/system/app-protocol", response_model=AppProtocolManifest)
+def get_app_protocol() -> AppProtocolManifest:
+    return app_protocol_manifest()
+
+
+@router.get("/system/app-protocol/schemas", response_model=ProtocolSchemaCatalog, response_model_exclude_none=True)
+def get_app_protocol_schemas(include_json_schema: bool = False) -> ProtocolSchemaCatalog:
+    return app_protocol_schema_catalog(include_json_schema=include_json_schema)
+
+
+@router.get("/system/golden-generated-apps")
+def get_golden_generated_apps(container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    return container.workbench_service.golden_generated_apps()
+
+
+@router.get("/system/golden-generated-apps/{app_id}")
+def get_golden_generated_app(app_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.golden_generated_app(app_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.get("/system/worker-roles")
 def get_worker_roles(container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     return container.workbench_service.worker_roles()
@@ -173,9 +233,15 @@ def evaluate_workspace_command(
 ) -> dict[str, Any]:
     try:
         container.workspace_service.get_workspace(workspace_id)
-        if request.run_id:
-            return {"workspace_id": workspace_id, **container.workbench_service.evaluate_command_for_run(request.run_id, request.command, preset=request.preset)}
-        return {"workspace_id": workspace_id, **container.exec_policy_service.evaluate_command(request.command, preset=request.preset, root=container.workspace_service.source_dir(workspace_id))}
+        return {
+            "workspace_id": workspace_id,
+            **container.workbench_service.evaluate_command_for_workspace(
+                workspace_id,
+                request.command,
+                preset=request.preset,
+                run_id=request.run_id,
+            ),
+        }
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -364,6 +430,19 @@ def get_run_bookmarks(run_id: str, container: ServiceContainer = Depends(get_con
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@router.get("/runs/{run_id}/event-replay", response_model=RunEventReplayReport)
+def get_run_event_replay(
+    run_id: str,
+    after_sequence: int = 0,
+    limit: int = 500,
+    container: ServiceContainer = Depends(get_container),
+) -> RunEventReplayReport:
+    try:
+        return container.workbench_service.event_replay(run_id, after_sequence=after_sequence, limit=limit)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.post("/runs/{run_id}/resume-from-bookmark")
 def resume_run_from_bookmark(
     run_id: str,
@@ -388,6 +467,14 @@ def fork_run_from_bookmark(
         return container.workbench_service.resume_from_bookmark(run_id, request.bookmark_id, prompt=request.prompt, fork=True)
     except RunProtocolConflict as exc:
         raise HTTPException(status_code=409, detail=exc.payload) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/runs/{run_id}/compare/{target_run_id}", response_model=RunCompareReport)
+def compare_runs(run_id: str, target_run_id: str, container: ServiceContainer = Depends(get_container)) -> RunCompareReport:
+    try:
+        return container.workbench_service.compare_runs(run_id, target_run_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -651,6 +738,35 @@ def get_lsp_diagnostics(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@router.post("/workspaces/{workspace_id}/diagnostics/lsp/async")
+def start_lsp_diagnostics(
+    workspace_id: str,
+    request: LspDiagnosticsAsyncRequest,
+    container: ServiceContainer = Depends(get_container),
+) -> dict[str, Any]:
+    try:
+        return container.workbench_service.start_lsp_diagnostics(
+            workspace_id,
+            run_id=request.run_id,
+            changed_only=request.changed_only,
+            files=request.files or None,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/workspaces/{workspace_id}/diagnostics/lsp/async/{task_id}")
+def get_lsp_diagnostics_task(
+    workspace_id: str,
+    task_id: str,
+    container: ServiceContainer = Depends(get_container),
+) -> dict[str, Any]:
+    try:
+        return container.workbench_service.lsp_diagnostics_task(workspace_id, task_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.get("/workspaces/{workspace_id}/lsp/symbol-context")
 def get_lsp_symbol_context(
     workspace_id: str,
@@ -772,6 +888,14 @@ def get_run_state(run_id: str, container: ServiceContainer = Depends(get_contain
 def get_run_final_report(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     try:
         return container.workbench_service.final_report(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/runs/{run_id}/requirement-traceability")
+def get_run_requirement_traceability(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.requirement_traceability(run_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -900,6 +1024,14 @@ def get_recent_denials(container: ServiceContainer = Depends(get_container)) -> 
     return container.workbench_service.recent_denials()
 
 
+@router.get("/workspaces/{workspace_id}/permissions/approval-grants")
+def get_workspace_permission_grants(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.workspace_approval_grants(workspace_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.get("/workspaces/{workspace_id}/memory")
 def get_workspace_memory(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     try:
@@ -992,6 +1124,20 @@ def resolve_slash_command(
         return container.workbench_service.resolve_slash_command(command_id, request.model_dump())
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/slash-commands/{command_id}/execute")
+def execute_slash_command(
+    command_id: str,
+    request: SlashCommandResolveRequest,
+    container: ServiceContainer = Depends(get_container),
+) -> dict[str, Any]:
+    try:
+        return container.workbench_service.execute_slash_command(command_id, request.model_dump())
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/workspaces/{workspace_id}/magic-docs/product-architecture")
@@ -1188,10 +1334,58 @@ def get_background_task_output(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@router.post("/workspaces/{workspace_id}/pr-babysitter/snapshot")
+def pr_babysitter_snapshot(
+    workspace_id: str,
+    request: PrBabysitterRequest,
+    container: ServiceContainer = Depends(get_container),
+) -> dict[str, Any]:
+    try:
+        return container.workbench_service.pr_babysitter_snapshot(workspace_id, request.model_dump(mode="python"))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/workspaces/{workspace_id}/pr-babysitter/watch")
+def pr_babysitter_watch(
+    workspace_id: str,
+    request: PrBabysitterRequest,
+    container: ServiceContainer = Depends(get_container),
+) -> dict[str, Any]:
+    try:
+        return container.workbench_service.pr_babysitter_watch(workspace_id, request.model_dump(mode="python"))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/workspaces/{workspace_id}/pr-babysitter")
+def pr_babysitter_reports(
+    workspace_id: str,
+    run_id: str | None = None,
+    container: ServiceContainer = Depends(get_container),
+) -> dict[str, Any]:
+    try:
+        return container.workbench_service.pr_babysitter_reports(workspace_id, run_id=run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.get("/runs/{run_id}/workers")
 def get_run_workers(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     try:
         return container.workbench_service.workers(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/runs/{run_id}/workers/orchestration")
+def get_run_worker_orchestration(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.worker_orchestration(run_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -1328,6 +1522,14 @@ def start_browser_proof(run_id: str, container: ServiceContainer = Depends(get_c
 def get_browser_proof(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     try:
         return container.workbench_service.browser_proof(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/runs/{run_id}/browser-replay")
+def get_browser_replay(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.browser_replay(run_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
