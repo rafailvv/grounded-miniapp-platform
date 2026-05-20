@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "type": "module",
   "private": true,
+  "scripts": {
+    "typecheck": "../../platform/frontend/node_modules/.bin/tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext src/client.ts"
+  },
   "exports": {
     ".": "./src/client.ts"
   }

@@ -127,6 +127,14 @@ class AgentToolRegistry:
             activity="searching",
             progress_label="Scanning source semantics",
         ),
+        "tool_search": AgentToolSpec(
+            name="tool_search",
+            kind="read_only",
+            concurrency_safe=True,
+            output_cap_chars=9000,
+            activity="searching",
+            progress_label="Discovering optional deferred tools",
+        ),
         "lsp.diagnostics": AgentToolSpec(
             name="lsp.diagnostics",
             kind="read_only",
@@ -150,6 +158,22 @@ class AgentToolRegistry:
             output_cap_chars=10000,
             activity="searching",
             progress_label="Finding symbol references",
+        ),
+        "lsp.definition": AgentToolSpec(
+            name="lsp.definition",
+            kind="read_only",
+            concurrency_safe=True,
+            output_cap_chars=8000,
+            activity="searching",
+            progress_label="Finding symbol definition",
+        ),
+        "lsp.route_graph": AgentToolSpec(
+            name="lsp.route_graph",
+            kind="read_only",
+            concurrency_safe=True,
+            output_cap_chars=14000,
+            activity="searching",
+            progress_label="Building route graph",
         ),
         "lsp.route_static_context": AgentToolSpec(
             name="lsp.route_static_context",
@@ -182,6 +206,22 @@ class AgentToolRegistry:
             output_cap_chars=10000,
             activity="searching",
             progress_label="Finding symbol references",
+        ),
+        "lsp_definition": AgentToolSpec(
+            name="lsp_definition",
+            kind="read_only",
+            concurrency_safe=True,
+            output_cap_chars=8000,
+            activity="searching",
+            progress_label="Finding symbol definition",
+        ),
+        "lsp_route_graph": AgentToolSpec(
+            name="lsp_route_graph",
+            kind="read_only",
+            concurrency_safe=True,
+            output_cap_chars=14000,
+            activity="searching",
+            progress_label="Building route graph",
         ),
         "lsp_route_static_context": AgentToolSpec(
             name="lsp_route_static_context",
@@ -281,6 +321,15 @@ class AgentToolRegistry:
             concurrency_safe=True,
             activity="searching",
             progress_label="Listing files through the unified tool protocol",
+        ),
+        "tool.search": AgentToolSpec(
+            name="tool.search",
+            kind="read_only",
+            concurrency_safe=True,
+            output_cap_chars=9000,
+            activity="searching",
+            progress_label="Discovering optional deferred tools",
+            aliases=("tool_search",),
         ),
         "shell.exec": AgentToolSpec(
             name="shell.exec",
@@ -460,6 +509,20 @@ class AgentToolRegistry:
                     "reason": {"type": "string"},
                 }
                 required = ["file_path", "old_string", "new_string", "reason"]
+            elif name == "tool_search":
+                properties = {
+                    "query": {
+                        "type": "string",
+                        "description": "Short description of the optional capability to discover, such as deploy, browser verification, database, payments, CMS, GitHub, or Vercel.",
+                    },
+                    "domain": {
+                        "type": "string",
+                        "enum": ["", "deploy", "browser", "database", "payments", "cms", "github", "vercel"],
+                    },
+                    "intent": {"type": "string"},
+                    "reason": {"type": "string"},
+                }
+                required = ["query", "reason"]
             else:
                 properties = {
                     "mode": {"type": "string", "enum": ["exact", "final"]},

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import hashlib
 import os
 from pathlib import Path
 import signal
@@ -83,6 +84,35 @@ class HeadTailOutputBuffer:
         }
 
 
+@dataclass
+class BoundedOutputSpool:
+    max_chars: int = int(os.getenv("AGENT_EXEC_FULL_OUTPUT_CHARS", "2000000"))
+    total_chars: int = 0
+    truncated_full: bool = False
+    _parts: list[str] = field(default_factory=list)
+    _sha256: Any = field(default_factory=hashlib.sha256)
+
+    def append(self, text: str) -> None:
+        if not text:
+            return
+        self.total_chars += len(text)
+        self._sha256.update(text.encode("utf-8", errors="replace"))
+        current = sum(len(part) for part in self._parts)
+        remaining = max(0, self.max_chars - current)
+        if remaining:
+            self._parts.append(text[:remaining])
+        if len(text) > remaining:
+            self.truncated_full = True
+
+    @property
+    def content(self) -> str:
+        return "".join(self._parts)
+
+    @property
+    def sha256(self) -> str:
+        return self._sha256.hexdigest()
+
+
 @dataclass(frozen=True)
 class AgentCommandResult:
     process_id: str
@@ -102,6 +132,11 @@ class AgentCommandResult:
     output_delta_count: int
     policy_decision: dict[str, Any]
     error: str | None = None
+    stdout_ref: str | None = None
+    stderr_ref: str | None = None
+    stdout_sha256: str | None = None
+    stderr_sha256: str | None = None
+    output_artifacts: list[dict[str, Any]] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         payload = {
@@ -128,6 +163,11 @@ class AgentCommandResult:
             "stderr_omitted_chars": self.stderr.get("omitted_chars", 0),
             "stdout_truncated": bool(self.stdout.get("omitted_chars", 0)),
             "stderr_truncated": bool(self.stderr.get("omitted_chars", 0)),
+            "stdout_ref": self.stdout_ref,
+            "stderr_ref": self.stderr_ref,
+            "stdout_sha256": self.stdout_sha256,
+            "stderr_sha256": self.stderr_sha256,
+            "output_artifacts": list(self.output_artifacts),
             "output_delta_count": self.output_delta_count,
             "policy_decision": self.policy_decision,
         }
@@ -184,12 +224,15 @@ class AgentProcessManager:
         yield_time_ms: int = 1000,
         process_id: str | None = None,
         execution_plan: SandboxExecutionPlan | None = None,
+        output_artifact_writer: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None,
     ) -> AgentCommandResult:
         started = time.perf_counter()
         started_at = datetime.now(timezone.utc).isoformat()
         resolved_process_id = str(process_id or f"proc_{uuid4().hex[:12]}")
         stdout_buffer = HeadTailOutputBuffer(max_chars=max_output_chars)
         stderr_buffer = HeadTailOutputBuffer(max_chars=max_output_chars)
+        stdout_spool = BoundedOutputSpool()
+        stderr_spool = BoundedOutputSpool()
         output_delta_count = 0
         cwd = draft_source / "miniapp" if decision.cwd_policy == "miniapp" else draft_source
         base_exec_argv = list(decision.resolved_argv or decision.argv)
@@ -389,7 +432,7 @@ class AgentProcessManager:
 
         lock = threading.Lock()
 
-        def consume(stream: Any, buffer: HeadTailOutputBuffer, stream_name: str) -> None:
+        def consume(stream: Any, buffer: HeadTailOutputBuffer, spool: BoundedOutputSpool, stream_name: str) -> None:
             nonlocal output_delta_count
             try:
                 for chunk in iter(stream.readline, ""):
@@ -397,6 +440,7 @@ class AgentProcessManager:
                         break
                     with lock:
                         buffer.append(chunk)
+                        spool.append(chunk)
                         output_delta_count += 1
                     with self._lock:
                         meta = self._active_meta.get(resolved_process_id)
@@ -420,10 +464,10 @@ class AgentProcessManager:
                     pass
 
         threads = [
-            threading.Thread(target=consume, args=(process.stdout, stdout_buffer, "stdout"), daemon=True)
+            threading.Thread(target=consume, args=(process.stdout, stdout_buffer, stdout_spool, "stdout"), daemon=True)
             if process.stdout is not None
             else None,
-            threading.Thread(target=consume, args=(process.stderr, stderr_buffer, "stderr"), daemon=True)
+            threading.Thread(target=consume, args=(process.stderr, stderr_buffer, stderr_spool, "stderr"), daemon=True)
             if process.stderr is not None
             else None,
         ]
@@ -466,6 +510,33 @@ class AgentProcessManager:
             timed_out=timed_out,
         )
         duration_ms = int((time.perf_counter() - started) * 1000)
+        stdout_artifact = self._write_output_artifact(
+            writer=output_artifact_writer,
+            stream="stdout",
+            command=command,
+            process_id=resolved_process_id,
+            content=stdout_spool.content,
+            head_tail=stdout_buffer.snapshot(),
+            sha256=stdout_spool.sha256 if stdout_spool.total_chars else None,
+            total_chars=stdout_spool.total_chars,
+            truncated_full=stdout_spool.truncated_full,
+            exit_code=exit_code,
+            semantic_status=semantic_status,
+        )
+        stderr_artifact = self._write_output_artifact(
+            writer=output_artifact_writer,
+            stream="stderr",
+            command=command,
+            process_id=resolved_process_id,
+            content=stderr_spool.content,
+            head_tail=stderr_buffer.snapshot(),
+            sha256=stderr_spool.sha256 if stderr_spool.total_chars else None,
+            total_chars=stderr_spool.total_chars,
+            truncated_full=stderr_spool.truncated_full,
+            exit_code=exit_code,
+            semantic_status=semantic_status,
+        )
+        output_artifacts = [item for item in (stdout_artifact, stderr_artifact) if isinstance(item, dict)]
         emit(
             {
                 "status": "completed",
@@ -475,6 +546,8 @@ class AgentProcessManager:
                 "semantic_status": semantic_status,
                 "success": success,
                 "sandbox": sandbox_summary,
+                "stdout_ref": (stdout_artifact or {}).get("ref"),
+                "stderr_ref": (stderr_artifact or {}).get("ref"),
             }
         )
         with self._lock:
@@ -488,6 +561,9 @@ class AgentProcessManager:
                     "duration_ms": duration_ms,
                     "stdout": stdout_buffer.snapshot(),
                     "stderr": stderr_buffer.snapshot(),
+                    "stdout_ref": (stdout_artifact or {}).get("ref"),
+                    "stderr_ref": (stderr_artifact or {}).get("ref"),
+                    "output_artifacts": output_artifacts,
                     "output_delta_count": output_delta_count,
                     "sandbox": sandbox_summary,
                 }
@@ -512,6 +588,11 @@ class AgentProcessManager:
             output_delta_count=output_delta_count,
             policy_decision={**policy_payload, "sandbox": sandbox_summary},
             error=f"Command timed out after {timeout_seconds}s." if timed_out else None,
+            stdout_ref=(stdout_artifact or {}).get("ref"),
+            stderr_ref=(stderr_artifact or {}).get("ref"),
+            stdout_sha256=stdout_spool.sha256 if stdout_spool.total_chars else None,
+            stderr_sha256=stderr_spool.sha256 if stderr_spool.total_chars else None,
+            output_artifacts=output_artifacts,
         )
 
     def write_stdin(self, process_id: str, data: str) -> bool:
@@ -569,7 +650,43 @@ class AgentProcessManager:
             "total_chars": payload.get("total_chars", len(text)),
             "omitted_chars": payload.get("omitted_chars", 0),
             "status": meta.get("status", "unknown"),
+            "artifact_ref": meta.get(f"{stream_name}_ref"),
         }
+
+    @staticmethod
+    def _write_output_artifact(
+        *,
+        writer: Callable[[dict[str, Any]], dict[str, Any] | None] | None,
+        stream: str,
+        command: str,
+        process_id: str,
+        content: str,
+        head_tail: dict[str, Any],
+        sha256: str | None,
+        total_chars: int,
+        truncated_full: bool,
+        exit_code: int | None,
+        semantic_status: str,
+    ) -> dict[str, Any] | None:
+        if writer is None or not content:
+            return None
+        try:
+            return writer(
+                {
+                    "stream": stream,
+                    "command": command,
+                    "process_id": process_id,
+                    "content": content,
+                    "head_tail": {**head_tail, "sha256": sha256, "truncated_full": truncated_full},
+                    "sha256": sha256,
+                    "total_chars": total_chars,
+                    "truncated_full": truncated_full,
+                    "exit_code": exit_code,
+                    "semantic_status": semantic_status,
+                }
+            )
+        except Exception:
+            return None
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:

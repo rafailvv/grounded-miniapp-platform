@@ -57,16 +57,18 @@ class AgentWorkerManager:
         implementation_plan: dict[str, Any],
     ) -> dict[str, object]:
         has_contract = cls._has_product_contract(implementation_plan)
-        flag_enabled = os.getenv("GROUNDED_ENABLE_WORKER_BRANCHES", "").strip().lower() in {"1", "true", "yes", "on"}
+        flag_value = os.getenv("GROUNDED_ENABLE_WORKER_BRANCHES", "").strip().lower()
+        flag_disabled = flag_value in {"0", "false", "no", "off"}
+        flag_enabled = flag_value in {"1", "true", "yes", "on"}
         enabled = (
-            flag_enabled
+            (flag_enabled or not flag_disabled)
             and generation_mode == GenerationMode.QUALITY
             and has_contract
         )
         disabled_reason = ""
         if not enabled:
-            if not flag_enabled:
-                disabled_reason = "isolated worker branches are gated off unless GROUNDED_ENABLE_WORKER_BRANCHES=1"
+            if flag_disabled:
+                disabled_reason = "isolated worker branches are disabled by GROUNDED_ENABLE_WORKER_BRANCHES=0"
             elif generation_mode != GenerationMode.QUALITY:
                 disabled_reason = "isolated worker branches are available only for quality generation mode"
             elif not has_contract:
@@ -89,10 +91,55 @@ class AgentWorkerManager:
         ]
         return {
             "schema": "grounded.product_worker_mailbox.v1",
+            "branch_schema": "grounded.worker_branch_plan.v2",
             "enabled": enabled,
             "disabled_reason": disabled_reason,
             "mode": str(getattr(generation_mode, "value", generation_mode) or ""),
             "workers": workers,
+            "worker_groups": {
+                "writer": [
+                    worker["worker_id"]
+                    for worker in workers
+                    if worker.get("branch_role") == "writer"
+                ],
+                "verifier": [
+                    worker["worker_id"]
+                    for worker in workers
+                    if worker.get("branch_role") == "verifier"
+                ],
+                "repair": ["repair_worker"],
+            },
+            "execution_stages": [
+                {
+                    "stage": "backend_contract",
+                    "workers": ["backend_api_worker"],
+                    "mode": "serial_first",
+                    "reason": "Role UI and tests fork from the backend/API contract.",
+                },
+                {
+                    "stage": "role_ui_and_tests",
+                    "workers": [
+                        "client_surface_worker",
+                        "specialist_surface_worker",
+                        "manager_surface_worker",
+                        "test_verifier_worker",
+                    ],
+                    "mode": "parallel_isolated_drafts",
+                    "reason": "Owned writer branches run independently after backend contract merge.",
+                },
+                {
+                    "stage": "guardian_verifier",
+                    "workers": ["mobile_polish_worker"],
+                    "mode": "read_only_after_green_checks",
+                    "reason": "Verifier reviews the merged candidate; it does not write source.",
+                },
+                {
+                    "stage": "conflict_repair",
+                    "workers": ["repair_worker"],
+                    "mode": "targeted_serial_repair",
+                    "reason": "Merge conflicts and rejected worker diffs become repair cases.",
+                },
+            ],
             "plan_entities": list(implementation_plan.get("primary_entities") or [])[:8],
             "contract_ready": has_contract,
             "worker_prompt_contract": (
@@ -119,6 +166,9 @@ class AgentWorkerManager:
             "worker_id": canonical,
             "worker_type": canonical,
             "alias_ids": [],
+            "branch_role": cls.branch_role(canonical),
+            "branch_stage": cls.branch_stage(canonical),
+            "branch_policy": cls.branch_policy(canonical),
             "owner_scope": role.owner_scope if role else canonical,
             "path_prefixes": list(ownership.get("allowed_paths") or []),
             "ownership": ownership,
@@ -127,6 +177,37 @@ class AgentWorkerManager:
             "disabled_reason": disabled_reason if not enabled else "",
             "expected_proof": list(ownership.get("expected_proof") or []),
         }
+
+    @staticmethod
+    def branch_role(worker_id: str) -> str:
+        canonical = canonical_worker_id(worker_id)
+        if canonical == "mobile_polish_worker":
+            return "verifier"
+        if canonical == "repair_worker":
+            return "repair"
+        return "writer"
+
+    @staticmethod
+    def branch_stage(worker_id: str) -> str:
+        canonical = canonical_worker_id(worker_id)
+        if canonical == "backend_api_worker":
+            return "backend_contract"
+        if canonical in {"client_surface_worker", "specialist_surface_worker", "manager_surface_worker", "test_verifier_worker"}:
+            return "role_ui_and_tests"
+        if canonical == "mobile_polish_worker":
+            return "guardian_verifier"
+        if canonical == "repair_worker":
+            return "conflict_repair"
+        return "shared"
+
+    @staticmethod
+    def branch_policy(worker_id: str) -> str:
+        role = AgentWorkerManager.branch_role(worker_id)
+        if role == "verifier":
+            return "read_only_after_green_checks"
+        if role == "repair":
+            return "targeted_serial_repair"
+        return "isolated_draft_writer"
 
     @classmethod
     def ownership_locks(cls) -> list[dict[str, object]]:
@@ -147,8 +228,8 @@ class AgentWorkerManager:
         locks.append(
             {
                 "lock_id": "read_only_verification",
-                "worker": "test_verifier_worker",
-                "owner_scope": "checks, browser proof, and review artifacts",
+                "worker": "mobile_polish_worker",
+                "owner_scope": "read-only browser proof, mobile layout, and guardian review artifacts",
                 "path_prefixes": ["verification", "browser_proof", "reports"],
                 "exclusive_write": False,
             }

@@ -14,7 +14,13 @@ import sys
 from typing import Any
 from uuid import uuid4
 
-from app.models.domain import CreateRunRequest, RunRecord
+from app.ai.model_registry import model_capabilities
+from app.models.domain import CheckExecutionRecord, CreateRunRequest, RunCheckResult, RunRecord
+from app.models.context_pressure import ContextPressureReport
+from app.models.memory import MemoryConsolidationReport, MemoryRetrievalRequest
+from app.models.observability import ObservabilityReport
+from app.models.prompt_suggestions import PromptSuggestionsReport
+from app.models.webhooks import WebhookCreateRequest, WebhookUpdateRequest
 from app.models.workbench import (
     GateReport,
     RepairAttemptsReport,
@@ -31,6 +37,7 @@ from app.models.workbench import (
     WorkbenchApiModel,
 )
 from app.modules.miniapp_agent_loop.lsp_tools import LspToolService
+from app.modules.miniapp_agent_loop.guardian_review import GuardianReview
 from app.modules.miniapp_agent_loop.agent_worker_manager import AgentWorkerManager
 from app.modules.miniapp_agent_loop.product_workers import (
     PRODUCT_WORKERS,
@@ -54,6 +61,7 @@ from app.services.generation_enhancements import (
     VisualQAGenerator,
     WorkerRoleCatalog,
 )
+from app.services.skill_registry import SkillRegistryService
 from app.services.miniapp_contract import MiniAppContractMaterializer, MiniAppRouteRegistry
 from app.services.repair_catalog import RepairCatalog
 from app.services.repair_cases import RepairCaseService
@@ -61,6 +69,8 @@ from app.services.run_state_machine import RunStateMachine
 from app.services.tool_protocol import TOOL_PROTOCOL_VERSION, tool_envelope, tool_registry_contract
 from app.modules.miniapp_agent_loop.tool_router import ToolRouter
 from app.services.memory_pipeline import WorkspaceMemoryPipeline
+from app.services.output_artifact_service import OutputArtifactService
+from app.services.prompt_suggestions import PromptSuggestionService
 from app.services.run_compaction import RunCompactionService
 from app.services.run_protocol import RunProtocolConflict, RunProtocolService, diff_sha256
 from app.services.trace_bundle import TraceBundleReducer
@@ -98,6 +108,7 @@ class WorkbenchService:
         background_task_service: BackgroundTaskService | None = None,
         repair_case_service: RepairCaseService | None = None,
         event_journal_service: EventJournalService | None = None,
+        output_artifact_service: OutputArtifactService | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
@@ -110,7 +121,141 @@ class WorkbenchService:
         self.run_compaction_service = run_compaction_service
         self.background_task_service = background_task_service
         self.event_journal_service = event_journal_service
+        self.output_artifact_service = output_artifact_service
         self.repair_case_service = repair_case_service or RepairCaseService(store, event_journal_service=event_journal_service)
+        self.prompt_suggestion_service = PromptSuggestionService()
+
+    def list_webhooks(self, *, workspace_id: str | None = None) -> dict[str, Any]:
+        if workspace_id:
+            self.workspace_service.get_workspace(workspace_id)
+        items = [
+            self._public_webhook(record)
+            for record in self.store.list("webhooks")
+            if not workspace_id or record.get("workspace_id") == workspace_id
+        ]
+        items.sort(key=lambda item: str(item.get("created_at") or ""))
+        return {"schema": "grounded.webhooks.v1", "status": "ok", "workspace_id": workspace_id, "items": items}
+
+    def create_webhook(self, request: WebhookCreateRequest, *, idempotency_key: str | None = None) -> dict[str, Any]:
+        if request.workspace_id:
+            self.workspace_service.get_workspace(request.workspace_id)
+        if idempotency_key:
+            existing = self._webhook_by_idempotency_key(idempotency_key)
+            if existing is not None:
+                return self._public_webhook(existing)
+        now = datetime.now(timezone.utc).isoformat()
+        webhook_id = f"wh_{uuid4().hex[:16]}"
+        record: dict[str, Any] = {
+            "schema": "grounded.webhook.subscription.v1",
+            "webhook_id": webhook_id,
+            "url": request.url,
+            "events": list(request.events),
+            "workspace_id": request.workspace_id,
+            "enabled": request.enabled,
+            "description": request.description,
+            "metadata": self._webhook_safe_metadata(request.metadata),
+            "secret_configured": bool(request.secret),
+            "created_at": now,
+            "updated_at": now,
+        }
+        if request.secret:
+            record["secret_sha256"] = hashlib.sha256(request.secret.encode("utf-8")).hexdigest()
+        if idempotency_key:
+            record["idempotency_key"] = idempotency_key
+        self.store.upsert("webhooks", webhook_id, record)
+        return self._public_webhook(record)
+
+    def get_webhook(self, webhook_id: str) -> dict[str, Any]:
+        record = self.store.get("webhooks", webhook_id)
+        if record is None:
+            raise KeyError(f"Webhook not found: {webhook_id}")
+        return self._public_webhook(record)
+
+    def update_webhook(self, webhook_id: str, request: WebhookUpdateRequest) -> dict[str, Any]:
+        record = self.store.get("webhooks", webhook_id)
+        if record is None:
+            raise KeyError(f"Webhook not found: {webhook_id}")
+        updated = dict(record)
+        if request.workspace_id is not None:
+            self.workspace_service.get_workspace(request.workspace_id)
+            updated["workspace_id"] = request.workspace_id
+        if request.url is not None:
+            updated["url"] = request.url
+        if request.events is not None:
+            updated["events"] = list(request.events)
+        if request.enabled is not None:
+            updated["enabled"] = request.enabled
+        if request.description is not None:
+            updated["description"] = request.description
+        if request.metadata is not None:
+            updated["metadata"] = self._webhook_safe_metadata(request.metadata)
+        if request.secret is not None:
+            updated["secret_configured"] = bool(request.secret)
+            if request.secret:
+                updated["secret_sha256"] = hashlib.sha256(request.secret.encode("utf-8")).hexdigest()
+            else:
+                updated.pop("secret_sha256", None)
+        updated["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self.store.upsert("webhooks", webhook_id, updated)
+        return self._public_webhook(updated)
+
+    def delete_webhook(self, webhook_id: str) -> dict[str, Any]:
+        record = self.store.get("webhooks", webhook_id)
+        if record is None:
+            raise KeyError(f"Webhook not found: {webhook_id}")
+        self.store.delete("webhooks", webhook_id)
+        return {"schema": "grounded.webhook.deleted.v1", "webhook_id": webhook_id, "deleted": True}
+
+    def test_webhook(self, webhook_id: str, *, event_type: str = "webhook.test", payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        record = self.store.get("webhooks", webhook_id)
+        if record is None:
+            raise KeyError(f"Webhook not found: {webhook_id}")
+        now = datetime.now(timezone.utc).isoformat()
+        delivery = {
+            "schema": "grounded.webhook.delivery.v1",
+            "webhook_id": webhook_id,
+            "event_type": event_type or "webhook.test",
+            "status": "simulated",
+            "simulated": True,
+            "delivered_at": now,
+            "target_url": record.get("url"),
+            "payload_preview": self._webhook_safe_metadata(payload or {}) if isinstance(payload, dict) else {},
+        }
+        updated = {**record, "last_delivery": delivery, "updated_at": now}
+        self.store.upsert("webhooks", webhook_id, updated)
+        return delivery
+
+    def _webhook_by_idempotency_key(self, idempotency_key: str) -> dict[str, Any] | None:
+        key = str(idempotency_key or "").strip()
+        if not key:
+            return None
+        for record in self.store.list("webhooks"):
+            if record.get("idempotency_key") == key:
+                return record
+        return None
+
+    @staticmethod
+    def _public_webhook(record: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: value
+            for key, value in record.items()
+            if key not in {"secret", "secret_sha256", "idempotency_key"}
+        }
+
+    @staticmethod
+    def _webhook_safe_metadata(payload: dict[str, Any]) -> dict[str, Any]:
+        def check_value(key: str, value: Any) -> Any:
+            if re.search(r"(secret|token|password|api[_-]?key|authorization)", key, re.IGNORECASE):
+                raise ValueError(f"Webhook metadata contains secret-like key: {key}")
+            if isinstance(value, str) and re.search(r"(sk-[A-Za-z0-9_-]{12,}|ghp_[A-Za-z0-9_]{12,}|xox[baprs]-|AKIA[0-9A-Z]{12,})", value):
+                raise ValueError("Webhook metadata contains secret-like value.")
+            if isinstance(value, dict):
+                return {str(nested_key): check_value(str(nested_key), nested_value) for nested_key, nested_value in value.items()}
+            if isinstance(value, list):
+                return [check_value(key, item) for item in value[:50]]
+            return value
+
+        return {str(key): check_value(str(key), value) for key, value in dict(payload or {}).items()}
 
     def tool_events(self, run_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
@@ -512,6 +657,9 @@ class WorkbenchService:
                     "worker_id": canonical,
                     "worker_type": canonical,
                     "alias_ids": [],
+                    "branch_role": AgentWorkerManager.branch_role(canonical),
+                    "branch_stage": AgentWorkerManager.branch_stage(canonical),
+                    "branch_policy": AgentWorkerManager.branch_policy(canonical),
                     "status": status,
                     "badge": str(output.get("badge") or status) if isinstance(output, dict) else status,
                     "owner_scope": self._worker_scope(canonical),
@@ -531,12 +679,14 @@ class WorkbenchService:
             )
         return {
             "schema": "grounded.product_workers.v1",
+            "branch_schema": "grounded.worker_branch_plan.v2",
             "run_id": run_id,
             "workspace_id": run.workspace_id,
             "workers": lanes,
             "worker_branch_refs": run.worker_branch_refs,
             "merge_decision_ref": merge_decision_ref if merge_decision else None,
             "mailbox": (mailbox or {}).get("mailbox") if isinstance(mailbox, dict) else {},
+            "branch_plan": ((mailbox or {}).get("mailbox") or {}).get("execution_stages") if isinstance(mailbox, dict) else [],
         }
 
     def tasks(self, run_id: str) -> dict[str, Any]:
@@ -716,6 +866,56 @@ class WorkbenchService:
         check_results = [item for item in artifacts.get("check_results") or [] if isinstance(item, dict)]
         check_by_name = {str(item.get("name") or ""): item for item in check_results}
         acceptance_required = bool((run.acceptance_contract or {}).get("required")) or run.intent == "create"
+        guardian_results: list[RunCheckResult] = []
+        for item in check_results:
+            try:
+                guardian_results.append(RunCheckResult.model_validate(item))
+            except Exception:
+                continue
+        guardian_execution = (
+            CheckExecutionRecord(
+                workspace_id=run.workspace_id,
+                run_id=run_id,
+                changed_files=changed_files,
+                results=guardian_results,
+                completed_at=datetime.now(timezone.utc),
+            )
+            if guardian_results
+            else None
+        )
+        guardian_source = self.workspace_service.draft_source_dir(run.workspace_id, run_id)
+        if not guardian_source.exists():
+            guardian_source = self.workspace_service.source_dir(run.workspace_id)
+        guardian_report = GuardianReview.review(
+            workspace_id=run.workspace_id,
+            run_id=run_id,
+            draft_source=guardian_source,
+            changed_files=changed_files,
+            latest_execution=guardian_execution,
+            preview_details=artifacts.get("preview") if isinstance(artifacts.get("preview"), dict) else {},
+            acceptance_contract=run.acceptance_contract,
+            implementation_plan=run.implementation_plan,
+            target_role_scope=run.target_role_scope,
+            intent=run.intent,
+            source="manual_review",
+        ).model_dump(mode="json", by_alias=True)
+        self.store.upsert("reports", f"guardian_review:{run.workspace_id}:{run_id}", guardian_report)
+        for finding in guardian_report.get("findings") or []:
+            if not isinstance(finding, dict):
+                continue
+            findings.append(
+                self._review_finding(
+                    code=str(finding.get("code") or "guardian_blocker"),
+                    message=str(finding.get("message") or "Guardian review found a blocker."),
+                    severity=str(finding.get("severity") or "high"),
+                    category=str(finding.get("category") or "product_contract"),
+                    source="guardian_review",
+                    file_path=finding.get("file_path"),
+                    line=finding.get("line"),
+                    evidence=dict(finding.get("evidence") or {}),
+                    blocker=bool(finding.get("is_blocker_for_apply", True)),
+                )
+            )
         browser_check = check_by_name.get("browser_flow_smoke")
         api_check = check_by_name.get("api_workflow_smoke")
         browser_passed = browser_check and browser_check.get("status") == "passed"
@@ -820,12 +1020,22 @@ class WorkbenchService:
                 "checks": check_results,
                 "browser_proof_ref": run.browser_proof_ref,
                 "verifier_review_ref": run.verifier_review_ref,
+                "guardian_review_ref": f"guardian_review:{run.workspace_id}:{run_id}",
+                "guardian_review": guardian_report,
                 "acceptance_contract_required": acceptance_required,
             },
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         self.store.upsert("reports", f"review:{run_id}", payload)
         return payload
+
+    def prompt_suggestions(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        artifacts = self._run_artifacts_or_empty(run_id)
+        report = self.prompt_suggestion_service.build(run, artifacts)
+        payload = report.model_dump(mode="json", by_alias=True)
+        self.store.upsert("reports", f"prompt_suggestions:{run_id}", payload)
+        return PromptSuggestionsReport.model_validate(payload).model_dump(mode="json", by_alias=True)
 
     @staticmethod
     def _review_finding(
@@ -1621,6 +1831,14 @@ class WorkbenchService:
         run = self.run_service.get_run(run_id)
         payload = WorkspaceMemoryPipeline.extract_run(run, self._run_artifacts_or_empty(run_id))
         self.store.upsert("reports", f"memory_stage1:{run.workspace_id}:{run_id}", payload)
+        self._journal_run_event(
+            run_id,
+            "memory.raw_extracted",
+            {"memory_ref": f"memory_stage1:{run.workspace_id}:{run_id}", "raw_count": len(payload.get("items") or [])},
+            summary="Raw run memory extracted.",
+            source_ref=f"memory_stage1:{run.workspace_id}:{run_id}",
+            idempotency_key=f"memory.raw_extracted:{run_id}",
+        )
         return payload
 
     def memory_pipeline(self, workspace_id: str) -> dict[str, Any]:
@@ -1631,13 +1849,37 @@ class WorkbenchService:
             if key.startswith(f"memory_stage1:{workspace_id}:") and isinstance(payload, dict)
         ]
         consolidated = self.store.get("reports", f"memory_consolidation:{workspace_id}") or {}
+        workspace_memory = self.store.get("reports", f"workspace_memory:{workspace_id}") or {"items": []}
+        items = [item for item in workspace_memory.get("items") or [] if isinstance(item, dict)]
+        active_count = sum(1 for item in items if item.get("status", "active") == "active")
+        stale_count = sum(1 for item in items if item.get("status") == "stale")
+        expired_count = sum(1 for item in items if item.get("status") == "expired" or (item.get("expiry") or {}).get("expired"))
+        superseded_count = sum(1 for item in items if item.get("status") == "superseded")
         return {
             "schema": "grounded.memory_pipeline.v1",
             "workspace_id": workspace_id,
             "status": "ready" if stage1 or consolidated else "empty",
+            "phase1": {
+                "schema": "grounded.memory_stage1.v1",
+                "batch_count": len(stage1),
+                "raw_count": sum(len(payload.get("items") or []) for payload in stage1),
+            },
+            "phase2": {
+                "schema": "grounded.workspace_memory.v2",
+                "active_count": active_count,
+                "stale_count": stale_count,
+                "expired_count": expired_count,
+                "superseded_count": superseded_count,
+                "retrieval_schema": "grounded.memory_retrieval.v1",
+            },
             "stage1_count": len(stage1),
             "stage1_items": sum(len(payload.get("items") or []) for payload in stage1),
+            "active_count": active_count,
+            "stale_count": stale_count,
+            "expired_count": expired_count,
+            "superseded_count": superseded_count,
             "consolidated_at": consolidated.get("updated_at") or consolidated.get("created_at"),
+            "retrieval_schema": "grounded.memory_retrieval.v1",
             "items": stage1[-20:],
         }
 
@@ -1649,19 +1891,57 @@ class WorkbenchService:
             if key.startswith(f"memory_stage1:{workspace_id}:") and isinstance(payload, dict)
         ]
         current = self.store.get("reports", f"workspace_memory:{workspace_id}") or {"workspace_id": workspace_id, "items": []}
-        consolidated = WorkspaceMemoryPipeline.consolidate(workspace_id, stage1, current)
+        consolidated = WorkspaceMemoryPipeline.consolidate(
+            workspace_id,
+            stage1,
+            current,
+            workspace_root=self.workspace_service.source_dir(workspace_id),
+        )
         consolidated["stale_check"] = WorkspaceMemoryPipeline.stale_check(self.workspace_service.source_dir(workspace_id), consolidated)
         self.store.upsert("reports", f"workspace_memory:{workspace_id}", consolidated)
-        summary = {
-            "schema": "grounded.memory_consolidation.v1",
-            "workspace_id": workspace_id,
-            "status": "consolidated",
-            "stage1_count": len(stage1),
-            "active_count": len(consolidated.get("items") or []),
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }
+        pipeline = consolidated.get("pipeline") if isinstance(consolidated.get("pipeline"), dict) else {}
+        summary = MemoryConsolidationReport(
+            workspace_id=workspace_id,
+            status="consolidated",
+            stage1_count=len(stage1),
+            raw_count=int(pipeline.get("stage1_items", 0) or 0),
+            active_count=int(pipeline.get("active_count", 0) or 0),
+            stale_count=int(pipeline.get("stale_count", 0) or 0),
+            expired_count=int(pipeline.get("expired_count", 0) or 0),
+            superseded_count=int(pipeline.get("superseded_count", 0) or 0),
+            deduped_count=int(pipeline.get("deduped_count", 0) or 0),
+            updated_at=datetime.now(timezone.utc).isoformat(),
+        ).model_dump(mode="json", by_alias=True)
         self.store.upsert("reports", f"memory_consolidation:{workspace_id}", summary)
+        for payload in stage1:
+            run_id = str(payload.get("run_id") or "")
+            if not run_id:
+                continue
+            self._journal_run_event(
+                run_id,
+                "memory.consolidated",
+                {"memory_ref": f"workspace_memory:{workspace_id}", "consolidation_ref": f"memory_consolidation:{workspace_id}"},
+                summary="Workspace memory consolidated.",
+                source_ref=f"workspace_memory:{workspace_id}",
+                idempotency_key=f"memory.consolidated:{workspace_id}:{run_id}",
+            )
         return {**consolidated, "pipeline": self.memory_pipeline(workspace_id)}
+
+    def retrieve_memory(self, workspace_id: str, payload: dict[str, Any] | MemoryRetrievalRequest) -> dict[str, Any]:
+        self.workspace_service.get_workspace(workspace_id)
+        request = payload if isinstance(payload, MemoryRetrievalRequest) else MemoryRetrievalRequest.model_validate(payload or {})
+        current = self.memory(workspace_id)
+        result = WorkspaceMemoryPipeline.retrieve(
+            workspace_id,
+            current,
+            prompt=request.prompt,
+            paths=request.paths,
+            top_k=request.top_k,
+            include_inactive=request.include_inactive,
+            failure_class=request.failure_class,
+        )
+        self.store.upsert("reports", f"memory_retrieval:last:{workspace_id}", result)
+        return result
 
     def project_instructions(self) -> dict[str, Any]:
         payload = ProjectInstructionBundle.build(repo_root=self.settings.repo_root, template_dir=self.settings.template_dir)
@@ -1675,6 +1955,9 @@ class WorkbenchService:
             "kind": str(payload.get("kind") or "note"),
             "text": str(payload.get("text") or payload.get("content") or "").strip(),
             "citation": payload.get("citation"),
+            "citations": [payload.get("citation")] if isinstance(payload.get("citation"), dict) else [],
+            "status": "active",
+            "source": "manual",
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         if not item["text"]:
@@ -1683,6 +1966,9 @@ class WorkbenchService:
         if secret_scan["status"] != "passed":
             raise ValueError("Memory text appears to contain secret-like material; remove the secret before saving.")
         item["secret_scan"] = secret_scan
+        item["fingerprint"] = WorkspaceMemoryPipeline._key(item)
+        item["confidence"] = {"score": 0.7, "level": "medium", "signals": ["manual_entry"]}
+        item["expiry"] = {"expires_at": None, "ttl_days": None, "reason": None, "expired": False}
         current.setdefault("items", []).append(item)
         bucket_map = {
             "user_preference": "user_preferences",
@@ -1703,25 +1989,51 @@ class WorkbenchService:
         return current
 
     def skills(self) -> dict[str, Any]:
-        skills = dict(self._builtin_skills())
-        prefetch = SkillPackCatalog.prefetch(self.settings.runtime_dir, self.settings.repo_root)
+        registry = SkillRegistryService(runtime_dir=self.settings.runtime_dir, repo_root=self.settings.repo_root, data_dir=self.settings.data_dir)
+        prefetch = registry.prefetch()
+        skills: dict[str, dict[str, Any]] = {}
         for item in prefetch.get("items") or []:
-            skills.setdefault(item["id"], item)
+            if isinstance(item, dict) and item.get("id"):
+                skills.setdefault(str(item["id"]), dict(item))
         for item in self._document_skills():
+            item.setdefault("scope", "system")
+            item.setdefault("scoped_id", f"system:{item['id']}")
+            item.setdefault("invocationPolicy", "explicit")
             skills.setdefault(item["id"], item)
         for item in skills.values():
             item.setdefault("activation_reason", "available_metadata")
         return {
-            "schema": "grounded.skills.v1",
+            "schema": "grounded.skills.v2",
             "prefetch": {key: value for key, value in prefetch.items() if key != "items"},
+            "manifest": prefetch.get("manifest") or registry.manifest(),
+            "scopes": prefetch.get("scopes") or {},
+            "validation_issues": prefetch.get("validation_issues") or [],
             "items": sorted(skills.values(), key=lambda item: str(item.get("id") or "")),
         }
 
     def skill(self, skill_id: str) -> dict[str, Any]:
-        item = {item["id"]: item for item in self.skills()["items"]}.get(skill_id)
+        items = list(self.skills()["items"])
+        item = (
+            {str(item.get("scoped_id") or ""): item for item in items}.get(skill_id)
+            or {str(item.get("id") or ""): item for item in items}.get(skill_id)
+        )
         if item is None:
             raise KeyError(f"Skill not found: {skill_id}")
         return item
+
+    def skill_registry_manifest(self) -> dict[str, Any]:
+        return SkillRegistryService(runtime_dir=self.settings.runtime_dir, repo_root=self.settings.repo_root, data_dir=self.settings.data_dir).manifest()
+
+    def evaluate_skills(self, payload: dict[str, Any]) -> dict[str, Any]:
+        registry = SkillRegistryService(runtime_dir=self.settings.runtime_dir, repo_root=self.settings.repo_root, data_dir=self.settings.data_dir)
+        return registry.search_for_context(
+            prompt=str(payload.get("prompt") or ""),
+            intent=str(payload.get("intent") or "") or None,
+            generation_mode=str(payload.get("generation_mode") or "") or None,
+            paths=[str(item) for item in payload.get("paths") or [] if str(item).strip()],
+            failure_class=str(payload.get("failure_class") or "") or None,
+            max_skills=int(payload["max_skills"]) if str(payload.get("max_skills") or "").isdigit() else None,
+        )
 
     def slash_commands(self) -> dict[str, Any]:
         payload = SlashCommandCatalog.list()
@@ -1794,21 +2106,28 @@ class WorkbenchService:
 
     def doctor(self) -> dict[str, Any]:
         checks = [
-            self._check("python", True, sys.version.split()[0], str(Path(sys.executable))),
-            self._binary_check("node"),
-            self._binary_check("npm"),
+            self._python_version_check(),
+            self._node_version_check(),
+            self._npm_version_check(),
             self._binary_check("docker"),
             self._compose_check(),
+            self._docker_daemon_check(),
             self._playwright_check(),
+            self._playwright_browsers_check(),
             self._openai_check(),
+            self._model_access_check(),
             self._writable_check("data_dir", self.settings.data_dir),
+            self._writable_dirs_check(),
+            self._disk_space_check(),
             self._template_check(),
+            self._template_hash_check(),
             self._port_check(),
+            self._preview_port_range_check(),
             self._backend_routes_check(),
             self._stale_backend_check(),
-            self._playwright_browsers_check(),
             self._preview_container_check(),
             self._test_command_check(),
+            self._runtime_policy_files_check(),
             self.exec_policy_service.doctor_check(),
         ]
         status = "passed" if all(item["status"] == "passed" for item in checks if item["required"]) else "failed"
@@ -1818,16 +2137,339 @@ class WorkbenchService:
         return payload
 
     def metrics_summary(self) -> dict[str, Any]:
-        runs = self.store.list("runs")
-        return {
+        return self.observability_summary()
+
+    def observability_summary(self, *, workspace_id: str | None = None) -> dict[str, Any]:
+        if workspace_id:
+            self.workspace_service.get_workspace(workspace_id)
+        runs = [
+            run
+            for run in self.store.list("runs")
+            if isinstance(run, dict) and (not workspace_id or run.get("workspace_id") == workspace_id)
+        ]
+        by_status = self._count_by(runs, "status")
+        token_usage = self._observability_token_usage(runs)
+        cost = self._observability_cost(runs)
+        latency = self._observability_latency(runs)
+        failure_classes = self._observability_failure_classes(runs)
+        repair_success = self._observability_repair_success(runs)
+        green_rates = self._observability_green_rates(runs, cost.get("_cost_by_mode", {}))
+        cost.pop("_cost_by_mode", None)
+        payload = {
+            "schema": "grounded.observability.v1",
+            "status": "ok",
+            "workspace_id": workspace_id,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
             "run_count": len(runs),
-            "completed_runs": len([run for run in runs if run.get("status") == "completed"]),
-            "failed_runs": len([run for run in runs if run.get("status") == "failed"]),
-            "blocked_runs": len([run for run in runs if run.get("status") == "blocked"]),
+            "completed_runs": by_status.get("completed", 0),
+            "failed_runs": by_status.get("failed", 0),
+            "blocked_runs": by_status.get("blocked", 0),
+            "running_runs": by_status.get("running", 0),
+            "awaiting_approval_runs": by_status.get("awaiting_approval", 0),
             "tool_protocol_version": TOOL_PROTOCOL_VERSION,
-            "token_usage_total": sum(int(((run.get("token_usage") or {}).get("total_tokens") or 0)) for run in runs),
-            "latency_ms_total": sum(int(((run.get("latency_breakdown") or {}).get("total_ms") or 0)) for run in runs),
+            "token_usage_total": token_usage["total_tokens"],
+            "latency_ms_total": latency["total_ms"],
+            "token_usage": token_usage,
+            "cost": cost,
+            "latency": latency,
+            "green_rate_by_generation_mode": green_rates,
+            "failure_classes": failure_classes,
+            "repair_success": repair_success,
+            "by_status": by_status,
         }
+        typed = ObservabilityReport.model_validate(payload).model_dump(mode="json", by_alias=True)
+        self.store.upsert("reports", f"observability:{workspace_id or 'system'}", typed)
+        return typed
+
+    @staticmethod
+    def _count_by(items: list[dict[str, Any]], key: str) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for item in items:
+            value = str(item.get(key) or "unknown")
+            counts[value] = counts.get(value, 0) + 1
+        return dict(sorted(counts.items()))
+
+    @classmethod
+    def _observability_token_usage(cls, runs: list[dict[str, Any]]) -> dict[str, int]:
+        totals = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_tokens": 0,
+            "total_tokens": 0,
+            "turn_count": 0,
+            "cached_tokens": 0,
+            "cache_write_tokens": 0,
+        }
+        for run in runs:
+            usage = run.get("token_usage") if isinstance(run.get("token_usage"), dict) else {}
+            cache_stats = run.get("cache_stats") if isinstance(run.get("cache_stats"), dict) else {}
+            totals["input_tokens"] += cls._safe_int(usage.get("input_tokens"))
+            totals["output_tokens"] += cls._safe_int(usage.get("output_tokens"))
+            totals["reasoning_tokens"] += cls._safe_int(usage.get("reasoning_tokens"))
+            total_tokens = cls._safe_int(usage.get("total_tokens"))
+            if not total_tokens:
+                total_tokens = cls._safe_int(usage.get("input_tokens")) + cls._safe_int(usage.get("output_tokens"))
+            totals["total_tokens"] += total_tokens
+            totals["turn_count"] += cls._safe_int(usage.get("turn_count"))
+            totals["cached_tokens"] += cls._safe_int(cache_stats.get("cached_tokens"))
+            totals["cache_write_tokens"] += cls._safe_int(cache_stats.get("cache_write_tokens"))
+        return totals
+
+    @classmethod
+    def _observability_cost(cls, runs: list[dict[str, Any]]) -> dict[str, Any]:
+        by_model: dict[str, dict[str, Any]] = {}
+        cost_by_mode: dict[str, float] = {}
+        explicit_total = 0.0
+        estimated_total = 0.0
+        unpriced_tokens = 0
+        for run in runs:
+            model = str(run.get("llm_model") or run.get("model") or "unknown")
+            usage = run.get("token_usage") if isinstance(run.get("token_usage"), dict) else {}
+            cache_stats = run.get("cache_stats") if isinstance(run.get("cache_stats"), dict) else {}
+            input_tokens = cls._safe_int(usage.get("input_tokens"))
+            output_tokens = cls._safe_int(usage.get("output_tokens"))
+            reasoning_tokens = cls._safe_int(usage.get("reasoning_tokens"))
+            total_tokens = cls._safe_int(usage.get("total_tokens")) or input_tokens + output_tokens
+            explicit_cost = cls._safe_float(usage.get("estimated_cost_usd") or usage.get("cost_usd") or usage.get("cost") or cache_stats.get("estimated_cost_usd"))
+            estimate = explicit_cost if explicit_cost > 0 else cls._estimate_cost_usd(model, input_tokens=input_tokens, output_tokens=output_tokens)
+            if explicit_cost > 0:
+                explicit_total += explicit_cost
+                pricing_source = "explicit_usage"
+            elif estimate > 0:
+                estimated_total += estimate
+                pricing_source = "builtin_cost_tier_estimate"
+            else:
+                unpriced_tokens += total_tokens
+                pricing_source = "unknown"
+            mode = str(run.get("generation_mode") or "unknown")
+            cost_by_mode[mode] = cost_by_mode.get(mode, 0.0) + estimate
+            item = by_model.setdefault(
+                model,
+                {
+                    "model": model,
+                    "provider": str(model_capabilities(model).get("provider") or "openai"),
+                    "cost_tier": str(model_capabilities(model).get("cost_tier") or "unknown"),
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "reasoning_tokens": 0,
+                    "total_tokens": 0,
+                    "estimated_cost_usd": 0.0,
+                    "pricing_source": pricing_source,
+                    "run_count": 0,
+                },
+            )
+            item["input_tokens"] += input_tokens
+            item["output_tokens"] += output_tokens
+            item["reasoning_tokens"] += reasoning_tokens
+            item["total_tokens"] += total_tokens
+            item["estimated_cost_usd"] = round(float(item["estimated_cost_usd"]) + estimate, 6)
+            item["run_count"] += 1
+            if item["pricing_source"] != pricing_source:
+                item["pricing_source"] = "mixed"
+        total = explicit_total + estimated_total
+        return {
+            "estimated_cost_usd": round(total, 6),
+            "explicit_cost_usd": round(explicit_total, 6),
+            "estimated_from_tokens_usd": round(estimated_total, 6),
+            "unpriced_tokens": unpriced_tokens,
+            "pricing_source": "explicit_usage" if explicit_total and not estimated_total else "builtin_cost_tier_estimate" if estimated_total and not explicit_total else "mixed" if total else "unknown",
+            "by_model": sorted(by_model.values(), key=lambda item: float(item.get("estimated_cost_usd") or 0), reverse=True),
+            "_cost_by_mode": cost_by_mode,
+        }
+
+    @staticmethod
+    def _estimate_cost_usd(model: str, *, input_tokens: int, output_tokens: int) -> float:
+        tier = str(model_capabilities(model).get("cost_tier") or "unknown")
+        # Local estimate only. If providers return explicit usage cost, that value wins.
+        rates_per_1m = {
+            "low": {"input": 0.15, "output": 0.60},
+            "high": {"input": 1.25, "output": 10.00},
+            "embedding": {"input": 0.13, "output": 0.0},
+        }.get(tier)
+        if rates_per_1m is None:
+            return 0.0
+        return round((input_tokens / 1_000_000) * rates_per_1m["input"] + (output_tokens / 1_000_000) * rates_per_1m["output"], 6)
+
+    @classmethod
+    def _observability_latency(cls, runs: list[dict[str, Any]]) -> dict[str, Any]:
+        phase_totals: dict[str, int] = {}
+        run_totals: list[tuple[int, dict[str, Any]]] = []
+        for run in runs:
+            latency = run.get("latency_breakdown") if isinstance(run.get("latency_breakdown"), dict) else {}
+            total = cls._safe_int(latency.get("total_ms") or latency.get("agent_total_ms"))
+            if not total:
+                total = sum(cls._safe_int(value) for value in latency.values() if isinstance(value, (int, float, str)))
+            for key, value in latency.items():
+                numeric = cls._safe_int(value)
+                if numeric:
+                    phase_totals[str(key)] = phase_totals.get(str(key), 0) + numeric
+            if total:
+                run_totals.append((total, run))
+        sorted_totals = sorted(value for value, _run in run_totals)
+        total_ms = sum(sorted_totals)
+        return {
+            "total_ms": total_ms,
+            "average_ms": round(total_ms / len(sorted_totals), 2) if sorted_totals else 0.0,
+            "p50_ms": cls._percentile(sorted_totals, 0.50),
+            "p95_ms": cls._percentile(sorted_totals, 0.95),
+            "phase_totals_ms": dict(sorted(phase_totals.items(), key=lambda item: item[1], reverse=True)),
+            "slowest_runs": [
+                {
+                    "run_id": str(run.get("run_id") or ""),
+                    "workspace_id": str(run.get("workspace_id") or ""),
+                    "generation_mode": str(run.get("generation_mode") or "unknown"),
+                    "status": str(run.get("status") or "unknown"),
+                    "total_ms": total,
+                }
+                for total, run in sorted(run_totals, key=lambda item: item[0], reverse=True)[:5]
+            ],
+        }
+
+    @classmethod
+    def _observability_green_rates(cls, runs: list[dict[str, Any]], cost_by_mode: dict[str, float]) -> list[dict[str, Any]]:
+        by_mode: dict[str, list[dict[str, Any]]] = {}
+        for run in runs:
+            by_mode.setdefault(str(run.get("generation_mode") or "unknown"), []).append(run)
+        rows: list[dict[str, Any]] = []
+        for mode, mode_runs in sorted(by_mode.items()):
+            status_counts = cls._count_by(mode_runs, "status")
+            terminal = [run for run in mode_runs if str(run.get("status") or "") in {"completed", "failed", "blocked", "awaiting_approval"}]
+            green = [run for run in terminal if cls._is_green_run(run)]
+            token_sum = sum(cls._safe_int((run.get("token_usage") or {}).get("total_tokens")) for run in mode_runs if isinstance(run.get("token_usage"), dict))
+            rows.append(
+                {
+                    "generation_mode": mode,
+                    "run_count": len(mode_runs),
+                    "terminal_count": len(terminal),
+                    "green_count": len(green),
+                    "green_rate": round(len(green) / len(terminal), 4) if terminal else 0.0,
+                    "status_counts": status_counts,
+                    "average_total_tokens": round(token_sum / len(mode_runs), 2) if mode_runs else 0.0,
+                    "estimated_cost_usd": round(float(cost_by_mode.get(mode) or 0.0), 6),
+                }
+            )
+        return rows
+
+    @classmethod
+    def _observability_failure_classes(cls, runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        buckets: dict[str, dict[str, Any]] = {}
+        for run in runs:
+            failure_class = str(run.get("failure_class") or "")
+            if not failure_class:
+                issues = ((run.get("checks_summary") or {}).get("issues") if isinstance(run.get("checks_summary"), dict) else []) or []
+                if isinstance(issues, list) and issues:
+                    first = issues[0] if isinstance(issues[0], dict) else {}
+                    failure_class = str(first.get("failure_class") or first.get("code") or "")
+            if not failure_class:
+                continue
+            bucket = buckets.setdefault(
+                failure_class,
+                {"failure_class": failure_class, "count": 0, "latest_run_id": None, "latest_at": None, "generation_modes": {}, "examples": []},
+            )
+            bucket["count"] += 1
+            mode = str(run.get("generation_mode") or "unknown")
+            bucket["generation_modes"][mode] = bucket["generation_modes"].get(mode, 0) + 1
+            updated_at = str(run.get("updated_at") or run.get("created_at") or "")
+            if not bucket["latest_at"] or updated_at >= str(bucket["latest_at"]):
+                bucket["latest_at"] = updated_at
+                bucket["latest_run_id"] = str(run.get("run_id") or "")
+            if len(bucket["examples"]) < 3:
+                bucket["examples"].append(
+                    {
+                        "run_id": str(run.get("run_id") or ""),
+                        "status": str(run.get("status") or "unknown"),
+                        "generation_mode": mode,
+                        "summary": str(run.get("failure_reason") or run.get("root_cause_summary") or "")[:240],
+                    }
+                )
+        return sorted(buckets.values(), key=lambda item: int(item.get("count") or 0), reverse=True)
+
+    def _observability_repair_success(self, runs: list[dict[str, Any]]) -> dict[str, Any]:
+        fix_runs = [run for run in runs if str(run.get("mode") or "") == "fix"]
+        successful_fix_runs = [run for run in fix_runs if str(run.get("status") or "") == "completed"]
+        case_count = 0
+        resolved_case_count = 0
+        attempt_count = 0
+        successful_attempt_count = 0
+        status_counts: dict[str, int] = {}
+        for run in runs:
+            cases = self._repair_cases_for_observability(str(run.get("run_id") or ""))
+            repair_iterations = run.get("repair_iterations") if isinstance(run.get("repair_iterations"), list) else []
+            for iteration in repair_iterations:
+                if isinstance(iteration, dict):
+                    status = str(iteration.get("status") or "recorded")
+                    attempt_count += 1
+                    status_counts[status] = status_counts.get(status, 0) + 1
+                    if status in {"completed", "passed", "repaired", "resolved"}:
+                        successful_attempt_count += 1
+            for case in cases:
+                if not isinstance(case, dict):
+                    continue
+                case_count += 1
+                status = str(case.get("status") or "open")
+                status_counts[status] = status_counts.get(status, 0) + 1
+                if status in {"repaired", "resolved", "superseded"}:
+                    resolved_case_count += 1
+                for attempt in case.get("attempts") or []:
+                    if isinstance(attempt, dict):
+                        attempt_status = str(attempt.get("status") or "recorded")
+                        attempt_count += 1
+                        status_counts[attempt_status] = status_counts.get(attempt_status, 0) + 1
+                        if attempt_status in {"completed", "passed", "repaired", "resolved"}:
+                            successful_attempt_count += 1
+        return {
+            "fix_run_count": len(fix_runs),
+            "successful_fix_runs": len(successful_fix_runs),
+            "fix_success_rate": round(len(successful_fix_runs) / len(fix_runs), 4) if fix_runs else 0.0,
+            "repair_case_count": case_count,
+            "resolved_case_count": resolved_case_count,
+            "case_resolution_rate": round(resolved_case_count / case_count, 4) if case_count else 0.0,
+            "attempt_count": attempt_count,
+            "successful_attempt_count": successful_attempt_count,
+            "attempt_success_rate": round(successful_attempt_count / attempt_count, 4) if attempt_count else 0.0,
+            "status_counts": dict(sorted(status_counts.items())),
+        }
+
+    def _repair_cases_for_observability(self, run_id: str) -> list[dict[str, Any]]:
+        if not run_id:
+            return []
+        index = self.store.get("reports", RepairCaseService.index_ref(run_id)) or {}
+        refs = index.get("case_refs") if isinstance(index, dict) else []
+        cases: list[dict[str, Any]] = []
+        for ref in refs if isinstance(refs, list) else []:
+            payload = self.store.get("reports", str(ref))
+            if isinstance(payload, dict):
+                cases.append(payload)
+        return cases
+
+    @staticmethod
+    def _is_green_run(run: dict[str, Any]) -> bool:
+        if str(run.get("status") or "") != "completed":
+            return False
+        checks = run.get("checks_summary") if isinstance(run.get("checks_summary"), dict) else {}
+        required_keys = ("validators", "build", "preview")
+        return all(str(checks.get(key) or "pending") in {"passed", "skipped"} for key in required_keys)
+
+    @staticmethod
+    def _percentile(values: list[int], percentile: float) -> int:
+        if not values:
+            return 0
+        index = min(len(values) - 1, max(0, int(round((len(values) - 1) * percentile))))
+        return int(values[index])
+
+    @staticmethod
+    def _safe_int(value: Any) -> int:
+        try:
+            return int(float(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _safe_float(value: Any) -> float:
+        try:
+            return float(value or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
 
     def config_schema(self) -> dict[str, Any]:
         return {
@@ -1901,6 +2543,17 @@ class WorkbenchService:
                     "properties": {
                         "project_instructions": {"type": "boolean", "default": True},
                         "runtime_skills": {"type": "boolean", "default": True},
+                        "scoped_skills": {"type": "boolean", "default": True},
+                        "skill_roots": {
+                            "type": "object",
+                            "properties": {
+                                "system": {"type": "boolean", "default": True},
+                                "repo": {"type": "boolean", "default": True},
+                                "plugin": {"type": "boolean", "default": True},
+                                "user": {"type": "boolean", "default": True},
+                            },
+                            "additionalProperties": False,
+                        },
                         "workspace_memory": {"type": "boolean", "default": True},
                         "magic_docs": {"type": "boolean", "default": True},
                         "slash_commands": {"type": "boolean", "default": True},
@@ -2148,6 +2801,36 @@ class WorkbenchService:
             return {"schema": "grounded.run_compaction.v1", "run_id": run_id, "status": "unavailable", "sections": {}, "refs": {}}
         return self.run_compaction_service.get_compaction(run_id)
 
+    def context_pressure(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        ref = run.context_pressure_ref or f"context_pressure:{run.workspace_id}:{run_id}"
+        payload = self.store.get("reports", ref)
+        if not isinstance(payload, dict):
+            return ContextPressureReport(
+                workspace_id=run.workspace_id,
+                run_id=run_id,
+                status="missing",
+            ).model_dump(mode="json", by_alias=True)
+        if payload.get("schema") == "grounded.context_pressure.v2":
+            return ContextPressureReport.model_validate(payload).model_dump(mode="json", by_alias=True)
+        items = [item for item in payload.get("items") or [] if isinstance(item, dict)]
+        latest = items[-1] if items else None
+        normalized = {
+            "schema": "grounded.context_pressure.v2",
+            "workspace_id": run.workspace_id,
+            "run_id": run_id,
+            "status": "ready" if latest else "empty",
+            "latest": latest,
+            "items": items,
+            "sections": (latest or {}).get("sections") or {},
+            "recommendations": (latest or {}).get("recommendations") or [],
+            "microcompact_candidates": (latest or {}).get("microcompact_candidates") or [],
+            "avoid_reread_files": (latest or {}).get("avoid_reread_files") or [],
+            "compact_boundary": (latest or {}).get("compact_boundary") or {},
+            "updated_at": (latest or {}).get("created_at"),
+        }
+        return ContextPressureReport.model_validate(normalized).model_dump(mode="json", by_alias=True)
+
     def compaction_boundaries(self, run_id: str) -> dict[str, Any]:
         self.run_service.get_run(run_id)
         if self.run_compaction_service is None:
@@ -2159,6 +2842,18 @@ class WorkbenchService:
         if self.run_compaction_service is None:
             raise KeyError("Run compaction service is unavailable.")
         return self.run_compaction_service.microcompact(run.workspace_id, run_id, digest)
+
+    def output_artifacts(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        if self.output_artifact_service is None:
+            return {"schema": "grounded.output_artifact_index.v1", "workspace_id": run.workspace_id, "run_id": run_id, "items": []}
+        return self.output_artifact_service.list_run(run_id, workspace_id=run.workspace_id)
+
+    def output_artifact(self, run_id: str, artifact_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        if self.output_artifact_service is None:
+            raise KeyError("Output artifact service is unavailable.")
+        return self.output_artifact_service.get(run_id, artifact_id, workspace_id=run.workspace_id)
 
     def post_compact_message(self, run_id: str, boundary_id: str) -> dict[str, Any]:
         self.run_service.get_run(run_id)
@@ -2206,6 +2901,17 @@ class WorkbenchService:
             if path in contract_owned or path.startswith("miniapp/app/generated/")
         )
         files = list(dict.fromkeys([*files, *blocking_required]))
+        allowed, guardian_report = self.run_service.enforce_guardian_before_apply(
+            run,
+            source="pre_apply_guardian",
+            changed_files=files,
+        )
+        if not allowed:
+            artifacts = self._run_artifacts_or_empty(run_id)
+            artifacts["guardian_review"] = guardian_report
+            artifacts["run"] = self.run_service.get_run(run_id).model_dump(mode="json")
+            self.store.upsert("reports", f"run_artifacts:{run_id}", artifacts)
+            return self.run_service.get_run(run_id)
         revision = self.workspace_service.apply_selected_draft_files(run.workspace_id, run_id, files, message=f"Apply staged AI draft files for run {run_id}")
         fully_applied = bool(changed_before_apply) and set(files).issuperset(changed_before_apply)
         run.result_revision_id = revision.revision_id
@@ -2315,18 +3021,27 @@ class WorkbenchService:
             changed_files=changed_files,
             changed_only=changed_only,
         )
-        return {
+        route_graph = LspToolService.route_graph(root=root, targets=files)
+        payload = {
             **report,
             "workspace_id": workspace_id,
             "run_id": run_id,
             "sources": sorted({str(item.get("source") or "unknown") for item in report.get("items") or []} or {"none"}),
             "symbols": LspToolService.symbol_context(root=root, query="", targets=files).get("items", []),
+            "route_graph": route_graph,
         }
+        self.store.upsert("reports", f"lsp_diagnostics:{workspace_id}:{run_id or 'source'}", payload)
+        return payload
 
     def lsp_symbol_context(self, workspace_id: str, *, run_id: str | None = None, query: str = "", targets: list[str] | None = None) -> dict[str, Any]:
         self.workspace_service.get_workspace(workspace_id)
         root = self.workspace_service.draft_source_dir(workspace_id, run_id) if run_id else self.workspace_service.source_dir(workspace_id)
         return {**LspToolService.symbol_context(root=root, query=query, targets=targets), "workspace_id": workspace_id, "run_id": run_id}
+
+    def lsp_definition(self, workspace_id: str, *, run_id: str | None = None, symbol: str = "", targets: list[str] | None = None) -> dict[str, Any]:
+        self.workspace_service.get_workspace(workspace_id)
+        root = self.workspace_service.draft_source_dir(workspace_id, run_id) if run_id else self.workspace_service.source_dir(workspace_id)
+        return {**LspToolService.definition(root=root, symbol=symbol, targets=targets), "workspace_id": workspace_id, "run_id": run_id}
 
     def lsp_find_references(self, workspace_id: str, *, run_id: str | None = None, symbol: str = "", targets: list[str] | None = None) -> dict[str, Any]:
         self.workspace_service.get_workspace(workspace_id)
@@ -2337,6 +3052,11 @@ class WorkbenchService:
         self.workspace_service.get_workspace(workspace_id)
         root = self.workspace_service.draft_source_dir(workspace_id, run_id) if run_id else self.workspace_service.source_dir(workspace_id)
         return {**LspToolService.route_static_context(root=root, targets=targets), "workspace_id": workspace_id, "run_id": run_id}
+
+    def lsp_route_graph(self, workspace_id: str, *, run_id: str | None = None, targets: list[str] | None = None) -> dict[str, Any]:
+        self.workspace_service.get_workspace(workspace_id)
+        root = self.workspace_service.draft_source_dir(workspace_id, run_id) if run_id else self.workspace_service.source_dir(workspace_id)
+        return {**LspToolService.route_graph(root=root, targets=targets), "workspace_id": workspace_id, "run_id": run_id}
 
     def patch_preflight(self, workspace_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         raw_ops = payload.get("ops") or payload.get("patch_actions") or []
@@ -3177,6 +3897,54 @@ class WorkbenchService:
     def _check(self, name: str, ok: bool, details: str = "", command: str | None = None, *, required: bool = True) -> dict[str, Any]:
         return {"name": name, "status": "passed" if ok else "failed", "details": details, "command": command, "required": required}
 
+    def _python_version_check(self) -> dict[str, Any]:
+        version = sys.version_info
+        required_major, required_minor = self._required_python_version()
+        ok = (version.major, version.minor) >= (required_major, required_minor)
+        details = (
+            f"python={version.major}.{version.minor}.{version.micro}; executable={Path(sys.executable)}; "
+            f"required>={required_major}.{required_minor}"
+        )
+        return self._check("python", ok, details, str(Path(sys.executable)), required=True)
+
+    def _required_python_version(self) -> tuple[int, int]:
+        pyproject = self.settings.repo_root / "platform" / "backend" / "pyproject.toml"
+        try:
+            text = pyproject.read_text(encoding="utf-8")
+        except OSError:
+            return (3, 11)
+        match = re.search(r'requires-python\s*=\s*"[^"]*>=\s*(\d+)\.(\d+)', text)
+        if not match:
+            return (3, 11)
+        return (int(match.group(1)), int(match.group(2)))
+
+    def _node_version_check(self) -> dict[str, Any]:
+        return self._versioned_binary_check("node", ["node", "--version"], minimum_major=18, required=True)
+
+    def _npm_version_check(self) -> dict[str, Any]:
+        return self._versioned_binary_check("npm", ["npm", "--version"], minimum_major=9, required=True)
+
+    def _versioned_binary_check(self, name: str, command: list[str], *, minimum_major: int, required: bool) -> dict[str, Any]:
+        path = shutil.which(command[0])
+        if not path:
+            return self._check(name, False, f"{name} not found; required>={minimum_major}", " ".join(command), required=required)
+        try:
+            result = subprocess.run(command, text=True, capture_output=True, timeout=5)
+        except Exception as exc:
+            return self._check(name, False, f"{path}; version check failed: {exc}", " ".join(command), required=required)
+        version_text = (result.stdout or result.stderr).strip()
+        major = self._parse_major_version(version_text)
+        ok = result.returncode == 0 and major is not None and major >= minimum_major
+        details = f"path={path}; version={version_text or 'unknown'}; required>={minimum_major}"
+        return self._check(name, ok, details, " ".join(command), required=required)
+
+    @staticmethod
+    def _parse_major_version(value: str) -> int | None:
+        match = re.search(r"(\d+)", value or "")
+        if not match:
+            return None
+        return int(match.group(1))
+
     def _binary_check(self, binary: str) -> dict[str, Any]:
         path = shutil.which(binary)
         return self._check(binary, bool(path), path or f"{binary} not found", binary, required=binary in {"node", "npm"})
@@ -3191,6 +3959,28 @@ class WorkbenchService:
         except Exception as exc:
             return self._check("docker_compose", False, str(exc), "docker compose version", required=False)
 
+    def _docker_daemon_check(self) -> dict[str, Any]:
+        docker = shutil.which("docker")
+        if not docker:
+            return self._check("docker_daemon", False, "docker CLI not found", "docker info --format '{{.ServerVersion}}'", required=False)
+        try:
+            result = subprocess.run(
+                [docker, "info", "--format", "{{.ServerVersion}}"],
+                text=True,
+                capture_output=True,
+                timeout=5,
+            )
+        except Exception as exc:
+            return self._check("docker_daemon", False, str(exc), "docker info --format '{{.ServerVersion}}'", required=False)
+        output = (result.stdout or result.stderr).strip()
+        return self._check(
+            "docker_daemon",
+            result.returncode == 0,
+            output or "docker daemon did not respond",
+            "docker info --format '{{.ServerVersion}}'",
+            required=False,
+        )
+
     def _playwright_check(self) -> dict[str, Any]:
         try:
             import playwright  # noqa: F401
@@ -3203,13 +3993,85 @@ class WorkbenchService:
         config = self.openai_client.configuration()
         return self._check("openai", bool(config.get("enabled")), "configured" if config.get("enabled") else "not configured", required=False)
 
+    def _model_access_check(self) -> dict[str, Any]:
+        manager = getattr(self.openai_client, "model_manager", None)
+        if manager is None:
+            return self._check("model_access", False, "model manager unavailable", required=False)
+        try:
+            status = manager.status()
+            route = manager.select(role="agent_turn", model_profile=status.default_coding_profile, generation_mode="balanced")
+        except Exception as exc:
+            return self._check("model_access", False, f"model manager failed: {exc}", required=False)
+        provider = status.providers.get(route.selected_provider)
+        provider_status = provider.status if provider is not None else "unknown"
+        details = (
+            f"enabled={status.enabled}; provider={route.selected_provider}:{provider_status}; "
+            f"selected={route.selected_model}; profile={route.model_profile}; fallback={route.fallback_enabled}"
+        )
+        return self._check("model_access", bool(status.enabled and route.status == "ready"), details, required=False)
+
     def _writable_check(self, name: str, path: Path) -> dict[str, Any]:
         return self._check(name, os.access(path, os.W_OK), str(path), required=True)
+
+    def _writable_dirs_check(self) -> dict[str, Any]:
+        paths = [
+            self.settings.data_dir,
+            self.settings.workspaces_dir,
+            self.settings.exports_dir,
+            self.settings.host_data_dir,
+            self.settings.data_dir / ".sandbox" / "tmp",
+            self.settings.data_dir / ".sandbox" / "home",
+        ]
+        failed: list[str] = []
+        passed: list[str] = []
+        for path in paths:
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+                probe = path / ".doctor-write-test"
+                probe.write_text("ok", encoding="utf-8")
+                probe.unlink(missing_ok=True)
+                passed.append(str(path))
+            except Exception as exc:
+                failed.append(f"{path}: {exc}")
+        details = f"writable={len(passed)}/{len(paths)}; " + ("failed: " + "; ".join(failed) if failed else ", ".join(passed[:6]))
+        return self._check("writable_dirs", not failed, details, required=True)
+
+    def _disk_space_check(self) -> dict[str, Any]:
+        try:
+            usage = shutil.disk_usage(self.settings.data_dir)
+        except Exception as exc:
+            return self._check("disk_space", False, str(exc), required=True)
+        free_gb = usage.free / (1024**3)
+        total_gb = usage.total / (1024**3)
+        ok = free_gb >= 1.0
+        details = f"free={free_gb:.1f}GB total={total_gb:.1f}GB path={self.settings.data_dir}; required>=1GB"
+        return self._check("disk_space", ok, details, required=True)
 
     def _template_check(self) -> dict[str, Any]:
         required = [self.settings.template_dir / "miniapp" / "app" / "main.py", self.settings.template_dir / "docker" / "docker-compose.yml"]
         missing = [str(path) for path in required if not path.exists()]
         return self._check("template_integrity", not missing, "missing: " + ", ".join(missing) if missing else str(self.settings.template_dir), required=True)
+
+    def _template_hash_check(self) -> dict[str, Any]:
+        root = self.settings.template_dir
+        if not root.exists():
+            return self._check("template_hash", False, f"missing template dir: {root}", required=True)
+        digest = hashlib.sha256()
+        file_count = 0
+        ignored_dirs = {".git", "__pycache__", "node_modules", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
+        try:
+            paths = sorted(path for path in root.rglob("*") if path.is_file() and not any(part in ignored_dirs for part in path.relative_to(root).parts))
+            for path in paths:
+                rel = path.relative_to(root).as_posix()
+                digest.update(rel.encode("utf-8"))
+                digest.update(b"\0")
+                digest.update(path.read_bytes())
+                digest.update(b"\0")
+                file_count += 1
+        except Exception as exc:
+            return self._check("template_hash", False, f"hash failed: {exc}", required=True)
+        ok = file_count > 0
+        return self._check("template_hash", ok, f"sha256={digest.hexdigest()}; files={file_count}; root={root}", required=True)
 
     def _port_check(self) -> dict[str, Any]:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -3218,6 +4080,21 @@ class WorkbenchService:
             return self._check("preview_port_base", result != 0, f"port {self.settings.preview_port_base} {'available' if result != 0 else 'in use'}", required=False)
         finally:
             sock.close()
+
+    def _preview_port_range_check(self) -> dict[str, Any]:
+        base = int(self.settings.preview_port_base)
+        ports = list(range(base, base + 8))
+        available: list[int] = []
+        in_use: list[int] = []
+        for port in ports:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                result = sock.connect_ex(("127.0.0.1", port))
+                (available if result != 0 else in_use).append(port)
+            finally:
+                sock.close()
+        details = f"available={available}; in_use={in_use}; range={base}-{base + 7}"
+        return self._check("preview_port_range", bool(available), details, required=False)
 
     def _backend_routes_check(self) -> dict[str, Any]:
         route_file = self.settings.repo_root / "platform" / "backend" / "app" / "api" / "routes_workbench.py"
@@ -3248,17 +4125,65 @@ class WorkbenchService:
 
     def _playwright_browsers_check(self) -> dict[str, Any]:
         try:
-            result = subprocess.run([sys.executable, "-m", "playwright", "install", "--dry-run"], text=True, capture_output=True, timeout=10)
-            output = (result.stdout or result.stderr).strip()
+            import playwright  # noqa: F401
+        except Exception as exc:
+            return self._check("playwright_browsers", False, f"playwright package unavailable: {exc}", "python -m playwright install", required=False)
+
+        browser_roots = self._playwright_browser_roots()
+        installed: list[str] = []
+        for root in browser_roots:
+            try:
+                if root.exists():
+                    installed.extend(
+                        sorted(
+                            child.name
+                            for child in root.iterdir()
+                            if child.is_dir() and any(marker in child.name.lower() for marker in ("chromium", "firefox", "webkit"))
+                        )
+                    )
+            except OSError:
+                continue
+        if installed:
             return self._check(
                 "playwright_browsers",
-                result.returncode == 0,
-                output[:600] or "dry run completed",
-                "python -m playwright install --dry-run",
+                True,
+                f"installed={', '.join(installed[:8])}; roots={', '.join(str(path) for path in browser_roots)}",
+                "python -m playwright install",
                 required=False,
             )
+        try:
+            result = subprocess.run([sys.executable, "-m", "playwright", "install", "--dry-run"], text=True, capture_output=True, timeout=10)
+            output = (result.stdout or result.stderr).strip()
         except Exception as exc:
-            return self._check("playwright_browsers", False, str(exc), "python -m playwright install --dry-run", required=False)
+            output = str(exc)
+        return self._check(
+            "playwright_browsers",
+            False,
+            f"no browser cache found in {', '.join(str(path) for path in browser_roots)}; dry_run={output[:400]}",
+            "python -m playwright install --dry-run",
+            required=False,
+        )
+
+    def _playwright_browser_roots(self) -> list[Path]:
+        configured = os.getenv("PLAYWRIGHT_BROWSERS_PATH")
+        roots: list[Path] = []
+        if configured and configured not in {"0", "false", "False"}:
+            roots.append(Path(configured).expanduser())
+        roots.extend(
+            [
+                Path.home() / "Library" / "Caches" / "ms-playwright",
+                Path.home() / ".cache" / "ms-playwright",
+                self.settings.data_dir / ".cache" / "ms-playwright",
+            ]
+        )
+        unique: list[Path] = []
+        seen: set[str] = set()
+        for root in roots:
+            key = str(root)
+            if key not in seen:
+                unique.append(root)
+                seen.add(key)
+        return unique
 
     def _preview_container_check(self) -> dict[str, Any]:
         docker = shutil.which("docker")
@@ -3279,6 +4204,29 @@ class WorkbenchService:
 
     def _test_command_check(self) -> dict[str, Any]:
         return self._check("platform_tests", (self.settings.repo_root / "platform" / "backend" / "tests").exists(), "pytest platform/backend/tests", required=True)
+
+    def _runtime_policy_files_check(self) -> dict[str, Any]:
+        policy_dir = self.settings.runtime_dir / "policies"
+        files = [
+            policy_dir / "agent_exec_policy.json",
+            policy_dir / "agent_hooks.json",
+        ]
+        missing: list[str] = []
+        invalid: list[str] = []
+        loaded: list[str] = []
+        for path in files:
+            if not path.exists():
+                missing.append(str(path))
+                continue
+            try:
+                json.loads(path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                invalid.append(f"{path}: {exc}")
+                continue
+            loaded.append(str(path))
+        ok = not invalid and not any(path.endswith("agent_exec_policy.json") for path in missing)
+        details = f"loaded={loaded}; missing_optional={missing}; invalid={invalid}"
+        return self._check("runtime_policy_files", ok, details, required=True)
 
     @staticmethod
     def _builtin_skills() -> dict[str, dict[str, Any]]:

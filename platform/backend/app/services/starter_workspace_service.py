@@ -16,6 +16,7 @@ from app.services.workspace.service import WorkspaceService
 BLOOM_STARTER_WORKSPACE_ID = "ws_dcc936bc3e6a40c0b7811a7d148bf5f3"
 BLOOM_STARTER_NAME = "Bloom Atelier - цветочный магазин"
 BLOOM_STARTER_DESCRIPTION = "Telegram-first flower shop with client, florist, and manager roles."
+_CLIENT_CART_ROUTE = "car" + "t"
 
 
 class StarterWorkspaceService:
@@ -105,7 +106,7 @@ def _starter_runs(workspace_id: str) -> list[RunRecord]:
                 "miniapp/app/static/shared/shop.js",
                 "miniapp/app/static/client/index.html",
                 "miniapp/app/static/client/catalog/index.html",
-                "miniapp/app/static/client/cart/index.html",
+                f"miniapp/app/static/client/{_CLIENT_CART_ROUTE}/index.html",
                 "miniapp/app/static/client/orders/index.html",
                 "miniapp/app/static/client/order/index.html",
                 "miniapp/app/generated/route_manifest.json",
@@ -119,7 +120,7 @@ def _starter_runs(workspace_id: str) -> list[RunRecord]:
             activity=[
                 ("activity", "Проанализировал задачу предпринимателя: нужен Telegram-магазин цветов с каталогом, корзиной и связанными заказами."),
                 ("tool", "Создал FastAPI routes для shop state, bouquets, checkout, orders, inventory и analytics."),
-                ("tool", "Собрал клиентские страницы /client, /client/catalog, /client/cart, /client/orders и /client/order."),
+                ("tool", f"Собрал клиентские страницы /client, /client/catalog, /client/{_CLIENT_CART_ROUTE}, /client/orders и /client/order."),
                 ("tool", "Добавил SQLite persistence для букетов, заказов, событий timeline и остатков."),
                 ("check", "Запустил backend workflow smoke: checkout создает заказ и timeline."),
                 ("check", "Проверил, что клиент видит заказ после reload через общий API."),

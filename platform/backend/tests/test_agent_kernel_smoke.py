@@ -9,6 +9,7 @@ from app.ai.openai_client import OpenAIClient
 from app.ai.model_registry import CODEX_MINI_MODEL, models_for_role
 from app.models.common import GenerationMode
 from app.models.domain import CheckExecutionRecord, CreateRunRequest, DraftAction, RunCheckResult, WorkspaceRecord, utc_now
+from app.models.hooks import HookContext
 from app.modules.miniapp_agent_loop.agent_file_state import AgentFileStateCache
 from app.modules.miniapp_agent_loop.agent_command_policy import DEFAULT_COMMAND_POLICY, AgentCommandPolicy, decide_workspace_command
 from app.modules.miniapp_agent_loop.agent_coordinator import AgentCoordinator
@@ -38,6 +39,7 @@ from app.modules.miniapp_agent_loop.agent_tool_runtime import validate_workspace
 from app.services.tool_protocol import TOOL_RISK_DEFAULTS
 from app.modules.miniapp_agent_loop.turn_diff_tracker import AgentTurnDiffTracker
 from app.modules.miniapp_agent_loop.types import AgentTurnPlan
+from app.modules.miniapp_agent_loop.guardian_review import GuardianReview
 from app.modules.miniapp_agent_loop.verification_worker import VerificationWorker
 from app.modules.workspace_code_agent_runtime.browser_replay import BrowserProofReplay
 from app.modules.workspace_code_agent_runtime.check_orchestrator import WorkspaceAgentCheckOrchestrator
@@ -45,10 +47,12 @@ from app.modules.workspace_code_agent_runtime.process_recovery import AgentProce
 from app.modules.workspace_code_agent_runtime.prompt_contract import agent_system_prompt
 from app.modules.workspace_code_agent_runtime.runtime import WorkspaceCodeAgentRuntime
 from app.services.check_runner import CheckRunner
+from app.services.hook_policy_service import HookPolicyService
 from app.services.miniapp_contract import MiniAppContractCompiler
 from app.services.repair_catalog import RepairCatalog
 from app.services.workspace.run_service import RunService
 from app.services.workflow_acceptance import build_acceptance_contract, build_implementation_plan, extract_prompt_planning_hints
+from app.repositories.state_store import StateStore
 
 
 def _prompt_analysis(
@@ -496,12 +500,19 @@ def test_lsp_tool_service_symbol_reference_and_route_context(tmp_path: Path) -> 
 
     symbols = LspToolService.symbol_context(root=tmp_path, query="list_items")
     refs = LspToolService.find_references(root=tmp_path, symbol="loadItems")
+    definition = LspToolService.definition(root=tmp_path, symbol="list_items")
     route_context = LspToolService.route_static_context(root=tmp_path)
+    route_graph = LspToolService.route_graph(root=tmp_path)
 
     assert symbols["items"][0]["name"] == "list_items"
     assert len(refs["items"]) == 2
+    assert definition["schema"] == "grounded.lsp_definition.v1"
+    assert definition["items"][0]["name"] == "list_items"
     assert "GET /api/items" in route_context["api_routes"]
     assert route_context["frontend_api_refs"][0]["declared"] is True
+    assert route_graph["schema"] == "grounded.lsp_route_graph.v1"
+    assert route_graph["summary"]["missing_edge_count"] == 0
+    assert any(edge["status"] == "resolved" for edge in route_graph["edges"])
 
 
 def test_lsp_agent_tools_are_model_visible_aliases_with_canonical_protocol() -> None:
@@ -509,7 +520,9 @@ def test_lsp_agent_tools_are_model_visible_aliases_with_canonical_protocol() -> 
 
     assert "lsp_diagnostics" in tool_names
     assert "lsp_symbol_context" in tool_names
+    assert "lsp_definition" in tool_names
     assert "lsp_find_references" in tool_names
+    assert "lsp_route_graph" in tool_names
     assert "lsp_route_static_context" in tool_names
     assert AgentToolRegistry.kind("lsp.diagnostics") == "read_only"
 
@@ -1215,6 +1228,7 @@ def test_agent_registry_exposes_real_openai_tool_contract() -> None:
     names = {str(tool["name"]) for tool in tools}
 
     assert any(tool["name"] == "apply_patch_to_draft" for tool in tools)
+    assert "tool_search" in names
     assert AgentToolRegistry.spec("browser_verify") is not None
     assert "browser_verify" not in names
     assert all("." not in name and name != "browser_verify" for name in names)
@@ -1316,10 +1330,35 @@ def test_tool_router_mode_filtering_and_forced_tools() -> None:
     forced_browser_names = {tool["name"] for tool in ToolRouter.allowed_openai_tools(forced_allowed={"browser_verify"})}
 
     assert "read_files" in default_names
+    assert "tool_search" in default_names
     assert "ask_user" not in default_names
     assert "browser_verify" not in default_names
     assert mutation_names == {"write_file"}
     assert forced_browser_names == {"browser_verify"}
+
+
+def test_tool_router_dynamic_tool_search_discovers_deferred_capabilities(tmp_path: Path) -> None:
+    router = ToolRouter(_router_context(tmp_path))
+
+    result = router.route_batch(
+        [
+            {
+                "tool": "tool_search",
+                "tool_use_id": "search_1",
+                "query": "deploy to vercel with database and payments",
+                "reason": "Find optional tools without exposing every connector.",
+            }
+        ]
+    )
+    payload = result.model_results[1]
+    domains = {str(item.get("domain")) for item in payload["items"]}  # type: ignore[index]
+
+    assert result.envelopes[0]["status"] == "completed"
+    assert result.model_results[1]["status"] == "ready"
+    assert result.envelopes[0]["tool"] == "tool.search"
+    assert {"deploy", "vercel", "database", "payments"}.issubset(domains)
+    assert payload["summary"]["deferred_count"] >= 3  # type: ignore[index]
+    assert "browser_verify" not in {tool["name"] for tool in ToolRouter.allowed_openai_tools()}
 
 
 def test_tool_router_disallowed_and_hook_block_return_failed_envelopes(tmp_path: Path, monkeypatch) -> None:
@@ -1338,6 +1377,36 @@ def test_tool_router_disallowed_and_hook_block_return_failed_envelopes(tmp_path:
     assert blocked.model_results[1]["status"] == "failed"
     assert blocked.model_results[1]["envelope"]["error"]["code"] == "tool_hook_blocked"  # type: ignore[index]
     assert hook_manager.snapshot("run_router")["counts"]["pre_tool_use:failed"] == 1
+
+
+def test_tool_router_post_hook_adds_context_without_changing_envelope_shape(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.json")
+    service = HookPolicyService(store)
+    service.update_workspace_policy(
+        "ws_router",
+        {
+            "rules": [
+                {
+                    "rule_id": "post_read_context",
+                    "conditions": {"hook": "post_tool_use", "canonical_tool": "file.read"},
+                    "actions": [{"action": "add_context", "text": "Read output should guide the next patch.", "priority": 5}],
+                }
+            ]
+        },
+    )
+    hook_manager = AgentHookManager(policy_service=service)
+
+    result = ToolRouter(_router_context(tmp_path, hook_manager=hook_manager)).route_batch(
+        [{"tool": "read_files", "tool_use_id": "read_1", "targets": ["miniapp/app/static/client/app.js"], "reason": "inspect"}]
+    )
+    model_result = result.model_results[1]
+    envelope = model_result["envelope"]
+
+    assert model_result["status"] == "completed"
+    assert model_result["hook_contexts"] == ["Read output should guide the next patch."]
+    assert envelope["tool"] == "file.read"  # type: ignore[index]
+    assert envelope["status"] == "completed"  # type: ignore[index]
+    assert envelope["hook_contexts"] == ["Read output should guide the next patch."]  # type: ignore[index]
 
 
 def test_tool_router_mutating_tools_defer_without_writing_files(tmp_path: Path) -> None:
@@ -2298,6 +2367,47 @@ def test_process_manager_keeps_completed_output_readable(tmp_path: Path) -> None
     assert manager.snapshot()["processes"][0]["status"] == "completed"  # type: ignore[index]
 
 
+def test_process_manager_writes_head_tail_output_artifact(tmp_path: Path) -> None:
+    root = tmp_path
+    app_dir = root / "miniapp/app"
+    app_dir.mkdir(parents=True)
+    (app_dir / "big.txt").write_text(
+        "\n".join([f"needle head {index}" for index in range(80)] + ["needle tail error marker"]),
+        encoding="utf-8",
+    )
+    written: list[dict[str, object]] = []
+
+    def writer(payload: dict[str, object]) -> dict[str, object] | None:
+        written.append(payload)
+        return {
+            "ref": f"exec_output:ws_1:run_1:{payload['process_id']}:{payload['stream']}:abc",
+            "artifact_id": f"{payload['process_id']}:{payload['stream']}:abc",
+            "stream": payload["stream"],
+            "sha256": payload.get("sha256"),
+            "chars": payload.get("total_chars"),
+            "omitted_chars": (payload.get("head_tail") or {}).get("omitted_chars") if isinstance(payload.get("head_tail"), dict) else 0,
+        }
+
+    manager = AgentProcessManager()
+    decision = decide_workspace_command("rg needle miniapp/app")
+    result = manager.run(
+        draft_source=root,
+        command="rg needle miniapp/app",
+        decision=decision,
+        timeout_seconds=5,
+        max_output_chars=120,
+        output_artifact_writer=writer,
+    ).as_dict()
+
+    assert result["success"] is True
+    assert result["stdout_ref"].startswith("exec_output:ws_1:run_1:")
+    assert result["stdout_sha256"]
+    assert result["stdout_omitted_chars"] > 0
+    assert "needle head" in result["stdout_head"]
+    assert "tail error marker" in result["stdout_tail"]
+    assert written[0]["content"] and "tail error marker" in str(written[0]["content"])
+
+
 def test_head_tail_output_buffer_omits_middle() -> None:
     buffer = HeadTailOutputBuffer(max_chars=20)
     buffer.append("a" * 30)
@@ -2320,6 +2430,10 @@ def test_context_pressure_recommends_compaction_for_large_payload() -> None:
 
     assert pressure["compact_recommended"] is True
     assert {item["kind"] for item in pressure["suggestions"]} & {"narrow_file_context", "spill_tool_results", "compact_memory"}
+    assert pressure["schema"] == "grounded.context_pressure_snapshot.v2"
+    assert {"files", "tool_outputs", "memory", "diff", "skills", "checks", "prompt_contract", "full_payload"} <= set(pressure["sections"])
+    assert {item["code"] for item in pressure["recommendations"]} & {"avoid_broad_file_reads", "use_artifact_ref", "compact_memory_context"}
+    assert pressure["sections"]["files"]["top_contributors"][0]["label"] == "miniapp/app/main.py"
 
 
 def test_context_pressure_detects_duplicate_reads_from_transcript() -> None:
@@ -2359,6 +2473,8 @@ def test_context_pressure_detects_duplicate_reads_from_transcript() -> None:
     assert pressure["compact_recommended"] is True
     assert pressure["duplicate_file_reads"][0]["path"] == "miniapp/app/main.py"
     assert pressure["suggestions"][0]["kind"] == "avoid_duplicate_reads"
+    assert pressure["suggestions"][0]["code"] == "avoid_reread_files"
+    assert pressure["avoid_reread_files"][0]["path"] == "miniapp/app/main.py"
 
 
 def test_hook_manager_records_lifecycle_events() -> None:
@@ -2601,16 +2717,17 @@ def test_progress_reserves_ninety_percent_for_apply_not_repair() -> None:
     assert apply_progress >= 90
 
 
-def test_generation_modes_use_serial_contract_runtime_writes(monkeypatch) -> None:
+def test_quality_mode_uses_real_worker_branch_plan_by_default(monkeypatch) -> None:
     monkeypatch.delenv("GROUNDED_ENABLE_WORKER_BRANCHES", raising=False)
-    for mode in (GenerationMode.FAST, GenerationMode.BALANCED, GenerationMode.QUALITY):
+    plan = {"prompt_contract_v1": {"required": True, "entities": ["entity"], "flows": [{"roles": ["client"]}]}}
+    for mode in (GenerationMode.FAST, GenerationMode.BALANCED):
         mailbox = AgentWorkerManager.mailbox_for_plan(
             generation_mode=mode,
-            implementation_plan={"prompt_contract_v1": {"required": True, "entities": ["entity"], "flows": [{"roles": ["client"]}]}},
+            implementation_plan=plan,
         )
         prompt_payload = WorkspaceCodeAgentRuntime._worker_branching_prompt_payload(
             generation_mode=mode,
-            implementation_plan={"prompt_contract_v1": {"required": True, "entities": ["entity"], "flows": [{"roles": ["client"]}]}},
+            implementation_plan=plan,
         )
 
         assert mailbox["enabled"] is False
@@ -2618,25 +2735,37 @@ def test_generation_modes_use_serial_contract_runtime_writes(monkeypatch) -> Non
         assert mailbox["disabled_reason"]
         assert all(worker["status"] == "available_disabled" for worker in mailbox["workers"])  # type: ignore[index]
         assert prompt_payload["enabled"] is False
-        assert "GROUNDED_ENABLE_WORKER_BRANCHES" in prompt_payload["reason"]
-    monkeypatch.setenv("GROUNDED_ENABLE_WORKER_BRANCHES", "1")
     quality_mailbox = AgentWorkerManager.mailbox_for_plan(
         generation_mode=GenerationMode.QUALITY,
-        implementation_plan={"prompt_contract_v1": {"required": True, "entities": ["entity"], "flows": [{"roles": ["client"]}]}},
-    )
-    fast_mailbox = AgentWorkerManager.mailbox_for_plan(
-        generation_mode=GenerationMode.FAST,
-        implementation_plan={"prompt_contract_v1": {"required": True, "entities": ["entity"], "flows": [{"roles": ["client"]}]}},
+        implementation_plan=plan,
     )
     no_contract_mailbox = AgentWorkerManager.mailbox_for_plan(
         generation_mode=GenerationMode.QUALITY,
         implementation_plan={},
     )
     assert quality_mailbox["enabled"] is True
-    assert fast_mailbox["enabled"] is False
+    assert quality_mailbox["branch_schema"] == "grounded.worker_branch_plan.v2"
+    assert quality_mailbox["write_coordination"] == "parallel_owned_branches"
+    assert quality_mailbox["worker_groups"]["writer"] == [  # type: ignore[index]
+        "backend_api_worker",
+        "client_surface_worker",
+        "specialist_surface_worker",
+        "manager_surface_worker",
+        "test_verifier_worker",
+    ]
+    assert quality_mailbox["worker_groups"]["verifier"] == ["mobile_polish_worker"]  # type: ignore[index]
+    assert quality_mailbox["execution_stages"][0]["stage"] == "backend_contract"  # type: ignore[index]
     assert no_contract_mailbox["enabled"] is False
     assert any(worker["worker_id"] == "backend_api_worker" for worker in quality_mailbox["workers"])  # type: ignore[index]
+    assert any(worker["worker_id"] == "mobile_polish_worker" and worker["branch_role"] == "verifier" for worker in quality_mailbox["workers"])  # type: ignore[index]
     assert all(worker["alias_ids"] == [] for worker in quality_mailbox["workers"])  # type: ignore[index]
+    monkeypatch.setenv("GROUNDED_ENABLE_WORKER_BRANCHES", "0")
+    disabled_quality = AgentWorkerManager.mailbox_for_plan(
+        generation_mode=GenerationMode.QUALITY,
+        implementation_plan=plan,
+    )
+    assert disabled_quality["enabled"] is False
+    assert "GROUNDED_ENABLE_WORKER_BRANCHES=0" in disabled_quality["disabled_reason"]
 
 
 def test_hook_manager_records_context_and_blocks_forbidden_tool() -> None:
@@ -2651,6 +2780,90 @@ def test_hook_manager_records_context_and_blocks_forbidden_tool() -> None:
     assert blocked.should_block is True
     assert blocked.block_reason
     assert snapshot["counts"]["pre_tool_use:failed"] == 1
+
+
+def test_hook_policy_service_validates_and_evaluates_workspace_rules(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.json")
+    service = HookPolicyService(store)
+    report = service.update_workspace_policy(
+        "ws_1",
+        {
+            "policy_id": "workspace-test",
+            "rules": [
+                {
+                    "rule_id": "block_write",
+                    "conditions": {"hook": "pre_tool_use", "canonical_tool": "file.write"},
+                    "actions": [{"action": "block", "reason": "Writes are blocked in this workspace."}],
+                },
+                {
+                    "rule_id": "apply_context",
+                    "conditions": {"hook": "before_apply", "path_globs": ["miniapp/app/*.py"]},
+                    "actions": [{"action": "add_context", "text": "Review app route changes before apply.", "priority": 7, "target": "repair_turn"}],
+                },
+                {
+                    "rule_id": "secret_context",
+                    "conditions": {"hook": "before_apply"},
+                    "actions": [{"action": "add_context", "text": "sk-testsecret000000000000000000"}],
+                },
+            ],
+        },
+    )
+
+    blocked = service.evaluate(
+        HookContext(
+            hook="pre_tool_use",
+            workspace_id="ws_1",
+            run_id="run_1",
+            payload={"tool": "file.write", "model_tool": "write_file", "risk": "mutating"},
+        )
+    )
+    context = service.evaluate(
+        HookContext(
+            hook="before_apply",
+            workspace_id="ws_1",
+            run_id="run_1",
+            payload={"paths": ["miniapp/app/main.py"]},
+        )
+    )
+
+    assert report["validation_issues"][0]["code"] == "secret_like_content"
+    assert report["policy"]["rules"][2]["enabled"] is False
+    assert report["policy"]["rules"][2]["actions"][0]["text"] is None
+    assert blocked.should_block is True
+    assert blocked.block_reason == "Writes are blocked in this workspace."
+    assert blocked.matched_rules[0]["rule_id"] == "block_write"
+    assert [item.text for item in context.added_contexts] == ["Review app route changes before apply."]
+    assert all(item.source_rule_id != "secret_context" for item in context.added_contexts)
+
+
+def test_hook_manager_uses_configured_policy_in_snapshot(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.json")
+    service = HookPolicyService(store)
+    service.update_workspace_policy(
+        "ws_1",
+        {
+            "rules": [
+                {
+                    "rule_id": "protect_routes",
+                    "conditions": {"hook": "before_apply", "path_globs": ["miniapp/app/routes/*.py"]},
+                    "actions": [{"action": "block", "reason": "Route changes require manual review."}],
+                }
+            ]
+        },
+    )
+    manager = AgentHookManager(policy_service=service)
+
+    outcome = manager.run(
+        "run_1",
+        "before_apply",
+        payload={"workspace_id": "ws_1", "paths": ["miniapp/app/routes/orders.py"]},
+    )
+    snapshot = manager.snapshot("run_1")
+
+    assert outcome.should_block is True
+    assert outcome.block_reason == "Route changes require manual review."
+    assert snapshot["blocked_count"] == 1
+    assert snapshot["matched_rules"][0]["rule_id"] == "protect_routes"
 
 
 def test_worker_task_planner_builds_self_contained_owner_prompts() -> None:
@@ -2671,8 +2884,13 @@ def test_worker_task_planner_builds_self_contained_owner_prompts() -> None:
 
     assert "client_surface_worker" in by_id
     assert by_id["client_surface_worker"]["alias_ids"] == []
+    assert by_id["client_surface_worker"]["branch_role"] == "writer"
+    assert by_id["mobile_polish_worker"]["branch_role"] == "verifier"
+    assert by_id["mobile_polish_worker"]["isolated_branch"] is False
+    assert "blocker findings" in by_id["mobile_polish_worker"]["prompt"]
     assert "Own only these paths" in by_id["client_surface_worker"]["prompt"]
     assert "Forbidden paths" in by_id["client_surface_worker"]["prompt"]
+    assert "Branch role is writer" in by_id["client_surface_worker"]["prompt"]
     assert "Product task ledger slice" in by_id["client_surface_worker"]["prompt"]
     assert by_id["client_surface_worker"]["product_task_ledger_slice"][0]["id"] == "client.role_surface"
     assert by_id["backend_api_worker"]["product_task_ledger_slice"][0]["id"] == "shared_state.persistence_api"
@@ -2706,9 +2924,11 @@ def test_worker_runtime_prepares_isolated_drafts_and_merge_reports(tmp_path: Pat
     )
 
     assert prepared["enabled"] is True
+    assert prepared["schema"] == "grounded.worker_drafts.v2"
     assert len(prepared["workers"]) == 2  # type: ignore[arg-type]
     assert Path(prepared["workers"][0]["source_dir"]).exists()  # type: ignore[index]
     assert prepared["workers"][0]["agent_loop_ref"] == "worker_agent_loop:run_1:client_surface_worker"  # type: ignore[index]
+    assert prepared["workers"][0]["branch_policy"] == "isolated_draft_writer"  # type: ignore[index]
     assert report["status"] == "conflict"
 
     branch_results = runtime.record_branch_results(
@@ -2718,6 +2938,32 @@ def test_worker_runtime_prepares_isolated_drafts_and_merge_reports(tmp_path: Pat
 
     assert branch_results[0]["agent_loop"] == "branch_scoped"
     assert branch_results[0]["self_check"]["owned_paths_only"] is True  # type: ignore[index]
+
+
+def test_worker_merge_decisions_emit_repair_worker_packets() -> None:
+    packets = WorkspaceCodeAgentRuntime._repair_packets_from_worker_decisions(
+        [
+            {
+                "worker_id": "client_surface_worker",
+                "decision": "rejected",
+                "changed_files": ["miniapp/app/static/client/app.js"],
+                "blocked_paths": ["miniapp/app/static/client/app.js"],
+                "failure_reason": "conflicting owned diff",
+                "repair_worker_required": True,
+            },
+            {
+                "worker_id": "backend_api_worker",
+                "decision": "accepted",
+                "changed_files": ["miniapp/app/routes/api.py"],
+                "repair_worker_required": False,
+            },
+        ]
+    )
+
+    assert packets[0]["failure_class"] == "worker_merge"
+    assert packets[0]["failure_signature"] == "worker_merge.client_surface_worker.rejected"
+    assert packets[0]["target_files"] == ["miniapp/app/static/client/app.js"]
+    assert packets[0]["required_next_tool"] == "read_files"
 
 
 def test_worker_runtime_prepares_workspace_branch_run_ids(tmp_path: Path) -> None:
@@ -2744,7 +2990,9 @@ def test_worker_runtime_prepares_workspace_branch_run_ids(tmp_path: Path) -> Non
     )
 
     worker = prepared["workers"][0]  # type: ignore[index]
+    assert prepared["isolation"] == "workspace_draft_clone_per_worker"
     assert worker["branch_run_id"] == "run_main__worker__client_surface_worker"
+    assert worker["base_run_id"] == "run_main"
     assert Path(worker["source_dir"], "miniapp/app/static/client/app.js").exists()
 
 
@@ -2882,6 +3130,58 @@ def test_verification_worker_rejects_incomplete_browser_proof() -> None:
     assert report["status"] == "failed"
     assert "browser_proof_missing_roles" in issue_kinds
     assert "browser_proof_missing_persisted_marker" in issue_kinds
+
+
+def test_guardian_review_emits_blocker_findings_before_apply(tmp_path: Path) -> None:
+    draft = tmp_path / "draft"
+    target = draft / "miniapp/app/static/client/app.js"
+    target.parent.mkdir(parents=True)
+    target.write_text(
+        "const mockData = [{ name: 'John Doe' }];\n"
+        "export function render() { document.body.innerText = mockData[0].name; }\n",
+        encoding="utf-8",
+    )
+    execution = CheckExecutionRecord(
+        workspace_id="ws_1",
+        run_id="run_1",
+        changed_files=["miniapp/app/static/client/app.js"],
+        results=[
+            RunCheckResult(name="api_workflow_smoke", status="passed", details="ok", command="api"),
+            RunCheckResult(
+                name="browser_flow_smoke",
+                status="passed",
+                details="ok",
+                command="browser",
+                diagnostics={
+                    "roles_checked": ["client"],
+                    "ui_steps": [{"action": "open"}],
+                    "mobile_layout": {"status": "failed", "horizontal_overflow": True},
+                },
+            ),
+        ],
+        completed_at=utc_now(),
+    )
+
+    report = GuardianReview.review(
+        workspace_id="ws_1",
+        run_id="run_1",
+        draft_source=draft,
+        changed_files=["miniapp/app/static/client/app.js"],
+        latest_execution=execution,
+        acceptance_contract={"required": True, "flows": [{"id": "create_task"}], "features": {"workflow_update": True}},
+        implementation_plan={"primary_entities": ["task"]},
+        target_role_scope=["client", "specialist", "manager"],
+        intent="create",
+    ).model_dump(mode="json", by_alias=True)
+
+    codes = {finding["code"] for finding in report["findings"]}
+    assert report["schema"] == "grounded.guardian_review.v1"
+    assert report["status"] == "failed"
+    assert "guardian.seeded_mock_data.mock_or_seed_named_data" in codes
+    assert "guardian.mobile_overflow" in codes
+    assert "guardian.role_workflow_missing_browser_roles" in codes
+    assert "guardian.missing_acceptance_tests" in codes
+    assert "guardian.weak_persistence_missing_browser_marker" in codes
 
 
 def test_check_orchestrator_selects_full_create_gate() -> None:

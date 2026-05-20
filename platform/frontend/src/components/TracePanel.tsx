@@ -1,15 +1,17 @@
-import type { RunCompactionBoundaries, RunCompactionReport, RunProtocolReport, RunRepairCase, RunRepairCases, RunTraceView, TraceBundleReport, TraceBundleState } from "../lib/api";
+import type { ContextPressureReport, OutputArtifactIndex, RunCompactionBoundaries, RunCompactionReport, RunProtocolReport, RunRepairCase, RunRepairCases, RunTraceView, TraceBundleReport, TraceBundleState } from "../lib/api";
 
 type TracePanelProps = {
   trace: RunTraceView | null;
   traceBundle: TraceBundleReport | null;
   protocol: RunProtocolReport | null;
   compaction: RunCompactionReport | null;
+  contextPressure: ContextPressureReport | null;
   compactionBoundaries: RunCompactionBoundaries | null;
+  outputArtifacts: OutputArtifactIndex | null;
   repairCases: RunRepairCases | null;
 };
 
-export function TracePanel({ trace, traceBundle, protocol, compaction, compactionBoundaries, repairCases }: TracePanelProps) {
+export function TracePanel({ trace, traceBundle, protocol, compaction, contextPressure, compactionBoundaries, outputArtifacts, repairCases }: TracePanelProps) {
   if (!trace) {
     return (
       <div className="workbench-panel">
@@ -34,6 +36,22 @@ export function TracePanel({ trace, traceBundle, protocol, compaction, compactio
   const compactBoundaries = compactionBoundaries?.items || bundleState.compact_boundaries || [];
   const compactionSections = compaction?.sections || {};
   const microcompacts = (compactionSections.microcompacts as Array<Record<string, unknown>> | undefined) || [];
+  const outputArtifactItems = (outputArtifacts?.items || []) as Array<Record<string, unknown>>;
+  const compactPressure = (compactionSections.context_pressure as Record<string, unknown> | undefined) || {};
+  const pressureLatest = (contextPressure?.latest || compactPressure) as Record<string, unknown>;
+  const pressureSections = Object.values(
+    ((contextPressure?.sections || pressureLatest.sections || {}) as Record<string, Record<string, unknown>>)
+  );
+  const pressureRecommendations = (
+    contextPressure?.recommendations || (pressureLatest.recommendations as Array<Record<string, unknown>> | undefined) || []
+  ) as Array<Record<string, unknown>>;
+  const microcompactCandidates = (
+    contextPressure?.microcompact_candidates || (pressureLatest.microcompact_candidates as Array<Record<string, unknown>> | undefined) || []
+  ) as Array<Record<string, unknown>>;
+  const avoidRereadFiles = (
+    contextPressure?.avoid_reread_files || (pressureLatest.avoid_reread_files as Array<Record<string, unknown>> | undefined) || []
+  ) as Array<Record<string, unknown>>;
+  const compactBoundary = (contextPressure?.compact_boundary || pressureLatest.compact_boundary || {}) as Record<string, unknown>;
   const postCompactRef = compaction?.post_compact_message_ref || String(compaction?.refs?.post_compact_message_ref || "");
   const postCompactStatus = compaction?.post_compact_status || "missing";
   const sectionCount = Object.keys(compactionSections).length;
@@ -184,11 +202,11 @@ export function TracePanel({ trace, traceBundle, protocol, compaction, compactio
             <span>boundaries</span>
           </div>
           <div>
-            <strong>{microcompacts.length}</strong>
-            <span>micro</span>
+            <strong>{microcompacts.length + outputArtifactItems.length}</strong>
+            <span>outputs</span>
           </div>
           <div>
-            <strong>{String((compactionSections.context_pressure as Record<string, unknown> | undefined)?.pressure_ratio ?? "n/a")}</strong>
+            <strong>{String(pressureLatest.pressure_ratio ?? "n/a")}</strong>
             <span>pressure</span>
           </div>
           <div>
@@ -220,9 +238,92 @@ export function TracePanel({ trace, traceBundle, protocol, compaction, compactio
             ))}
           </div>
         ) : null}
+        {outputArtifactItems.length ? (
+          <div className="run-detail-list compact">
+            {outputArtifactItems.slice(0, 4).map((item) => (
+              <div className="run-detail-item" key={`output-artifact-${String(item.ref || item.artifact_id)}`}>
+                <strong>{String(item.stream || "output")} · {String(item.chars || 0)} chars</strong>
+                <span>{String(item.ref || item.artifact_id || "")}</span>
+              </div>
+            ))}
+          </div>
+        ) : null}
         {(compactionSections.next_repair_action as Record<string, unknown> | undefined) ? (
           <p className="muted">Next repair: {String((compactionSections.next_repair_action as Record<string, unknown>).failure_signature || (compactionSections.next_repair_action as Record<string, unknown>).required_next_tool || "recorded")}</p>
         ) : null}
+      </div>
+      <div className="workbench-panel">
+        <div className="workbench-panel-header">
+          <strong>Context Pressure</strong>
+          <span>{contextPressure?.status || (pressureLatest.pressure_ratio ? "legacy" : "missing")}</span>
+        </div>
+        <div className="trace-bundle-grid">
+          <div>
+            <strong>{String(pressureLatest.total_tokens_estimate ?? "0")}</strong>
+            <span>tokens</span>
+          </div>
+          <div>
+            <strong>{String(pressureLatest.pressure_ratio ?? "n/a")}</strong>
+            <span>ratio</span>
+          </div>
+          <div>
+            <strong>{pressureRecommendations.length}</strong>
+            <span>recs</span>
+          </div>
+          <div>
+            <strong>{microcompactCandidates.length}</strong>
+            <span>artifact refs</span>
+          </div>
+          <div>
+            <strong>{avoidRereadFiles.length}</strong>
+            <span>no reread</span>
+          </div>
+          <div>
+            <strong>{compactBoundary.recommended ? "near" : "ok"}</strong>
+            <span>boundary</span>
+          </div>
+        </div>
+        {pressureSections.length ? (
+          <div className="run-detail-list compact">
+            {pressureSections
+              .slice()
+              .sort((left, right) => Number(right.tokens || 0) - Number(left.tokens || 0))
+              .slice(0, 6)
+              .map((section) => (
+                <div className="run-detail-item" key={`pressure-section-${String(section.key || section.label)}`}>
+                  <strong>{String(section.label || section.key || "section")}</strong>
+                  <span>{String(section.tokens || 0)} tokens</span>
+                </div>
+              ))}
+          </div>
+        ) : null}
+        {pressureRecommendations.length ? (
+          <div className="run-detail-list compact">
+            {pressureRecommendations.slice(0, 5).map((item, index) => (
+              <div className="run-detail-item" key={`pressure-rec-${index}`}>
+                <strong>{String(item.code || item.action || "recommendation")}</strong>
+                <span>{String(item.message || "")}</span>
+              </div>
+            ))}
+          </div>
+        ) : null}
+        {microcompactCandidates.length || avoidRereadFiles.length ? (
+          <div className="run-detail-list compact">
+            {microcompactCandidates.slice(0, 3).map((item, index) => (
+              <div className="run-detail-item" key={`pressure-micro-${index}`}>
+                <strong>{String(item.tool || "tool output")}</strong>
+                <span>{String(item.microcompact_ref || item.artifact_ref || "use artifact ref")}</span>
+              </div>
+            ))}
+            {avoidRereadFiles.slice(0, 4).map((item) => (
+              <div className="run-detail-item" key={`pressure-file-${String(item.path)}`}>
+                <strong>avoid re-read</strong>
+                <span>{String(item.path || "")}</span>
+              </div>
+            ))}
+          </div>
+        ) : null}
+        {compactBoundary.message ? <p className="muted">{String(compactBoundary.message)}</p> : null}
       </div>
       <div className="workbench-panel">
         <div className="workbench-panel-header">

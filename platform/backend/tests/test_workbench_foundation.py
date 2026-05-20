@@ -13,8 +13,12 @@ from fastapi.testclient import TestClient
 from app.core.config import get_settings
 from app.main import create_app
 from app.models.common import GenerationMode
+from app.models.context_pressure import ContextPressureReport
 from app.models.domain import CreateRunRequest, GenerateRequest, JobRecord, PreviewRecord, RunCheckResult, RunRecord
 from app.models.event_journal import EventJournalPage, RunJournalState, ThreadJournalState
+from app.models.memory import MemoryRetrievalResult
+from app.models.output_artifacts import CommandOutputArtifact, OutputArtifactIndex
+from app.models.prompt_suggestions import PromptSuggestionsReport
 from app.models.workbench import (
     GateReport,
     RepairAttemptsReport,
@@ -62,6 +66,30 @@ def test_explicit_host_data_dir_env_still_overrides_data_dir(tmp_path: Path, mon
 
     assert settings.data_dir == tmp_path / "data"
     assert settings.host_data_dir == host_dir
+
+
+def test_model_manager_reports_status_cache_and_fallbacks(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_CODE_AGENT_TURN_FALLBACK_MODELS", "gpt-test-fallback")
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+
+    config = client.get("/system/configuration").json()
+    status = client.get("/system/models").json()
+    cached = app.state.container.store.get("reports", "model_catalog_cache:v1")
+    route = app.state.container.model_manager_service.select(
+        role="agent_turn",
+        model_profile="research_balanced",
+        generation_mode="balanced",
+    )
+
+    assert config["llm"]["enabled"] is True
+    assert config["llm"]["provider"] == "openai"
+    assert config["llm"]["model_manager"]["schema"] == "grounded.model_manager.v1"
+    assert status["providers"]["openai"]["status"] == "ready"
+    assert status["catalog_cache"]["offline_usable"] is True
+    assert cached["schema"] == "grounded.model_catalog_cache.v1"
+    assert any(candidate.model == "gpt-test-fallback" for candidate in route.candidates)
 
 
 def test_tool_protocol_normalizes_aliases() -> None:
@@ -364,7 +392,22 @@ def test_policy_simulation_endpoint_returns_matched_rules(tmp_path: Path) -> Non
     assert response["matched_rules"]
     assert response["selected_decision"] == "forbidden"
     assert response["policy_file"]["status"] == "loaded"
-    assert any(item["name"] == "exec_policy" for item in doctor["checks"])
+    check_names = {item["name"] for item in doctor["checks"]}
+    assert "exec_policy" in check_names
+    assert {
+        "docker_daemon",
+        "playwright_browsers",
+        "model_access",
+        "writable_dirs",
+        "disk_space",
+        "template_hash",
+        "preview_port_range",
+        "runtime_policy_files",
+    }.issubset(check_names)
+    template_hash = next(item for item in doctor["checks"] if item["name"] == "template_hash")
+    disk_space = next(item for item in doctor["checks"] if item["name"] == "disk_space")
+    assert "sha256=" in template_hash["details"]
+    assert "free=" in disk_space["details"]
 
 
 def test_background_tasks_crud_output_stop_retry_and_run_lane(tmp_path: Path) -> None:
@@ -499,6 +542,54 @@ def test_background_task_generate_product_links_created_run(tmp_path: Path) -> N
     assert task["linked_refs"]["run_id"] == task["run_id"]
 
 
+def test_hook_policy_apis_validate_store_and_evaluate(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Hook Workspace",
+            "description": "Hook policy endpoint test",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+
+    manifest = client.get("/system/policies/hooks").json()
+    stored = client.put(
+        f"/workspaces/{workspace['workspace_id']}/hooks",
+        json={
+            "policy_id": "workspace-hooks",
+            "rules": [
+                {
+                    "rule_id": "block_shell",
+                    "conditions": {"hook": "pre_tool_use", "canonical_tool": "shell.exec"},
+                    "actions": [{"action": "block", "reason": "Shell is disabled for this workspace."}],
+                },
+                {
+                    "rule_id": "bad_secret",
+                    "conditions": {"hook": "before_apply"},
+                    "actions": [{"action": "add_context", "text": "ghp_abcdefghijklmnopqrstuvwxyz123456"}],
+                },
+            ],
+        },
+    ).json()
+    fetched = client.get(f"/workspaces/{workspace['workspace_id']}/hooks").json()
+    evaluation = client.post(
+        f"/workspaces/{workspace['workspace_id']}/hooks/evaluate",
+        json={"hook": "pre_tool_use", "payload": {"tool": "shell.exec", "model_tool": "run_command", "risk": "network"}},
+    ).json()
+
+    assert manifest["schema"] == "grounded.hook_policy_manifest.v1"
+    assert "pre_tool_use" in manifest["supported_hooks"]
+    assert stored["workspace_id"] == workspace["workspace_id"]
+    assert stored["validation_issues"][0]["code"] == "secret_like_content"
+    assert fetched["policy"]["policy_id"] == "workspace-hooks"
+    assert evaluation["should_block"] is True
+    assert evaluation["block_reason"] == "Shell is disabled for this workspace."
+    assert evaluation["matched_rules"][0]["rule_id"] == "block_shell"
+
+
 def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
     app = create_app(data_dir=tmp_path)
     client = TestClient(app)
@@ -518,10 +609,105 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
         intent="create",
         target_role_scope=["client", "specialist", "manager"],
         model_profile="test",
+        implementation_plan={"primary_entities": ["workflow"]},
+        acceptance_contract={"roles": ["client", "specialist", "manager"]},
         linked_job_id=None,
     )
     run.worker_mailbox_ref = f"worker_mailbox:{workspace['workspace_id']}:{run.run_id}"
+    run.context_pressure_ref = f"context_pressure:{workspace['workspace_id']}:{run.run_id}"
     app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+    pressure_snapshot = {
+        "schema": "grounded.context_pressure_snapshot.v2",
+        "total_tokens_estimate": 88000,
+        "context_window_tokens": 128000,
+        "pressure_ratio": 0.6875,
+        "sections": {
+            "tool_outputs": {
+                "key": "tool_outputs",
+                "label": "Tool outputs",
+                "tokens": 24000,
+                "ratio": 0.1875,
+                "budget_tokens": 19200,
+                "top_contributors": [{"label": "run_command", "tokens": 24000, "section": "tool_outputs"}],
+            }
+        },
+        "section_tokens": {"tool_outputs": 24000, "full_payload": 88000},
+        "recommendations": [
+            {
+                "code": "use_artifact_ref",
+                "message": "Tool outputs are large; use artifact or microcompact refs instead of raw stdout/stderr.",
+                "section": "tool_outputs",
+                "severity": "warning",
+                "tokens": 24000,
+                "action": "use_artifact_ref",
+                "microcompact_ref": "microcompact:ws:run:digest",
+                "paths": [],
+                "metadata": {},
+            }
+        ],
+        "suggestions": [],
+        "microcompact_candidates": [
+            {
+                "tool": "run_command",
+                "status": "completed",
+                "original_chars": 96000,
+                "tokens_estimate": 24000,
+                "microcompact_ref": "microcompact:ws:run:digest",
+                "artifact_ref": "microcompact:ws:run:digest",
+                "digest": "digest",
+                "reason": "existing_microcompact_ref",
+            }
+        ],
+        "avoid_reread_files": [],
+        "duplicate_file_reads": [],
+        "duplicate_read_token_estimate": 0,
+        "compact_boundary": {
+            "recommended": False,
+            "pressure_ratio": 0.6875,
+            "threshold": 0.8,
+            "message": "Context is below compact boundary.",
+            "boundary_ref": None,
+            "reason": None,
+        },
+        "compact_recommended": True,
+        "created_at": "2026-01-01T00:00:00+00:00",
+    }
+    app.state.container.store.upsert(
+        "reports",
+        run.context_pressure_ref,
+        {
+            "schema": "grounded.context_pressure.v2",
+            "workspace_id": workspace["workspace_id"],
+            "run_id": run.run_id,
+            "status": "ready",
+            "latest": pressure_snapshot,
+            "items": [pressure_snapshot],
+            "sections": pressure_snapshot["sections"],
+            "recommendations": pressure_snapshot["recommendations"],
+            "microcompact_candidates": pressure_snapshot["microcompact_candidates"],
+            "avoid_reread_files": [],
+            "compact_boundary": pressure_snapshot["compact_boundary"],
+            "updated_at": pressure_snapshot["created_at"],
+        },
+    )
+    output_artifact = app.state.container.output_artifact_service.store_command_output(
+        workspace_id=workspace["workspace_id"],
+        run_id=run.run_id,
+        process_id="proc_test",
+        stream="stdout",
+        command="rg workflow miniapp/app",
+        content="workflow head\n" + ("middle\n" * 200) + "workflow tail error\n",
+        head_tail={
+            "head": "workflow head\n",
+            "tail": "workflow tail error\n",
+            "excerpt": "workflow head\n...[omitted 1200 chars]...\nworkflow tail error\n",
+            "total_chars": 1420,
+            "omitted_chars": 1200,
+            "chunk_count": 1,
+        },
+        exit_code=1,
+        semantic_status="failed",
+    )
     app.state.container.store.upsert(
         "reports",
         run.worker_mailbox_ref,
@@ -573,6 +759,7 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
     )
 
     policy = client.get("/system/policies/exec").json()
+    dynamic_tools = client.get("/system/tools/dynamic").json()
     evaluation = client.post(
         f"/workspaces/{workspace['workspace_id']}/policy/evaluate-command",
         json={"command": "rg workflow miniapp/app"},
@@ -584,7 +771,10 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
     protocol = client.get(f"/runs/{run.run_id}/protocol").json()
     bookmarks = client.get(f"/runs/{run.run_id}/bookmarks").json()
     compaction = client.get(f"/runs/{run.run_id}/compaction").json()
+    context_pressure = client.get(f"/runs/{run.run_id}/context-pressure").json()
     compaction_boundaries = client.get(f"/runs/{run.run_id}/compaction/boundaries").json()
+    output_artifacts = client.get(f"/runs/{run.run_id}/output-artifacts").json()
+    output_artifact_detail = client.get(f"/runs/{run.run_id}/output-artifacts/{output_artifact['artifact_id']}").json()
     tasks = client.get(f"/runs/{run.run_id}/tasks").json()
     run_events = client.get(f"/runs/{run.run_id}/events").json()
     run_events_v2 = client.get(f"/runs/{run.run_id}/events-v2").json()
@@ -597,7 +787,21 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
     extracted_memory = client.post(f"/runs/{run.run_id}/memory/extract").json()
     memory_pipeline = client.get(f"/workspaces/{workspace['workspace_id']}/memory/pipeline").json()
     consolidated_memory = client.post(f"/workspaces/{workspace['workspace_id']}/memory/consolidate").json()
+    retrieved_memory = client.post(
+        f"/workspaces/{workspace['workspace_id']}/memory/retrieve",
+        json={"prompt": "dense operational workflow UI", "top_k": 5},
+    ).json()
     skills = client.get("/skills").json()
+    skill_manifest = client.get("/system/skills/manifest").json()
+    skill_evaluation = client.post(
+        "/skills/evaluate",
+        json={
+            "prompt": "Build telegram app with browser proof",
+            "intent": "create",
+            "generation_mode": "quality",
+            "paths": ["miniapp/app/static/client/app.js"],
+        },
+    ).json()
     workers = client.get(f"/runs/{run.run_id}/workers").json()
     worker_context = client.get(f"/runs/{run.run_id}/workers/backend_api_worker/context").json()
     worker_memory = client.get(f"/runs/{run.run_id}/workers/backend_api_worker/memory").json()
@@ -607,7 +811,9 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
     lsp = client.get(f"/workspaces/{workspace['workspace_id']}/diagnostics/lsp").json()
     lsp_symbols = client.get(f"/workspaces/{workspace['workspace_id']}/lsp/symbol-context?q=app").json()
     lsp_refs = client.get(f"/workspaces/{workspace['workspace_id']}/lsp/references?symbol=app").json()
+    lsp_definition = client.get(f"/workspaces/{workspace['workspace_id']}/lsp/definition?symbol=app").json()
     lsp_route_context = client.get(f"/workspaces/{workspace['workspace_id']}/lsp/route-static-context").json()
+    lsp_route_graph = client.get(f"/workspaces/{workspace['workspace_id']}/lsp/route-graph").json()
     thread = client.post("/threads", json={"workspace_id": workspace["workspace_id"], "title": "Workbench Thread"}).json()
     thread_snapshot = client.get(f"/threads/{thread['thread_id']}").json()
     thread_events_v2 = client.get(f"/threads/{thread['thread_id']}/events-v2").json()
@@ -630,6 +836,9 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
     ).json()
 
     assert policy["tool_protocol_version"] == TOOL_PROTOCOL_VERSION
+    assert policy["tool_registry"]["router"]["dynamic_tool_discovery"]["default_visible_tool"] == "tool_search"
+    assert dynamic_tools["schema"] == "grounded.dynamic_tool_catalog.v1"
+    assert {"deploy", "browser", "database", "payments", "cms", "github", "vercel"}.issubset(set(dynamic_tools["domains"]))
     assert evaluation["decision"]["action"] == "allow"
     RunTimelineReport.model_validate(timeline)
     RunTraceViewReport.model_validate(trace)
@@ -638,6 +847,9 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
     RunProtocolReport.model_validate(protocol)
     RunBookmarksReport.model_validate(bookmarks)
     RunEventsReport.model_validate(run_events)
+    ContextPressureReport.model_validate(context_pressure)
+    OutputArtifactIndex.model_validate(output_artifacts)
+    CommandOutputArtifact.model_validate(output_artifact_detail)
     EventJournalPage.model_validate(run_events_v2)
     EventJournalPage.model_validate(thread_events_v2)
     RunJournalState.model_validate(run_journal_state)
@@ -649,7 +861,13 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
     assert protocol["schema"] == "grounded.run_protocol.v1"
     assert bookmarks["schema"] == "grounded.run_bookmarks.v1"
     assert compaction["schema"] == "grounded.run_compaction.v1"
+    assert context_pressure["schema"] == "grounded.context_pressure.v2"
+    assert context_pressure["recommendations"][0]["code"] == "use_artifact_ref"
+    assert context_pressure["microcompact_candidates"][0]["microcompact_ref"]
     assert compaction_boundaries["schema"] == "grounded.run_compaction_boundaries.v1"
+    assert output_artifacts["schema"] == "grounded.output_artifact_index.v1"
+    assert output_artifacts["items"][0]["ref"] == output_artifact["ref"]
+    assert output_artifact_detail["head_tail"]["tail"].strip() == "workflow tail error"
     assert tasks["schema"] == "grounded.run_tasks.v1"
     assert run_events["schema"] == "grounded.run_events.v1"
     assert run_events_v2["schema"] == "grounded.event_journal_page.v2"
@@ -657,10 +875,21 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
     assert doctor["checks"]
     assert memory["items"][0]["text"] == "Use dense operational UI."
     assert extracted_memory["schema"] == "grounded.memory_stage1.v1"
+    assert extracted_memory["items"][0]["fingerprint"]
     assert memory_pipeline["schema"] == "grounded.memory_pipeline.v1"
+    assert memory_pipeline["phase1"]["raw_count"] >= len(extracted_memory["items"])
+    assert memory_pipeline["phase2"]["retrieval_schema"] == "grounded.memory_retrieval.v1"
     assert consolidated_memory["pipeline"]["schema"] == "grounded.memory_pipeline.v1"
+    MemoryRetrievalResult.model_validate(retrieved_memory)
+    assert retrieved_memory["schema"] == "grounded.memory_retrieval.v1"
+    assert retrieved_memory["hits"][0]["selection_reason"]
+    assert skills["schema"] == "grounded.skills.v2"
     assert any(item["id"] == "state-workflow" for item in skills["items"])
     assert any(item["id"] == "role-surfaces" for item in skills["items"])
+    assert skill_manifest["schema"] == "grounded.skill_registry_manifest.v1"
+    assert skill_manifest["scopes"]["repo"] >= 1
+    assert skill_evaluation["schema"] == "grounded.skill_search.v2"
+    assert skill_evaluation["effective"]["allowedTools"]
     assert workers["schema"] == "grounded.product_workers.v1"
     assert any(item["worker_id"] == "backend_api_worker" and item["alias_ids"] == [] for item in workers["workers"])
     assert any(item["status"] == "available_disabled" for item in workers["workers"])
@@ -671,10 +900,15 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
     assert any(item["rule_id"] == "block_destructive" for item in permissions["items"])
     assert lsp["status"] in {"passed", "failed"}
     assert lsp["schema"] == "grounded.lsp_diagnostics.v1"
+    assert lsp["engine"] == "grounded.lsp.v2"
+    assert lsp["diagnostic_stream"]
+    assert lsp["route_graph"]["schema"] == "grounded.lsp_route_graph.v1"
     assert "jump" in lsp["items"][0] if lsp["items"] else True
     assert lsp_symbols["schema"] == "grounded.lsp_symbol_context.v1"
     assert lsp_refs["schema"] == "grounded.lsp_find_references.v1"
+    assert lsp_definition["schema"] == "grounded.lsp_definition.v1"
     assert lsp_route_context["schema"] == "grounded.lsp_route_static_context.v1"
+    assert lsp_route_graph["schema"] == "grounded.lsp_route_graph.v1"
     assert thread_snapshot["thread"]["thread_id"] == thread["thread_id"]
     assert thread_events_v2["items"][0]["event_type"] == "thread.started"
     assert thread_journal_state["event_count"] >= 1
@@ -1639,6 +1873,124 @@ def test_review_report_prioritizes_acceptance_blockers_with_locations(tmp_path: 
     assert repair_cases["items"]
     assert any(item["source"] == "review" for item in repair_cases["items"])
     assert any("miniapp/app/static/client/app.js" in item["target_files"] for item in repair_cases["items"])
+
+
+def test_prompt_suggestions_are_product_specific_followups(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Prompt Suggestions Workspace",
+            "description": "Prompt suggestions shape",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    run = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Build an order intake product with client, specialist, and manager list views",
+        intent="create",
+        target_role_scope=["client", "specialist", "manager"],
+        model_profile="test",
+        status="completed",
+        apply_status="applied",
+        touched_files=[
+            "miniapp/app/static/client/app.js",
+            "miniapp/app/static/specialist/app.js",
+            "miniapp/app/static/manager/app.js",
+        ],
+        acceptance_contract={"required": True, "flows": [{"name": "Order intake"}]},
+        implementation_plan={"primary_entities": ["order"], "roles": ["client", "specialist", "manager"]},
+    )
+    app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+    app.state.container.store.upsert(
+        "reports",
+        f"run_artifacts:{run.run_id}",
+        {
+            "diff": "\n".join(
+                [
+                    "diff --git a/miniapp/app/static/manager/app.js b/miniapp/app/static/manager/app.js",
+                    "+++ b/miniapp/app/static/manager/app.js",
+                    "+renderOrderList(orders)",
+                ]
+            ),
+            "check_results": [{"name": "browser_flow_smoke", "status": "passed", "details": "ok"}],
+        },
+    )
+
+    response = client.get(f"/runs/{run.run_id}/prompt-suggestions")
+    payload = response.json()
+    typed = PromptSuggestionsReport.model_validate(payload)
+    categories = {item.category for item in typed.items}
+    prompts = "\n".join(item.prompt for item in typed.items).lower()
+
+    assert response.status_code == 200
+    assert payload["schema"] == "grounded.prompt_suggestions.v1"
+    assert typed.status == "ready"
+    assert {"status_workflow", "manager_dashboard", "export", "empty_state"}.issubset(categories)
+    assert "order" in prompts
+    assert all(item.suggestion_id.startswith("ps_") for item in typed.items)
+
+
+def test_guardian_review_blocks_staged_apply_with_blocker_findings(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Guardian Apply Workspace",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    workspace_id = workspace["workspace_id"]
+    run = RunRecord(
+        workspace_id=workspace_id,
+        prompt="Build a persisted role workflow",
+        intent="create",
+        target_role_scope=["client", "specialist", "manager"],
+        status="awaiting_approval",
+        apply_status="awaiting_approval",
+        draft_status="ready",
+        draft_ready=True,
+        acceptance_contract={"required": True, "flows": [{"id": "create_task"}], "features": {"workflow_update": True}},
+        implementation_plan={"primary_entities": ["task"]},
+        touched_files=["miniapp/app/static/client/app.js"],
+    )
+    app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+    draft_source = app.state.container.workspace_service.prepare_draft(workspace_id, run.run_id)
+    target = draft_source / "miniapp/app/static/client/app.js"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("const mockData = [{ name: 'John Doe' }];\n", encoding="utf-8")
+    app.state.container.store.upsert(
+        "reports",
+        f"run_artifacts:{run.run_id}",
+        {
+            "diff": "diff --git a/miniapp/app/static/client/app.js b/miniapp/app/static/client/app.js\n",
+            "check_results": [
+                {"name": "api_workflow_smoke", "status": "passed", "details": "ok", "logs": []},
+                {
+                    "name": "browser_flow_smoke",
+                    "status": "passed",
+                    "details": "ok",
+                    "logs": [],
+                    "diagnostics": {"roles_checked": ["client", "specialist", "manager"], "ui_steps": [{"action": "open"}]},
+                },
+                {"name": "generated_app_js_tests", "status": "passed", "details": "ok", "logs": []},
+            ],
+        },
+    )
+
+    response = client.post(f"/runs/{run.run_id}/apply/staged")
+
+    assert response.status_code == 200
+    payload = response.json()
+    guardian = app.state.container.store.get("reports", f"guardian_review:{workspace_id}:{run.run_id}")
+    assert payload["status"] == "blocked"
+    assert payload["apply_status"] == "blocked"
+    assert guardian["status"] == "failed"
+    assert any(item["category"] == "seeded_mock_data" for item in guardian["findings"])
 
 
 def test_repair_case_service_blocks_repeated_patch_attempts(tmp_path: Path) -> None:
@@ -2685,3 +3037,139 @@ def test_structured_thread_compaction_contains_workbench_fields(tmp_path: Path) 
     assert summary["current_file_focus"] == ["miniapp/app/main.py"]
     assert summary["known_failures"] == ["example verification failure"]
     assert summary["unresolved_approvals"][0]["approval_id"] == "appr_test"
+
+
+def test_webhook_contracts_support_idempotent_sdk_management(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={"name": "SDK hooks", "description": "typed sdk", "target_platform": "telegram_mini_app"},
+    ).json()
+    payload = {
+        "url": "https://example.com/grounded-webhook",
+        "events": ["run.completed", "check.failed"],
+        "workspace_id": workspace["workspace_id"],
+        "metadata": {"owner": "sdk"},
+        "secret": "local-signing-secret",
+    }
+
+    created = client.post("/webhooks", json=payload, headers={"Idempotency-Key": "sdk-webhook-1"})
+    duplicate = client.post("/webhooks", json={**payload, "description": "ignored duplicate"}, headers={"Idempotency-Key": "sdk-webhook-1"})
+    listed = client.get("/webhooks", params={"workspace_id": workspace["workspace_id"]}).json()
+    detail = client.get(f"/webhooks/{created.json()['webhook_id']}").json()
+    delivery = client.post(
+        f"/webhooks/{created.json()['webhook_id']}/test",
+        json={"event_type": "run.completed", "payload": {"run_id": "run_sdk"}},
+    ).json()
+    invalid_secret = client.post(
+        "/webhooks",
+        json={"url": "https://example.com/hook", "events": ["run.completed"], "metadata": {"api_token": "hidden"}},
+    )
+    openapi = client.get("/openapi.json").json()
+
+    assert created.status_code == 200
+    assert duplicate.json()["webhook_id"] == created.json()["webhook_id"]
+    assert created.json()["secret_configured"] is True
+    assert "secret_sha256" not in created.json()
+    assert listed["schema"] == "grounded.webhooks.v1"
+    assert listed["items"][0]["webhook_id"] == created.json()["webhook_id"]
+    assert detail["metadata"] == {"owner": "sdk"}
+    assert delivery["status"] == "simulated"
+    assert delivery["payload_preview"]["run_id"] == "run_sdk"
+    assert invalid_secret.status_code == 400
+    assert "WebhookSubscription" in openapi["components"]["schemas"]
+
+
+def test_observability_report_tracks_cost_latency_green_rate_and_repairs(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={"name": "Observability", "description": "metrics", "target_platform": "telegram_mini_app"},
+    ).json()
+    green_run = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Build a green app",
+        intent="create",
+        generation_mode="balanced",
+        target_role_scope=["client"],
+        model_profile="test",
+        llm_model="gpt-5.4-mini",
+        status="completed",
+        apply_status="applied",
+        checks_summary={"validators": "passed", "build": "passed", "preview": "passed", "gate_status": "passed", "issues": []},
+        token_usage={"input_tokens": 1000, "output_tokens": 500, "reasoning_tokens": 100, "total_tokens": 1500, "turn_count": 2},
+        latency_breakdown={"agent_total_ms": 1200, "checks_ms": 300},
+    )
+    failed_run = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Build a failing app",
+        intent="create",
+        generation_mode="quality",
+        target_role_scope=["client"],
+        model_profile="test",
+        llm_model="gpt-5.4-mini",
+        status="failed",
+        failure_class="browser_flow_smoke",
+        failure_reason="button did not navigate",
+        checks_summary={"validators": "passed", "build": "passed", "preview": "failed", "gate_status": "failed", "issues": []},
+        token_usage={"input_tokens": 2000, "output_tokens": 1000, "total_tokens": 3000, "turn_count": 3},
+        latency_breakdown={"agent_total_ms": 2400, "preview_ms": 900},
+    )
+    fix_run = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Fix the failing app",
+        mode="fix",
+        intent="edit",
+        generation_mode="fast",
+        target_role_scope=["client"],
+        model_profile="test",
+        llm_model="gpt-5.4-mini",
+        status="completed",
+        apply_status="applied",
+        checks_summary={"validators": "passed", "build": "passed", "preview": "passed", "gate_status": "passed", "issues": []},
+        token_usage={"input_tokens": 800, "output_tokens": 400, "total_tokens": 1200, "turn_count": 1},
+        latency_breakdown={"agent_total_ms": 800},
+        repair_iterations=[{"status": "passed"}],
+    )
+    for run in (green_run, failed_run, fix_run):
+        app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+    case_ref = f"repair_case:{workspace['workspace_id']}:{failed_run.run_id}:case_1"
+    app.state.container.store.upsert(
+        "reports",
+        f"repair_cases:{failed_run.run_id}",
+        {"schema": "grounded.repair_cases.v1", "run_id": failed_run.run_id, "case_refs": [case_ref]},
+    )
+    app.state.container.store.upsert(
+        "reports",
+        case_ref,
+        {
+            "schema": "grounded.repair_case.v1",
+            "workspace_id": workspace["workspace_id"],
+            "run_id": failed_run.run_id,
+            "case_id": "case_1",
+            "status": "resolved",
+            "attempts": [{"attempt_id": "attempt_1", "status": "passed"}],
+            "updated_at": "2026-05-20T00:00:00+00:00",
+        },
+    )
+
+    report = client.get("/system/metrics/summary").json()
+    scoped = client.get(f"/workspaces/{workspace['workspace_id']}/observability").json()
+    openapi = client.get("/openapi.json").json()
+
+    assert report["schema"] == "grounded.observability.v1"
+    assert report["run_count"] == 3
+    assert report["completed_runs"] == 2
+    assert report["token_usage_total"] == 5700
+    assert report["token_usage"]["input_tokens"] == 3800
+    assert report["cost"]["estimated_cost_usd"] > 0
+    assert report["latency"]["p95_ms"] >= 1200
+    assert report["latency"]["phase_totals_ms"]["agent_total_ms"] == 4400
+    assert any(item["generation_mode"] == "balanced" and item["green_rate"] == 1.0 for item in report["green_rate_by_generation_mode"])
+    assert report["failure_classes"][0]["failure_class"] == "browser_flow_smoke"
+    assert report["repair_success"]["fix_success_rate"] == 1.0
+    assert report["repair_success"]["attempt_success_rate"] == 1.0
+    assert scoped["workspace_id"] == workspace["workspace_id"]
+    assert "ObservabilityReport" in openapi["components"]["schemas"]

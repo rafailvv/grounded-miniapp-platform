@@ -7,6 +7,8 @@ from pathlib import Path
 import re
 from typing import Any
 
+from app.services.skill_registry import SkillRegistryService
+
 
 ROLE_ORDER = ("client", "specialist", "manager")
 
@@ -39,7 +41,7 @@ class ProjectInstructionBundle:
                 continue
             sources.append(
                 {
-                    "path": str(path.relative_to(repo_root)) if path.is_relative_to(repo_root) else str(path),
+                    "path": ProjectInstructionBundle._source_path(path, repo_root=repo_root, template_dir=template_dir),
                     "title": ProjectInstructionBundle._title(text, path.stem),
                     "content": text,
                     "summary": ProjectInstructionBundle._summary(text),
@@ -61,6 +63,12 @@ class ProjectInstructionBundle:
                 continue
             lines.append(f"- {source.get('path')}: {source.get('summary')}")
         return "\n".join(lines)[:limit]
+
+    @staticmethod
+    def _source_path(path: Path, *, repo_root: Path, template_dir: Path) -> str:
+        if path == template_dir / "AGENTS.md":
+            return "AGENTS.md"
+        return str(path.relative_to(repo_root)) if path.is_relative_to(repo_root) else str(path)
 
     @staticmethod
     def _title(text: str, default_title: str) -> str:
@@ -86,44 +94,7 @@ class SkillPackCatalog:
 
     @staticmethod
     def builtin() -> dict[str, dict[str, Any]]:
-        items = [
-            {
-                "id": "state-workflow",
-                "name": "State workflow",
-                "activation": "create_or_behavior_edit",
-                "constraints": ["Persist only the shared records and state transitions implied by the prompt."],
-                "validation_hints": ["Prompt-derived persisted workflow exists."],
-            },
-            {
-                "id": "role-surfaces",
-                "name": "Role surfaces",
-                "activation": "create_or_role_edit",
-                "constraints": ["Role pages share connected state while exposing distinct actions."],
-                "validation_hints": ["Each role has a distinct action surface."],
-            },
-            {
-                "id": "route-manifest",
-                "name": "Route manifest",
-                "activation": "route_change",
-                "constraints": ["Route metadata must match real static pages."],
-                "validation_hints": ["Every role page is routeable."],
-            },
-            {
-                "id": "mobile-shell",
-                "name": "Mobile shell",
-                "activation": "visual_or_quality",
-                "constraints": ["Mobile-first role pages for Telegram widths."],
-                "validation_hints": ["No horizontal overflow on mobile."],
-            },
-            {
-                "id": "preview-profile",
-                "name": "Preview profile",
-                "activation": "preview_or_platform",
-                "constraints": ["Preview profile selects the right host shell."],
-                "validation_hints": ["Preview profile supports configured mock surface."],
-            },
-        ]
-        return {str(item["id"]): item for item in items}
+        return SkillRegistryService.system_builtin()
 
     @classmethod
     def load_from_runtime(cls, runtime_dir: Path, repo_root: Path) -> list[dict[str, Any]]:
@@ -131,61 +102,7 @@ class SkillPackCatalog:
 
     @classmethod
     def prefetch(cls, runtime_dir: Path, repo_root: Path, *, force: bool = False) -> dict[str, Any]:
-        root = runtime_dir / "skills"
-        if not root.exists():
-            return {
-                "schema": "grounded.skill_prefetch.v1",
-                "status": "missing",
-                "items": [],
-                "cache": {"status": "miss", "reason": "runtime_skills_missing"},
-                "created_at": _now(),
-            }
-        signature = cls._runtime_signature(root)
-        cache_key = str(root.resolve())
-        cached = cls._runtime_cache.get(cache_key)
-        if cached and not force and cached.get("signature") == signature:
-            return {
-                **cached,
-                "cache": {"status": "hit", "signature": signature},
-                "created_at": _now(),
-            }
-        items: list[dict[str, Any]] = []
-        for path in sorted(root.glob("*/SKILL.md")):
-            text = _read_text(path)
-            if not text:
-                continue
-            skill_id = path.parent.name
-            frontmatter, body = SkillPackCatalog._frontmatter(text)
-            rules, acceptance = SkillPackCatalog._sections(text)
-            items.append(
-                {
-                    "id": skill_id,
-                    "name": str(frontmatter.get("description") or ProjectInstructionBundle._title(body, skill_id)).removeprefix("MAGIC DOC: ").strip(),
-                    "source": str(path.relative_to(repo_root)) if path.is_relative_to(repo_root) else str(path),
-                    "activation": "frontmatter_match" if frontmatter else "skill_match",
-                    "whenToUse": SkillPackCatalog._frontmatter_list(frontmatter.get("whenToUse") or frontmatter.get("when_to_use")),
-                    "paths": SkillPackCatalog._frontmatter_list(frontmatter.get("paths")),
-                    "allowedTools": SkillPackCatalog._frontmatter_list(frontmatter.get("allowedTools") or frontmatter.get("allowed_tools")),
-                    "model": str(frontmatter.get("model") or "").strip(),
-                    "effort": str(frontmatter.get("effort") or "").strip(),
-                    "validation": SkillPackCatalog._frontmatter_list(frontmatter.get("validation")),
-                    "frontmatter": frontmatter,
-                    "constraints": rules[:8],
-                    "validation_hints": acceptance[:8],
-                    "body": body or text,
-                    "mtime_ns": path.stat().st_mtime_ns if path.exists() else 0,
-                }
-            )
-        payload = {
-            "schema": "grounded.skill_prefetch.v1",
-            "status": "ready",
-            "signature": signature,
-            "items": items,
-            "cache": {"status": "loaded", "signature": signature},
-            "created_at": _now(),
-        }
-        cls._runtime_cache[cache_key] = payload
-        return payload
+        return SkillRegistryService(runtime_dir=runtime_dir, repo_root=repo_root, data_dir=repo_root / "data").prefetch(force=force)
 
     @classmethod
     def search_for_context(
@@ -201,103 +118,17 @@ class SkillPackCatalog:
         max_body_chars: int | None = None,
         max_total_body_chars: int | None = None,
     ) -> dict[str, Any]:
-        budget = cls._activation_budget(
+        return SkillRegistryService.search_items_for_context(
+            skills,
+            prompt=prompt,
+            intent=intent,
             generation_mode=generation_mode,
+            paths=paths,
+            failure_class=failure_class,
             max_skills=max_skills,
             max_body_chars=max_body_chars,
             max_total_body_chars=max_total_body_chars,
         )
-        explicit_mentions = cls.explicit_mentions(prompt, skills)
-        haystack = " ".join(
-            [
-                str(prompt or ""),
-                str(intent or ""),
-                str(generation_mode or ""),
-                str(failure_class or ""),
-                " ".join(paths or []),
-            ]
-        ).lower()
-        candidates: list[dict[str, Any]] = []
-        skipped: list[dict[str, Any]] = []
-        for skill in skills:
-            score = 0
-            reasons: list[str] = []
-            skill_id = str(skill.get("id") or "")
-            if skill_id in explicit_mentions:
-                score += 100
-                reasons.append("explicit_mention")
-            when_to_use_items = [str(item).lower() for item in SkillPackCatalog._frontmatter_list(skill.get("whenToUse") or skill.get("activation"))]
-            for phrase in when_to_use_items:
-                if cls._phrase_matches(phrase, haystack):
-                    score += 3
-                    reasons.append("whenToUse")
-                    break
-            for path_pattern in skill.get("paths") or []:
-                if any(cls._path_matches(str(path_pattern), str(path)) for path in paths or []):
-                    score += 3
-                    reasons.append("paths")
-                    break
-            if failure_class and cls._failure_matches(skill, failure_class):
-                score += 4
-                reasons.append("failure_class")
-            if any(validation and validation.lower() in haystack for validation in [str(item) for item in skill.get("validation") or skill.get("validation_hints") or []]):
-                score += 2
-                reasons.append("validation")
-            if skill_id in {"telegram-miniapp-product"} and ("telegram" in haystack or str(intent or "") == "create"):
-                score += 2
-                reasons.append("platform")
-            if skill_id in {"fastapi-persistence"} and any(token in haystack for token in ("api", "persist", "state", "sqlite", "backend")):
-                score += 2
-                reasons.append("persistence")
-            if skill_id in {"repair-failed-generation"} and failure_class:
-                score += 3
-                reasons.append("failure")
-            if skill_id in {"mobile-ui-polish"} and (str(generation_mode or "").lower() == "quality" or "layout" in haystack or "overflow" in haystack):
-                score += 2
-                reasons.append("quality")
-            if skill_id in {"browser-acceptance-proof"} and (str(intent or "").lower() == "create" or "browser" in haystack or "final gate" in haystack):
-                score += 2
-                reasons.append("proof")
-            if score:
-                candidates.append(
-                    {
-                        **skill,
-                        "activation_reason": ", ".join(dict.fromkeys(reasons)),
-                        "activation_score": score,
-                        "explicit": skill_id in explicit_mentions,
-                    }
-                )
-            else:
-                skipped.append({"id": skill_id, "reason": "no intent/path/failure match", "source": skill.get("source")})
-        candidates.sort(key=lambda item: (-int(item.get("activation_score") or 0), str(item.get("id") or "")))
-        selected: list[dict[str, Any]] = []
-        used_body_chars = 0
-        conflict_groups: set[str] = set()
-        for item in candidates:
-            group = cls._conflict_group(item)
-            body_chars = min(len(str(item.get("body") or "")), int(budget["max_body_chars"]))
-            if len(selected) >= int(budget["max_skills"]):
-                skipped.append({"id": item.get("id"), "reason": "activation_budget_exceeded", "activation_score": item.get("activation_score")})
-                continue
-            if used_body_chars + body_chars > int(budget["max_total_body_chars"]) and not item.get("explicit"):
-                skipped.append({"id": item.get("id"), "reason": "body_budget_exceeded", "activation_score": item.get("activation_score")})
-                continue
-            if group and group in conflict_groups and not item.get("explicit"):
-                skipped.append({"id": item.get("id"), "reason": f"conflict_group:{group}", "activation_score": item.get("activation_score")})
-                continue
-            selected.append({**item, "body_budget_chars": int(budget["max_body_chars"])})
-            used_body_chars += body_chars
-            if group:
-                conflict_groups.add(group)
-        return {
-            "schema": "grounded.skill_search.v1",
-            "status": "ready",
-            "selected": selected,
-            "skipped": skipped[:80],
-            "explicit_mentions": sorted(explicit_mentions),
-            "budget": {**budget, "used_body_chars": used_body_chars},
-            "created_at": _now(),
-        }
 
     @classmethod
     def select_for_context(
@@ -326,35 +157,11 @@ class SkillPackCatalog:
 
     @staticmethod
     def compact_context(skills: list[dict[str, Any]], *, body_limit: int = 800) -> str:
-        if not skills:
-            return ""
-        lines = ["Active runtime skills:"]
-        for skill in skills:
-            lines.append(f"- {skill.get('id')}: {skill.get('activation_reason') or skill.get('activation')}")
-            constraints = "; ".join(str(item) for item in (skill.get("constraints") or [])[:4])
-            validation = "; ".join(str(item) for item in (skill.get("validation_hints") or skill.get("validation") or [])[:4])
-            if constraints:
-                lines.append(f"  Rules: {constraints}")
-            if validation:
-                lines.append(f"  Validation: {validation}")
-            body = str(skill.get("body") or "").strip()
-            if body:
-                limit = min(int(skill.get("body_budget_chars") or body_limit), body_limit)
-                lines.append(f"  Body excerpt: {body[:limit]}")
-        return "\n".join(lines)
+        return SkillRegistryService.compact_context(skills, body_limit=body_limit)
 
     @staticmethod
     def explicit_mentions(prompt: str, skills: list[dict[str, Any]]) -> set[str]:
-        text = str(prompt or "")
-        mentions = set(re.findall(r"[@$]([A-Za-z0-9_-]+)", text))
-        normalized = {item.lower() for item in mentions}
-        result: set[str] = set()
-        for skill in skills:
-            skill_id = str(skill.get("id") or "")
-            names = {skill_id.lower(), str(skill.get("name") or "").lower().replace(" ", "-")}
-            if normalized & names:
-                result.add(skill_id)
-        return result
+        return SkillRegistryService.explicit_mentions(prompt, skills)
 
     @staticmethod
     def usage_telemetry(
@@ -363,32 +170,7 @@ class SkillPackCatalog:
         check_results: list[dict[str, Any]],
         run_status: str,
     ) -> dict[str, Any]:
-        by_name = {str(item.get("name") or ""): str(item.get("status") or "") for item in check_results if isinstance(item, dict)}
-        items: list[dict[str, Any]] = []
-        for skill in selected:
-            validation = [str(item) for item in skill.get("validation") or skill.get("validation_hints") or []]
-            passed = [name for name in validation if by_name.get(name) == "passed"]
-            failed = [name for name in validation if by_name.get(name) == "failed"]
-            if passed and not failed:
-                outcome = "helped"
-            elif failed:
-                outcome = "not_helped"
-            elif run_status == "completed":
-                outcome = "neutral_completed"
-            else:
-                outcome = "unknown"
-            items.append(
-                {
-                    "skill_id": skill.get("id"),
-                    "activation_reason": skill.get("activation_reason"),
-                    "activation_score": skill.get("activation_score"),
-                    "validation": validation,
-                    "passed": passed,
-                    "failed": failed,
-                    "outcome": outcome,
-                }
-            )
-        return {"schema": "grounded.skill_usage_telemetry.v1", "status": run_status, "items": items, "created_at": _now()}
+        return SkillRegistryService.usage_telemetry(selected=selected, check_results=check_results, run_status=run_status)
 
     @staticmethod
     def _runtime_signature(root: Path) -> str:
@@ -913,7 +695,7 @@ class ConfigMigrationCatalog:
         return [
             {"id": "state_store_v2", "status": "current", "description": "State store supports sharded runtime reports and additive run fields."},
             {"id": "workspace_memory_v1", "status": "current", "description": "Workspace memory is stored as a report with secret scanning and stale reference checks."},
-            {"id": "skills_runtime_v1", "status": "current", "description": "Runtime skill packs are discovered from runtime/skills/*/SKILL.md."},
+            {"id": "skills_runtime_v2", "status": "current", "description": "Scoped skill packs are discovered from system, repo, plugin, and user roots."},
             {"id": "slash_commands_v1", "status": "current", "description": "Workbench slash commands expose stable ids and UI action hints."},
             {"id": "acceptance_scenarios_v1", "status": "current", "description": "Run acceptance scenarios are generated from acceptance contracts and proof status."},
             {"id": "visual_qa_v1", "status": "current", "description": "Static visual QA combines source checks with browser mobile diagnostics."},

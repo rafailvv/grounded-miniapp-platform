@@ -507,6 +507,37 @@ button:disabled {
   color: var(--muted);
 }
 
+.observability-strip {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: rgba(248, 250, 255, 0.86);
+}
+
+.observability-strip div {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.observability-strip span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.observability-strip strong {
+  min-width: 0;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.observability-strip-wide {
+  grid-column: 1 / -1;
+}
+
 .run-list {
   display: flex;
   flex-direction: column;
@@ -2289,6 +2320,114 @@ button:disabled {
   grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
   gap: 10px;
   margin-bottom: 14px;
+}
+
+.prompt-suggestions-panel {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.prompt-suggestions-header {
+  margin-bottom: 0;
+}
+
+.prompt-suggestions-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px;
+}
+
+.prompt-suggestion-card {
+  display: grid;
+  gap: 7px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--ink);
+  text-align: left;
+  cursor: pointer;
+}
+
+.prompt-suggestion-card:hover {
+  border-color: rgba(55, 89, 240, 0.35);
+  box-shadow: 0 8px 24px rgba(38, 54, 120, 0.08);
+}
+
+.prompt-suggestion-card strong,
+.prompt-suggestion-card p,
+.prompt-suggestion-card small,
+.prompt-suggestion-meta {
+  display: block;
+}
+
+.prompt-suggestion-card p {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.4;
+}
+
+.prompt-suggestion-card small,
+.prompt-suggestion-meta {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.lsp-status-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.lsp-status-card,
+.lsp-route-graph {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fff;
+  padding: 10px;
+}
+
+.lsp-status-card {
+  display: grid;
+  gap: 4px;
+}
+
+.lsp-status-card span,
+.lsp-status-card small,
+.lsp-stream-strip span,
+.lsp-route-graph span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.lsp-status-card.status-failed,
+.lsp-stream-strip .status-failed {
+  border-color: rgba(188, 75, 75, 0.35);
+  background: rgba(188, 75, 75, 0.06);
+}
+
+.lsp-stream-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.lsp-stream-strip span {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: #fff;
+  padding: 5px 8px;
+}
+
+.lsp-route-graph {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 12px;
 }
 
 .review-summary-grid div,

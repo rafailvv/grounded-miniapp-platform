@@ -321,7 +321,10 @@ class RunCompactionService:
                 },
                 max_chars=2400,
             ),
-            "context_pressure": _compact_json(context_pressure, max_chars=1800),
+            "context_pressure": _compact_json(
+                context_pressure.get("latest") if isinstance(context_pressure.get("latest"), dict) else context_pressure,
+                max_chars=1800,
+            ),
             "microcompacts": _compact_json(microcompact_index.get("items") or [], max_chars=1800),
         }
 

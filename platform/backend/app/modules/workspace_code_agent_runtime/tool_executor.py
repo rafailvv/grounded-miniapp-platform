@@ -26,11 +26,13 @@ class AgentToolExecutor:
         file_state_cache: AgentFileStateCache | None = None,
         process_manager: AgentProcessManager | None = None,
         read_artifact: Callable[[str], dict[str, Any] | None] | None = None,
+        output_artifact_writer: Callable[[str, str, dict[str, Any]], dict[str, Any] | None] | None = None,
     ) -> None:
         self.workspace_service = workspace_service
         self.file_state_cache = file_state_cache or AgentFileStateCache()
         self.process_manager = process_manager or AgentProcessManager(sandbox_service=workspace_service.sandbox_service)
         self.read_artifact = read_artifact
+        self.output_artifact_writer = output_artifact_writer
 
     def execute(
         self,
@@ -61,6 +63,11 @@ class AgentToolExecutor:
                 hook_manager=hook_manager,
                 mode=mode,
                 forced_allowed_tools=forced_allowed_tools,
+                output_artifact_writer=(
+                    (lambda payload: self.output_artifact_writer(workspace_id, run_id, payload))
+                    if self.output_artifact_writer is not None
+                    else None
+                ),
             )
         )
         result = router.route_batch(tool_calls)

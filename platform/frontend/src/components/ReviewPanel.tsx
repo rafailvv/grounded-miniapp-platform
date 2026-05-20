@@ -1,11 +1,14 @@
-import type { ReviewReport } from "../lib/api";
+import type { PromptSuggestion, PromptSuggestionsReport, ReviewReport } from "../lib/api";
 
 type ReviewPanelProps = {
   review: ReviewReport | null;
+  suggestions?: PromptSuggestionsReport | null;
+  onUseSuggestion?: (suggestion: PromptSuggestion) => void;
 };
 
-export function ReviewPanel({ review }: ReviewPanelProps) {
+export function ReviewPanel({ review, suggestions, onUseSuggestion }: ReviewPanelProps) {
   const summary = review?.summary;
+  const suggestionItems = suggestions?.items ?? [];
   return (
     <div className="workbench-panel">
       <div className="workbench-panel-header">
@@ -35,6 +38,32 @@ export function ReviewPanel({ review }: ReviewPanelProps) {
             <span>contract mismatches</span>
           </div>
         </div>
+      ) : null}
+      {suggestionItems.length ? (
+        <section className="prompt-suggestions-panel">
+          <div className="workbench-panel-header prompt-suggestions-header">
+            <strong>Product follow-ups</strong>
+            <span>{suggestionItems.length} suggestions</span>
+          </div>
+          <div className="prompt-suggestions-grid">
+            {suggestionItems.map((suggestion) => (
+              <button
+                key={suggestion.suggestion_id}
+                type="button"
+                className={`prompt-suggestion-card priority-${String(suggestion.priority ?? "should")}`}
+                onClick={() => onUseSuggestion?.(suggestion)}
+              >
+                <span className="prompt-suggestion-meta">
+                  {String(suggestion.category ?? "follow-up").replace(/_/g, " ")}
+                  {suggestion.target_role ? ` · ${suggestion.target_role}` : ""}
+                </span>
+                <strong>{String(suggestion.title ?? "Product follow-up")}</strong>
+                <p>{String(suggestion.reason ?? "")}</p>
+                {suggestion.target_files?.length ? <small>{suggestion.target_files.slice(0, 3).join(", ")}</small> : null}
+              </button>
+            ))}
+          </div>
+        </section>
       ) : null}
       {review?.findings.length ? (
         <div className="run-detail-list">

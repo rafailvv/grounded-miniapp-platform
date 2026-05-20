@@ -58,11 +58,18 @@ class AgentWorkerTaskPlanner:
             canonical_id = canonical_worker_id(worker_id)
             ownership = dict(worker.get("ownership") or ownership_for_worker(canonical_id))
             ledger_slice = cls._ledger_slice_for_worker(canonical_id, implementation_plan)
+            branch_role = str(worker.get("branch_role") or AgentWorkerManager.branch_role(canonical_id))
+            branch_stage = str(worker.get("branch_stage") or AgentWorkerManager.branch_stage(canonical_id))
+            branch_policy = str(worker.get("branch_policy") or AgentWorkerManager.branch_policy(canonical_id))
             tasks.append(
                 {
                     "worker_id": canonical_id,
                     "worker_type": str(worker.get("worker_type") or canonical_id),
                     "alias_ids": [],
+                    "branch_role": branch_role,
+                    "branch_stage": branch_stage,
+                    "branch_policy": branch_policy,
+                    "isolated_branch": branch_role == "writer",
                     "owner_scope": owner_scope,
                     "path_prefixes": path_prefixes,
                     "ownership": ownership,
@@ -72,6 +79,8 @@ class AgentWorkerTaskPlanner:
                     "mode_contract": mode_contract,
                     "prompt": cls._task_prompt(
                         worker_id=canonical_id,
+                        branch_role=branch_role,
+                        branch_policy=branch_policy,
                         owner_scope=owner_scope,
                         path_prefixes=path_prefixes,
                         ownership=ownership,
@@ -79,6 +88,12 @@ class AgentWorkerTaskPlanner:
                         implementation_plan=implementation_plan,
                         mode_contract=mode_contract,
                     ),
+                    "merge_contract": {
+                        "manager_decision": "accept owned diff, reject forbidden/conflicting paths, or create repair_worker packet",
+                        "accepted_status": "branch_diff_ready",
+                        "conflict_status": "needs_repair",
+                        "proof_required": list(worker.get("expected_proof") or ownership.get("expected_proof") or []),
+                    },
                     "self_check": [
                         "changes stay inside owner path prefixes unless shared runtime files are explicitly required",
                         "role UI actions are connected to JavaScript handlers and backend APIs",
@@ -94,6 +109,8 @@ class AgentWorkerTaskPlanner:
     def _task_prompt(
         *,
         worker_id: str,
+        branch_role: str,
+        branch_policy: str,
         owner_scope: str,
         path_prefixes: list[str],
         ownership: dict[str, Any],
@@ -104,8 +121,18 @@ class AgentWorkerTaskPlanner:
         plan_summary = str(implementation_plan.get("principle") or "plan, inspect, patch, verify, repair")
         forbidden_paths = ", ".join(str(item) for item in ownership.get("forbidden_paths") or []) or "none"
         expected_proof = ", ".join(str(item) for item in ownership.get("expected_proof") or []) or "owned self-check"
+        if branch_role == "verifier":
+            return (
+                f"You are verifier worker `{worker_id}` responsible for {owner_scope}. "
+                "Run after backend, role UI, and generated test worker branches have merged and checks are green. "
+                f"Branch policy is {branch_policy}: do not write source files; produce blocker findings, mobile/browser proof, and repair packets only. "
+                f"Expected proof: {expected_proof}. Product task ledger slice for this verifier: {ledger_slice or 'none'}. "
+                "Look for bugs, missing tests, broken role workflow, seeded/mock data, mobile overflow, and weak persistence. "
+                "Return concrete blocker findings with target files and exact proof gaps; do not provide prose-only review."
+            )
         return (
             f"You are worker `{worker_id}` responsible for {owner_scope}. "
+            f"Branch role is {branch_role}; branch policy is {branch_policy}. "
             f"Own only these paths unless the coordinator explicitly asks for shared files: {', '.join(path_prefixes) or 'shared workspace slice'}. "
             f"Forbidden paths for this worker: {forbidden_paths}. Expected proof: {expected_proof}. "
             f"Use the implementation plan ({plan_summary}) and the user's prompt-derived entities/actions as source of truth. "

@@ -12,14 +12,11 @@ import httpx
 
 from app.ai.model_registry import (
     MODEL_REGISTRY,
-    TASK_PROFILES,
-    default_profile_for_generation_mode,
-    models_for_role,
-    provider_routing_table,
 )
 from app.core.config import Settings
 from app.models.common import GenerationMode
 from app.services.agent_runtime_config import ACTIVE_AGENT_TURN_STATE, RetryPolicy, TimeoutProfile
+from app.services.model_manager import ModelManagerService
 from app.services.workspace.log_service import WorkspaceLogService
 
 logger = logging.getLogger(__name__)
@@ -33,11 +30,12 @@ class OpenAIClient:
     _LOG_DICT_LIMIT = 40
     _LOG_MAX_DEPTH = 5
 
-    def __init__(self, settings: Settings, workspace_log_service: WorkspaceLogService | None = None) -> None:
+    def __init__(self, settings: Settings, workspace_log_service: WorkspaceLogService | None = None, model_manager: ModelManagerService | None = None) -> None:
         self.settings = settings
         self.workspace_log_service = workspace_log_service
+        self.model_manager = model_manager or ModelManagerService(settings=settings)
         self.openai_api_key = os.getenv("OPENAI_API_KEY")
-        self.openai_base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+        self.openai_base_url = self.model_manager.provider_base_url("openai")
         self.timeout_profile = TimeoutProfile.from_env()
         self.retry_policy = RetryPolicy.from_env()
         self.connect_timeout_sec = self.timeout_profile.openai_connect_sec
@@ -46,6 +44,7 @@ class OpenAIClient:
         self.pool_timeout_sec = self.timeout_profile.openai_pool_sec
         self.api_key = self.openai_api_key
         self.base_url = self.openai_base_url
+        self._route_candidates_by_model: dict[str, list[Any]] = {}
 
     @property
     def openai_enabled(self) -> bool:
@@ -53,28 +52,10 @@ class OpenAIClient:
 
     @property
     def enabled(self) -> bool:
-        return self.openai_enabled
+        return self.model_manager.status().enabled
 
     def configuration(self) -> dict[str, object]:
-        default_profile = default_profile_for_generation_mode(GenerationMode.BALANCED)
-        return {
-            "enabled": self.enabled,
-            "base_url": self.base_url,
-            "models": MODEL_REGISTRY,
-            "task_profiles": TASK_PROFILES,
-            "default_coding_profile": default_profile,
-            "routing": {
-                "provider": "openai" if self.enabled else None,
-                "providers": ["openai"] if self.enabled else [],
-            },
-            "provider_routing": provider_routing_table(),
-            "supports_prompt_cache_key": True,
-            "mode_profiles": {
-                "fast": "openai_code_fast",
-                "balanced": default_profile,
-                "quality": default_profile_for_generation_mode(GenerationMode.QUALITY),
-            },
-        }
+        return self.model_manager.configuration()
 
     @contextmanager
     def workspace_logging(self, workspace_id: str | None) -> Any:
@@ -96,6 +77,16 @@ class OpenAIClient:
         finally:
             ACTIVE_LLM_ROUTING_CONTEXT.reset(token)
 
+    def _select_model(self, role: str, *, model_profile: str | None, generation_mode: GenerationMode | str | None, model_override: str | None = None) -> str:
+        route = self.model_manager.select(
+            role=role,
+            model_profile=model_profile,
+            generation_mode=generation_mode,
+            model_override=model_override,
+        )
+        self._route_candidates_by_model[route.selected_model] = route.candidates
+        return route.selected_model
+
     def generate_agent_tool_step(
         self,
         *,
@@ -114,11 +105,7 @@ class OpenAIClient:
         routing_context = ACTIVE_LLM_ROUTING_CONTEXT.get() or {}
         requested_profile = str(routing_context.get("model_profile") or "").strip() or None
         generation_mode = str(routing_context.get("generation_mode") or "").strip() or None
-        routed_model = models_for_role(
-            "agent_turn",
-            model_profile=requested_profile,
-            generation_mode=generation_mode,
-        )
+        routed_model = self._select_model("agent_turn", model_profile=requested_profile, generation_mode=generation_mode)
         model = str(model_override or routed_model or MODEL_REGISTRY["agent_turn"]["primary"])
         if model.startswith("gpt-5"):
             payload = self._responses_tool_step(
@@ -162,7 +149,7 @@ class OpenAIClient:
         if not self.enabled:
             raise RuntimeError("OpenAI API key is not configured.")
         mode_value = str(getattr(generation_mode, "value", generation_mode) or "").strip()
-        model = models_for_role("cheap_task", model_profile=model_profile, generation_mode=generation_mode)
+        model = self._select_model("cheap_task", model_profile=model_profile, generation_mode=generation_mode)
         system_prompt = (
             "You extract a product-neutral mini-app contract from a user prompt. "
             "Use only the supplied prompt and the requested JSON schema. Return only valid JSON. "
@@ -280,7 +267,7 @@ class OpenAIClient:
         """Classify non-deterministic repair needs with a structured LLM packet."""
         if not self.enabled:
             raise RuntimeError("OpenAI API key is not configured.")
-        model = models_for_role("cheap_task", model_profile=model_profile, generation_mode=generation_mode)
+        model = self._select_model("cheap_task", model_profile=model_profile, generation_mode=generation_mode)
         system_prompt = (
             "You classify a failed mini-app generation run into one concrete repair packet. "
             "Use only the supplied logs, browser proof, diff summary, and check metadata. "
@@ -352,9 +339,9 @@ class OpenAIClient:
         parsed["_llm_model"] = model
         return parsed
 
-    def _headers(self) -> dict[str, str]:
+    def _headers(self, *, api_key: str | None = None) -> dict[str, str]:
         return {
-            "Authorization": f"Bearer {self.openai_api_key}",
+            "Authorization": f"Bearer {api_key or self.openai_api_key}",
             "Content-Type": "application/json",
         }
 
@@ -710,69 +697,91 @@ class OpenAIClient:
 
     def _post_json_with_retries(self, *, endpoint: str, model: str, payload: dict[str, Any]) -> dict[str, Any]:
         last_error: Exception | None = None
-        provider_label = "OpenAI"
-        base_url = self.openai_base_url.rstrip("/")
-        for attempt in range(1, self.retry_policy.max_provider_attempts + 1):
-            try:
-                started = time.perf_counter()
-                with httpx.Client(
-                    timeout=httpx.Timeout(
-                        connect=self.connect_timeout_sec,
-                        read=self.read_timeout_sec,
-                        write=self.write_timeout_sec,
-                        pool=self.pool_timeout_sec,
-                    )
-                ) as client:
-                    response = client.post(f"{base_url}/{endpoint}", headers=self._headers(), json=payload)
-                    duration_ms = int((time.perf_counter() - started) * 1000)
-                    self._log_response(endpoint=endpoint, model=model, response=response)
+        candidates = self._route_candidates_by_model.get(model) or self.model_manager.route_candidates_for_model(model) or []
+        if not candidates:
+            candidates = [self.model_manager.select(role="agent_turn", model_profile=None, generation_mode=None, model_override=model).candidates[0]]
+        for fallback_index, candidate in enumerate(candidates):
+            provider = candidate.provider
+            provider_status = self.model_manager.provider_status(provider)
+            if not provider_status.enabled:
+                last_error = RuntimeError(f"{provider_status.label or provider} provider is not configured.")
+                continue
+            provider_label = provider_status.label or provider.title()
+            base_url = provider_status.base_url.rstrip("/")
+            api_key = self.model_manager.provider_api_key(provider)
+            candidate_payload = {**payload, "model": candidate.model}
+            for attempt in range(1, self.retry_policy.max_provider_attempts + 1):
+                try:
+                    started = time.perf_counter()
+                    with httpx.Client(
+                        timeout=httpx.Timeout(
+                            connect=self.connect_timeout_sec,
+                            read=self.read_timeout_sec,
+                            write=self.write_timeout_sec,
+                            pool=self.pool_timeout_sec,
+                        )
+                    ) as client:
+                        response = client.post(f"{base_url}/{endpoint}", headers=self._headers(api_key=api_key), json=candidate_payload)
+                        duration_ms = int((time.perf_counter() - started) * 1000)
+                        self._log_response(endpoint=endpoint, model=candidate.model, response=response)
+                        self._append_workspace_api_log(
+                            source="llm.metrics",
+                            message=f"{provider_label} request metrics recorded for {endpoint}.",
+                            payload={
+                                "endpoint": endpoint,
+                                "model": candidate.model,
+                                "provider": provider,
+                                "fallback_index": fallback_index,
+                                "duration_ms": duration_ms,
+                                "target_file_count": self._extract_target_file_count(candidate_payload),
+                                "usage": self._extract_usage_summary(response),
+                            },
+                        )
+                        self._raise_for_status(response, endpoint, provider_label)
+                        return response.json()
+                except Exception as exc:
+                    last_error = exc
+                    error_class = self.retry_policy.classify_error(exc)
+                    turn_state = ACTIVE_AGENT_TURN_STATE.get()
+                    if turn_state is not None:
+                        turn_state.last_error_class = error_class
                     self._append_workspace_api_log(
-                        source="llm.metrics",
-                        message=f"{provider_label} request metrics recorded for {endpoint}.",
+                        source="llm.error",
+                        message=f"{provider_label} request failed for {endpoint}.",
                         payload={
                             "endpoint": endpoint,
-                            "model": model,
-                            "provider": "openai",
-                            "duration_ms": duration_ms,
-                            "target_file_count": self._extract_target_file_count(payload),
-                            "usage": self._extract_usage_summary(response),
+                            "model": candidate.model,
+                            "provider": provider,
+                            "fallback_index": fallback_index,
+                            "attempt": attempt,
+                            "error": str(exc),
+                            "error_type": type(exc).__name__,
+                            "error_class": error_class,
                         },
                     )
-                    self._raise_for_status(response, endpoint, provider_label)
-                    return response.json()
-            except Exception as exc:
-                last_error = exc
-                error_class = self.retry_policy.classify_error(exc)
-                turn_state = ACTIVE_AGENT_TURN_STATE.get()
-                if turn_state is not None:
-                    turn_state.last_error_class = error_class
+                    if not self.retry_policy.should_retry(exc, attempt):
+                        break
+                    delay_seconds = self.retry_policy.backoff_seconds(attempt)
+                    if turn_state is not None:
+                        turn_state.llm_retry_ms += int(delay_seconds * 1000)
+                    logger.warning(
+                        "Retrying %s request endpoint=%s model=%s after %s failure: %s",
+                        provider_label,
+                        endpoint,
+                        candidate.model,
+                        error_class,
+                        exc,
+                    )
+                    time.sleep(delay_seconds)
+            if last_error is not None and not self.model_manager.should_fallback(last_error):
+                raise last_error
+            if last_error is not None and fallback_index < len(candidates) - 1:
+                next_model = candidates[fallback_index + 1].model
                 self._append_workspace_api_log(
-                    source="llm.error",
-                    message=f"{provider_label} request failed for {endpoint}.",
-                    payload={
-                        "endpoint": endpoint,
-                        "model": model,
-                        "provider": "openai",
-                        "attempt": attempt,
-                        "error": str(exc),
-                        "error_type": type(exc).__name__,
-                        "error_class": error_class,
-                    },
+                    source="llm.fallback",
+                    message=f"{provider_label} request is falling back to {next_model}.",
+                    payload={"endpoint": endpoint, "failed_model": candidate.model, "next_model": next_model, "error": str(last_error)},
                 )
-                if not self.retry_policy.should_retry(exc, attempt):
-                    raise
-                delay_seconds = self.retry_policy.backoff_seconds(attempt)
-                if turn_state is not None:
-                    turn_state.llm_retry_ms += int(delay_seconds * 1000)
-                logger.warning(
-                    "Retrying %s request endpoint=%s model=%s after %s failure: %s",
-                    provider_label,
-                    endpoint,
-                    model,
-                    error_class,
-                    exc,
-                )
-                time.sleep(delay_seconds)
         assert last_error is not None
         raise last_error
 

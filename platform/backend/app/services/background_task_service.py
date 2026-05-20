@@ -337,16 +337,27 @@ class BackgroundTaskService:
             if key.startswith(f"memory_stage1:{task.workspace_id}:") and isinstance(payload, dict)
         ]
         current = self.store.get("reports", f"workspace_memory:{task.workspace_id}") or {"workspace_id": task.workspace_id, "items": []}
-        consolidated = WorkspaceMemoryPipeline.consolidate(task.workspace_id, stage1, current)
+        consolidated = WorkspaceMemoryPipeline.consolidate(
+            task.workspace_id,
+            stage1,
+            current,
+            workspace_root=self.workspace_service.source_dir(task.workspace_id),
+        )
         consolidated["stale_check"] = WorkspaceMemoryPipeline.stale_check(self.workspace_service.source_dir(task.workspace_id), consolidated)
         self.store.upsert("reports", f"workspace_memory:{task.workspace_id}", consolidated)
         summary_ref = f"memory_consolidation:{task.workspace_id}"
+        pipeline = consolidated.get("pipeline") if isinstance(consolidated.get("pipeline"), dict) else {}
         summary = {
             "schema": "grounded.memory_consolidation.v1",
             "workspace_id": task.workspace_id,
             "status": "consolidated",
             "stage1_count": len(stage1),
-            "active_count": len(consolidated.get("items") or []),
+            "raw_count": int(pipeline.get("stage1_items", 0) or 0),
+            "active_count": int(pipeline.get("active_count", 0) or 0),
+            "stale_count": int(pipeline.get("stale_count", 0) or 0),
+            "expired_count": int(pipeline.get("expired_count", 0) or 0),
+            "superseded_count": int(pipeline.get("superseded_count", 0) or 0),
+            "deduped_count": int(pipeline.get("deduped_count", 0) or 0),
             "updated_at": _now_iso(),
         }
         self.store.upsert("reports", summary_ref, summary)

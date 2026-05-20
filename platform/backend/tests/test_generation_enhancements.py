@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 from app.main import create_app
 from app.models.domain import RunRecord
 from app.services.generation_enhancements import SkillPackCatalog
+from app.services.skill_registry import SkillRegistryService
 from app.services.memory_pipeline import WorkspaceMemoryPipeline
 from app.services.trace_bundle import TraceBundleWriter
 
@@ -35,13 +36,16 @@ def test_project_instructions_skills_slash_commands_and_worker_roles(tmp_path: P
 
     assert instructions["schema"] == "grounded.project_instructions.v1"
     assert any(source["path"] == "AGENTS.md" for source in instructions["sources"])
-    assert skills["schema"] == "grounded.skills.v1"
+    assert skills["schema"] == "grounded.skills.v2"
+    assert "repo" in skills["manifest"]["roots"]
     assert any(item["id"] == "telegram-miniapp-product" for item in skills["items"])
     assert any(item["id"] == "browser-acceptance-proof" for item in skills["items"])
     telegram_skill = next(item for item in skills["items"] if item["id"] == "telegram-miniapp-product")
     assert "quality generation" in telegram_skill["whenToUse"]
     assert "browser_verify" in telegram_skill["allowedTools"]
     assert telegram_skill["activation_reason"] == "available_metadata"
+    assert telegram_skill["scope"] == "repo"
+    assert telegram_skill["scoped_id"] == "repo:telegram-miniapp-product"
     assert slash["schema"] == "grounded.slash_commands.v1"
     assert any(item["name"] == "/visual-qa" for item in slash["items"])
     assert resolved["ui_action"]["type"] == "submit_composer_with_prompt"
@@ -120,13 +124,28 @@ def test_memory_pipeline_extracts_consolidates_dedupes_and_rejects_secrets(tmp_p
     )
     consolidated = WorkspaceMemoryPipeline.consolidate("ws_1", [stage1, stage1], {"workspace_id": "ws_1", "items": []})
     stale = WorkspaceMemoryPipeline.stale_check(tmp_path, {"items": [{"memory_id": "m1", "text": "See miniapp/app/missing.py"}]})
+    retrieval = WorkspaceMemoryPipeline.retrieve(
+        "ws_1",
+        consolidated,
+        prompt="Fix preview boot NameError without repeating the old failure",
+        top_k=2,
+    )
 
     assert stage1["status"] == "extracted"
+    assert stage1["phase"] == "raw"
     assert {item["kind"] for item in stage1["items"]} >= {"product_decision", "failure_signature", "avoidance"}
     assert all("api_key=secret" not in item["text"] for item in stage1["items"])
+    assert all(item["fingerprint"] and item["citations"] for item in stage1["items"])
+    assert all(item["confidence"]["score"] > 0 for item in stage1["items"])
     assert len(consolidated["items"]) == len(stage1["items"])
     assert all(item["status"] == "active" for item in consolidated["items"])
+    assert consolidated["pipeline"]["phase1"]["raw_count"] == len(stage1["items"]) * 2
+    assert consolidated["pipeline"]["phase2"]["deduped_count"] == len(stage1["items"])
     assert stale["status"] == "stale"
+    assert retrieval["schema"] == "grounded.memory_retrieval.v1"
+    assert retrieval["hits"]
+    assert retrieval["hits"][0]["selection_reason"]
+    assert any(item["kind"] == "failure_signature" for item in retrieval["items"])
 
 
 def test_skill_frontmatter_parser_and_activation(tmp_path: Path) -> None:
@@ -212,6 +231,88 @@ validation:
     assert "explicit_mention" in search["selected"][0]["activation_reason"]
     assert any(item["reason"] == "activation_budget_exceeded" for item in search["skipped"])
     assert telemetry["items"][0]["outcome"] == "helped"
+
+
+def test_scoped_skill_registry_loads_roots_dependencies_and_policy(tmp_path: Path) -> None:
+    runtime_dir = tmp_path / "runtime"
+    data_dir = tmp_path / "data"
+    repo_skill = runtime_dir / "skills" / "api-skill"
+    repo_skill.mkdir(parents=True)
+    (repo_skill / "SKILL.md").write_text(
+        """---
+description: API repo skill
+whenToUse:
+  - api workflow
+paths:
+  - miniapp/app/routes/**
+allowedTools:
+  - read_files
+model: gpt-test
+effort: high
+dependencies:
+  - helper-skill
+invocationPolicy: auto
+---
+# API Repo Skill
+
+## Rules
+- Keep API stable.
+""",
+        encoding="utf-8",
+    )
+    helper_skill = runtime_dir / "skills" / "helper-skill"
+    helper_skill.mkdir(parents=True)
+    (helper_skill / "SKILL.md").write_text(
+        """---
+description: Helper skill
+invocationPolicy: explicit
+---
+# Helper Skill
+""",
+        encoding="utf-8",
+    )
+    plugin_root = runtime_dir / "plugins" / "demo-plugin"
+    (plugin_root / "skills" / "plugin-skill").mkdir(parents=True)
+    (plugin_root / "plugin.json").write_text('{"id":"demo-plugin","version":"1.0.0","capabilities":["skills"]}', encoding="utf-8")
+    (plugin_root / "skills" / "plugin-skill" / "SKILL.md").write_text(
+        """---
+description: Plugin skill
+whenToUse:
+  - plugin flow
+invocationPolicy: disabled
+---
+# Plugin Skill
+""",
+        encoding="utf-8",
+    )
+    user_skill = data_dir / "skills" / "user-skill"
+    user_skill.mkdir(parents=True)
+    (user_skill / "SKILL.md").write_text("# User Skill\n", encoding="utf-8")
+
+    registry = SkillRegistryService(runtime_dir=runtime_dir, repo_root=tmp_path, data_dir=data_dir)
+    prefetch = registry.prefetch()
+    manifest = registry.manifest()
+    search = registry.search_for_context(
+        prompt="Fix api workflow",
+        intent="edit",
+        generation_mode="quality",
+        paths=["miniapp/app/routes/items.py"],
+    )
+    explicit = registry.search_for_context(prompt="Use $repo:helper-skill", generation_mode="fast")
+
+    all_items = {item["scoped_id"]: item for item in prefetch["all_items"]}
+    selected_ids = [item["scoped_id"] for item in search["selected"]]
+    assert prefetch["schema"] == "grounded.skill_prefetch.v2"
+    assert manifest["schema"] == "grounded.skill_registry_manifest.v1"
+    assert all_items["repo:api-skill"]["dependencies"][0]["id"] == "helper-skill"
+    assert all_items["plugin:plugin-skill"]["plugin_id"] == "demo-plugin"
+    assert all_items["plugin:plugin-skill"]["enabled"] is False
+    assert "repo:api-skill" in selected_ids
+    assert "repo:helper-skill" in selected_ids
+    assert search["effective"]["allowedTools"] == ["read_files"]
+    assert search["effective"]["model"] == "gpt-test"
+    assert search["effective"]["effort"] == "high"
+    assert explicit["selected"][0]["scoped_id"] == "repo:helper-skill"
 
 
 def test_acceptance_visual_trace_and_magic_docs_reports(tmp_path: Path) -> None:
@@ -348,6 +449,11 @@ def test_context_pack_includes_workspace_memory_and_instruction_summary(tmp_path
         workspace.workspace_id,
         {"kind": "project_rule", "text": "Use compact operational dashboards for this workspace."},
     )
+    for index in range(12):
+        container.workbench_service.upsert_memory(
+            workspace.workspace_id,
+            {"kind": "project_rule", "text": f"Unrelated saved note {index} about checkout settings."},
+        )
     container.code_index_service.index_workspace(workspace, container.workspace_service.source_dir(workspace.workspace_id))
 
     pack = container.context_pack_builder.build(
@@ -359,4 +465,6 @@ def test_context_pack_includes_workspace_memory_and_instruction_summary(tmp_path
 
     assert "Workspace memory:" in pack.workspace_summary
     assert "compact operational dashboards" in pack.workspace_summary
+    assert "selected:" in pack.workspace_summary
+    assert "memory_retrieval" in pack.retrieval_stats
     assert "Project instruction summary:" in pack.workspace_summary

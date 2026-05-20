@@ -17,6 +17,7 @@ from app.ai.model_registry import models_for_role, resolve_model_profile
 from app.ai.openai_client import OpenAIClient
 from app.models.artifacts import ValidationIssue
 from app.models.common import GenerationMode
+from app.models.context_pressure import ContextPressureReport
 from app.models.domain import (
     BackgroundTaskRecord,
     CheckExecutionRecord,
@@ -69,6 +70,7 @@ from app.modules.miniapp_agent_loop.agent_tool_runtime import (
 )
 from app.modules.miniapp_agent_loop.tool_router import ToolRouter
 from app.modules.miniapp_agent_loop.types import AgentLoopCallbacks, AgentLoopResult, AgentTurnPlan
+from app.modules.miniapp_agent_loop.guardian_review import GuardianReview
 from app.modules.miniapp_agent_loop.turn_diff_tracker import AgentTurnDiffTracker
 from app.modules.miniapp_agent_loop.verification_worker import VerificationWorker
 from app.modules.workspace_code_agent_runtime.budget import (
@@ -90,6 +92,10 @@ from app.services.miniapp_contract import MiniAppContractCompiler, MiniAppContra
 from app.services.platform_shell import BASE_STYLESHEET_HREF, BASE_STYLESHEET_PATH, PAGE_SHELL_INLINE_STYLE
 from app.services.run_compaction import RunCompactionService
 from app.services.event_journal import EventJournalService
+from app.services.hook_policy_service import HookPolicyService
+from app.services.memory_pipeline import WorkspaceMemoryPipeline
+from app.services.output_artifact_service import OutputArtifactService
+from app.services.repair_cases import RepairCaseService
 from app.services.run_protocol import RunProtocolService, diff_sha256
 from app.services.trace_bundle import TraceBundleWriter
 from app.services.generation_enhancements import SkillPackCatalog
@@ -166,6 +172,8 @@ class WorkspaceCodeAgentRuntime:
         run_protocol_service: RunProtocolService | None = None,
         run_compaction_service: RunCompactionService | None = None,
         event_journal_service: EventJournalService | None = None,
+        hook_policy_service: HookPolicyService | None = None,
+        output_artifact_service: OutputArtifactService | None = None,
     ) -> None:
         self.store = store
         self.workspace_service = workspace_service
@@ -190,11 +198,12 @@ class WorkspaceCodeAgentRuntime:
             read_artifact=lambda ref: self.store.get("reports", ref),
         )
         self.memory_store = AgentMemoryStore()
-        self.hook_manager = AgentHookManager()
+        self.hook_manager = AgentHookManager(policy_service=hook_policy_service, event_journal_service=event_journal_service)
         self.context_pressure = AgentContextPressureAnalyzer()
         self.rollout_trace = RolloutTraceRecorder()
         self.transcript_store = AgentTranscriptStore()
         self.process_manager = AgentProcessManager(sandbox_service=workspace_service.sandbox_service)
+        self.output_artifact_service = output_artifact_service
         self.trace_bundle_writers: dict[str, TraceBundleWriter] = {}
         self.tool_batch_summaries: dict[str, list[dict[str, object]]] = {}
         self.context_pressure_history: dict[str, list[dict[str, Any]]] = {}
@@ -207,6 +216,7 @@ class WorkspaceCodeAgentRuntime:
             file_state_cache=self.file_state_cache,
             process_manager=self.process_manager,
             read_artifact=lambda ref: self.store.get("reports", ref),
+            output_artifact_writer=self._store_command_output_artifact,
         )
         self.context_pack_builder = context_pack_builder
         self.platform_db = platform_db
@@ -1279,7 +1289,10 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             },
         )
         self._store_report(job.command_policy_ref, {"workspace_id": workspace_id, "run_id": run_id, **command_policy_snapshot()})
-        self._store_report(job.context_pressure_ref, {"workspace_id": workspace_id, "run_id": run_id, "items": []})
+        self._store_report(
+            job.context_pressure_ref,
+            self._context_pressure_report(workspace_id=workspace_id, run_id=run_id, items=[]),
+        )
         self._store_report(job.hook_trace_ref, {"workspace_id": workspace_id, "run_id": run_id, **self.hook_manager.snapshot(artifact_run_id)})
         semantic_graph = semantic_scan(root=draft_source, targets=["miniapp/app", "miniapp/tests"])
         self._store_report(job.semantic_graph_ref, {"workspace_id": workspace_id, "run_id": run_id, "graph": semantic_graph})
@@ -1348,7 +1361,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         writer_worker_tasks = [
             task
             for task in worker_tasks
-            if canonical_worker_id(str(task.get("worker_id") or "")).strip() not in {"mobile_polish_worker"}
+            if str(task.get("branch_role") or AgentWorkerManager.branch_role(str(task.get("worker_id") or ""))) == "writer"
         ]
         worker_drafts = self.worker_runtime.prepare_workspace_branches(
             workspace_id=workspace_id,
@@ -1601,6 +1614,32 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             self._store_transcript_snapshot(job, artifact_run_id)
             self._store_agent_quality_report(workspace_id, run_id, execution)
             failed_checks = [item for item in execution.results if item.status in {"failed", "blocked"}]
+            after_checks_outcome = self._record_hook(
+                job=job,
+                hook="after_checks",
+                status="failed" if failed_checks else "completed",
+                payload={
+                    "changed_files": list(last_changed_files),
+                    "checks": [
+                        {"name": item.name, "status": item.status, "details": item.details}
+                        for item in execution.results[:20]
+                    ],
+                    "failed_checks": [
+                        {"name": item.name, "status": item.status, "details": item.details}
+                        for item in failed_checks[:8]
+                    ],
+                    "check_count": len(execution.results),
+                },
+            )
+            if after_checks_outcome is not None and after_checks_outcome.should_block:
+                execution.results.append(
+                    RunCheckResult(
+                        name="hook.after_checks",
+                        status="blocked",
+                        details=after_checks_outcome.block_reason or "after_checks hook blocked this check execution.",
+                    )
+                )
+                failed_checks = [item for item in execution.results if item.status in {"failed", "blocked"}]
             self._record_hook(
                 job=job,
                 hook="before_checks",
@@ -2021,7 +2060,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                 )
             return synced
 
-        def _before_apply(turn: int, file_changes: list[DraftAction]) -> None:
+        def _before_apply(turn: int, file_changes: list[DraftAction]):
             paths = [operation.file_path for operation in file_changes]
             self._record_hook(
                 job=job,
@@ -2035,6 +2074,14 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                 status="started",
                 payload={"turn": turn, "paths": paths, "file_change_count": len(file_changes)},
             )
+            outcome = self._record_hook(
+                job=job,
+                hook="before_apply",
+                status="completed",
+                payload={"turn": turn, "paths": paths, "file_change_count": len(file_changes)},
+            )
+            if outcome is not None and outcome.should_block:
+                return outcome
             self.turn_diff_tracker.capture_baseline(
                 workspace_service=self.workspace_service,
                 workspace_id=workspace_id,
@@ -2055,6 +2102,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             self.transcript_store.append_file_changes(artifact_run_id, turn=turn, file_changes=file_changes)
             self._store_transcript_snapshot(job, artifact_run_id)
             self.rollout_trace.append(artifact_run_id, "patch_apply_started", {"turn": turn, "paths": paths})
+            return outcome
 
         def _after_apply(turn: int, file_changes: list[DraftAction], apply_result: Any, paths: list[str]) -> None:
             self.file_state_cache.invalidate(run_id, paths)
@@ -2142,6 +2190,49 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                 acceptance_contract=acceptance_contract,
                 require_browser_proof=bool((create_intent or acceptance_contract.get("required")) and not focused_visual_edit),
             ).model_dump()
+            guardian_report = GuardianReview.review(
+                workspace_id=workspace_id,
+                run_id=run_id,
+                draft_source=draft_source,
+                changed_files=list(last_changed_files),
+                latest_execution=latest_execution,
+                preview_details=latest_preview_details,
+                acceptance_contract=acceptance_contract,
+                implementation_plan=implementation_plan,
+                target_role_scope=role_scope,
+                intent=str(request.intent or ""),
+                source="runtime_verifier",
+            ).model_dump(mode="json", by_alias=True)
+            guardian_ref = f"guardian_review:{workspace_id}:{artifact_run_id}"
+            self._store_report(guardian_ref, guardian_report)
+            report["guardian_review_ref"] = guardian_ref
+            report["guardian_review"] = guardian_report
+            report["guardian_findings"] = list(guardian_report.get("findings") or [])
+            if guardian_report.get("status") != "passed":
+                report["status"] = "failed"
+                report["summary"] = "Guardian review found pre-apply blocker findings."
+                report["issues"] = [
+                    *list(report.get("issues") or []),
+                    *[
+                        {
+                            "kind": "guardian_blocker",
+                            "code": finding.get("code"),
+                            "category": finding.get("category"),
+                            "message": finding.get("message"),
+                            "file_path": finding.get("file_path"),
+                            "line": finding.get("line"),
+                            "evidence": finding.get("evidence") or {},
+                        }
+                        for finding in guardian_report.get("findings") or []
+                        if isinstance(finding, dict) and finding.get("is_blocker_for_apply", True)
+                    ],
+                ]
+                self._append_event(
+                    job,
+                    "validation_failed",
+                    "Guardian review blocked source apply.",
+                    {"worker_id": "guardian_review_worker", "guardian_review_ref": guardian_ref, "findings": guardian_report.get("findings") or []},
+                )
             browser_replay_packet = self.browser_replay.failed_step_packet(latest_execution)
             if browser_replay_packet:
                 browser_replay_ref = f"browser_replay:{workspace_id}:{artifact_run_id}:latest"
@@ -2223,6 +2314,14 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                     "issues": report.get("issues", []),
                     "proof": report,
                 },
+            )
+            self._update_verifier_worker_output(
+                workspace_id=workspace_id,
+                run_id=run_id,
+                artifact_run_id=artifact_run_id,
+                report=report,
+                verification_report_ref=job.verification_report_ref,
+                browser_step_ref=browser_step_ref,
             )
             self.transcript_store.append_browser_proof(artifact_run_id, report)
             self._store_transcript_snapshot(job, artifact_run_id)
@@ -2390,10 +2489,32 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                 continue
             refs = worker_refs(workspace_id, artifact_run_id, worker_id)
             ownership = dict(task.get("ownership") or ownership_for_worker(worker_id))
-            selected_memory, rejected_memory = select_memory_items(
+            branch_role = str(task.get("branch_role") or AgentWorkerManager.branch_role(worker_id))
+            branch_stage = str(task.get("branch_stage") or AgentWorkerManager.branch_stage(worker_id))
+            branch_policy = str(task.get("branch_policy") or AgentWorkerManager.branch_policy(worker_id))
+            memory_query = " ".join(
+                str(value or "")
+                for value in (
+                    worker_id,
+                    task.get("title"),
+                    task.get("summary"),
+                    task.get("prompt"),
+                    task.get("description"),
+                    implementation_plan.get("summary") if isinstance(implementation_plan, dict) else "",
+                )
+            )
+            retrieval = WorkspaceMemoryPipeline.retrieve(
+                workspace_id,
                 {"items": [*(workspace_memory.get("items") or []), *(run_memory.get("items") or [])]},
+                prompt=memory_query,
+                paths=list(ownership.get("allowed_paths") or []),
+                top_k=24,
+            )
+            selected_memory, role_rejected_memory = select_memory_items(
+                {"items": retrieval.get("items") or []},
                 worker_id=worker_id,
             )
+            rejected_memory = [*(retrieval.get("skipped") or []), *role_rejected_memory]
             memory_snapshot = {
                 "schema": "grounded.worker_memory_snapshot.v1",
                 "workspace_id": workspace_id,
@@ -2401,11 +2522,28 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                 "artifact_run_id": artifact_run_id,
                 "worker_id": worker_id,
                 "worker_type": worker_id,
+                "branch_role": branch_role,
+                "branch_stage": branch_stage,
+                "branch_policy": branch_policy,
                 "items": selected_memory,
                 "rejected": rejected_memory,
                 "source_refs": {
                     "workspace_memory": f"workspace_memory:{workspace_id}",
                     "run_memory": f"memory_stage1:{workspace_id}:{run_id}",
+                },
+                "retrieval": {
+                    "schema": retrieval.get("schema"),
+                    "status": retrieval.get("status"),
+                    "stats": retrieval.get("stats") or {},
+                    "hits": [
+                        {
+                            "memory_id": (hit.get("item") or {}).get("memory_id"),
+                            "score": hit.get("score"),
+                            "selection_reason": hit.get("selection_reason") or [],
+                        }
+                        for hit in retrieval.get("hits") or []
+                        if isinstance(hit, dict) and isinstance(hit.get("item"), dict)
+                    ][:12],
                 },
                 "stale_check": stale_path_checks(draft_source, {"items": selected_memory}),
                 "created_at": utc_now().isoformat(),
@@ -2417,6 +2555,9 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                 "artifact_run_id": artifact_run_id,
                 "worker_id": worker_id,
                 "worker_type": worker_id,
+                "branch_role": branch_role,
+                "branch_stage": branch_stage,
+                "branch_policy": branch_policy,
                 "generation_mode": str(generation_mode.value),
                 "ownership": ownership,
                 "contract_slice": self._worker_contract_slice(
@@ -2438,23 +2579,44 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                 "artifact_run_id": artifact_run_id,
                 "worker_id": worker_id,
                 "worker_type": worker_id,
-                "status": "context_ready" if enabled else "available_disabled",
-                "badge": "context_ready" if enabled else "available_disabled",
+                "branch_role": branch_role,
+                "branch_stage": branch_stage,
+                "branch_policy": branch_policy,
+                "status": (
+                    "context_ready"
+                    if enabled and branch_role == "writer"
+                    else "verifier_waiting_for_green_checks"
+                    if enabled and branch_role == "verifier"
+                    else "available_disabled"
+                ),
+                "badge": (
+                    "context_ready"
+                    if enabled and branch_role == "writer"
+                    else "verifier_waiting_for_green_checks"
+                    if enabled and branch_role == "verifier"
+                    else "available_disabled"
+                ),
                 "ownership": ownership,
                 "changed_files": [],
                 "diff_ref": None,
                 "proof_refs": [],
                 "issues": [],
-                "self_check": {"status": "pending" if enabled else "skipped"},
+                "self_check": {"status": "pending" if enabled and branch_role == "writer" else "deferred" if enabled else "skipped"},
                 "token_usage": {},
-                "summary": "Worker context prepared." if enabled else "Worker available but disabled by gate.",
-                "merge_recommendation": "pending" if enabled else "deferred",
+                "summary": (
+                    "Worker isolated branch context prepared."
+                    if enabled and branch_role == "writer"
+                    else "Verifier worker will run after green checks."
+                    if enabled and branch_role == "verifier"
+                    else "Worker available but disabled by gate."
+                ),
+                "merge_recommendation": "pending" if enabled and branch_role == "writer" else "deferred",
                 "context_ref": refs["context_ref"],
                 "memory_snapshot_ref": refs["memory_snapshot_ref"],
                 "created_at": utc_now().isoformat(),
             }
             task_id = ""
-            if enabled:
+            if enabled and branch_role == "writer":
                 task_id = self._record_worker_background_task(
                     workspace_id=workspace_id,
                     run_id=run_id,
@@ -2471,6 +2633,9 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                 {
                     "worker_id": worker_id,
                     "worker_type": worker_id,
+                    "branch_role": branch_role,
+                    "branch_stage": branch_stage,
+                    "branch_policy": branch_policy,
                     "ownership": ownership,
                     "context_ref": refs["context_ref"],
                     "memory_snapshot_ref": refs["memory_snapshot_ref"],
@@ -2620,6 +2785,57 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                 task_payload["linked_refs"] = {**(task_payload.get("linked_refs") or {}), "branch_ref": branch_ref, "output_ref": refs["output_ref"]}
                 self.store.upsert("background_tasks", task_id, task_payload)
 
+    def _update_verifier_worker_output(
+        self,
+        *,
+        workspace_id: str,
+        run_id: str,
+        artifact_run_id: str,
+        report: dict[str, Any],
+        verification_report_ref: str,
+        browser_step_ref: str,
+    ) -> None:
+        worker_id = "mobile_polish_worker"
+        refs = worker_refs(workspace_id, artifact_run_id, worker_id)
+        current = self.store.get("reports", refs["output_ref"]) or {}
+        issues = [
+            {"message": str(issue.get("message") or issue.get("details") or issue), "severity": "high", "evidence": issue}
+            for issue in list(report.get("issues") or [])[:20]
+            if isinstance(issue, dict)
+        ]
+        status = "verified" if report.get("status") == "passed" else "failed"
+        payload = {
+            **(current if isinstance(current, dict) else {}),
+            "schema": "grounded.worker_output.v1",
+            "workspace_id": workspace_id,
+            "run_id": run_id,
+            "artifact_run_id": artifact_run_id,
+            "worker_id": worker_id,
+            "worker_type": worker_id,
+            "branch_role": "verifier",
+            "branch_stage": "guardian_verifier",
+            "branch_policy": "read_only_after_green_checks",
+            "status": status,
+            "badge": status,
+            "ownership": ownership_for_worker(worker_id),
+            "changed_files": [],
+            "diff_ref": None,
+            "proof_refs": [verification_report_ref, browser_step_ref],
+            "issues": issues,
+            "self_check": {
+                "status": "passed" if status == "verified" else "failed",
+                "blocker_count": len(issues),
+                "read_only": True,
+            },
+            "token_usage": {},
+            "summary": str(report.get("summary") or ("Verifier accepted the merged candidate." if status == "verified" else "Verifier found blocker findings."))[:1200],
+            "merge_recommendation": "accept" if status == "verified" else "needs_repair",
+            "context_ref": refs["context_ref"],
+            "memory_snapshot_ref": refs["memory_snapshot_ref"],
+            "updated_at": utc_now().isoformat(),
+        }
+        self._store_report(refs["output_ref"], payload)
+
     def _store_worker_merge_decision(
         self,
         *,
@@ -2661,15 +2877,30 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                 {
                     "worker_id": worker_id,
                     "worker_type": worker_id,
+                    "branch_role": AgentWorkerManager.branch_role(worker_id),
+                    "branch_stage": AgentWorkerManager.branch_stage(worker_id),
+                    "branch_policy": AgentWorkerManager.branch_policy(worker_id),
                     "decision": decision,
                     "changed_files": changed,
                     "blocked_paths": blocked_paths,
+                    "failure_reason": result.error or "",
                     "output_ref": worker_refs(workspace_id, artifact_run_id, worker_id)["output_ref"],
                     "repair_worker_required": decision in {"needs_repair", "rejected"},
                 }
             )
+        repair_packets = self._repair_packets_from_worker_decisions(decisions)
+        repair_cases: dict[str, Any] = {}
+        if repair_packets:
+            repair_cases = RepairCaseService(self.store, event_journal_service=self.event_journal_service).sync_from_packets(
+                workspace_id=workspace_id,
+                run_id=run_id,
+                packets=repair_packets,
+                source="worker_merge",
+                trace_state=self.store.get("reports", f"trace_reducer:{workspace_id}:{artifact_run_id}") or {},
+            )
         payload = {
             "schema": "grounded.worker_manager_merge_decision.v1",
+            "branch_schema": "grounded.worker_branch_plan.v2",
             "workspace_id": workspace_id,
             "run_id": run_id,
             "artifact_run_id": artifact_run_id,
@@ -2677,11 +2908,43 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             "decisions": decisions,
             "merge_report": merge_report,
             "apply_result": apply_result or {},
+            "repair_packets": repair_packets,
+            "repair_cases_ref": RepairCaseService.index_ref(run_id) if repair_packets else None,
+            "repair_cases": repair_cases if repair_packets else {},
             "repair_worker": self._repair_worker_packet_from_decisions(run_id=run_id, decisions=decisions),
             "created_at": utc_now().isoformat(),
         }
         ref = f"worker_manager_merge_decision:{workspace_id}:{artifact_run_id}"
         self._store_report(ref, payload)
+
+    @staticmethod
+    def _repair_packets_from_worker_decisions(decisions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        packets: list[dict[str, Any]] = []
+        for decision in decisions:
+            if not decision.get("repair_worker_required"):
+                continue
+            worker_id = str(decision.get("worker_id") or "worker")
+            target_files = list(decision.get("blocked_paths") or decision.get("changed_files") or [])
+            if not target_files:
+                target_files = list((ownership_for_worker(worker_id).get("allowed_paths") or []))[:4]
+            signature = f"worker_merge.{worker_id}.{decision.get('decision') or 'needs_repair'}"
+            packets.append(
+                {
+                    "signature": signature,
+                    "issue_code": str(decision.get("decision") or "worker_merge_needs_repair"),
+                    "severity": "high",
+                    "likely_root_cause": decision.get("failure_reason") or f"{worker_id} branch could not be safely merged.",
+                    "target_files": target_files,
+                    "verification_check": "worker_manager_merge_decision",
+                    "instruction": "Repair exactly the blocked worker branch slice, preserve accepted worker diffs, then rerun merge/check proof.",
+                    "required_next_tool": "read_files",
+                    "expected_proof": "worker merge decision no longer reports this worker as needs_repair/rejected",
+                    "failure_class": "worker_merge",
+                    "failure_signature": signature,
+                    "evidence": {"worker_decision": decision},
+                }
+            )
+        return packets
 
     @staticmethod
     def _repair_worker_packet_from_decisions(*, run_id: str, decisions: list[dict[str, Any]]) -> dict[str, Any]:
@@ -2950,10 +3213,16 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                 for conflict in (merge_report.get("ownership") if isinstance(merge_report.get("ownership"), dict) else {}).get("conflicts", [])
                 if isinstance(conflict, dict) and str(conflict.get("path") or "").strip()
             }
+            forbidden_paths = {
+                str(item.get("path") or "")
+                for item in (merge_report.get("ownership") if isinstance(merge_report.get("ownership"), dict) else {}).get("forbidden", [])
+                if isinstance(item, dict) and str(item.get("path") or "").strip()
+            }
+            blocked_paths = {*conflict_paths, *forbidden_paths}
             mergeable_changes = [
                 change
                 for change in file_changes
-                if str(change.file_path or "").strip() not in conflict_paths
+                if str(change.file_path or "").strip() not in blocked_paths
             ]
             if mergeable_changes:
                 mergeable_report = self.worker_runtime.merge_report(artifact_run_id, mergeable_changes)
@@ -2964,6 +3233,8 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                     "mergeable_report": mergeable_report,
                     "partial_apply_result": apply_result.model_dump(mode="json"),
                     "conflict_paths": sorted(conflict_paths),
+                    "forbidden_paths": sorted(forbidden_paths),
+                    "blocked_paths": sorted(blocked_paths),
                     "branch_results": [result.as_dict() for result in results],
                 }
                 self._store_report(job.worker_merge_ref, {"workspace_id": workspace_id, "run_id": run_id, **self.worker_runtime.snapshot(artifact_run_id), **merge_payload})
@@ -2991,6 +3262,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                             "worker_id": "merge",
                             "changed_files": changed_files,
                             "conflict_paths": sorted(conflict_paths),
+                            "forbidden_paths": sorted(forbidden_paths),
                             "artifact_ref": job.worker_merge_ref,
                         },
                     )
@@ -3275,7 +3547,22 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             pending_post_compact_messages = list(transcript_context.get("post_compact_messages") or [])
             if pending_post_compact_messages:
                 user_prompt = self._with_post_compact_messages(user_prompt, pending_post_compact_messages)
-            available_tools = ToolRouter.allowed_openai_tools()
+            skill_allowed_tools = self._selected_skill_allowed_tools(
+                prompt=request.prompt,
+                intent=str(request.intent or ""),
+                generation_mode=str(getattr(request.generation_mode, "value", request.generation_mode)),
+                paths=[
+                    *list(initial_context.keys()),
+                    *list(extra_file_context.keys()),
+                    *self._target_files_from_execution(latest_execution),
+                ][:32],
+                failure_class=str(job.failure_class or ""),
+            )
+            available_tools = (
+                ToolRouter.allowed_openai_tools(forced_allowed=skill_allowed_tools)
+                if skill_allowed_tools
+                else ToolRouter.allowed_openai_tools()
+            )
             forced_tool_names = {
                 str(item)
                 for item in (next_forced_action or {}).get("forced_tool_names", [])
@@ -3829,6 +4116,11 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                 self._compact_jsonish(agent_memory or {}, max_chars=700, max_items=5)
                 if browser_step_repair or generated_tests_repair
                 else agent_memory or {}
+            ),
+            "hook_contexts": self._compact_jsonish(
+                self._recent_hook_contexts(run_id),
+                max_chars=1800 if compact_repair_prompt else 2400,
+                max_items=8,
             ),
             "repair_packets": self._compact_jsonish(
                 repair_packets or [],
@@ -4835,28 +5127,49 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         transcript_suggestions = [
             item for item in transcript_pressure.get("suggestions") or [] if isinstance(item, dict)
         ]
+        if transcript_pressure.get("avoid_reread_files"):
+            pressure["avoid_reread_files"] = transcript_pressure.get("avoid_reread_files")
         if transcript_suggestions:
             pressure["suggestions"] = [
                 *[item for item in pressure.get("suggestions") or [] if isinstance(item, dict)],
                 *transcript_suggestions,
             ]
+            pressure["recommendations"] = [
+                *[item for item in pressure.get("recommendations") or [] if isinstance(item, dict)],
+                *[
+                    {
+                        "code": item.get("code") or "avoid_reread_files",
+                        "message": item.get("message") or "Avoid duplicate file reads.",
+                        "section": item.get("section") or "transcript",
+                        "severity": "warning",
+                        "tokens": int(item.get("tokens") or 0),
+                        "action": "avoid_reread_files",
+                        "paths": [str(path) for path in item.get("paths") or [] if str(path).strip()],
+                        "metadata": {},
+                    }
+                    for item in transcript_suggestions
+                ],
+            ]
             pressure["compact_recommended"] = True
         pressure.update({"attempt": attempt, "tool_round": tool_round, "created_at": datetime.now(timezone.utc).isoformat()})
         self.context_pressure_history.setdefault(artifact_run_id, []).append(pressure)
         job.context_pressure_ref = job.context_pressure_ref or f"context_pressure:{workspace_id}:{artifact_run_id}"
-        self._store_report(
-            job.context_pressure_ref,
-            {
-                "workspace_id": workspace_id,
-                "run_id": run_id,
-                "items": self.context_pressure_history.get(artifact_run_id, [])[-200:],
-            },
+        report = self._context_pressure_report(
+            workspace_id=workspace_id,
+            run_id=run_id,
+            items=self.context_pressure_history.get(artifact_run_id, [])[-200:],
         )
+        self._store_report(job.context_pressure_ref, report)
+        self._record_context_pressure_journal(workspace_id=workspace_id, run_id=run_id, report=report)
         payload["context_pressure"] = {
             "total_tokens_estimate": pressure.get("total_tokens_estimate"),
             "pressure_ratio": pressure.get("pressure_ratio"),
             "compact_recommended": pressure.get("compact_recommended"),
             "suggestions": pressure.get("suggestions"),
+            "recommendations": pressure.get("recommendations"),
+            "microcompact_candidates": pressure.get("microcompact_candidates"),
+            "avoid_reread_files": pressure.get("avoid_reread_files"),
+            "compact_boundary": pressure.get("compact_boundary"),
             "duplicate_file_reads": pressure.get("duplicate_file_reads"),
         }
         if pressure.get("duplicate_file_reads"):
@@ -4895,6 +5208,72 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             )
             self.rollout_trace.append(artifact_run_id, "context_suggestion", pressure)
         return json.dumps(payload, ensure_ascii=False)
+
+    @staticmethod
+    def _context_pressure_report(*, workspace_id: str, run_id: str, items: list[dict[str, Any]]) -> dict[str, Any]:
+        latest = items[-1] if items else None
+        payload = {
+            "schema": "grounded.context_pressure.v2",
+            "workspace_id": workspace_id,
+            "run_id": run_id,
+            "status": "ready" if latest else "empty",
+            "latest": latest,
+            "items": items,
+            "sections": (latest or {}).get("sections") or {},
+            "recommendations": (latest or {}).get("recommendations") or [],
+            "microcompact_candidates": (latest or {}).get("microcompact_candidates") or [],
+            "avoid_reread_files": (latest or {}).get("avoid_reread_files") or [],
+            "compact_boundary": (latest or {}).get("compact_boundary") or {},
+            "updated_at": (latest or {}).get("created_at"),
+        }
+        return ContextPressureReport.model_validate(payload).model_dump(mode="json", by_alias=True)
+
+    def _record_context_pressure_journal(self, *, workspace_id: str, run_id: str, report: dict[str, Any]) -> None:
+        if self.event_journal_service is None:
+            return
+        latest = report.get("latest") if isinstance(report.get("latest"), dict) else {}
+        try:
+            self.event_journal_service.append_run(
+                workspace_id=workspace_id,
+                run_id=run_id,
+                event_type="context.pressure_recorded",
+                payload={
+                    "context_pressure_ref": f"context_pressure:{workspace_id}:{run_id}",
+                    "pressure_ratio": latest.get("pressure_ratio"),
+                    "total_tokens_estimate": latest.get("total_tokens_estimate"),
+                    "recommendation_codes": [
+                        item.get("code")
+                        for item in report.get("recommendations") or []
+                        if isinstance(item, dict) and item.get("code")
+                    ],
+                },
+                actor="system",
+                summary="Context pressure recorded.",
+                source_ref=f"context_pressure:{workspace_id}:{run_id}",
+            )
+            if report.get("microcompact_candidates"):
+                self.event_journal_service.append_run(
+                    workspace_id=workspace_id,
+                    run_id=run_id,
+                    event_type="context.microcompact_recommended",
+                    payload={"candidates": report.get("microcompact_candidates") or []},
+                    actor="system",
+                    summary="Microcompact candidate recommended.",
+                    source_ref=f"context_pressure:{workspace_id}:{run_id}",
+                )
+            compact_boundary = report.get("compact_boundary") if isinstance(report.get("compact_boundary"), dict) else {}
+            if compact_boundary.get("recommended"):
+                self.event_journal_service.append_run(
+                    workspace_id=workspace_id,
+                    run_id=run_id,
+                    event_type="context.compact_boundary_recommended",
+                    payload=compact_boundary,
+                    actor="system",
+                    summary="Compact boundary recommended.",
+                    source_ref=f"context_pressure:{workspace_id}:{run_id}",
+                )
+        except Exception:
+            pass
 
     @staticmethod
     def _with_post_compact_messages(user_prompt: str, messages: list[dict[str, Any]]) -> str:
@@ -5034,20 +5413,24 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         hook: str,
         status: str = "completed",
         payload: dict[str, Any] | None = None,
-    ) -> None:
+    ):
         artifact_run_id = job.linked_run_id or job.job_id
         outcome_payload: dict[str, Any] | None = None
+        outcome = None
+        hook_payload = {"workspace_id": job.workspace_id, "run_id": artifact_run_id, **dict(payload or {})}
         try:
             if status == "started":
-                event = self.hook_manager.record(artifact_run_id, hook, status=status, payload=payload or {})  # type: ignore[arg-type]
+                event = self.hook_manager.record(artifact_run_id, hook, status=status, payload=hook_payload)  # type: ignore[arg-type]
             else:
-                outcome = self.hook_manager.run(artifact_run_id, hook, payload={**dict(payload or {}), "requested_status": status})  # type: ignore[arg-type]
+                outcome = self.hook_manager.run(artifact_run_id, hook, payload={**hook_payload, "requested_status": status})  # type: ignore[arg-type]
                 event = outcome.event
                 outcome_payload = outcome.as_dict()
                 if outcome.should_block:
                     status = "failed"
+                if outcome.additional_contexts:
+                    self._store_hook_contexts(job=job, artifact_run_id=artifact_run_id, outcome=outcome)
         except Exception:
-            return
+            return None
         job.hook_trace_ref = job.hook_trace_ref or f"hook_trace:{job.workspace_id}:{artifact_run_id}"
         hook_report = {
             "workspace_id": job.workspace_id,
@@ -5076,6 +5459,60 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             save=False,
         )
         self.rollout_trace.append(artifact_run_id, f"hook_{hook}", event)
+        return outcome
+
+    def _store_hook_contexts(self, *, job: JobRecord, artifact_run_id: str, outcome: Any) -> None:
+        key = f"hook_context:{artifact_run_id}"
+        existing = self.store.get("reports", key) or {}
+        items = list(existing.get("contexts") or []) if isinstance(existing.get("contexts"), list) else []
+        created_at = datetime.now(timezone.utc).isoformat()
+        context_items = outcome.context_items or [
+            {
+                "text": text,
+                "priority": 0,
+                "target": "next_turn",
+                "source": "legacy",
+                "source_rule_id": None,
+                "metadata": {},
+            }
+            for text in outcome.additional_contexts
+        ]
+        for item in context_items:
+            if not isinstance(item, dict) or not str(item.get("text") or "").strip():
+                continue
+            items.append(
+                {
+                    "hook": outcome.hook,
+                    "text": str(item.get("text") or "")[:2000],
+                    "priority": int(item.get("priority") or 0),
+                    "target": str(item.get("target") or "next_turn"),
+                    "source": str(item.get("source") or ""),
+                    "source_rule_id": item.get("source_rule_id"),
+                    "metadata": item.get("metadata") if isinstance(item.get("metadata"), dict) else {},
+                    "created_at": created_at,
+                }
+            )
+        items = sorted(items[-100:], key=lambda value: int(value.get("priority") or 0), reverse=True)
+        payload = {
+            "schema": "grounded.hook_context.v1",
+            "workspace_id": job.workspace_id,
+            "run_id": job.linked_run_id or artifact_run_id,
+            "context_count": len(items),
+            "contexts": items,
+            "updated_at": created_at,
+        }
+        self._store_report(key, payload)
+        job.agent_memory = {
+            **dict(job.agent_memory or {}),
+            "hook_context_ref": key,
+            "hook_contexts": items[:8],
+        }
+
+    def _recent_hook_contexts(self, run_id: str) -> list[dict[str, Any]]:
+        record = self.store.get("reports", f"hook_context:{run_id}") or {}
+        contexts = record.get("contexts") if isinstance(record.get("contexts"), list) else []
+        normalized = [item for item in contexts if isinstance(item, dict) and str(item.get("text") or "").strip()]
+        return sorted(normalized[-20:], key=lambda value: int(value.get("priority") or 0), reverse=True)[:8]
 
     @staticmethod
     def _tool_result_json(item: dict[str, object]) -> str:
@@ -5520,6 +5957,22 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                 "pending_items": snapshot.get("tool_result_messages", []),
                 "transcript_ref": job.agent_transcript_ref,
             },
+        )
+
+    def _store_command_output_artifact(self, workspace_id: str, run_id: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+        if self.output_artifact_service is None:
+            return None
+        return self.output_artifact_service.store_command_output(
+            workspace_id=workspace_id,
+            run_id=run_id,
+            process_id=str(payload.get("process_id") or ""),
+            stream=str(payload.get("stream") or "stdout"),
+            command=str(payload.get("command") or ""),
+            content=str(payload.get("content") or ""),
+            head_tail=payload.get("head_tail") if isinstance(payload.get("head_tail"), dict) else {},
+            exit_code=payload.get("exit_code") if isinstance(payload.get("exit_code"), int) else None,
+            semantic_status=str(payload.get("semantic_status") or "") or None,
+            metadata={"source": "agent_tool"},
         )
 
     @staticmethod
@@ -7273,16 +7726,49 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             "selected": [
                 {
                     "id": item.get("id"),
+                    "scoped_id": item.get("scoped_id"),
+                    "scope": item.get("scope"),
                     "source": item.get("source"),
+                    "dependencies": item.get("dependencies") or [],
+                    "invocationPolicy": item.get("invocationPolicy"),
                     "activation_reason": item.get("activation_reason"),
                     "activation_score": item.get("activation_score"),
                     "allowedTools": item.get("allowedTools") or [],
+                    "model": item.get("model") or "",
+                    "effort": item.get("effort") or "",
                     "validation": item.get("validation") or item.get("validation_hints") or [],
                 }
                 for item in selected
             ],
+            "effective": search.get("effective") or {},
             "skipped": skipped,
         }
+
+    def _selected_skill_allowed_tools(
+        self,
+        *,
+        prompt: str,
+        intent: str,
+        generation_mode: str,
+        paths: list[str],
+        failure_class: str,
+    ) -> set[str]:
+        builder = getattr(self, "context_pack_builder", None)
+        if builder is None or not hasattr(builder, "skill_search_for_context"):
+            return set()
+        try:
+            search = builder.skill_search_for_context(
+                prompt=prompt,
+                intent=intent,
+                generation_mode=generation_mode,
+                paths=paths,
+                failure_class=failure_class,
+            )
+        except Exception:
+            return set()
+        effective = search.get("effective") if isinstance(search.get("effective"), dict) else {}
+        tools = effective.get("allowedTools") if isinstance(effective, dict) else []
+        return {str(item).strip() for item in tools or [] if str(item).strip()}
 
     def _memory_injection_trace(self, *, workspace_id: str, run_id: str, agent_memory: dict[str, Any]) -> dict[str, Any]:
         workspace_payload = self.store.get("reports", f"workspace_memory:{workspace_id}") or {}

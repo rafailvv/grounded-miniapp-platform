@@ -359,6 +359,10 @@ export type SystemConfiguration = {
     provider?: string | null;
     models?: Record<string, unknown>;
     task_profiles?: Record<string, unknown>;
+    routing?: Record<string, unknown>;
+    provider_routing?: Record<string, unknown>;
+    model_manager?: Record<string, unknown>;
+    model_catalog?: Record<string, unknown>;
   };
   defaults: {
     generation_mode: "fast" | "balanced" | "quality" | "basic";
@@ -367,6 +371,77 @@ export type SystemConfiguration = {
   default_coding_profile: string;
   supports_staged_apply: boolean;
   research_artifacts_enabled: boolean;
+};
+
+export type ObservabilityReport = {
+  schema: string;
+  status: string;
+  workspace_id?: string | null;
+  generated_at: string;
+  run_count: number;
+  completed_runs: number;
+  failed_runs: number;
+  blocked_runs: number;
+  running_runs?: number;
+  awaiting_approval_runs?: number;
+  token_usage_total: number;
+  latency_ms_total: number;
+  token_usage: {
+    input_tokens: number;
+    output_tokens: number;
+    reasoning_tokens: number;
+    total_tokens: number;
+    turn_count: number;
+    cached_tokens?: number;
+    cache_write_tokens?: number;
+  };
+  cost: {
+    estimated_cost_usd: number;
+    explicit_cost_usd?: number;
+    estimated_from_tokens_usd?: number;
+    unpriced_tokens?: number;
+    pricing_source?: string;
+    by_model?: Array<Record<string, unknown>>;
+  };
+  latency: {
+    total_ms: number;
+    average_ms: number;
+    p50_ms: number;
+    p95_ms: number;
+    phase_totals_ms: Record<string, number>;
+    slowest_runs?: Array<Record<string, unknown>>;
+  };
+  green_rate_by_generation_mode: Array<{
+    generation_mode: string;
+    run_count: number;
+    terminal_count: number;
+    green_count: number;
+    green_rate: number;
+    status_counts: Record<string, number>;
+    average_total_tokens?: number;
+    estimated_cost_usd?: number;
+  }>;
+  failure_classes: Array<{
+    failure_class: string;
+    count: number;
+    latest_run_id?: string | null;
+    latest_at?: string | null;
+    generation_modes?: Record<string, number>;
+    examples?: Array<Record<string, unknown>>;
+  }>;
+  repair_success: {
+    fix_run_count: number;
+    successful_fix_runs: number;
+    fix_success_rate: number;
+    repair_case_count: number;
+    resolved_case_count: number;
+    case_resolution_rate: number;
+    attempt_count: number;
+    successful_attempt_count: number;
+    attempt_success_rate: number;
+    status_counts?: Record<string, number>;
+  };
+  by_status: Record<string, number>;
 };
 
 export type AgentThread = {
@@ -437,6 +512,11 @@ export type RunCompactionReport = {
   refs?: Record<string, string | null | undefined>;
   created_at?: string;
 };
+
+export type ContextPressureReport = RequiredKeys<ApiSchemas["ContextPressureReport"], "items" | "recommendations">;
+export type OutputArtifactIndex = RequiredKeys<ApiSchemas["OutputArtifactIndex"], "items">;
+export type PromptSuggestion = ApiSchemas["PromptSuggestion"];
+export type PromptSuggestionsReport = RequiredKeys<ApiSchemas["PromptSuggestionsReport"], "items">;
 
 export type RunCompactionBoundaries = {
   schema: string;
@@ -748,13 +828,35 @@ export type LspDiagnosticsReport = {
   workspace_id: string;
   run_id?: string | null;
   status: string;
+  engine?: string;
   items: Array<{ path: string; file?: string; severity: string; message: string; source: string; line?: number; column?: number; code?: string; jump?: { path: string; line: number; column?: number; label?: string } }>;
   symbols?: Array<{ path: string; kind: string; name: string; line: number; column?: number; jump?: { path: string; line: number; column?: number; label?: string } }>;
   tool_status?: Record<string, unknown>;
+  diagnostic_stream?: Array<{ phase: string; status: string; created_at?: string; issue_count?: number; error_count?: number; warning_count?: number; file_count?: number } & Record<string, unknown>>;
+  route_graph?: LspRouteGraphReport;
   error_count?: number;
   warning_count?: number;
   changed_only?: boolean;
   changed_files?: string[];
+};
+
+export type LspDefinitionReport = {
+  schema?: string;
+  workspace_id?: string;
+  run_id?: string | null;
+  symbol: string;
+  items: Array<{ path: string; kind: string; name: string; line: number; column?: number; excerpt?: string; definition_kind?: string; jump?: { path: string; line: number; column?: number; label?: string } }>;
+};
+
+export type LspRouteGraphReport = {
+  schema?: string;
+  workspace_id?: string;
+  run_id?: string | null;
+  nodes: Array<Record<string, unknown>>;
+  edges: Array<{ from?: string; to?: string; kind?: string; status?: string; file?: string; method?: string; path?: string } & Record<string, unknown>>;
+  missing_edges?: Array<Record<string, unknown>>;
+  summary?: Record<string, unknown>;
+  static_context?: Record<string, unknown>;
 };
 
 export type CommandPaletteAction = {
@@ -993,6 +1095,14 @@ export async function listRuns(workspaceId: string): Promise<Run[]> {
   return request<Run[]>(`/workspaces/${workspaceId}/runs`);
 }
 
+export async function getObservabilitySummary(): Promise<ObservabilityReport> {
+  return request<ObservabilityReport>("/system/observability");
+}
+
+export async function getWorkspaceObservability(workspaceId: string): Promise<ObservabilityReport> {
+  return request<ObservabilityReport>(`/workspaces/${workspaceId}/observability`);
+}
+
 export async function createRun(
   workspaceId: string,
   payload: {
@@ -1223,6 +1333,10 @@ export async function getRunCompaction(runId: string): Promise<RunCompactionRepo
   return request<RunCompactionReport>(`/runs/${runId}/compaction`);
 }
 
+export async function getRunContextPressure(runId: string): Promise<ContextPressureReport> {
+  return request<ContextPressureReport>(`/runs/${runId}/context-pressure`);
+}
+
 export async function getRunCompactionBoundaries(runId: string): Promise<RunCompactionBoundaries> {
   return request<RunCompactionBoundaries>(`/runs/${runId}/compaction/boundaries`);
 }
@@ -1233,6 +1347,10 @@ export async function getRunMicrocompact(runId: string, digest: string): Promise
 
 export async function getRunPostCompactMessage(runId: string, boundaryId: string): Promise<Record<string, unknown>> {
   return request<Record<string, unknown>>(`/runs/${runId}/compaction/post-message/${boundaryId}`);
+}
+
+export async function getRunOutputArtifacts(runId: string): Promise<OutputArtifactIndex> {
+  return request<OutputArtifactIndex>(`/runs/${runId}/output-artifacts`);
 }
 
 export async function startReviewFix(runId: string): Promise<Run> {
@@ -1265,6 +1383,10 @@ export async function getRunWorkerMergeDecision(runId: string): Promise<Record<s
 
 export async function getRunReview(runId: string): Promise<ReviewReport> {
   return request<ReviewReport>(`/runs/${runId}/review`);
+}
+
+export async function getRunPromptSuggestions(runId: string): Promise<PromptSuggestionsReport> {
+  return request<PromptSuggestionsReport>(`/runs/${runId}/prompt-suggestions`);
 }
 
 export async function getRunTestMatrix(runId: string): Promise<TestMatrixReport> {
@@ -1359,6 +1481,29 @@ export async function getLspDiagnostics(workspaceId: string, runId?: string, opt
   }
   const suffix = params.toString() ? `?${params.toString()}` : "";
   return request<LspDiagnosticsReport>(`/workspaces/${workspaceId}/diagnostics/lsp${suffix}`);
+}
+
+export async function getLspDefinition(workspaceId: string, symbol: string, runId?: string, targets?: string[]): Promise<LspDefinitionReport> {
+  const params = new URLSearchParams({ symbol });
+  if (runId) {
+    params.set("run_id", runId);
+  }
+  if (targets?.length) {
+    params.set("targets", targets.join(","));
+  }
+  return request<LspDefinitionReport>(`/workspaces/${workspaceId}/lsp/definition?${params.toString()}`);
+}
+
+export async function getLspRouteGraph(workspaceId: string, runId?: string, targets?: string[]): Promise<LspRouteGraphReport> {
+  const params = new URLSearchParams();
+  if (runId) {
+    params.set("run_id", runId);
+  }
+  if (targets?.length) {
+    params.set("targets", targets.join(","));
+  }
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  return request<LspRouteGraphReport>(`/workspaces/${workspaceId}/lsp/route-graph${suffix}`);
 }
 
 export async function stopRun(runId: string): Promise<Run> {

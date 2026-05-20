@@ -6,6 +6,8 @@ from pydantic import ConfigDict, Field
 
 from app.models.common import StrictModel
 from app.models.event_journal import EventJournalPage, EventJournalPayload, RunEventV2, RunJournalState, ThreadEventV2, ThreadJournalState
+from app.models.observability import ObservabilityReport
+from app.models.webhooks import WebhookDeliveryReport, WebhookListReport, WebhookSubscription
 
 
 class WorkbenchApiModel(StrictModel):
@@ -318,6 +320,10 @@ class SystemSchemaShapes(WorkbenchApiModel):
     thread_event_v2: ThreadEventV2 | None = None
     event_journal_page: EventJournalPage | None = None
     event_journal_payload: EventJournalPayload | None = None
+    observability_report: ObservabilityReport | None = None
+    webhook_subscription: WebhookSubscription | None = None
+    webhook_list_report: WebhookListReport | None = None
+    webhook_delivery_report: WebhookDeliveryReport | None = None
     run_journal_state: RunJournalState | None = None
     thread_journal_state: ThreadJournalState | None = None
     tool_envelope: ToolEnvelope | None = None
@@ -344,12 +350,26 @@ SYSTEM_SCHEMA_MODEL_REFS: tuple[SchemaModelRef, ...] = (
     SchemaModelRef(name="RunJournalState", purpose="Reduced run state reconstructed from v2 journal."),
     SchemaModelRef(name="ThreadJournalState", purpose="Reduced thread state reconstructed from v2 journal."),
     SchemaModelRef(name="ToolEnvelope", purpose="Canonical workbench tool-call envelope."),
+    SchemaModelRef(name="ToolEventsReport", purpose="Run tool event report."),
+    SchemaModelRef(name="RunEventsReport", purpose="Run event report."),
+    SchemaModelRef(name="RunProtocolReport", purpose="Run protocol event report."),
+    SchemaModelRef(name="RunTimelineReport", purpose="Run timeline report."),
+    SchemaModelRef(name="RunTraceViewReport", purpose="Run trace view report."),
+    SchemaModelRef(name="TraceBundleReport", purpose="Trace bundle report."),
     SchemaModelRef(name="CheckResult", purpose="Workbench check execution result."),
     SchemaModelRef(name="ArtifactRef", purpose="Stable reference to persisted run artifacts."),
     SchemaModelRef(name="GateReport", purpose="Generation acceptance gate report."),
     SchemaModelRef(name="RepairCase", purpose="Evidence-driven repair case."),
     SchemaModelRef(name="TraceState", purpose="Reduced trace bundle state."),
     SchemaModelRef(name="ThreadSnapshot", purpose="Typed thread read snapshot."),
+    SchemaModelRef(name="ContextPressureReport", purpose="Context budget pressure report and recommendations."),
+    SchemaModelRef(name="OutputArtifactIndex", purpose="Indexed head/tail command output artifacts."),
+    SchemaModelRef(name="PromptSuggestionsReport", purpose="Product follow-up prompts generated after a run."),
+    SchemaModelRef(name="MemoryRetrievalResult", purpose="Top-k workspace memory retrieval response."),
+    SchemaModelRef(name="ObservabilityReport", purpose="Cost, latency, failure class, green-rate, and repair success dashboard."),
+    SchemaModelRef(name="WebhookSubscription", purpose="SDK-managed webhook subscription."),
+    SchemaModelRef(name="WebhookListReport", purpose="Paged webhook subscription list."),
+    SchemaModelRef(name="WebhookDeliveryReport", purpose="Webhook test/delivery status report."),
 )
 
 

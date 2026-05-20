@@ -2,13 +2,27 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, Header, HTTPException
+from pydantic import BaseModel, Field
 
 from app.api.deps import get_container
+from app.models.context_pressure import ContextPressureReport
 from app.models.domain import RunRecord
 from app.models.event_journal import EventJournalPage, EventJournalPayload, RunJournalState, ThreadJournalState
+from app.models.hooks import HookContext
+from app.models.memory import MemoryRetrievalRequest, MemoryRetrievalResult
+from app.models.observability import ObservabilityReport
+from app.models.output_artifacts import CommandOutputArtifact, OutputArtifactIndex
+from app.models.prompt_suggestions import PromptSuggestionsReport
 from app.models.threads import ThreadSnapshot
+from app.models.webhooks import (
+    WebhookCreateRequest,
+    WebhookDeliveryReport,
+    WebhookListReport,
+    WebhookSubscription,
+    WebhookTestRequest,
+    WebhookUpdateRequest,
+)
 from app.models.workbench import (
     GateReport,
     RepairAttemptsReport,
@@ -37,6 +51,21 @@ class CommandPolicyRequest(BaseModel):
     command: str
     preset: str = "safe_auto"
     run_id: str | None = None
+
+
+class HookEvaluateRequest(BaseModel):
+    hook: str
+    run_id: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class SkillEvaluateRequest(BaseModel):
+    prompt: str = ""
+    intent: str | None = None
+    generation_mode: str | None = None
+    paths: list[str] = Field(default_factory=list)
+    failure_class: str | None = None
+    max_skills: int | None = None
 
 
 class MemoryRequest(BaseModel):
@@ -108,6 +137,16 @@ def get_exec_policy(container: ServiceContainer = Depends(get_container)) -> dic
     }
 
 
+@router.get("/system/tools/dynamic")
+def get_dynamic_tool_catalog() -> dict[str, Any]:
+    return ToolRouter.dynamic_tool_manifest()
+
+
+@router.get("/system/policies/hooks")
+def get_hook_policy_manifest(container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    return container.hook_policy_service.manifest()
+
+
 @router.post("/policy/evaluate")
 def evaluate_policy(
     request: CommandPolicyRequest,
@@ -139,6 +178,120 @@ def evaluate_workspace_command(
         return {"workspace_id": workspace_id, **container.exec_policy_service.evaluate_command(request.command, preset=request.preset, root=container.workspace_service.source_dir(workspace_id))}
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/workspaces/{workspace_id}/hooks")
+def get_workspace_hooks(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        container.workspace_service.get_workspace(workspace_id)
+        return container.hook_policy_service.workspace_policy_report(workspace_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.put("/workspaces/{workspace_id}/hooks")
+def put_workspace_hooks(
+    workspace_id: str,
+    policy: dict[str, Any],
+    container: ServiceContainer = Depends(get_container),
+) -> dict[str, Any]:
+    try:
+        container.workspace_service.get_workspace(workspace_id)
+        return container.hook_policy_service.update_workspace_policy(workspace_id, policy)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/workspaces/{workspace_id}/hooks/evaluate")
+def evaluate_workspace_hooks(
+    workspace_id: str,
+    request: HookEvaluateRequest,
+    container: ServiceContainer = Depends(get_container),
+) -> dict[str, Any]:
+    try:
+        container.workspace_service.get_workspace(workspace_id)
+        evaluation = container.hook_policy_service.evaluate(
+            HookContext(
+                hook=request.hook,
+                workspace_id=workspace_id,
+                run_id=request.run_id,
+                payload={**dict(request.payload or {}), "workspace_id": workspace_id, "run_id": request.run_id},
+            )
+        )
+        return evaluation.model_dump(mode="json", by_alias=True)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/webhooks", response_model=WebhookListReport)
+def list_webhooks(
+    workspace_id: str | None = None,
+    container: ServiceContainer = Depends(get_container),
+) -> dict[str, Any]:
+    try:
+        return container.workbench_service.list_webhooks(workspace_id=workspace_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/webhooks", response_model=WebhookSubscription)
+def create_webhook(
+    request: WebhookCreateRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    container: ServiceContainer = Depends(get_container),
+) -> dict[str, Any]:
+    try:
+        return container.workbench_service.create_webhook(request, idempotency_key=idempotency_key)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/webhooks/{webhook_id}", response_model=WebhookSubscription)
+def get_webhook(webhook_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.get_webhook(webhook_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.patch("/webhooks/{webhook_id}", response_model=WebhookSubscription)
+def update_webhook(
+    webhook_id: str,
+    request: WebhookUpdateRequest,
+    container: ServiceContainer = Depends(get_container),
+) -> dict[str, Any]:
+    try:
+        return container.workbench_service.update_webhook(webhook_id, request)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.delete("/webhooks/{webhook_id}")
+def delete_webhook(webhook_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.delete_webhook(webhook_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/webhooks/{webhook_id}/test", response_model=WebhookDeliveryReport)
+def test_webhook(
+    webhook_id: str,
+    request: WebhookTestRequest | None = None,
+    container: ServiceContainer = Depends(get_container),
+) -> dict[str, Any]:
+    try:
+        payload = request.payload if request is not None else {}
+        event_type = request.event_type if request is not None else "webhook.test"
+        return container.workbench_service.test_webhook(webhook_id, event_type=event_type, payload=payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/runs/{run_id}/approvals")
@@ -528,6 +681,21 @@ def get_lsp_references(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@router.get("/workspaces/{workspace_id}/lsp/definition")
+def get_lsp_definition(
+    workspace_id: str,
+    symbol: str,
+    run_id: str | None = None,
+    targets: str | None = None,
+    container: ServiceContainer = Depends(get_container),
+) -> dict[str, Any]:
+    try:
+        target_list = [item.strip() for item in str(targets or "").split(",") if item.strip()]
+        return container.workbench_service.lsp_definition(workspace_id, run_id=run_id, symbol=symbol, targets=target_list or None)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.get("/workspaces/{workspace_id}/lsp/route-static-context")
 def get_lsp_route_static_context(
     workspace_id: str,
@@ -538,6 +706,20 @@ def get_lsp_route_static_context(
     try:
         target_list = [item.strip() for item in str(targets or "").split(",") if item.strip()]
         return container.workbench_service.lsp_route_static_context(workspace_id, run_id=run_id, targets=target_list or None)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/workspaces/{workspace_id}/lsp/route-graph")
+def get_lsp_route_graph(
+    workspace_id: str,
+    run_id: str | None = None,
+    targets: str | None = None,
+    container: ServiceContainer = Depends(get_container),
+) -> dict[str, Any]:
+    try:
+        target_list = [item.strip() for item in str(targets or "").split(",") if item.strip()]
+        return container.workbench_service.lsp_route_graph(workspace_id, run_id=run_id, targets=target_list or None)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -642,9 +824,22 @@ def resume_run(run_id: str, container: ServiceContainer = Depends(get_container)
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.get("/system/metrics/summary")
+@router.get("/system/metrics/summary", response_model=ObservabilityReport)
 def get_metrics_summary(container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     return container.workbench_service.metrics_summary()
+
+
+@router.get("/system/observability", response_model=ObservabilityReport)
+def get_system_observability(container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    return container.workbench_service.observability_summary()
+
+
+@router.get("/workspaces/{workspace_id}/observability", response_model=ObservabilityReport)
+def get_workspace_observability(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.observability_summary(workspace_id=workspace_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.get("/workspaces/{workspace_id}/git/status")
@@ -729,6 +924,18 @@ def consolidate_workspace_memory(workspace_id: str, container: ServiceContainer 
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@router.post("/workspaces/{workspace_id}/memory/retrieve", response_model=MemoryRetrievalResult)
+def retrieve_workspace_memory(
+    workspace_id: str,
+    request: MemoryRetrievalRequest,
+    container: ServiceContainer = Depends(get_container),
+) -> dict[str, Any]:
+    try:
+        return container.workbench_service.retrieve_memory(workspace_id, request)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.post("/runs/{run_id}/memory/extract")
 def extract_run_memory(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     try:
@@ -750,6 +957,16 @@ def upsert_workspace_memory(workspace_id: str, request: MemoryRequest, container
 @router.get("/skills")
 def list_skills(container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     return container.workbench_service.skills()
+
+
+@router.get("/system/skills/manifest")
+def get_skill_registry_manifest(container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    return container.workbench_service.skill_registry_manifest()
+
+
+@router.post("/skills/evaluate")
+def evaluate_skills(request: SkillEvaluateRequest, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    return container.workbench_service.evaluate_skills(request.model_dump())
 
 
 @router.get("/skills/{skill_id}")
@@ -809,6 +1026,14 @@ def get_run_compaction(run_id: str, container: ServiceContainer = Depends(get_co
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@router.get("/runs/{run_id}/context-pressure", response_model=ContextPressureReport)
+def get_run_context_pressure(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.context_pressure(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.get("/runs/{run_id}/compaction/boundaries")
 def get_run_compaction_boundaries(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     try:
@@ -829,6 +1054,22 @@ def get_run_post_compact_message(run_id: str, boundary_id: str, container: Servi
 def get_run_microcompact(run_id: str, digest: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     try:
         return container.workbench_service.microcompact(run_id, digest)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/runs/{run_id}/output-artifacts", response_model=OutputArtifactIndex)
+def get_run_output_artifacts(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.output_artifacts(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/runs/{run_id}/output-artifacts/{artifact_id}", response_model=CommandOutputArtifact)
+def get_run_output_artifact(run_id: str, artifact_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.output_artifact(run_id, artifact_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -1031,6 +1272,14 @@ def start_run_review_fix(run_id: str, container: ServiceContainer = Depends(get_
 def get_run_review(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     try:
         return container.store.get("reports", f"review:{run_id}") or container.workbench_service.review(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/runs/{run_id}/prompt-suggestions", response_model=PromptSuggestionsReport)
+def get_run_prompt_suggestions(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.prompt_suggestions(run_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 

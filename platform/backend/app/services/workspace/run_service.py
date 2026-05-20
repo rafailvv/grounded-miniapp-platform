@@ -29,6 +29,7 @@ from app.models.domain import (
     ValidationSnapshot,
     WorkspaceRecord,
 )
+from app.modules.miniapp_agent_loop.guardian_review import GuardianReview
 from app.modules.workspace_code_agent_runtime import WorkspaceCodeAgentRuntime
 from app.repositories.state_store import StateStore
 from app.services.check_runner import CheckRunner
@@ -848,12 +849,135 @@ class RunService:
         artifacts = self.get_run_artifacts(run_id)
         return list(artifacts.get("iterations", []) or [])
 
+    def enforce_guardian_before_apply(
+        self,
+        run: RunRecord,
+        *,
+        source: str,
+        changed_files: list[str] | None = None,
+    ) -> tuple[bool, dict[str, Any]]:
+        report = self._guardian_review_for_apply(run, source=source, changed_files=changed_files)
+        if report.get("status") == "passed":
+            return True, report
+        findings = [item for item in report.get("findings") or [] if isinstance(item, dict)]
+        run.status = "blocked"
+        run.apply_status = "blocked"
+        run.outcome_kind = "blocked_generation"
+        run.draft_status = "ready" if self.workspace_service.draft_exists(run.workspace_id, run.run_id) else run.draft_status
+        run.draft_ready = run.draft_status == "ready"
+        run.current_stage = "guardian review blocked apply"
+        run.progress_percent = self._terminal_failure_progress(run.progress_percent)
+        run.failure_class = "guardian.pre_apply_blocked"
+        run.failure_signature = f"guardian.pre_apply_blocked:{findings[0].get('code') if findings else 'blocker'}"
+        run.failure_reason = findings[0].get("message") if findings else "Guardian review blocked source apply."
+        run.remaining_issues = [
+            {
+                "kind": "guardian_blocker",
+                "code": item.get("code"),
+                "category": item.get("category"),
+                "details": item.get("message"),
+                "file_path": item.get("file_path"),
+                "line": item.get("line"),
+                "blocking": True,
+                "evidence": item.get("evidence") or {},
+            }
+            for item in findings
+        ]
+        run.updated_at = datetime.now(timezone.utc)
+        self._save_run(run)
+        self._append_job_event(
+            run.linked_job_id,
+            "validation_failed",
+            "Guardian review blocked source apply.",
+            {"run_id": run.run_id, "guardian_review_ref": f"guardian_review:{run.workspace_id}:{run.run_id}", "findings": findings},
+        )
+        self._journal_run(
+            run,
+            "guardian.apply_blocked",
+            {"run_id": run.run_id, "workspace_id": run.workspace_id, "findings": findings},
+            summary="Guardian review blocked source apply.",
+            idempotency_key=f"guardian.apply_blocked:{run.run_id}:{report.get('created_at')}",
+        )
+        return False, report
+
+    def _guardian_review_for_apply(
+        self,
+        run: RunRecord,
+        *,
+        source: str,
+        changed_files: list[str] | None = None,
+    ) -> dict[str, Any]:
+        stored = self._stored_guardian_review(run)
+        if stored and source == "pre_apply_guardian" and stored.get("status") == "passed":
+            self.store.upsert("reports", f"guardian_review:{run.workspace_id}:{run.run_id}", stored)
+            return stored
+        artifacts = self.store.get("reports", f"run_artifacts:{run.run_id}")
+        artifacts = artifacts if isinstance(artifacts, dict) else {}
+        raw_checks = artifacts.get("check_results") if isinstance(artifacts.get("check_results"), list) else []
+        if not raw_checks and run.linked_job_id:
+            job_payload = self.store.get("jobs", run.linked_job_id)
+            raw_checks = job_payload.get("executed_checks") if isinstance(job_payload, dict) and isinstance(job_payload.get("executed_checks"), list) else []
+        results: list[RunCheckResult] = []
+        for item in raw_checks or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                results.append(RunCheckResult.model_validate(item))
+            except Exception:
+                continue
+        execution = CheckExecutionRecord(
+            workspace_id=run.workspace_id,
+            run_id=run.run_id,
+            changed_files=list(changed_files or run.touched_files or self._paths_from_diff(str(artifacts.get("diff") or ""))),
+            results=results,
+            completed_at=datetime.now(timezone.utc),
+        ) if results else None
+        draft_source = self.workspace_service.draft_source_dir(run.workspace_id, run.run_id)
+        if not draft_source.exists():
+            draft_source = self.workspace_service.source_dir(run.workspace_id)
+        report = GuardianReview.review(
+            workspace_id=run.workspace_id,
+            run_id=run.run_id,
+            draft_source=draft_source,
+            changed_files=list(changed_files or run.touched_files or self._paths_from_diff(str(artifacts.get("diff") or ""))),
+            latest_execution=execution,
+            preview_details=artifacts.get("preview") if isinstance(artifacts.get("preview"), dict) else {},
+            acceptance_contract=run.acceptance_contract,
+            implementation_plan=run.implementation_plan,
+            target_role_scope=run.target_role_scope,
+            intent=run.intent,
+            source="pre_apply_guardian",
+        ).model_dump(mode="json", by_alias=True)
+        self.store.upsert("reports", f"guardian_review:{run.workspace_id}:{run.run_id}", report)
+        return report
+
+    def _stored_guardian_review(self, run: RunRecord) -> dict[str, Any] | None:
+        candidates: list[Any] = []
+        if run.verifier_review_ref:
+            candidates.append(self.store.get("reports", run.verifier_review_ref))
+        candidates.append(self.store.get("reports", f"guardian_review:{run.workspace_id}:{run.run_id}"))
+        for payload in candidates:
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("schema") == "grounded.guardian_review.v1":
+                return dict(payload)
+            for key in ("review", "report"):
+                review = payload.get(key) if isinstance(payload.get(key), dict) else None
+                if isinstance(review, dict) and isinstance(review.get("guardian_review"), dict):
+                    return dict(review["guardian_review"])
+            if isinstance(payload.get("guardian_review"), dict):
+                return dict(payload["guardian_review"])
+        return None
+
     def apply_run(self, run_id: str) -> RunRecord:
         run = self.get_run(run_id)
         if run.apply_strategy != "manual_approve":
             return run
         if run.status != "awaiting_approval":
             return run
+        allowed, _ = self.enforce_guardian_before_apply(run, source="pre_apply_guardian")
+        if not allowed:
+            return self.get_run(run_id)
         apply_started_at = time.perf_counter()
         run.current_stage = "finalizing apply"
         run.progress_percent = 99
@@ -1704,8 +1828,8 @@ class RunService:
             if job.status == "completed":
                 should_apply_fix_draft = request.mode == "fix" and self.workspace_service.draft_exists(run.workspace_id, run.run_id)
                 if should_apply_fix_draft:
-                    self._apply_completed_draft(run, message="Applying verified fix draft to the source workspace.")
-                    self._clear_successful_completion_metadata(run=run, job=job)
+                    if self._apply_completed_draft(run, message="Applying verified fix draft to the source workspace."):
+                        self._clear_successful_completion_metadata(run=run, job=job)
                 else:
                     meaningful_paths = self._meaningful_paths_for_run(
                         workspace_id=run.workspace_id,
@@ -1716,8 +1840,8 @@ class RunService:
                     if not meaningful_paths:
                         self._mark_run_without_meaningful_diff(run, job)
                     else:
-                        self._apply_completed_draft(run, message="Applying generated draft to the source workspace.")
-                        self._clear_successful_completion_metadata(run=run, job=job)
+                        if self._apply_completed_draft(run, message="Applying generated draft to the source workspace."):
+                            self._clear_successful_completion_metadata(run=run, job=job)
             else:
                 meaningful_paths = self._meaningful_paths_for_run(
                     workspace_id=run.workspace_id,
@@ -2389,6 +2513,20 @@ class RunService:
             artifacts = {}
         payload = WorkspaceMemoryPipeline.extract_run(run, artifacts)
         self.store.upsert("reports", f"memory_stage1:{run.workspace_id}:{run.run_id}", payload)
+        if self.event_journal_service is not None:
+            try:
+                self.event_journal_service.append_run(
+                    workspace_id=run.workspace_id,
+                    run_id=run.run_id,
+                    event_type="memory.raw_extracted",
+                    payload={"memory_ref": f"memory_stage1:{run.workspace_id}:{run.run_id}", "raw_count": len(payload.get("items") or [])},
+                    actor="system",
+                    summary="Raw run memory extracted.",
+                    source_ref=f"memory_stage1:{run.workspace_id}:{run.run_id}",
+                    idempotency_key=f"memory.raw_extracted:{run.run_id}",
+                )
+            except Exception:
+                pass
 
     def _schedule_auto_repair_continuation_if_needed(self, run: RunRecord) -> None:
         try:
@@ -2872,7 +3010,10 @@ class RunService:
             job.fix_targets = []
             job.handoff_from_failed_generate = None
 
-    def _apply_completed_draft(self, run: RunRecord, *, message: str) -> None:
+    def _apply_completed_draft(self, run: RunRecord, *, message: str) -> bool:
+        allowed, _ = self.enforce_guardian_before_apply(run, source="pre_apply_guardian")
+        if not allowed:
+            return False
         apply_started_at = time.perf_counter()
         run.current_stage = "finalizing apply"
         run.progress_percent = max(run.progress_percent, 94)
@@ -2905,6 +3046,7 @@ class RunService:
             "apply_completed",
             "Generated draft was applied successfully.",
         )
+        return True
 
     def _meaningful_paths_for_run(
         self,

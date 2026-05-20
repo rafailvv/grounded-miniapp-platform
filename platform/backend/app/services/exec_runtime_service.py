@@ -12,6 +12,7 @@ from app.modules.miniapp_agent_loop.agent_process_manager import AgentProcessMan
 from app.repositories.platform_db import PlatformDb
 from app.repositories.state_store import StateStore
 from app.services.event_journal import EventJournalService
+from app.services.output_artifact_service import OutputArtifactService
 from app.services.sandbox_service import SandboxService
 from app.services.rpc_event_hub import RpcEventHub
 from app.services.tool_protocol import tool_envelope
@@ -30,12 +31,14 @@ class ExecRuntimeService:
         store: StateStore,
         event_journal_service: EventJournalService | None = None,
         sandbox_service: SandboxService | None = None,
+        output_artifact_service: OutputArtifactService | None = None,
     ) -> None:
         self.workspace_service = workspace_service
         self.platform_db = platform_db
         self.event_hub = event_hub
         self.store = store
         self.event_journal_service = event_journal_service
+        self.output_artifact_service = output_artifact_service
         self.sandbox_service = sandbox_service or workspace_service.sandbox_service
         self.process_manager = AgentProcessManager(sandbox_service=self.sandbox_service)
         self._sessions: dict[str, dict[str, Any]] = {}
@@ -158,6 +161,7 @@ class ExecRuntimeService:
             max_output_chars=24000,
             progress_callback=progress,
             process_id=process_id,
+            output_artifact_writer=self._output_artifact_writer(process_id),
         )
         result_payload = result.as_dict()
         completed_at = self._now().isoformat()
@@ -171,6 +175,9 @@ class ExecRuntimeService:
                 "success": result_payload.get("success"),
                 "stdout": result_payload.get("stdout"),
                 "stderr": result_payload.get("stderr"),
+                "stdout_ref": result_payload.get("stdout_ref"),
+                "stderr_ref": result_payload.get("stderr_ref"),
+                "output_artifacts": result_payload.get("output_artifacts") or [],
                 "completed_at": completed_at,
                 "updated_at": completed_at,
                 "result": result_payload,
@@ -233,9 +240,11 @@ class ExecRuntimeService:
                     risk=(session.get("policy_decision") or {}).get("risk") or "read_only",
                     timing={"duration_ms": session.get("duration_ms")},
                     artifacts=[
-                        {"kind": "stdout", "ref": f"exec:{process_id}:stdout"},
-                        {"kind": "stderr", "ref": f"exec:{process_id}:stderr"},
+                        {"kind": "stdout", "ref": result_payload.get("stdout_ref") or f"exec:{process_id}:stdout"},
+                        {"kind": "stderr", "ref": result_payload.get("stderr_ref") or f"exec:{process_id}:stderr"},
                     ],
+                    stdout_ref=result_payload.get("stdout_ref"),
+                    stderr_ref=result_payload.get("stderr_ref"),
                 ),
             )
             if self.event_journal_service is not None:
@@ -259,6 +268,31 @@ class ExecRuntimeService:
                     )
                 except Exception:
                     pass
+
+    def _output_artifact_writer(self, process_id: str):
+        if self.output_artifact_service is None:
+            return None
+
+        def write(payload: dict[str, Any]) -> dict[str, Any] | None:
+            session = dict(self._sessions.get(process_id) or {})
+            run_id = str(session.get("run_id") or "").strip()
+            workspace_id = str(session.get("workspace_id") or "").strip()
+            if not run_id or not workspace_id:
+                return None
+            return self.output_artifact_service.store_command_output(
+                workspace_id=workspace_id,
+                run_id=run_id,
+                process_id=process_id,
+                stream=str(payload.get("stream") or "stdout"),
+                command=str(payload.get("command") or session.get("command") or ""),
+                content=str(payload.get("content") or ""),
+                head_tail=payload.get("head_tail") if isinstance(payload.get("head_tail"), dict) else {},
+                exit_code=payload.get("exit_code") if isinstance(payload.get("exit_code"), int) else None,
+                semantic_status=str(payload.get("semantic_status") or "") or None,
+                metadata={"source": "exec_runtime", "thread_id": session.get("thread_id"), "turn_id": session.get("turn_id")},
+            )
+
+        return write
 
     def _update_session(self, process_id: str, patch: dict[str, Any]) -> dict[str, Any]:
         with self._lock:

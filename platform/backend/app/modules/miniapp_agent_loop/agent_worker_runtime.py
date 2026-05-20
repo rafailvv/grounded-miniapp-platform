@@ -20,6 +20,10 @@ class WorkerDraft:
     agent_loop_ref: str
     transcript_ref: str
     repair_cycle_ref: str
+    branch_role: str = "writer"
+    branch_stage: str = "role_ui_and_tests"
+    branch_policy: str = "isolated_draft_writer"
+    base_run_id: str = ""
     status: str = "ready"
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
@@ -32,6 +36,10 @@ class WorkerDraft:
             "agent_loop_ref": self.agent_loop_ref,
             "transcript_ref": self.transcript_ref,
             "repair_cycle_ref": self.repair_cycle_ref,
+            "branch_role": self.branch_role,
+            "branch_stage": self.branch_stage,
+            "branch_policy": self.branch_policy,
+            "base_run_id": self.base_run_id,
             "status": self.status,
             "created_at": self.created_at,
         }
@@ -73,10 +81,20 @@ class AgentWorkerRuntime:
                     agent_loop_ref=f"worker_agent_loop:{run_id}:{worker_id}",
                     transcript_ref=f"worker_transcript:{run_id}:{worker_id}",
                     repair_cycle_ref=f"worker_repair_cycle:{run_id}:{worker_id}",
+                    branch_role=str(spec.get("branch_role") or AgentWorkerManager.branch_role(worker_id)),
+                    branch_stage=str(spec.get("branch_stage") or AgentWorkerManager.branch_stage(worker_id)),
+                    branch_policy=str(spec.get("branch_policy") or AgentWorkerManager.branch_policy(worker_id)),
+                    base_run_id=run_id,
                 )
             )
         self._drafts[run_id] = drafts
-        return {"enabled": bool(drafts), "mode": str(generation_mode.value), "workers": [item.as_dict() for item in drafts]}
+        return {
+            "schema": "grounded.worker_drafts.v2",
+            "enabled": bool(drafts),
+            "mode": str(generation_mode.value),
+            "isolation": "filesystem_clone_per_worker",
+            "workers": [item.as_dict() for item in drafts],
+        }
 
     def prepare_workspace_branches(
         self,
@@ -103,17 +121,30 @@ class AgentWorkerRuntime:
                     agent_loop_ref=f"worker_agent_loop:{run_id}:{worker_id}",
                     transcript_ref=f"worker_transcript:{run_id}:{worker_id}",
                     repair_cycle_ref=f"worker_repair_cycle:{run_id}:{worker_id}",
+                    branch_role=str(spec.get("branch_role") or AgentWorkerManager.branch_role(worker_id)),
+                    branch_stage=str(spec.get("branch_stage") or AgentWorkerManager.branch_stage(worker_id)),
+                    branch_policy=str(spec.get("branch_policy") or AgentWorkerManager.branch_policy(worker_id)),
+                    base_run_id=run_id,
                 )
             )
         self._drafts[run_id] = drafts
-        return {"enabled": bool(drafts), "mode": str(generation_mode.value), "workers": [item.as_dict() for item in drafts]}
+        return {
+            "schema": "grounded.worker_drafts.v2",
+            "enabled": bool(drafts),
+            "mode": str(generation_mode.value),
+            "isolation": "workspace_draft_clone_per_worker",
+            "workers": [item.as_dict() for item in drafts],
+        }
 
     def merge_report(self, run_id: str, file_changes: list[DraftAction]) -> dict[str, Any]:
         ownership = AgentWorkerManager.validate_non_conflicting(file_changes)
         report = {
+            "schema": "grounded.worker_merge_report.v2",
+            "branch_schema": "grounded.worker_branch_plan.v2",
             "run_id": run_id,
             "status": "accepted" if ownership.get("ok") else "conflict",
             "ownership": ownership,
+            "manager_decision_policy": "accept non-conflicting owned diffs; reject forbidden/conflicting paths; create repair_worker packet",
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         self._merge_reports.setdefault(run_id, []).append(report)

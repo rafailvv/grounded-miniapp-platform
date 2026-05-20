@@ -12,10 +12,11 @@ from typing import Any, Callable
 
 from app.models.domain import CheckExecutionRecord, DraftAction
 from app.modules.miniapp_agent_loop.agent_file_state import AgentFileStateCache
-from app.modules.miniapp_agent_loop.agent_hooks import AgentHookManager
+from app.modules.miniapp_agent_loop.agent_hooks import AgentHookManager, AgentHookOutcome
 from app.modules.miniapp_agent_loop.agent_process_manager import AgentProcessManager
 from app.modules.miniapp_agent_loop.agent_tool_registry import AgentToolBatch, AgentToolRegistry
 from app.modules.miniapp_agent_loop.agent_worker_manager import AgentWorkerManager
+from app.modules.miniapp_agent_loop.dynamic_tool_catalog import DynamicToolCatalog
 from app.modules.miniapp_agent_loop.edit_validator import AgentEditValidator
 from app.modules.miniapp_agent_loop.lsp_tools import LspToolService
 from app.modules.miniapp_agent_loop.product_workers import canonical_worker_id
@@ -43,6 +44,7 @@ MODEL_TOOL_FOR_CANONICAL: dict[str, str] = {
     "artifact.read": "read_artifact_ref",
     "search.grep": "search_files",
     "semantic.scan": "semantic_scan",
+    "tool.search": "tool_search",
     "diff.inspect": "inspect_diff",
     "checks.run": "run_checks",
     "browser.verify": "browser_verify",
@@ -73,6 +75,9 @@ NORMALIZED_INPUT_KEYS = {
     "worker_id",
     "owner_scope",
     "reason",
+    "domain",
+    "intent",
+    "capability",
 }
 MUTATING_MODEL_TOOLS = {"apply_patch_to_draft", "write_file", "edit_file_exact"}
 EXECUTABLE_MODEL_TOOLS = {
@@ -82,9 +87,12 @@ EXECUTABLE_MODEL_TOOLS = {
     "inspect_diff",
     "read_artifact_ref",
     "semantic_scan",
+    "tool_search",
     "lsp_diagnostics",
     "lsp_symbol_context",
+    "lsp_definition",
     "lsp_find_references",
+    "lsp_route_graph",
     "lsp_route_static_context",
     "run_command",
     "run_checks",
@@ -109,6 +117,7 @@ class ToolRouterContext:
     mode: str = "default"
     forced_allowed_tools: set[str] | None = None
     output_spill_writer: Callable[[str, dict[str, Any]], dict[str, Any] | None] | None = None
+    output_artifact_writer: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None
     max_parallel_read_tools: int = 6
 
 
@@ -239,6 +248,9 @@ class ToolRouter:
             "worker_id": str(item.get("worker_id") or "").strip(),
             "owner_scope": str(item.get("owner_scope") or "").strip(),
             "reason": str(item.get("reason") or "").strip(),
+            "domain": str(item.get("domain") or "").strip().lower(),
+            "intent": str(item.get("intent") or "").strip(),
+            "capability": str(item.get("capability") or "").strip(),
         }
         return ToolCallRequest(
             tool=tool,
@@ -321,8 +333,13 @@ class ToolRouter:
             "boundary": "model_facing_agent_tools",
             "mutation_boundary": "validate_and_defer_to_draft_apply_pipeline",
             "allowed_modes": ["default", "read_only", "mutation_required", "verification", "worker_branch"],
+            "dynamic_tool_discovery": DynamicToolCatalog.manifest(),
             "tools": tools,
         }
+
+    @classmethod
+    def dynamic_tool_manifest(cls) -> dict[str, Any]:
+        return DynamicToolCatalog.manifest()
 
     @classmethod
     def deferred_mutations_from_calls(
@@ -508,6 +525,11 @@ class ToolRouter:
                 "tool_count": len(requests),
                 "duration_ms": int((time.perf_counter() - started_at) * 1000),
                 "envelope_count": len(envelopes),
+                "hook_context_count": sum(
+                    len(item.get("hook_contexts") or [])
+                    for item in model_results
+                    if isinstance(item.get("hook_contexts"), list)
+                ),
             },
         )
 
@@ -529,7 +551,10 @@ class ToolRouter:
         pre_hook_error = self._pre_hook_error(request, decision)
         if pre_hook_error is not None:
             result = self._failed_result(request, decision, pre_hook_error)
-            self._post_hook(request, result.envelope, failed=True)
+            post_outcome = self._post_hook(request, result.envelope, failed=True)
+            if post_outcome is not None and post_outcome.additional_contexts:
+                result.model_result["hook_contexts"] = list(post_outcome.additional_contexts)
+                result.model_result["hook_evaluation"] = post_outcome.as_dict()
             return result
         try:
             if decision.deferred:
@@ -549,7 +574,10 @@ class ToolRouter:
                     details={"error_class": exc.__class__.__name__},
                 ),
             )
-        self._post_hook(request, result.envelope, failed=str(result.envelope.get("status") or "") == "failed")
+        post_outcome = self._post_hook(request, result.envelope, failed=str(result.envelope.get("status") or "") == "failed")
+        if post_outcome is not None and post_outcome.additional_contexts:
+            result.model_result["hook_contexts"] = list(post_outcome.additional_contexts)
+            result.model_result["hook_evaluation"] = post_outcome.as_dict()
         return result
 
     def _requests_from_tool_calls(self, tool_calls: list[dict[str, Any]]) -> list[ToolCallRequest]:
@@ -662,6 +690,8 @@ class ToolRouter:
 
     def _pre_hook_error(self, request: ToolCallRequest, decision: ToolRouteDecision) -> dict[str, Any] | None:
         payload = {
+            "workspace_id": self.context.workspace_id,
+            "run_id": self.context.run_id,
             "tool": request.canonical_tool,
             "model_tool": request.tool,
             "tool_use_id": request.tool_call_id,
@@ -686,9 +716,11 @@ class ToolRouter:
             details={"hook": "pre_tool_use", "outcome": outcome.as_dict()},
         )
 
-    def _post_hook(self, request: ToolCallRequest, envelope: dict[str, Any], *, failed: bool) -> None:
+    def _post_hook(self, request: ToolCallRequest, envelope: dict[str, Any], *, failed: bool) -> AgentHookOutcome | None:
         hook = "post_tool_use_failure" if failed else "post_tool_use"
         payload = {
+            "workspace_id": self.context.workspace_id,
+            "run_id": self.context.run_id,
             "tool": request.canonical_tool,
             "model_tool": request.tool,
             "tool_use_id": request.tool_call_id,
@@ -696,13 +728,22 @@ class ToolRouter:
             "risk": envelope.get("risk"),
             "error": envelope.get("error"),
         }
+        outcome = None
         if self.context.hook_manager is not None:
-            self.context.hook_manager.run(self.context.run_id, hook, payload=payload)  # type: ignore[arg-type]
+            outcome = self.context.hook_manager.run(self.context.run_id, hook, payload=payload)  # type: ignore[arg-type]
+            outcome_payload = outcome.as_dict()
+            envelope["hook_evaluation"] = outcome_payload
+            if outcome.additional_contexts:
+                envelope["hook_contexts"] = list(outcome.additional_contexts)
+                result_payload = envelope.get("result")
+                if isinstance(result_payload, dict):
+                    result_payload["hook_contexts"] = list(outcome.additional_contexts)
         self._emit_activity(
             "hook_completed",
             "Tool failure hook" if failed else "Post-tool hook",
             {"hook": hook, "tool_use_id": request.tool_call_id, "tool": request.tool, "status": "failed" if failed else "completed"},
         )
+        return outcome
 
     def _execute_read_only(self, request: ToolCallRequest, decision: ToolRouteDecision) -> ToolRouterResult:
         started_at = time.perf_counter()
@@ -762,6 +803,18 @@ class ToolRouter:
             }
         elif tool_name == "semantic_scan":
             result = {**semantic_scan(root=self.context.draft_source, targets=request_targets), "reason": request.reason, "tool_use_id": request.tool_call_id, "blocked_targets": blocked_targets}
+        elif tool_name in {"tool.search", "tool_search"}:
+            result = {
+                **DynamicToolCatalog.search(
+                    query=str(request.input.get("query") or request.input.get("capability") or ""),
+                    domain=str(request.input.get("domain") or ""),
+                    intent=str(request.input.get("intent") or request.reason or ""),
+                ),
+                "reason": request.reason,
+                "tool_use_id": request.tool_call_id,
+                "blocked_targets": blocked_targets,
+                "visible_now": sorted(self.allowed_tool_names(mode=self.context.mode, forced_allowed=self.context.forced_allowed_tools)),
+            }
         elif tool_name in {"lsp.diagnostics", "lsp_diagnostics"}:
             changed_files = _paths_from_diff(self.context.workspace_service.diff(self.context.workspace_id, run_id=self.context.run_id))
             files = [
@@ -793,6 +846,21 @@ class ToolRouter:
             symbol = str(request.input.get("symbol") or request.input.get("query") or request.input.get("pattern") or "").strip()
             result = {
                 **LspToolService.find_references(root=self.context.draft_source, symbol=symbol, targets=request_targets),
+                "reason": request.reason,
+                "tool_use_id": request.tool_call_id,
+                "blocked_targets": blocked_targets,
+            }
+        elif tool_name in {"lsp.definition", "lsp_definition"}:
+            symbol = str(request.input.get("symbol") or request.input.get("query") or request.input.get("pattern") or "").strip()
+            result = {
+                **LspToolService.definition(root=self.context.draft_source, symbol=symbol, targets=request_targets),
+                "reason": request.reason,
+                "tool_use_id": request.tool_call_id,
+                "blocked_targets": blocked_targets,
+            }
+        elif tool_name in {"lsp.route_graph", "lsp_route_graph"}:
+            result = {
+                **LspToolService.route_graph(root=self.context.draft_source, targets=request_targets),
                 "reason": request.reason,
                 "tool_use_id": request.tool_call_id,
                 "blocked_targets": blocked_targets,
@@ -1027,6 +1095,7 @@ class ToolRouter:
                 progress_callback=command_progress,
                 process_manager=self.context.process_manager,
                 process_id=process_id,
+                output_artifact_writer=self.context.output_artifact_writer,
             ),
             "reason": request.reason,
             "tool_use_id": request.tool_call_id,

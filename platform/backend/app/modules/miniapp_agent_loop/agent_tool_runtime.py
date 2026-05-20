@@ -130,6 +130,7 @@ def run_workspace_command(
     progress_callback=None,
     process_manager: AgentProcessManager | None = None,
     process_id: str | None = None,
+    output_artifact_writer=None,
 ) -> dict[str, object]:
     started_at = time.perf_counter()
     decision = decide_workspace_command(command)
@@ -142,6 +143,7 @@ def run_workspace_command(
         max_output_chars=max_output_chars,
         progress_callback=progress_callback,
         process_id=process_id,
+        output_artifact_writer=output_artifact_writer,
     ).as_dict()
     result.setdefault("duration_ms", int((time.perf_counter() - started_at) * 1000))
     return result

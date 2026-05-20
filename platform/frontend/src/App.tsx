@@ -18,12 +18,16 @@ import {
   getRunTraceBundle,
   getRunProtocol,
   getRunCompaction,
+  getRunContextPressure,
   getRunCompactionBoundaries,
+  getRunOutputArtifacts,
   getRunTasks,
   getRunRepairCases,
+  getWorkspaceObservability,
   getDoctorReport,
   getRunWorkers,
   getRunReview,
+  getRunPromptSuggestions,
   getRunTestMatrix,
   getRunPromptContract,
   getRunMiniAppContract,
@@ -48,9 +52,12 @@ import {
   TraceBundleReport,
   RunProtocolReport,
   RunCompactionReport,
+  ContextPressureReport,
   RunCompactionBoundaries,
+  OutputArtifactIndex,
   RunTaskReport,
   RunRepairCases,
+  ObservabilityReport,
   FileSearchResult,
   LspDiagnosticsReport,
   CommandPaletteAction,
@@ -60,6 +67,8 @@ import {
   DoctorReport,
   WorkerReport,
   ReviewReport,
+  PromptSuggestion,
+  PromptSuggestionsReport,
   WorkspaceMemory,
   SystemConfiguration,
   WorkspaceLogs,
@@ -311,6 +320,47 @@ function formatCompactTokenCount(value: number): string {
     return `${(value / 1_000).toFixed(1).replace(/\.0$/, "")}k`;
   }
   return String(value);
+}
+
+function formatDurationMs(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) {
+    return "n/a";
+  }
+  if (value >= 60_000) {
+    return `${(value / 60_000).toFixed(1).replace(/\.0$/, "")}m`;
+  }
+  if (value >= 1000) {
+    return `${(value / 1000).toFixed(1).replace(/\.0$/, "")}s`;
+  }
+  return `${Math.round(value)}ms`;
+}
+
+function formatUsd(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) {
+    return "$0";
+  }
+  return `$${value >= 1 ? value.toFixed(2) : value.toFixed(4).replace(/0+$/, "").replace(/\.$/, "")}`;
+}
+
+function formatRate(value: number): string {
+  if (!Number.isFinite(value) || value < 0) {
+    return "n/a";
+  }
+  return `${Math.round(value * 100)}%`;
+}
+
+function observabilityGreenRate(report: ObservabilityReport | null): number {
+  if (!report) {
+    return 0;
+  }
+  const totals = report.green_rate_by_generation_mode.reduce(
+    (acc, item) => ({
+      green: acc.green + (item.green_count || 0),
+      terminal: acc.terminal + (item.terminal_count || 0),
+    }),
+    { green: 0, terminal: 0 },
+  );
+  return totals.terminal > 0 ? totals.green / totals.terminal : 0;
 }
 
 function asRecordArray(value: unknown): Array<Record<string, unknown>> {
@@ -1172,12 +1222,16 @@ export default function App() {
   const [runTraceBundle, setRunTraceBundle] = useState<TraceBundleReport | null>(null);
   const [runProtocol, setRunProtocol] = useState<RunProtocolReport | null>(null);
   const [runCompaction, setRunCompaction] = useState<RunCompactionReport | null>(null);
+  const [runContextPressure, setRunContextPressure] = useState<ContextPressureReport | null>(null);
   const [runCompactionBoundaries, setRunCompactionBoundaries] = useState<RunCompactionBoundaries | null>(null);
+  const [runOutputArtifacts, setRunOutputArtifacts] = useState<OutputArtifactIndex | null>(null);
   const [runTaskReport, setRunTaskReport] = useState<RunTaskReport | null>(null);
   const [runRepairCases, setRunRepairCases] = useState<RunRepairCases | null>(null);
+  const [observabilityReport, setObservabilityReport] = useState<ObservabilityReport | null>(null);
   const [doctorReport, setDoctorReport] = useState<DoctorReport | null>(null);
   const [workerReport, setWorkerReport] = useState<WorkerReport | null>(null);
   const [reviewReport, setReviewReport] = useState<ReviewReport | null>(null);
+  const [promptSuggestions, setPromptSuggestions] = useState<PromptSuggestionsReport | null>(null);
   const [testMatrixReport, setTestMatrixReport] = useState<TestMatrixReport | null>(null);
   const [promptContractReport, setPromptContractReport] = useState<PromptContractReport | null>(null);
   const [miniAppContractReport, setMiniAppContractReport] = useState<MiniAppContractReport | null>(null);
@@ -1468,11 +1522,14 @@ export default function App() {
       setRunTraceBundle(null);
       setRunProtocol(null);
       setRunCompaction(null);
+      setRunContextPressure(null);
       setRunCompactionBoundaries(null);
+      setRunOutputArtifacts(null);
       setRunTaskReport(null);
       setRunRepairCases(null);
       setWorkerReport(null);
       setReviewReport(null);
+      setPromptSuggestions(null);
       setTestMatrixReport(null);
       setPromptContractReport(null);
       setMiniAppContractReport(null);
@@ -1481,17 +1538,20 @@ export default function App() {
     let cancelled = false;
     void (async () => {
       try {
-        const [timeline, traceView, traceBundle, protocol, compaction, compactionBoundaries, tasks, repairCases, workers, review, matrix, contract, miniappContract] = await Promise.all([
+        const [timeline, traceView, traceBundle, protocol, compaction, contextPressure, compactionBoundaries, outputArtifacts, tasks, repairCases, workers, review, suggestions, matrix, contract, miniappContract] = await Promise.all([
           getRunTimeline(activeRunId),
           getRunTraceView(activeRunId),
           getRunTraceBundle(activeRunId),
           getRunProtocol(activeRunId),
           getRunCompaction(activeRunId),
+          getRunContextPressure(activeRunId),
           getRunCompactionBoundaries(activeRunId),
+          getRunOutputArtifacts(activeRunId),
           getRunTasks(activeRunId),
           getRunRepairCases(activeRunId),
           getRunWorkers(activeRunId),
           getRunReview(activeRunId),
+          getRunPromptSuggestions(activeRunId),
           getRunTestMatrix(activeRunId),
           getRunPromptContract(activeRunId),
           getRunMiniAppContract(activeRunId),
@@ -1502,11 +1562,14 @@ export default function App() {
           setRunTraceBundle(traceBundle);
           setRunProtocol(protocol);
           setRunCompaction(compaction);
+          setRunContextPressure(contextPressure);
           setRunCompactionBoundaries(compactionBoundaries);
+          setRunOutputArtifacts(outputArtifacts);
           setRunTaskReport(tasks);
           setRunRepairCases(repairCases);
           setWorkerReport(workers);
           setReviewReport(review);
+          setPromptSuggestions(suggestions);
           setTestMatrixReport(matrix);
           setPromptContractReport(contract);
           setMiniAppContractReport(miniappContract);
@@ -1520,6 +1583,7 @@ export default function App() {
           setRunRepairCases(null);
           setWorkerReport(null);
           setReviewReport(null);
+          setPromptSuggestions(null);
           setTestMatrixReport(null);
           setPromptContractReport(null);
           setMiniAppContractReport(null);
@@ -1714,6 +1778,12 @@ export default function App() {
   const topbarRun = selectedRun ?? null;
   const topbarStatus = displayRunStatus(topbarRun);
   const touchedFilesCount = topbarRun?.touched_files.length ?? 0;
+  const dominantFailureClass = observabilityReport?.failure_classes[0]?.failure_class ?? "none";
+  const repairRate = observabilityReport?.repair_success.fix_run_count
+    ? observabilityReport.repair_success.fix_success_rate
+    : observabilityReport?.repair_success.attempt_count
+      ? observabilityReport.repair_success.attempt_success_rate
+      : 0;
   const editorStats = useMemo(() => {
     const lines = fileContent ? fileContent.split("\n").length : 0;
     const characters = fileContent.length;
@@ -1877,9 +1947,10 @@ export default function App() {
       }
       inFlight = true;
       try {
-        const [runsResult, logsResult] = await Promise.allSettled([
+        const [runsResult, logsResult, observabilityResult] = await Promise.allSettled([
           listRuns(workspace.workspace_id),
           getWorkspaceLogs(workspace.workspace_id),
+          getWorkspaceObservability(workspace.workspace_id),
         ]);
 
         if (cancelled || activeWorkspaceIdRef.current !== workspace.workspace_id) {
@@ -1892,6 +1963,10 @@ export default function App() {
 
         if (logsResult.status === "fulfilled") {
           setWorkspaceLogs(logsResult.value);
+        }
+
+        if (observabilityResult.status === "fulfilled") {
+          setObservabilityReport(observabilityResult.value);
         }
       } finally {
         inFlight = false;
@@ -1968,11 +2043,12 @@ export default function App() {
   async function refreshWorkspaceState(workspaceId: string, preferredRunId?: string) {
     setWorkspaceTransitioning(true);
     try {
-      const [treeResult, runsResult, logsResult, previewResult] = await Promise.allSettled([
+      const [treeResult, runsResult, logsResult, previewResult, observabilityResult] = await Promise.allSettled([
         request<FileEntry[]>(`/workspaces/${workspaceId}/files/tree`),
         listRuns(workspaceId),
         getWorkspaceLogs(workspaceId),
         request<PreviewInfo>(`/workspaces/${workspaceId}/preview/url`),
+        getWorkspaceObservability(workspaceId),
       ]);
 
       const refreshErrors: string[] = [];
@@ -2026,6 +2102,12 @@ export default function App() {
         setWorkspaceLogs(logsResult.value);
       } else {
         setWorkspaceLogs(null);
+      }
+
+      if (observabilityResult.status === "fulfilled") {
+        setObservabilityReport(observabilityResult.value);
+      } else {
+        setObservabilityReport(null);
       }
 
       if (previewResult.status === "fulfilled") {
@@ -2211,6 +2293,7 @@ export default function App() {
       setRuns((current) => [run, ...current.filter((item) => item.run_id !== run.run_id)]);
       setSelectedRunId(run.run_id);
       setRunArtifacts(null);
+      setPromptSuggestions(null);
       await refreshWorkspaceState(workspace.workspace_id, run.run_id);
       setActiveTab("preview");
       void pollRunUntilSettled(workspace.workspace_id, run.run_id);
@@ -2227,6 +2310,13 @@ export default function App() {
     setSelectedRunMode("fix");
     setPrompt(handoff.prompt);
     setFixErrorContext(handoff.context);
+  }
+
+  function handleUsePromptSuggestion(suggestion: PromptSuggestion) {
+    setSelectedRunMode("generate");
+    setFixErrorContext(null);
+    setPrompt(String(suggestion.prompt || ""));
+    setActiveTab("preview");
   }
 
   async function handleRunFix(run: Run) {
@@ -2373,13 +2463,15 @@ export default function App() {
 
   async function refreshWorkbenchPanels(runId: string) {
     try {
-      const [timeline, traceView, traceBundle, protocol, compaction, compactionBoundaries, tasks, repairCases, workers, review] = await Promise.all([
+      const [timeline, traceView, traceBundle, protocol, compaction, contextPressure, compactionBoundaries, outputArtifacts, tasks, repairCases, workers, review] = await Promise.all([
         getRunTimeline(runId),
         getRunTraceView(runId),
         getRunTraceBundle(runId),
         getRunProtocol(runId),
         getRunCompaction(runId),
+        getRunContextPressure(runId),
         getRunCompactionBoundaries(runId),
+        getRunOutputArtifacts(runId),
         getRunTasks(runId),
         getRunRepairCases(runId),
         getRunWorkers(runId),
@@ -2390,7 +2482,9 @@ export default function App() {
       setRunTraceBundle(traceBundle);
       setRunProtocol(protocol);
       setRunCompaction(compaction);
+      setRunContextPressure(contextPressure);
       setRunCompactionBoundaries(compactionBoundaries);
+      setRunOutputArtifacts(outputArtifacts);
       setRunTaskReport(tasks);
       setRunRepairCases(repairCases);
       setWorkerReport(workers);
@@ -3295,6 +3389,30 @@ export default function App() {
               <h3>Run Timeline</h3>
               <span>{runs.length} total</span>
             </div>
+            {observabilityReport ? (
+              <div className="observability-strip" aria-label="Workspace observability summary">
+                <div>
+                  <span>Cost</span>
+                  <strong>{formatUsd(observabilityReport.cost.estimated_cost_usd)}</strong>
+                </div>
+                <div>
+                  <span>Green</span>
+                  <strong>{formatRate(observabilityGreenRate(observabilityReport))}</strong>
+                </div>
+                <div>
+                  <span>Repair</span>
+                  <strong>{formatRate(repairRate)}</strong>
+                </div>
+                <div>
+                  <span>p95</span>
+                  <strong>{formatDurationMs(observabilityReport.latency.p95_ms)}</strong>
+                </div>
+                <div className="observability-strip-wide">
+                  <span>Failure</span>
+                  <strong>{dominantFailureClass}</strong>
+                </div>
+              </div>
+            ) : null}
             <div className="run-list">
               {runs.length ? (
                 runs.map((run) => {
@@ -3479,7 +3597,7 @@ export default function App() {
           ) : null}
 
           {activeTab === "trace" ? (
-            <TracePanel trace={runTraceView} traceBundle={runTraceBundle} protocol={runProtocol} compaction={runCompaction} compactionBoundaries={runCompactionBoundaries} repairCases={runRepairCases} />
+            <TracePanel trace={runTraceView} traceBundle={runTraceBundle} protocol={runProtocol} compaction={runCompaction} contextPressure={runContextPressure} compactionBoundaries={runCompactionBoundaries} outputArtifacts={runOutputArtifacts} repairCases={runRepairCases} />
           ) : null}
 
           {activeTab === "tasks" ? (
@@ -3687,7 +3805,7 @@ export default function App() {
           ) : null}
 
           {activeTab === "review" ? (
-            <ReviewPanel review={reviewReport} />
+            <ReviewPanel review={reviewReport} suggestions={promptSuggestions} onUseSuggestion={handleUsePromptSuggestion} />
           ) : null}
 
           {activeTab === "checks" ? (
