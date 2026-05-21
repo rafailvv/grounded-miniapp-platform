@@ -33,35 +33,104 @@ class ProjectInstructionBundle:
     """Loads repo and generated-workspace guidance as a stable agent contract."""
 
     @staticmethod
-    def build(*, repo_root: Path, template_dir: Path) -> dict[str, Any]:
+    def build(
+        *,
+        repo_root: Path,
+        template_dir: Path,
+        workspace_root: Path | None = None,
+        paths: list[str] | None = None,
+    ) -> dict[str, Any]:
+        targets = ProjectInstructionBundle._normalize_targets(paths or [])
         sources = []
-        for path in (repo_root / "AGENTS.md", template_dir / "AGENTS.md", template_dir / "docs" / "agent-guidelines.md"):
+        seen: set[Path] = set()
+        candidates: list[tuple[Path, Path, str]] = []
+        candidates.append((repo_root / "AGENTS.md", repo_root, "repo"))
+        candidates.extend((path, template_dir, "template") for path in ProjectInstructionBundle._agents_files(template_dir))
+        if workspace_root is not None:
+            candidates.extend((path, workspace_root, "workspace") for path in ProjectInstructionBundle._agents_files(workspace_root))
+        candidates.append((template_dir / "docs" / "agent-guidelines.md", template_dir, "template_docs"))
+        for path, scope_root, layer in candidates:
+            resolved = path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
             text = _read_text(path)
             if not text:
                 continue
+            scope_dir = ProjectInstructionBundle._scope_dir(path, scope_root=scope_root)
+            rules = ProjectInstructionBundle._rules(text)
+            applicable = ProjectInstructionBundle._applies(scope_dir, targets) if targets else True
             sources.append(
                 {
                     "path": ProjectInstructionBundle._source_path(path, repo_root=repo_root, template_dir=template_dir),
+                    "layer": layer,
+                    "scope": scope_dir,
+                    "depth": 0 if scope_dir == "." else len(Path(scope_dir).parts),
+                    "precedence": ProjectInstructionBundle._precedence(layer, scope_dir),
+                    "applicable": applicable,
+                    "matched_paths": ProjectInstructionBundle._matched_paths(scope_dir, targets),
                     "title": ProjectInstructionBundle._title(text, path.stem),
                     "content": text,
                     "summary": ProjectInstructionBundle._summary(text),
+                    "rules": rules,
                 }
             )
+        sources.sort(key=lambda source: int(source.get("precedence", 0) or 0))
+        applicable_sources = [source for source in sources if source.get("applicable")]
+        active_rules = ProjectInstructionBundle._active_rules(applicable_sources)
         return {
             "schema": "grounded.project_instructions.v1",
             "status": "available" if sources else "missing",
-            "precedence": ["workspace AGENTS.md", "template AGENTS.md", "template docs/agent-guidelines.md"],
+            "precedence": [
+                "lower number loads first",
+                "repo root AGENTS.md",
+                "template root/nested AGENTS.md",
+                "workspace root/nested AGENTS.md",
+                "deeper scope overrides parent scope for matching files",
+            ],
+            "targets": targets,
             "sources": sources,
+            "applicable_sources": [
+                {
+                    "path": source.get("path"),
+                    "layer": source.get("layer"),
+                    "scope": source.get("scope"),
+                    "precedence": source.get("precedence"),
+                    "matched_paths": source.get("matched_paths"),
+                }
+                for source in applicable_sources
+            ],
+            "active_rules": active_rules,
+            "conflicts": ProjectInstructionBundle._conflicts(active_rules),
             "created_at": _now(),
         }
 
     @staticmethod
     def compact_summary(bundle: dict[str, Any], *, limit: int = 1800) -> str:
         lines = ["Project instruction summary:"]
-        for source in bundle.get("sources") or []:
+        active_rules = [rule for rule in bundle.get("active_rules") or [] if isinstance(rule, dict)]
+        if active_rules:
+            lines.append("Active AGENTS.md rules for current files:")
+            for rule in active_rules[:10]:
+                lines.append(f"- {rule.get('source_path')} ({rule.get('scope')}): {rule.get('text')}")
+        conflicts = [item for item in bundle.get("conflicts") or [] if isinstance(item, dict)]
+        if conflicts:
+            lines.append("Instruction conflicts to resolve by precedence:")
+            for item in conflicts[:4]:
+                winner = item.get("winner") or {}
+                shadowed = item.get("shadowed") or {}
+                lines.append(f"- {item.get('rule_key')}: use {winner.get('source_path')} over {shadowed.get('source_path')}")
+        sources = bundle.get("applicable_sources") or bundle.get("sources") or []
+        by_path = {str(source.get("path")): source for source in bundle.get("sources") or [] if isinstance(source, dict)}
+        for source_ref in sources:
+            if not isinstance(source_ref, dict):
+                continue
+            source = by_path.get(str(source_ref.get("path"))) or source_ref
             if not isinstance(source, dict):
                 continue
-            lines.append(f"- {source.get('path')}: {source.get('summary')}")
+            scope = source.get("scope") or "."
+            applies = "applicable" if source.get("applicable", True) else "available"
+            lines.append(f"- {source.get('path')} [{applies}; scope={scope}; precedence={source.get('precedence')}]: {source.get('summary')}")
         return "\n".join(lines)[:limit]
 
     @staticmethod
@@ -69,6 +138,115 @@ class ProjectInstructionBundle:
         if path == template_dir / "AGENTS.md":
             return "AGENTS.md"
         return str(path.relative_to(repo_root)) if path.is_relative_to(repo_root) else str(path)
+
+    @staticmethod
+    def _agents_files(root: Path) -> list[Path]:
+        if not root.exists():
+            return []
+        ignored = {"node_modules", ".git", "__pycache__", ".venv", "dist", "build"}
+        return [
+            path
+            for path in sorted(root.rglob("AGENTS.md"))
+            if not any(part in ignored for part in path.parts)
+        ]
+
+    @staticmethod
+    def _scope_dir(path: Path, *, scope_root: Path) -> str:
+        try:
+            rel = path.parent.relative_to(scope_root)
+        except ValueError:
+            return "."
+        value = rel.as_posix()
+        return "." if value == "." else value
+
+    @staticmethod
+    def _normalize_targets(paths: list[str]) -> list[str]:
+        targets = []
+        for raw in paths:
+            value = str(raw or "").strip().replace("\\", "/").lstrip("/")
+            if value and value not in targets:
+                targets.append(value)
+        return targets[:40]
+
+    @staticmethod
+    def _applies(scope: str, targets: list[str]) -> bool:
+        if scope in {"", "."}:
+            return True
+        prefix = scope.rstrip("/") + "/"
+        return any(target == scope or target.startswith(prefix) for target in targets)
+
+    @staticmethod
+    def _matched_paths(scope: str, targets: list[str]) -> list[str]:
+        if not targets:
+            return []
+        if scope in {"", "."}:
+            return targets[:12]
+        prefix = scope.rstrip("/") + "/"
+        return [target for target in targets if target == scope or target.startswith(prefix)][:12]
+
+    @staticmethod
+    def _precedence(layer: str, scope: str) -> int:
+        base = {"repo": 100, "template_docs": 180, "template": 200, "workspace": 300}.get(layer, 100)
+        depth = 0 if scope in {"", "."} else len(Path(scope).parts)
+        return base + depth
+
+    @staticmethod
+    def _rules(text: str) -> list[dict[str, Any]]:
+        rules: list[dict[str, Any]] = []
+        current_heading = "general"
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                current_heading = stripped.lstrip("#").strip().lower() or "general"
+                continue
+            if not stripped.startswith(("-", "*")):
+                continue
+            body = stripped.lstrip("-* ").strip()
+            if len(body) < 4:
+                continue
+            rules.append({"text": body[:500], "section": current_heading, "key": ProjectInstructionBundle._rule_key(body, current_heading)})
+        return rules[:80]
+
+    @staticmethod
+    def _rule_key(text: str, section: str) -> str:
+        lowered = re.sub(r"[^a-z0-9а-яё ]+", " ", text.lower())
+        words = [word for word in lowered.split() if len(word) > 3 and word not in {"must", "should", "never", "always", "prefer", "keep", "using", "when", "with", "that", "this"}]
+        return f"{section}:{'-'.join(words[:4])}" if words else section
+
+    @staticmethod
+    def _active_rules(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        for source in sources:
+            for rule in source.get("rules") or []:
+                if not isinstance(rule, dict):
+                    continue
+                items.append(
+                    {
+                        **rule,
+                        "source_path": source.get("path"),
+                        "layer": source.get("layer"),
+                        "scope": source.get("scope"),
+                        "precedence": source.get("precedence"),
+                    }
+                )
+        return sorted(items, key=lambda item: int(item.get("precedence", 0) or 0), reverse=True)
+
+    @staticmethod
+    def _conflicts(rules: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        by_key: dict[str, list[dict[str, Any]]] = {}
+        for rule in rules:
+            key = str(rule.get("key") or "")
+            if not key:
+                continue
+            by_key.setdefault(key, []).append(rule)
+        conflicts = []
+        for key, grouped in by_key.items():
+            unique_texts = {str(item.get("text") or "").strip().lower() for item in grouped}
+            if len(grouped) < 2 or len(unique_texts) < 2:
+                continue
+            ordered = sorted(grouped, key=lambda item: int(item.get("precedence", 0) or 0), reverse=True)
+            conflicts.append({"rule_key": key, "winner": ordered[0], "shadowed": ordered[-1], "candidates": ordered[:4]})
+        return conflicts[:20]
 
     @staticmethod
     def _title(text: str, default_title: str) -> str:
@@ -317,6 +495,11 @@ class SlashCommandCatalog:
         {"id": "deploy", "name": "/deploy", "kind": "workflow", "description": "Prepare deploy artifacts only after the production gate is green.", "requires": ["workspace"], "workflow": "deploy_bundle"},
         {"id": "babysit-pr", "name": "/babysit-pr", "kind": "workflow", "description": "Watch exported app PR CI, reviews, flaky failures, and next repair/push actions.", "requires": ["workspace"], "workflow": "pr_ci_babysitter"},
         {"id": "docs", "name": "/docs", "kind": "workflow", "description": "Regenerate and write product architecture documentation.", "requires": ["workspace"], "workflow": "product_architecture_docs"},
+        {"id": "skillify", "name": "/skillify", "kind": "workflow", "description": "Turn a successful product run into a reusable runtime SKILL.md draft.", "requires": ["run"], "workflow": "skillify_successful_run"},
+        {"id": "simplify", "name": "/simplify", "kind": "workflow", "description": "After green checks, review changed files for reuse, selector stability, JS simplicity, and state consistency.", "requires": ["run"], "workflow": "post_green_simplify"},
+        {"id": "debug-run", "name": "/debug-run", "kind": "workflow", "description": "Read preview/API/check/agent trace evidence for a run and emit a concrete repair packet.", "requires": ["run"], "workflow": "debug_run"},
+        {"id": "stuck-run", "name": "/stuck-run", "kind": "workflow", "description": "Diagnose a stalled or repeatedly failing run and produce the next repair packet.", "requires": ["run"], "workflow": "stuck_run"},
+        {"id": "doctor-workspace", "name": "/doctor-workspace", "kind": "workflow", "description": "Inspect workspace preview/API/platform logs and latest run evidence, then emit a workspace repair packet.", "requires": ["workspace"], "workflow": "doctor_workspace"},
     )
     ALIASES: dict[str, str] = {
         "/add-page": "add-flow",
@@ -327,6 +510,12 @@ class SlashCommandCatalog:
         "visual-qa": "acceptance",
         "/watch-pr": "babysit-pr",
         "watch-pr": "babysit-pr",
+        "/debug": "debug-run",
+        "debug": "debug-run",
+        "/stuck": "stuck-run",
+        "stuck": "stuck-run",
+        "/doctor": "doctor-workspace",
+        "doctor": "doctor-workspace",
     }
 
     @classmethod
@@ -367,6 +556,11 @@ class SlashCommandCatalog:
             "acceptance": {"type": "execute_workflow", "workflow": "acceptance_proof", "tab": "checks"},
             "deploy": {"type": "execute_workflow", "workflow": "deploy_bundle"},
             "docs": {"type": "execute_workflow", "workflow": "product_architecture_docs"},
+            "skillify": {"type": "execute_workflow", "workflow": "skillify_successful_run", "tab": "memory"},
+            "simplify": {"type": "execute_workflow", "workflow": "post_green_simplify", "tab": "review"},
+            "debug-run": {"type": "execute_workflow", "workflow": "debug_run", "tab": "trace"},
+            "stuck-run": {"type": "execute_workflow", "workflow": "stuck_run", "tab": "trace"},
+            "doctor-workspace": {"type": "execute_workflow", "workflow": "doctor_workspace", "tab": "doctor"},
         }
         return mapping.get(SlashCommandCatalog.normalize_id(command_id), {"type": "execute_workflow"})
 
@@ -380,6 +574,11 @@ class SlashCommandCatalog:
             "acceptance": "Run the full production acceptance proof loop and report exact blockers.",
             "deploy": "Prepare deploy artifacts after the production readiness gate is green.",
             "docs": "Update product architecture documentation from current routes, APIs, memory, and runs.",
+            "skillify": "Generate a reusable SKILL.md draft from the selected successful run.",
+            "simplify": "Review changed files after green checks and create safe simplification tasks.",
+            "debug-run": "Diagnose this run from preview/API/check/agent trace evidence and emit a repair packet.",
+            "stuck-run": "Find why this run is stuck or repeating and emit the next repair packet.",
+            "doctor-workspace": "Inspect workspace runtime, preview/API logs, and latest run evidence; emit a workspace repair packet.",
         }
         return templates.get(SlashCommandCatalog.normalize_id(command_id), detail)
 
@@ -439,6 +638,236 @@ class WorkerRoleCatalog:
             },
         ]
         return {"schema": "grounded.worker_roles.v1", "items": items}
+
+
+class SubagentForkContract:
+    """Hard ownership and tool policy for quality-mode subagents."""
+
+    TOOL_ALLOWLISTS: dict[str, list[str]] = {
+        "planner": ["read_files", "search_files", "semantic_scan", "inspect_project"],
+        "backend": ["read_files", "search_files", "semantic_scan", "patch_files", "run_command", "run_checks"],
+        "frontend-role-ui": ["read_files", "search_files", "semantic_scan", "patch_files", "browser_verify"],
+        "tests": ["read_files", "search_files", "patch_files", "run_command", "run_checks"],
+        "verifier": ["read_files", "search_files", "semantic_scan", "run_command", "run_checks", "browser_verify"],
+        "polish": ["read_files", "search_files", "patch_files", "browser_verify"],
+        "repair": ["read_files", "search_files", "semantic_scan", "patch_files", "run_command", "run_checks", "browser_verify"],
+    }
+
+    @classmethod
+    def tool_allowlist_for_worker(cls, worker_id: str) -> list[str]:
+        for lane in cls.build().get("lanes") or []:
+            if isinstance(lane, dict) and worker_id in set(str(item) for item in lane.get("worker_ids") or []):
+                return [str(item) for item in lane.get("tool_allowlist") or []]
+        return []
+
+    @classmethod
+    def build(cls, *, implementation_plan: dict[str, Any] | None = None, generation_mode: str | None = None) -> dict[str, Any]:
+        implementation_plan = implementation_plan if isinstance(implementation_plan, dict) else {}
+        lanes = [
+            cls._lane(
+                lane_id="planner",
+                worker_ids=["planner_worker"],
+                branch_role="planner",
+                stage="plan_contract",
+                ownership="read-only product plan, acceptance contract, task ledger, and worker slicing",
+                allowed_paths=["AGENTS.md", "docs", "miniapp/app/generated", "miniapp/tests", "miniapp/app"],
+                forbidden_paths=["data", "runtime", ".env"],
+                writes=False,
+                dependencies=[],
+                proof=["implementation_plan_ready", "product_task_ledger_ready"],
+            ),
+            cls._lane(
+                lane_id="backend",
+                worker_ids=["backend_api_worker"],
+                branch_role="writer",
+                stage="backend_contract",
+                ownership="backend API, schemas, persistence, and shared role state",
+                allowed_paths=["miniapp/app/routes", "miniapp/app/schemas.py", "miniapp/app/db.py", "miniapp/app/generated"],
+                forbidden_paths=["miniapp/app/static/client", "miniapp/app/static/specialist", "miniapp/app/static/manager", "miniapp/tests"],
+                writes=True,
+                dependencies=["planner"],
+                proof=["api_workflow_smoke", "lsp_static_diagnostics"],
+            ),
+            cls._lane(
+                lane_id="frontend-role-ui",
+                worker_ids=["client_surface_worker", "specialist_surface_worker", "manager_surface_worker"],
+                branch_role="writer",
+                stage="role_ui_and_tests",
+                ownership="role-specific UI surfaces; each worker owns only its static/<role> tree",
+                allowed_paths=["miniapp/app/static/client", "miniapp/app/static/specialist", "miniapp/app/static/manager", "miniapp/app/static/shared"],
+                forbidden_paths=["miniapp/app/routes", "miniapp/app/schemas.py", "miniapp/app/db.py", "miniapp/tests"],
+                writes=True,
+                dependencies=["planner", "backend"],
+                proof=["browser_flow_smoke:<role>", "mobile_layout:<role>"],
+                child_lanes=[
+                    {"worker_id": "client_surface_worker", "owned_paths": ["miniapp/app/static/client"], "role": "client"},
+                    {"worker_id": "specialist_surface_worker", "owned_paths": ["miniapp/app/static/specialist"], "role": "specialist"},
+                    {"worker_id": "manager_surface_worker", "owned_paths": ["miniapp/app/static/manager"], "role": "manager"},
+                ],
+            ),
+            cls._lane(
+                lane_id="tests",
+                worker_ids=["test_verifier_worker"],
+                branch_role="writer",
+                stage="test_materialization",
+                ownership="generated acceptance tests and smoke checks",
+                allowed_paths=["miniapp/tests"],
+                forbidden_paths=["miniapp/app/static/client", "miniapp/app/static/specialist", "miniapp/app/static/manager", "miniapp/app/routes"],
+                writes=True,
+                dependencies=["planner", "backend", "frontend-role-ui"],
+                proof=["generated_acceptance_tests", "api_workflow_smoke", "browser_flow_smoke"],
+            ),
+            cls._lane(
+                lane_id="verifier",
+                worker_ids=["verifier_worker", "mobile_polish_worker"],
+                branch_role="verifier",
+                stage="guardian_verifier",
+                ownership="read-only browser proof, mobile layout proof, and blocker findings",
+                allowed_paths=["miniapp/app", "miniapp/tests", "reports", "browser_proof"],
+                forbidden_paths=["runtime", "data", ".env"],
+                writes=False,
+                dependencies=["backend", "frontend-role-ui", "tests"],
+                proof=["all_checks_green", "browser_proof", "mobile_layout"],
+            ),
+            cls._lane(
+                lane_id="polish",
+                worker_ids=["polish_worker"],
+                branch_role="writer",
+                stage="visual_polish_after_green",
+                ownership="targeted visual polish inside role UI/static shared assets only",
+                allowed_paths=["miniapp/app/static/client", "miniapp/app/static/specialist", "miniapp/app/static/manager", "miniapp/app/static/shared"],
+                forbidden_paths=["miniapp/app/routes", "miniapp/app/schemas.py", "miniapp/app/db.py", "miniapp/tests"],
+                writes=True,
+                dependencies=["verifier"],
+                proof=["mobile_layout", "browser_flow_smoke"],
+            ),
+            cls._lane(
+                lane_id="repair",
+                worker_ids=["repair_worker"],
+                branch_role="repair",
+                stage="targeted_repair",
+                ownership="only the owner scope implicated by failure signature or repair packet",
+                allowed_paths=["miniapp/app", "miniapp/tests"],
+                forbidden_paths=["runtime", "data", ".env", ".github"],
+                writes=True,
+                dependencies=["verifier"],
+                proof=["latest_failed_check_passes", "repair_packet_resolved"],
+            ),
+        ]
+        return {
+            "schema": "grounded.subagent_fork_contract.v1",
+            "status": "ready",
+            "generation_mode": str(generation_mode or ""),
+            "principle": "hard ownership scopes, scoped tool allowlists, isolated forks, raw proof before merge",
+            "lanes": lanes,
+            "execution_order": ["planner", "backend", "frontend-role-ui", "tests", "verifier", "polish", "repair"],
+            "quality_mode_policy": {
+                "parallelizable_lanes": [["frontend-role-ui", "tests"], ["polish"]],
+                "serial_gates": ["planner", "backend", "verifier"],
+                "merge_gate": "accept only owned diffs with required proof; forbidden or overlapping paths become repair packets",
+                "same_owner_repair": "continue the worker that owns the failing paths; do not let a broad coordinator rewrite unrelated surfaces",
+            },
+            "ownership_matrix": cls.ownership_matrix(lanes),
+            "conflict_policy": cls.conflict_policy(lanes),
+            "plan_bindings": cls._plan_bindings(implementation_plan),
+        }
+
+    @classmethod
+    def _lane(
+        cls,
+        *,
+        lane_id: str,
+        worker_ids: list[str],
+        branch_role: str,
+        stage: str,
+        ownership: str,
+        allowed_paths: list[str],
+        forbidden_paths: list[str],
+        writes: bool,
+        dependencies: list[str],
+        proof: list[str],
+        child_lanes: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "lane_id": lane_id,
+            "worker_ids": worker_ids,
+            "branch_role": branch_role,
+            "stage": stage,
+            "ownership": ownership,
+            "tool_allowlist": list(cls.TOOL_ALLOWLISTS.get(lane_id, [])),
+            "file_scope": {
+                "allowed_paths": allowed_paths,
+                "forbidden_paths": forbidden_paths,
+                "exclusive_write": writes,
+            },
+            "writes": writes,
+            "dependencies": dependencies,
+            "required_proof": proof,
+            "child_lanes": child_lanes or [],
+        }
+
+    @staticmethod
+    def ownership_matrix(lanes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        matrix: list[dict[str, Any]] = []
+        for lane in lanes:
+            scope = lane.get("file_scope") if isinstance(lane.get("file_scope"), dict) else {}
+            for path in scope.get("allowed_paths") or []:
+                matrix.append(
+                    {
+                        "lane_id": lane.get("lane_id"),
+                        "worker_ids": lane.get("worker_ids") or [],
+                        "path_prefix": path,
+                        "exclusive_write": bool(scope.get("exclusive_write")),
+                        "tool_allowlist": lane.get("tool_allowlist") or [],
+                    }
+                )
+        return matrix
+
+    @staticmethod
+    def conflict_policy(lanes: list[dict[str, Any]]) -> dict[str, Any]:
+        writers = [lane for lane in lanes if bool(lane.get("writes"))]
+        overlaps: list[dict[str, Any]] = []
+        for index, left in enumerate(writers):
+            left_paths = [str(item).rstrip("/") for item in ((left.get("file_scope") or {}).get("allowed_paths") or [])]
+            for right in writers[index + 1 :]:
+                right_paths = [str(item).rstrip("/") for item in ((right.get("file_scope") or {}).get("allowed_paths") or [])]
+                shared = [
+                    {"left": a, "right": b}
+                    for a in left_paths
+                    for b in right_paths
+                    if a == b or a.startswith(b + "/") or b.startswith(a + "/")
+                ]
+                if shared:
+                    overlaps.append({"left_lane": left.get("lane_id"), "right_lane": right.get("lane_id"), "overlaps": shared})
+        return {
+            "status": "passed" if not overlaps else "needs_serial_gate",
+            "overlaps": overlaps,
+            "rule": "overlapping writer lanes cannot run in parallel unless a serial gate narrows the repair packet or path slice",
+        }
+
+    @staticmethod
+    def _plan_bindings(implementation_plan: dict[str, Any]) -> dict[str, Any]:
+        ledger = implementation_plan.get("product_task_ledger") if isinstance(implementation_plan.get("product_task_ledger"), list) else []
+        bindings: dict[str, list[str]] = {
+            "backend": [],
+            "frontend-role-ui": [],
+            "tests": [],
+            "verifier": [],
+        }
+        for item in ledger:
+            if not isinstance(item, dict):
+                continue
+            item_id = str(item.get("id") or "")
+            kind = str(item.get("kind") or "").lower()
+            role = str(item.get("role") or "").lower()
+            if kind == "backend":
+                bindings["backend"].append(item_id)
+            if role in {"client", "specialist", "manager"}:
+                bindings["frontend-role-ui"].append(item_id)
+            if kind == "proof":
+                bindings["tests"].append(item_id)
+                bindings["verifier"].append(item_id)
+        return {key: value[:12] for key, value in bindings.items() if value}
 
 
 class AcceptanceScenarioGenerator:

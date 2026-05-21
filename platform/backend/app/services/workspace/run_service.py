@@ -39,6 +39,7 @@ from app.services.repair_cases import RepairCaseService
 from app.services.event_journal import EventJournalService
 from app.services.run_protocol import RunProtocolService
 from app.services.run_state_machine import RunStateMachine
+from app.services.run_task_ledger import RunTaskLedger
 from app.services.workflow_acceptance import build_acceptance_contract, build_implementation_plan, orchestration_metadata_for_contract
 from app.services.workspace.log_service import WorkspaceLogService
 from app.services.workspace.preview_service import PreviewService
@@ -303,7 +304,20 @@ class RunService:
             storage_version=2,
             token_usage=self._token_usage_from_prompt_analysis(prompt_analysis_usage),
         )
+        run.task_ledger_ref = f"task_ledger:{workspace_id}:{run.run_id}"
         run.implementation_plan = implementation_plan
+        self.store.upsert(
+            "reports",
+            run.task_ledger_ref,
+            RunTaskLedger.build(
+                run_id=run.run_id,
+                workspace_id=workspace_id,
+                implementation_plan=implementation_plan,
+                run_status=run.status,
+                current_stage=run.current_stage,
+                updated_at=run.updated_at.isoformat(),
+            ),
+        )
         if acceptance_contract.get("required"):
             miniapp_contract = MiniAppContractCompiler.compile(
                 workspace_id=workspace_id,
@@ -1191,6 +1205,7 @@ class RunService:
                 "turn_diff_ref",
                 "environment_snapshot_ref",
                 "tool_batch_summaries_ref",
+                "task_ledger_ref",
                 "worker_mailbox_ref",
                 "scratchpad_ref",
                 "memory_ref",

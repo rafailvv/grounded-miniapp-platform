@@ -3005,6 +3005,11 @@ def test_quality_mode_uses_real_worker_branch_plan_by_default(monkeypatch) -> No
     ]
     assert quality_mailbox["worker_groups"]["verifier"] == ["mobile_polish_worker"]  # type: ignore[index]
     assert quality_mailbox["execution_stages"][0]["stage"] == "backend_contract"  # type: ignore[index]
+    assert quality_mailbox["subagent_contract"]["schema"] == "grounded.subagent_fork_contract.v1"
+    assert quality_mailbox["subagent_contract"]["execution_order"] == ["planner", "backend", "frontend-role-ui", "tests", "verifier", "polish", "repair"]
+    verifier_lane = next(lane for lane in quality_mailbox["subagent_contract"]["lanes"] if lane["lane_id"] == "verifier")
+    assert verifier_lane["file_scope"]["exclusive_write"] is False
+    assert "patch_files" not in verifier_lane["tool_allowlist"]
     assert no_contract_mailbox["enabled"] is False
     production_mailbox = AgentWorkerManager.mailbox_for_plan(
         generation_mode=GenerationMode.PRODUCTION,
@@ -3141,7 +3146,9 @@ def test_worker_task_planner_builds_self_contained_owner_prompts() -> None:
     assert "client_surface_worker" in by_id
     assert by_id["client_surface_worker"]["alias_ids"] == []
     assert by_id["client_surface_worker"]["branch_role"] == "writer"
+    assert "patch_files" in by_id["client_surface_worker"]["tool_allowlist"]
     assert by_id["mobile_polish_worker"]["branch_role"] == "verifier"
+    assert "patch_files" not in by_id["mobile_polish_worker"]["tool_allowlist"]
     assert by_id["mobile_polish_worker"]["isolated_branch"] is False
     assert "blocker findings" in by_id["mobile_polish_worker"]["prompt"]
     assert "Own only these paths" in by_id["client_surface_worker"]["prompt"]
@@ -3186,6 +3193,7 @@ def test_worker_runtime_prepares_isolated_drafts_and_merge_reports(tmp_path: Pat
     assert prepared["workers"][0]["agent_loop_ref"] == "worker_agent_loop:run_1:client_surface_worker"  # type: ignore[index]
     assert prepared["workers"][0]["branch_policy"] == "isolated_draft_writer"  # type: ignore[index]
     assert prepared["workers"][0]["write_scope"]["allowed_paths"] == ["miniapp/app/static/client"]  # type: ignore[index]
+    assert prepared["workers"][0]["tool_allowlist"] == []  # type: ignore[index]
     assert prepared["write_scope_report"]["status"] == "passed"  # type: ignore[index]
     assert report["status"] == "conflict"
     assert report["conflict_report"]["blocked_paths"] == ["miniapp/app/static/client/app.js"]

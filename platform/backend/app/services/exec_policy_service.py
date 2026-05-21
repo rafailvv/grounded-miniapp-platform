@@ -58,6 +58,92 @@ SANDBOX_PROFILES: dict[str, dict[str, Any]] = {
     },
 }
 
+READ_WRITE_NETWORK_POLICY: dict[str, dict[str, Any]] = {
+    "read": {
+        "default": "allow_workspace_visible_paths",
+        "allow": ["miniapp/**", "README.md", "docs/**"],
+        "deny": [".git/**", "node_modules/**", "dist/**", "build/**", ".sandbox/**"],
+        "path_safety": ["no_parent_traversal", "no_home_paths", "no_absolute_paths", "no_git_internals"],
+    },
+    "write": {
+        "default": "deny_unless_draft_or_apply_gate",
+        "allow": ["miniapp/app/**", "miniapp/tests/**", "miniapp/package*.json", "miniapp/requirements.txt", "README.md", "docs/**"],
+        "deny": [".git/**", "node_modules/**", "dist/**", "build/**", ".cache/**", ".sandbox/**"],
+        "write_modes": {
+            "agent_draft_write": "draft workspace only",
+            "source_apply_gate": "reviewed draft apply after gate/manual approval",
+            "analysis_readonly": "no writes",
+        },
+        "path_safety": ["snapshot_required_for_overwrite", "symlink_writes_blocked", "hardlink_writes_blocked"],
+    },
+    "network": {
+        "default": "blocked",
+        "hard_enforcement": "sandbox-exec or unshare when available; fail closed for strict model-facing execution",
+        "blocked_classes": ["direct_network_tool", "package_network_operation", "git_network_operation", "node_network_imports", "network_proxy_config"],
+        "exception_policy": "no generated exception; human/dev integration must provision dependencies outside the agent command path",
+    },
+}
+
+DANGEROUS_COMMAND_CLASSIFIER: dict[str, dict[str, Any]] = {
+    "shell_escape": {
+        "severity": "critical",
+        "codes": ["shell_metacharacter", "shell_expansion", "heredoc", "process_substitution", "multiline_command", "command_chain", "background_execution"],
+        "action": "forbidden",
+    },
+    "host_destructive": {
+        "severity": "critical",
+        "executables": ["rm", "rmdir", "docker", "apt", "apt-get", "brew"],
+        "patterns": ["git reset", "git clean", "find -delete"],
+        "action": "forbidden",
+    },
+    "network": {
+        "severity": "high",
+        "codes": READ_WRITE_NETWORK_POLICY["network"]["blocked_classes"],
+        "action": "forbidden",
+    },
+    "workspace_write": {
+        "severity": "medium",
+        "codes": ["sed_in_place", "mutating_filesystem"],
+        "action": "prompt_or_draft_tool",
+    },
+    "unknown_generated": {
+        "severity": "medium",
+        "codes": ["no_matching_allow_rule", "untrusted_basename", "untrusted_absolute", "relative_executable"],
+        "action": "forbidden",
+    },
+}
+
+APPROVAL_TEMPLATES: dict[str, dict[str, Any]] = {
+    "workspace_scoped_command": {
+        "schema": "grounded.approval_template.v1",
+        "scope": "workspace",
+        "ttl": "one command fingerprint",
+        "required_fields": ["workspace_id", "run_id", "command_fingerprint", "command_class", "risk", "reason"],
+        "copy": "Approve this exact workspace-scoped command fingerprint for the current repair.",
+    },
+    "draft_mutation": {
+        "schema": "grounded.approval_template.v1",
+        "scope": "run_draft",
+        "ttl": "current run",
+        "required_fields": ["workspace_id", "run_id", "tool", "target_files", "diff_summary"],
+        "copy": "Approve draft-only file changes. Source apply still requires the completion gate.",
+    },
+    "source_apply_gate": {
+        "schema": "grounded.approval_template.v1",
+        "scope": "workspace_source",
+        "ttl": "single apply",
+        "required_fields": ["workspace_id", "run_id", "gate_status", "changed_files", "rollback_ref"],
+        "copy": "Apply reviewed draft changes to the source workspace.",
+    },
+    "network_exception": {
+        "schema": "grounded.approval_template.v1",
+        "scope": "disabled_for_generated_commands",
+        "ttl": "not_applicable",
+        "required_fields": ["human_operator", "external_integration"],
+        "copy": "Generated commands cannot request network/package exceptions through this path.",
+    },
+}
+
 
 SECRET_PATTERNS = (
     re.compile(r"(api[_-]?key|token|secret|password)=([^\s]+)", re.I),
@@ -152,9 +238,13 @@ class ExecPolicyService:
                     "allowed": False,
                     "hard_blocked": ["direct network tools", "package installs/updates", "git network subcommands", "proxy/network config flags"],
                 },
+                "read_write_network_policy": READ_WRITE_NETWORK_POLICY,
+                "dangerous_command_classifier": DANGEROUS_COMMAND_CLASSIFIER,
                 "approval_presets": APPROVAL_PRESETS,
+                "approval_templates": APPROVAL_TEMPLATES,
                 "approval_gates": self.approval_gates(),
                 "per_tool_policy": self.per_tool_policy(),
+                "per_tool_limits": self.per_tool_limits(),
                 "generated_command_default": {
                     "action": "forbidden",
                     "reason": "Generated commands are denied unless the shell parser, trusted executable resolver, network policy, and allowlist all accept them.",
@@ -199,6 +289,9 @@ class ExecPolicyService:
             command_fingerprint=command_fingerprint,
         )
         safety = self._safety_payload(decision)
+        canonical_command = self._canonical_command_payload(decision, command_fingerprint=command_fingerprint)
+        dangerous = self.dangerous_command_classification(decision, command_class=command_class)
+        io_policy = self.io_policy(decision, command_class=command_class, risk=risk)
         approval_gate = self._approval_gate_payload(
             decision=decision,
             risk=risk,
@@ -214,6 +307,7 @@ class ExecPolicyService:
             "command_class": command_class,
             "argv": [self.redact(item) for item in decision.argv],
             "resolved_argv": [self.redact(item) for item in decision.resolved_argv],
+            "canonical_command": canonical_command,
             "resolved_executable": decision.executable_resolution,
             "matched_rules": [self._redact_rule(item) for item in decision.matched_rules],
             "matched_amendments": [self._redact_rule(item) for item in decision.matched_amendments],
@@ -221,14 +315,18 @@ class ExecPolicyService:
             "shell_parse": decision.parse_tree,
             "blocked_syntax": decision.blocked_syntax,
             "network_policy": decision.network_policy,
+            "read_write_network_policy": io_policy,
+            "dangerous_command_classifier": dangerous,
             "safety": safety,
             "decision": self._decision_payload(decision, risk=risk),
             "approval": approval,
+            "approval_template": self.approval_template_for(approval, command_class=command_class, risk=risk),
             "approval_gate": approval_gate,
             "block_explanation": block_explanation,
             "per_command_policy": {
                 "command_fingerprint": command_fingerprint,
                 "command_class": command_class,
+                "canonical_command": canonical_command,
                 "preset": preset if preset in APPROVAL_PRESETS else "safe_auto",
                 "matched_rule_ids": [str(item.get("rule_id") or "") for item in [*decision.matched_rules, *decision.matched_amendments] if isinstance(item, dict)],
                 "generated_default": "deny_unmatched",
@@ -321,14 +419,56 @@ class ExecPolicyService:
         registry = tool_registry_contract()
         raw_tools = registry.get("tools")
         tools = {str(item.get("canonical")): item for item in raw_tools if isinstance(item, dict)} if isinstance(raw_tools, list) else {}
-        shell = tools.get("shell.exec") if isinstance(tools.get("shell.exec"), dict) else {}
-        return {
-            "shell.exec": {
-                "approval_class": shell.get("approval_class") or "policy",
-                "command_policy": "shell_subset_prefix_rule",
-                "audit": COMMAND_AUDIT_SCHEMA,
-                "dangerous_generated_default": "forbidden",
+        policy: dict[str, Any] = {}
+        for canonical, tool in sorted(tools.items()):
+            approval_class = str(tool.get("approval_class") or "none")
+            risk = str(tool.get("risk") or "unknown")
+            policy[canonical] = {
+                "approval_class": approval_class,
+                "risk": risk,
+                "sandbox_profile": tool.get("sandbox_profile"),
+                "allowed_paths": tool.get("allowed_paths") if isinstance(tool.get("allowed_paths"), dict) else {},
+                "side_effect_class": tool.get("side_effect_class"),
+                "parallel_safe": bool(tool.get("parallel_safe")),
+                "limits": {
+                    "timeout_seconds": tool.get("timeout_seconds"),
+                    "output_cap_chars": tool.get("output_cap_chars"),
+                    "artifact_spill_policy": tool.get("artifact_spill_policy"),
+                },
+                "approval_template": (
+                    "draft_mutation"
+                    if approval_class == "human" and risk in {"mutating", "destructive"}
+                    else "workspace_scoped_command"
+                    if approval_class == "policy"
+                    else None
+                ),
             }
+        if "shell.exec" in policy:
+            policy["shell.exec"].update(
+                {
+                    "command_policy": "shell_subset_prefix_rule",
+                    "audit": COMMAND_AUDIT_SCHEMA,
+                    "dangerous_generated_default": "forbidden",
+                }
+            )
+        return policy
+
+    @staticmethod
+    def per_tool_limits() -> dict[str, Any]:
+        registry = tool_registry_contract()
+        raw_tools = registry.get("tools")
+        tools = [item for item in raw_tools if isinstance(item, dict)] if isinstance(raw_tools, list) else []
+        return {
+            str(tool.get("canonical")): {
+                "timeout_seconds": tool.get("timeout_seconds"),
+                "output_cap_chars": tool.get("output_cap_chars"),
+                "concurrency_safe": bool(tool.get("concurrency_safe")),
+                "parallel_safe": bool(tool.get("parallel_safe")),
+                "artifact_spill_policy": tool.get("artifact_spill_policy"),
+                "retry_policy": tool.get("retry_policy") if isinstance(tool.get("retry_policy"), dict) else {},
+                "result_summarization": tool.get("result_summarization") if isinstance(tool.get("result_summarization"), dict) else {},
+            }
+            for tool in tools
         }
 
     @staticmethod
@@ -361,6 +501,90 @@ class ExecPolicyService:
         normalized = self.policy.decide(command).normalized_command
         scope = str(workspace_id or "global")
         return hashlib.sha256(f"{scope}\n{normalized}".encode("utf-8", errors="replace")).hexdigest()
+
+    def _canonical_command_payload(self, decision: CommandPolicyDecision, *, command_fingerprint: str) -> dict[str, Any]:
+        executable = PurePosixPath(decision.argv[0]).name.lower() if decision.argv else ""
+        resolved = decision.executable_resolution if isinstance(decision.executable_resolution, dict) else {}
+        return {
+            "schema": "grounded.canonical_command.v1",
+            "fingerprint": command_fingerprint,
+            "normalized_command": self.redact(decision.normalized_command),
+            "argv": [self.redact(item) for item in decision.argv],
+            "resolved_argv": [self.redact(item) for item in decision.resolved_argv],
+            "executable": executable,
+            "resolved_executable": self.redact(str(resolved.get("resolved_path") or "")) or None,
+            "executable_resolution_status": resolved.get("status"),
+            "cwd_policy": decision.cwd_policy,
+            "shell_ast": decision.parse_tree,
+            "matched_prefix": list(decision.matched_prefix),
+        }
+
+    def io_policy(self, decision: CommandPolicyDecision, *, command_class: str, risk: ToolRisk) -> dict[str, Any]:
+        read_allowed = decision.action != "forbidden" and command_class in {"read_only", "build_test"}
+        write_allowed = decision.action != "forbidden" and command_class == "mutation"
+        network_allowed = False
+        return {
+            "schema": "grounded.exec_io_policy.v1",
+            "read": {
+                "allowed": read_allowed,
+                "policy": READ_WRITE_NETWORK_POLICY["read"]["default"],
+                "paths": READ_WRITE_NETWORK_POLICY["read"]["allow"],
+            },
+            "write": {
+                "allowed": write_allowed,
+                "policy": READ_WRITE_NETWORK_POLICY["write"]["default"],
+                "mode": "agent_draft_write" if write_allowed else "none",
+                "paths": READ_WRITE_NETWORK_POLICY["write"]["allow"] if write_allowed else [],
+            },
+            "network": {
+                "allowed": network_allowed,
+                "policy": READ_WRITE_NETWORK_POLICY["network"]["default"],
+                "blocked": bool((decision.network_policy or {}).get("blocked")) or risk == "network",
+                "reason": (decision.network_policy or {}).get("reason") or READ_WRITE_NETWORK_POLICY["network"]["exception_policy"],
+            },
+        }
+
+    def dangerous_command_classification(self, decision: CommandPolicyDecision, *, command_class: str) -> dict[str, Any]:
+        blocked_code = str((decision.blocked_syntax or {}).get("code") or "")
+        executable = PurePosixPath(decision.argv[0]).name.lower() if decision.argv else ""
+        args = [str(arg).lower() for arg in decision.argv]
+        matched = "none"
+        if blocked_code in set(DANGEROUS_COMMAND_CLASSIFIER["shell_escape"]["codes"]):
+            matched = "shell_escape"
+        elif command_class == "destructive" or executable in set(DANGEROUS_COMMAND_CLASSIFIER["host_destructive"]["executables"]):
+            matched = "host_destructive"
+        elif command_class == "network" or blocked_code in set(DANGEROUS_COMMAND_CLASSIFIER["network"]["codes"]):
+            matched = "network"
+        elif command_class == "mutation" or blocked_code in set(DANGEROUS_COMMAND_CLASSIFIER["workspace_write"]["codes"]):
+            matched = "workspace_write"
+        elif command_class == "unknown" or blocked_code in set(DANGEROUS_COMMAND_CLASSIFIER["unknown_generated"]["codes"]):
+            matched = "unknown_generated"
+        classifier = DANGEROUS_COMMAND_CLASSIFIER.get(matched, {})
+        return {
+            "schema": "grounded.dangerous_command_classifier.v1",
+            "matched_class": matched,
+            "severity": classifier.get("severity", "none"),
+            "action": classifier.get("action", "allow"),
+            "blocked_code": blocked_code or None,
+            "executable": executable,
+            "signals": {
+                "has_force_flag": any(arg in {"-f", "--force", "-rf", "-fr"} for arg in args),
+                "network_policy_blocked": bool((decision.network_policy or {}).get("blocked")),
+                "shell_syntax_blocked": bool(blocked_code),
+            },
+        }
+
+    @staticmethod
+    def approval_template_for(approval: dict[str, Any], *, command_class: str, risk: ToolRisk) -> dict[str, Any]:
+        if risk == "network" or command_class == "network":
+            template_id = "network_exception"
+        elif approval.get("required"):
+            template_id = "workspace_scoped_command"
+        elif command_class == "mutation":
+            template_id = "draft_mutation"
+        else:
+            template_id = "workspace_scoped_command"
+        return {"template_id": template_id, **APPROVAL_TEMPLATES[template_id]}
 
     def doctor_check(self) -> dict[str, Any]:
         snapshot = self.snapshot()

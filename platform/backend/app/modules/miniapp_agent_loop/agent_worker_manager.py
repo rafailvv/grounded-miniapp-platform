@@ -7,6 +7,7 @@ from typing import Any
 
 from app.models.common import GenerationMode
 from app.models.domain import DraftAction
+from app.services.generation_enhancements import SubagentForkContract
 from app.modules.miniapp_agent_loop.product_workers import (
     PRODUCT_WORKERS,
     canonical_worker_id,
@@ -154,6 +155,10 @@ class AgentWorkerManager:
             ),
             "ownership_locks": cls.ownership_locks(),
             "write_scope_report": cls.write_scope_report(workers),
+            "subagent_contract": SubagentForkContract.build(
+                implementation_plan=implementation_plan,
+                generation_mode=str(getattr(generation_mode, "value", generation_mode) or ""),
+            ),
             "merge_policy": "manager accepts only non-conflicting owned diffs with required proof; conflicts become repair_worker packets",
         }
 
@@ -173,6 +178,7 @@ class AgentWorkerManager:
             "owner_scope": role.owner_scope if role else canonical,
             "path_prefixes": list(ownership.get("allowed_paths") or []),
             "ownership": ownership,
+            "tool_allowlist": SubagentForkContract.tool_allowlist_for_worker(canonical),
             "status": status,
             "badge": status,
             "disabled_reason": disabled_reason if not enabled else "",

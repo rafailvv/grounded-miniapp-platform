@@ -8,6 +8,7 @@ from app.services.check_runner import CheckRunner
 from app.services.generation_sla import GenerationSla
 from app.services.product_readiness import ProductReadinessContract
 from app.services.requirement_traceability import RequirementTraceabilityMatrix
+from app.services.run_task_ledger import RunTaskLedger
 from app.services.workspace.service import WorkspaceService
 
 
@@ -77,6 +78,17 @@ class WorkspaceAgentCompletionGate:
                 for issue in validation_snapshot.issues
                 if isinstance(issue, dict) and issue.get("blocking", False)
             )
+        remaining_issues.extend(
+            RunTaskLedger.blocking_issues(
+                run_id=run_id,
+                workspace_id=workspace_id,
+                implementation_plan=implementation_plan,
+                run_status="completed",
+                current_stage="completion_gate",
+                results=results,
+                remaining_issues=remaining_issues,
+            )
+        )
         blocking_issues = [issue for issue in remaining_issues if isinstance(issue, dict) and issue.get("blocking", True)]
         complete = not failed and not no_app_diff and not blocking_issues
         optimistic = complete

@@ -8,6 +8,7 @@ type MemoryPanelProps = {
 export function MemoryPanel({ memory, formatTimestamp }: MemoryPanelProps) {
   const pipeline = memory?.pipeline;
   const summary = memory?.memory_summary || pipeline?.summary;
+  const sessionMemory = memory?.session_memory;
   return (
     <div className="workbench-stack">
       <div className="workbench-panel">
@@ -52,6 +53,29 @@ export function MemoryPanel({ memory, formatTimestamp }: MemoryPanelProps) {
           </div>
         ) : (
           <p className="muted">No active memory summary yet.</p>
+        )}
+      </div>
+      <div className="workbench-panel">
+        <div className="workbench-panel-header">
+          <strong>Session memory</strong>
+          <span>{sessionMemory?.status || "empty"}</span>
+        </div>
+        {sessionMemory?.sections?.length ? (
+          <div className="run-detail-list">
+            {sessionMemory.sections.map((section) => (
+              <div key={section.id} className="run-detail-item">
+                <div className="run-detail-item-top">
+                  <strong>{section.title}</strong>
+                  <span>{section.items.length}</span>
+                </div>
+                {section.items.slice(0, 3).map((item, index) => (
+                  <p key={`${section.id}-${index}`}>{String(item.text || "")}</p>
+                ))}
+              </div>
+            ))}
+          </div>
+        ) : (
+          <p className="muted">No sectioned session memory yet.</p>
         )}
       </div>
       <div className="workbench-panel">

@@ -215,6 +215,7 @@ class JobRecord(StrictModel):
     turn_diff_ref: str | None = None
     environment_snapshot_ref: str | None = None
     tool_batch_summaries_ref: str | None = None
+    task_ledger_ref: str | None = None
     worker_mailbox_ref: str | None = None
     scratchpad_ref: str | None = None
     memory_ref: str | None = None
@@ -608,6 +609,7 @@ class RunRecord(StrictModel):
     turn_diff_ref: str | None = None
     environment_snapshot_ref: str | None = None
     tool_batch_summaries_ref: str | None = None
+    task_ledger_ref: str | None = None
     worker_mailbox_ref: str | None = None
     scratchpad_ref: str | None = None
     memory_ref: str | None = None

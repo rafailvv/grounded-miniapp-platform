@@ -14,6 +14,8 @@ type TaskLanePanelProps = {
 
 export function TaskLanePanel({ taskReport }: TaskLanePanelProps) {
   const items = taskReport?.items ?? [];
+  const ledgerCounts = taskReport?.task_ledger?.counts;
+  const ledgerTotal = taskReport?.task_ledger?.items?.length || items.length;
   const [selectedTaskId, setSelectedTaskId] = useState("");
   const [output, setOutput] = useState<BackgroundTaskOutput | null>(null);
   const [busyTaskId, setBusyTaskId] = useState("");
@@ -55,7 +57,7 @@ export function TaskLanePanel({ taskReport }: TaskLanePanelProps) {
       <div className="workbench-panel">
         <div className="workbench-panel-header">
           <strong>Task lane</strong>
-          <span>{items.length} tasks</span>
+          <span>{ledgerCounts ? `${ledgerCounts.completed || 0}/${ledgerTotal} done` : `${items.length} tasks`}</span>
         </div>
         <div className="task-lane">
           {items.length ? (
@@ -74,7 +76,9 @@ export function TaskLanePanel({ taskReport }: TaskLanePanelProps) {
                   </div>
                   <div className="task-lane-meta">
                     <span>{item.owner || "agent"}</span>
+                    {item.role ? <span>{item.role}</span> : null}
                     {item.phase ? <span>{item.phase}</span> : null}
+                    {item.proof_status ? <span>proof {item.proof_status}</span> : null}
                     {background ? <span>attempt {item.attempt || 1}/{item.max_attempts || 1}</span> : null}
                   </div>
                   {item.files?.length ? <small>{item.files.slice(0, 6).join(", ")}</small> : null}
@@ -101,7 +105,7 @@ export function TaskLanePanel({ taskReport }: TaskLanePanelProps) {
             <div className="task-drawer-summary">
               <div>
                 <strong>{selectedTask.title || selectedTask.task_id}</strong>
-                <span>{selectedTask.phase || "task"}</span>
+                <span>{[selectedTask.role, selectedTask.phase || "task", selectedTask.proof_status ? `proof ${selectedTask.proof_status}` : ""].filter(Boolean).join(" / ")}</span>
               </div>
               <span className={`run-status ${selectedTask.background_status || selectedTask.status}`}>{selectedTask.background_status || selectedTask.status}</span>
             </div>

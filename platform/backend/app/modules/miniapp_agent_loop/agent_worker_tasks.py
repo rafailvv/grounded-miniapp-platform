@@ -73,6 +73,7 @@ class AgentWorkerTaskPlanner:
                     "owner_scope": owner_scope,
                     "path_prefixes": path_prefixes,
                     "ownership": ownership,
+                    "tool_allowlist": list(worker.get("tool_allowlist") or []),
                     "product_task_ledger_slice": ledger_slice,
                     "expected_proof": list(worker.get("expected_proof") or ownership.get("expected_proof") or []),
                     "badge": str(worker.get("badge") or worker.get("status") or "planned"),

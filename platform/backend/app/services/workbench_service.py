@@ -58,6 +58,7 @@ from app.services.event_journal import EventJournalService
 from app.services.export_service import ExportService
 from app.repositories.state_store import StateStore
 from app.services.exec_policy_service import ExecPolicyService
+from app.services.diagnostic_workflows import DiagnosticWorkflow
 from app.services.generation_enhancements import (
     AcceptanceScenarioGenerator,
     ConfigMigrationCatalog,
@@ -65,6 +66,7 @@ from app.services.generation_enhancements import (
     ProjectInstructionBundle,
     SkillPackCatalog,
     SlashCommandCatalog,
+    SubagentForkContract,
     TraceReducer,
     VisualRegressionGenerator,
     VisualQAGenerator,
@@ -73,6 +75,7 @@ from app.services.generation_enhancements import (
 from app.services.generation_sla import GenerationSla
 from app.services.golden_generated_apps import GoldenGeneratedAppCatalog
 from app.services.skill_registry import SkillRegistryService
+from app.services.simplify_pass import SimplifyPass
 from app.services.miniapp_contract import MiniAppContractMaterializer, MiniAppRouteRegistry
 from app.services.repair_catalog import RepairCatalog
 from app.services.repair_cases import RepairCaseService
@@ -86,9 +89,13 @@ from app.services.pr_babysitter import PrBabysitterService
 from app.services.prompt_suggestions import PromptSuggestionService
 from app.services.product_readiness import ProductReadinessContract
 from app.services.requirement_traceability import PromptArtifactCompletionAudit, RequirementTraceabilityMatrix
+from app.services.rollout_trace_evidence import RolloutTraceEvidence
 from app.services.run_compaction import RunCompactionService
 from app.services.run_protocol import RunProtocolConflict, RunProtocolService, diff_sha256
 from app.services.trace_bundle import TraceBundleReducer
+from app.services.run_task_ledger import RunTaskLedger
+from app.services.skillify import SkillifyService
+from app.services.session_memory import SessionMemorySections
 from app.services.workspace.run_service import RunService
 from app.services.workspace.service import WorkspaceService
 from app.core.config import Settings
@@ -1092,11 +1099,15 @@ class WorkbenchService:
     def tasks(self, run_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
         background_items = self._background_tasks_for_run(run)
+        latest_results = self._latest_run_check_results(run)
+        task_ledger = self._runtime_task_ledger_for_run(run, latest_results=latest_results)
         scratchpad = self.store.get("reports", run.scratchpad_ref) if run.scratchpad_ref else None
         raw_todos = []
         if isinstance(scratchpad, dict):
             raw_todos = scratchpad.get("todo_plan") or scratchpad.get("agent_todos") or []
         items: list[dict[str, Any]] = []
+        if task_ledger.get("items"):
+            items.extend(task_ledger["items"])
         for index, item in enumerate(raw_todos if isinstance(raw_todos, list) else [], start=1):
             if not isinstance(item, dict):
                 continue
@@ -1140,7 +1151,15 @@ class WorkbenchService:
             items = [*repair_tasks, *items]
         if not items:
             items = self._tasks_from_activity(run)
-        return {"schema": "grounded.run_tasks.v1", "run_id": run_id, "workspace_id": run.workspace_id, "status": run.status, "items": items, "repair_cases": repair_cases}
+        return {
+            "schema": "grounded.run_tasks.v1",
+            "run_id": run_id,
+            "workspace_id": run.workspace_id,
+            "status": run.status,
+            "items": items,
+            "task_ledger": task_ledger,
+            "repair_cases": repair_cases,
+        }
 
     def create_background_task(self, payload: dict[str, Any]) -> dict[str, Any]:
         if self.background_task_service is None:
@@ -1226,6 +1245,9 @@ class WorkbenchService:
 
     def worker_roles(self) -> dict[str, Any]:
         return WorkerRoleCatalog.roles()
+
+    def subagent_fork_contract(self) -> dict[str, Any]:
+        return SubagentForkContract.build(generation_mode="quality")
 
     def worker_artifacts(self, run_id: str, worker_id: str) -> dict[str, Any]:
         workers = self.workers(run_id)["workers"]
@@ -1828,6 +1850,122 @@ class WorkbenchService:
         self.store.upsert("reports", f"trace_reducer:{run_id}", payload)
         return payload
 
+    def simplify_run(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        gate = self.store.get("reports", f"gate:{run_id}") or {}
+        artifacts = self._run_artifacts_or_empty(run_id)
+        source_dir = self.workspace_service.draft_source_dir(run.workspace_id, run_id)
+        if not source_dir.exists():
+            source_dir = self.workspace_service.source_dir(run.workspace_id)
+        payload = SimplifyPass.build(run=run, source_dir=source_dir, gate=gate, artifacts=artifacts)
+        self.store.upsert("reports", f"simplify:{run.workspace_id}:{run_id}", payload)
+        self._journal_run_event(
+            run_id,
+            "simplify.evaluated",
+            payload,
+            summary=f"Simplify pass {payload.get('status')} with {((payload.get('summary') or {}).get('finding_count') or 0)} finding(s).",
+            source_ref=f"simplify:{run.workspace_id}:{run_id}",
+            idempotency_key=f"simplify:{run_id}:{payload.get('status')}:{((payload.get('summary') or {}).get('finding_count') or 0)}",
+        )
+        return payload
+
+    def debug_run(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        inputs = self._diagnostic_inputs(run)
+        payload = DiagnosticWorkflow.debug_run(run=run, **inputs)
+        self.store.upsert("reports", f"debug_run:{run.workspace_id}:{run_id}", payload)
+        self._journal_run_event(
+            run_id,
+            "debug_run.evaluated",
+            payload,
+            summary=str((payload.get("diagnosis") or {}).get("primary_signal") or "Debug run evaluated."),
+            source_ref=f"debug_run:{run.workspace_id}:{run_id}",
+            idempotency_key=f"debug_run:{run_id}:{(payload.get('repair_packet') or {}).get('failure_signature')}",
+        )
+        return payload
+
+    def stuck_run(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        inputs = self._diagnostic_inputs(run)
+        payload = DiagnosticWorkflow.stuck_run(run=run, **inputs)
+        self.store.upsert("reports", f"stuck_run:{run.workspace_id}:{run_id}", payload)
+        self._journal_run_event(
+            run_id,
+            "stuck_run.evaluated",
+            payload,
+            summary=str(((payload.get("diagnosis") or {}).get("stuck") or {}).get("kind") or "Stuck run evaluated."),
+            source_ref=f"stuck_run:{run.workspace_id}:{run_id}",
+            idempotency_key=f"stuck_run:{run_id}:{(payload.get('repair_packet') or {}).get('failure_signature')}",
+        )
+        return payload
+
+    def doctor_workspace(self, workspace_id: str) -> dict[str, Any]:
+        self.workspace_service.get_workspace(workspace_id)
+        runs = self.run_service.list_runs(workspace_id)
+        latest = runs[0] if runs else None
+        reports = {
+            "gate": self.store.get("reports", f"gate:{latest.run_id}") if latest else {},
+            "trace_state": self.trace_bundle_state(latest.run_id) if latest else {},
+            "trace_reducer": self.store.get("reports", getattr(latest, "trace_reducer_ref", "") or "") if latest else {},
+            "workspace_memory": self.store.get("reports", f"workspace_memory:{workspace_id}"),
+        }
+        payload = DiagnosticWorkflow.doctor_workspace(
+            workspace_id=workspace_id,
+            workspace_root=self.workspace_service.workspace_root(workspace_id),
+            latest_run=latest,
+            preview=self._preview_payload(workspace_id),
+            platform_logs=self._workspace_log_lines(workspace_id, kind="platform"),
+            api_logs=self._workspace_log_lines(workspace_id, kind="api"),
+            reports=reports,
+        )
+        self.store.upsert("reports", f"doctor_workspace:{workspace_id}", payload)
+        return payload
+
+    def _diagnostic_inputs(self, run: RunRecord) -> dict[str, Any]:
+        process_outputs = self.store.get("reports", run.process_outputs_ref) if run.process_outputs_ref else {}
+        trace_reducer = self.store.get("reports", run.trace_reducer_ref) if run.trace_reducer_ref else {}
+        return {
+            "workspace_root": self.workspace_service.workspace_root(run.workspace_id),
+            "artifacts": self._run_artifacts_or_empty(run.run_id),
+            "gate": self.store.get("reports", f"gate:{run.run_id}") or {},
+            "trace_state": self.trace_bundle_state(run.run_id),
+            "trace_reducer": trace_reducer if isinstance(trace_reducer, dict) else {},
+            "preview": self._preview_payload(run.workspace_id),
+            "process_outputs": process_outputs if isinstance(process_outputs, dict) else {},
+            "platform_logs": self._workspace_log_lines(run.workspace_id, kind="platform"),
+            "api_logs": self._workspace_log_lines(run.workspace_id, kind="api"),
+        }
+
+    def _preview_payload(self, workspace_id: str) -> dict[str, Any]:
+        payload = self.store.get("previews", workspace_id)
+        return payload if isinstance(payload, dict) else {}
+
+    def _workspace_log_lines(self, workspace_id: str, *, kind: str) -> list[str]:
+        path = self.settings.workspaces_dir / workspace_id / "logs" / ("platform.log" if kind == "platform" else "api.log")
+        if not path.exists():
+            return []
+        try:
+            return [line.rstrip("\n") for line in path.read_text(encoding="utf-8", errors="ignore").splitlines()[-400:]]
+        except OSError:
+            return []
+
+    def rollout_trace(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        trace_bundle = self.trace_bundle(run_id)
+        trace_state = self.trace_bundle_state(run_id)
+        trace_reducer = self.trace_reducer(run_id)
+        protocol = self.run_protocol_service.protocol_events(run_id) if self.run_protocol_service is not None else {}
+        payload = RolloutTraceEvidence.build(
+            run=run,
+            store=self.store,
+            trace_bundle=trace_bundle,
+            trace_state=trace_state,
+            trace_reducer=trace_reducer,
+            protocol=protocol,
+        )
+        self.store.upsert("reports", f"rollout_trace_evidence:{run.workspace_id}:{run_id}", payload)
+        return payload
+
     def trace_bundle(self, run_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
         ref = run.trace_bundle_ref or f"trace_bundle:{run.workspace_id}:{run_id}"
@@ -2163,6 +2301,12 @@ class WorkbenchService:
                     self.store.upsert("reports", f"gate:{run_id}", payload)
             except Exception:
                 pass
+        else:
+            try:
+                payload["simplify_pass"] = self.simplify_run(run_id)
+                self.store.upsert("reports", f"gate:{run_id}", payload)
+            except Exception:
+                pass
         return self._typed_payload(GateReport, payload)
 
     @classmethod
@@ -2443,6 +2587,7 @@ class WorkbenchService:
         WorkspaceMemoryPipeline.apply_stale_status(current, stale_check)
         current["pipeline"] = self.memory_pipeline(workspace_id)
         current["memory_summary"] = WorkspaceMemoryPipeline.summary(workspace_id, current)
+        current["session_memory"] = self.session_memory(workspace_id, memory=current)
         return current
 
     def extract_run_memory(self, run_id: str) -> dict[str, Any]:
@@ -2521,6 +2666,9 @@ class WorkbenchService:
             workspace_root=self.workspace_service.source_dir(workspace_id),
         )
         consolidated["stale_check"] = WorkspaceMemoryPipeline.stale_check(self.workspace_service.source_dir(workspace_id), consolidated)
+        WorkspaceMemoryPipeline.apply_stale_status(consolidated, consolidated["stale_check"])
+        consolidated["memory_summary"] = WorkspaceMemoryPipeline.summary(workspace_id, consolidated)
+        consolidated["session_memory"] = self.session_memory(workspace_id, memory=consolidated)
         self.store.upsert("reports", f"workspace_memory:{workspace_id}", consolidated)
         pipeline = consolidated.get("pipeline") if isinstance(consolidated.get("pipeline"), dict) else {}
         summary = MemoryConsolidationReport(
@@ -2572,6 +2720,14 @@ class WorkbenchService:
         current = self.memory(workspace_id)
         return WorkspaceMemoryPipeline.summary(workspace_id, current)
 
+    def session_memory(self, workspace_id: str, *, memory: dict[str, Any] | None = None) -> dict[str, Any]:
+        self.workspace_service.get_workspace(workspace_id)
+        current = memory if isinstance(memory, dict) else self.store.get("reports", f"workspace_memory:{workspace_id}") or {"workspace_id": workspace_id, "items": []}
+        runs = self.run_service.list_runs(workspace_id)
+        payload = SessionMemorySections.build(workspace_id=workspace_id, memory=current, runs=runs)
+        self.store.upsert("reports", f"session_memory:{workspace_id}", payload)
+        return payload
+
     def _auto_consolidate_workspace_memory(self, workspace_id: str) -> None:
         stage1 = [
             payload
@@ -2589,6 +2745,7 @@ class WorkbenchService:
         consolidated["stale_check"] = stale_check
         WorkspaceMemoryPipeline.apply_stale_status(consolidated, stale_check)
         consolidated["memory_summary"] = WorkspaceMemoryPipeline.summary(workspace_id, consolidated)
+        consolidated["session_memory"] = self.session_memory(workspace_id, memory=consolidated)
         self.store.upsert("reports", f"workspace_memory:{workspace_id}", consolidated)
 
     def project_instructions(self) -> dict[str, Any]:
@@ -2655,6 +2812,7 @@ class WorkbenchService:
             current.setdefault(bucket, []).append(item)
         current["stale_check"] = self._memory_stale_check(workspace_id, current)
         current["memory_summary"] = WorkspaceMemoryPipeline.summary(workspace_id, current)
+        current["session_memory"] = self.session_memory(workspace_id, memory=current)
         self.store.upsert("reports", f"workspace_memory:{workspace_id}", current)
         return current
 
@@ -2690,6 +2848,22 @@ class WorkbenchService:
         if item is None:
             raise KeyError(f"Skill not found: {skill_id}")
         return item
+
+    def skillify_run(self, run_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload = payload or {}
+        run = self.run_service.get_run(run_id)
+        report = SkillifyService(data_dir=self.settings.data_dir).build(
+            run=run,
+            artifacts=self._run_artifacts_or_empty(run_id),
+            skill_id=str(payload.get("skill_id") or "").strip() or None,
+            title=str(payload.get("title") or "").strip() or None,
+            write=bool(payload.get("write")),
+            scope=str(payload.get("scope") or "user"),
+        )
+        self.store.upsert("reports", f"skillify:{run.workspace_id}:{run.run_id}", report)
+        if report.get("write_status") == "written":
+            SkillRegistryService(runtime_dir=self.settings.runtime_dir, repo_root=self.settings.repo_root, data_dir=self.settings.data_dir).prefetch(force=True)
+        return report
 
     def skill_registry_manifest(self) -> dict[str, Any]:
         return SkillRegistryService(runtime_dir=self.settings.runtime_dir, repo_root=self.settings.repo_root, data_dir=self.settings.data_dir).manifest()
@@ -2773,6 +2947,37 @@ class WorkbenchService:
                 raise ValueError("/docs requires workspace_id.")
             report = self.magic_doc(workspace_id, write=True)
             return self._store_slash_execution({**base, "status": "completed", "workflow": "product_architecture_docs", "report": report, "artifact_refs": {"magic_doc": f"magic_doc:{workspace_id}:product_architecture"}})
+        if command_id == "skillify":
+            target = run or self._latest_run_for_slash(workspace_id, prefer_failed=False)
+            report = self.skillify_run(
+                target.run_id,
+                {
+                    "skill_id": payload.get("skill_id") or (payload.get("metadata") or {}).get("skill_id"),
+                    "title": payload.get("title") or (payload.get("metadata") or {}).get("title"),
+                    "write": bool(payload.get("write") or (payload.get("metadata") or {}).get("write")),
+                    "scope": payload.get("scope") or (payload.get("metadata") or {}).get("scope") or "user",
+                },
+            )
+            return self._store_slash_execution({**base, "workspace_id": target.workspace_id, "run_id": target.run_id, "status": "completed", "workflow": "skillify_successful_run", "report": report, "artifact_refs": {"skillify": f"skillify:{target.workspace_id}:{target.run_id}"}})
+        if command_id == "simplify":
+            target = run or self._latest_run_for_slash(workspace_id, prefer_failed=False)
+            report = self.simplify_run(target.run_id)
+            return self._store_slash_execution({**base, "workspace_id": target.workspace_id, "run_id": target.run_id, "status": report.get("status") or "completed", "workflow": "post_green_simplify", "report": report, "artifact_refs": {"simplify": f"simplify:{target.workspace_id}:{target.run_id}"}})
+        if command_id == "debug-run":
+            target = run or self._latest_run_for_slash(workspace_id, prefer_failed=True)
+            report = self.debug_run(target.run_id)
+            return self._store_slash_execution({**base, "workspace_id": target.workspace_id, "run_id": target.run_id, "status": report.get("status") or "diagnosed", "workflow": "debug_run", "report": report, "artifact_refs": {"debug_run": f"debug_run:{target.workspace_id}:{target.run_id}"}})
+        if command_id == "stuck-run":
+            target = run or self._latest_run_for_slash(workspace_id, prefer_failed=True)
+            report = self.stuck_run(target.run_id)
+            return self._store_slash_execution({**base, "workspace_id": target.workspace_id, "run_id": target.run_id, "status": report.get("status") or "diagnosed", "workflow": "stuck_run", "report": report, "artifact_refs": {"stuck_run": f"stuck_run:{target.workspace_id}:{target.run_id}"}})
+        if command_id == "doctor-workspace":
+            if not workspace_id:
+                workspace_id = run.workspace_id if run else ""
+            if not workspace_id:
+                raise ValueError("/doctor-workspace requires workspace_id.")
+            report = self.doctor_workspace(workspace_id)
+            return self._store_slash_execution({**base, "workspace_id": workspace_id, "run_id": report.get("run_id"), "status": report.get("status") or "diagnosed", "workflow": "doctor_workspace", "report": report, "artifact_refs": {"doctor_workspace": f"doctor_workspace:{workspace_id}"}})
         raise KeyError(f"Slash command not found: {command_id}")
 
     def _store_slash_execution(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -4847,6 +5052,39 @@ class WorkbenchService:
                 }
             )
         return items[-80:]
+
+    def _runtime_task_ledger_for_run(self, run: Any, *, latest_results: list[dict[str, Any]]) -> dict[str, Any]:
+        stored = self.store.get("reports", run.task_ledger_ref) if getattr(run, "task_ledger_ref", None) else None
+        updated_at = run.updated_at.isoformat() if hasattr(run.updated_at, "isoformat") else str(getattr(run, "updated_at", "") or "")
+        ledger = RunTaskLedger.build(
+            run_id=run.run_id,
+            workspace_id=run.workspace_id,
+            implementation_plan=run.implementation_plan,
+            run_status=run.status,
+            current_stage=run.current_stage,
+            results=latest_results,
+            remaining_issues=run.remaining_issues,
+            updated_at=updated_at,
+        )
+        if isinstance(stored, dict) and stored.get("items") and not ledger.get("items"):
+            return stored
+        return ledger
+
+    def _latest_run_check_results(self, run: Any) -> list[dict[str, Any]]:
+        refs = [
+            f"check_results:{run.workspace_id}",
+            f"run_artifacts:{run.run_id}",
+        ]
+        for ref in refs:
+            report = self.store.get("reports", ref)
+            if not isinstance(report, dict):
+                continue
+            if report.get("run_id") and str(report.get("run_id")) != str(run.run_id):
+                continue
+            items = report.get("items") or report.get("check_results") or []
+            if isinstance(items, list):
+                return [item for item in items if isinstance(item, dict)]
+        return []
 
     def _background_tasks_for_run(self, run: Any) -> list[dict[str, Any]]:
         if self.background_task_service is None:

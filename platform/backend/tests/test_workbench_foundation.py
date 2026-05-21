@@ -194,6 +194,11 @@ def test_exec_policy_classifies_and_redacts_commands() -> None:
     assert allowed["decision"]["risk"] == "read_only"
     assert allowed["command_class"] == "read_only"
     assert allowed["approval_gate"]["gate"] == "auto"
+    assert allowed["canonical_command"]["normalized_command"] == "rg api miniapp/app"
+    assert allowed["read_write_network_policy"]["read"]["allowed"] is True
+    assert allowed["read_write_network_policy"]["write"]["allowed"] is False
+    assert allowed["read_write_network_policy"]["network"]["allowed"] is False
+    assert allowed["dangerous_command_classifier"]["matched_class"] == "none"
     assert allowed["decision"]["shell_parse"]["kind"] == "simple_command"
     assert allowed["decision"]["network_policy"]["blocked"] is False
     assert allowed["decision"]["resolved_argv"]
@@ -211,13 +216,18 @@ def test_exec_policy_classifies_and_redacts_commands() -> None:
     assert blocked["safety"]["class"] == "destructive"
     assert blocked["approval"]["status"] == "blocked"
     assert blocked["approval_gate"]["gate"] == "block"
+    assert blocked["dangerous_command_classifier"]["matched_class"] == "host_destructive"
+    assert blocked["dangerous_command_classifier"]["severity"] == "critical"
     assert blocked["block_explanation"]["blocked"] is True
     assert "delete" in blocked["block_explanation"]["remediation"].lower() or "reset" in blocked["block_explanation"]["remediation"].lower()
     assert package_network["decision"]["risk"] == "network"
     assert package_network["command_class"] == "network"
     assert package_network["safety"]["class"] == "network"
+    assert package_network["approval_template"]["template_id"] == "network_exception"
+    assert package_network["read_write_network_policy"]["network"]["blocked"] is True
     assert redirection["decision"]["action"] == "forbidden"
     assert redirection["decision"]["blocked_syntax"]["code"] == "shell_metacharacter"
+    assert redirection["dangerous_command_classifier"]["matched_class"] == "shell_escape"
     assert git_internal["decision"]["action"] == "forbidden"
     assert "sk-secretvalue" not in redacted["command"]
 
@@ -228,7 +238,12 @@ def test_exec_policy_snapshot_exposes_command_classes_gates_and_per_tool_policy(
     assert {"read_only", "build_test", "network", "mutation", "destructive"} <= set(snapshot["command_class_model"])
     assert snapshot["approval_gates"]["block"]["classes"] == ["network", "destructive", "unknown"]
     assert snapshot["generated_command_default"]["action"] == "forbidden"
+    assert snapshot["read_write_network_policy"]["network"]["default"] == "blocked"
+    assert snapshot["dangerous_command_classifier"]["shell_escape"]["action"] == "forbidden"
+    assert snapshot["approval_templates"]["draft_mutation"]["scope"] == "run_draft"
     assert snapshot["per_tool_policy"]["shell.exec"]["dangerous_generated_default"] == "forbidden"
+    assert snapshot["per_tool_policy"]["patch.apply"]["approval_template"] == "draft_mutation"
+    assert snapshot["per_tool_limits"]["shell.exec"]["timeout_seconds"] == 30
 
 
 def test_workspace_policy_records_denials_and_scoped_approval_grants(tmp_path: Path) -> None:
@@ -601,6 +616,492 @@ def test_background_tasks_crud_output_stop_retry_and_run_lane(tmp_path: Path) ->
     assert lane["items"][0]["source"] == "background"
     assert any(item["artifact_refs"]["background_task"] == created["task_id"] for item in lane["items"])
     assert stopped["status"] in {"cancelled", "failed", "stopping"}
+
+
+def test_run_tasks_exposes_runtime_task_ledger_with_proof_and_blockers(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Runtime Ledger Workspace",
+            "description": "runtime ledger test",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    run = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Build a booking workflow",
+        intent="create",
+        target_role_scope=["client", "specialist", "manager"],
+        model_profile="test",
+        status="blocked",
+        current_stage="completion_gate",
+        implementation_plan={
+            "product_task_ledger": [
+                {
+                    "id": "client.role_surface",
+                    "role": "client",
+                    "kind": "source",
+                    "content": "Client books a slot.",
+                    "owned_paths": ["miniapp/app/static/client/app.js"],
+                    "proof_checks": ["platform_invariants", "browser_flow_smoke"],
+                },
+                {
+                    "id": "manager.role_surface",
+                    "role": "manager",
+                    "kind": "observer",
+                    "content": "Manager reviews bookings.",
+                    "owned_paths": ["miniapp/app/static/manager/app.js"],
+                    "proof_checks": ["platform_invariants"],
+                },
+            ]
+        },
+        remaining_issues=[
+            {
+                "kind": "product_task_ledger",
+                "ledger_item_id": "manager.role_surface",
+                "role": "manager",
+                "details": "manager route missing",
+                "blocking": True,
+            }
+        ],
+    )
+    app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+    app.state.container.store.upsert(
+        "reports",
+        f"check_results:{workspace['workspace_id']}",
+        {
+            "run_id": run.run_id,
+            "items": [
+                RunCheckResult(name="platform_invariants", status="passed").model_dump(mode="json"),
+                RunCheckResult(name="browser_flow_smoke", status="passed").model_dump(mode="json"),
+            ],
+        },
+    )
+
+    lane = client.get(f"/runs/{run.run_id}/tasks").json()
+
+    assert lane["task_ledger"]["schema"] == "grounded.run_task_ledger.v1"
+    by_id = {item["task_id"]: item for item in lane["items"] if item["source"] == "runtime_task_ledger"}
+    assert by_id["client.role_surface"]["status"] == "completed"
+    assert by_id["client.role_surface"]["proof_status"] == "passed"
+    assert by_id["manager.role_surface"]["status"] == "blocked"
+    assert by_id["manager.role_surface"]["blocker"]["details"] == "manager route missing"
+
+
+def test_skillify_successful_run_generates_and_writes_user_skill(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Skillify Workspace",
+            "description": "skillify test",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    run = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Create a salon booking app with client booking, specialist schedule, and manager utilization.",
+        intent="create",
+        target_role_scope=["client", "specialist", "manager"],
+        model_profile="test",
+        status="completed",
+        apply_status="applied",
+        touched_files=["miniapp/app/static/client/app.js", "miniapp/app/routes/bookings.py"],
+        acceptance_contract={
+            "required": True,
+            "flows": [
+                {
+                    "id": "book_slot",
+                    "name": "Book a salon slot",
+                    "roles": ["client", "specialist", "manager"],
+                    "api_paths": ["/api/bookings"],
+                }
+            ],
+        },
+        implementation_plan={
+            "product_task_ledger": [
+                {
+                    "id": "client.role_surface",
+                    "role": "client",
+                    "kind": "source",
+                    "content": "Client chooses a service and books a free slot.",
+                    "owned_paths": ["miniapp/app/static/client/app.js"],
+                    "proof_checks": ["browser_flow_smoke"],
+                },
+                {
+                    "id": "shared_state.persistence_api",
+                    "kind": "shared_state",
+                    "content": "Bookings persist through FastAPI routes.",
+                    "owned_paths": ["miniapp/app/routes/bookings.py"],
+                    "proof_checks": ["api_workflow_smoke"],
+                },
+            ]
+        },
+    )
+    app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+    app.state.container.store.upsert(
+        "reports",
+        f"run_artifacts:{run.run_id}",
+        {
+            "run_id": run.run_id,
+            "check_results": [
+                RunCheckResult(name="api_workflow_smoke", status="passed", details="created booking").model_dump(mode="json"),
+                RunCheckResult(name="browser_flow_smoke", status="passed", details="client booked slot").model_dump(mode="json"),
+            ],
+        },
+    )
+
+    preview = client.post(f"/runs/{run.run_id}/skillify", json={"skill_id": "salon-booking", "title": "Salon Booking", "write": False}).json()
+    written = client.post(f"/runs/{run.run_id}/skillify", json={"skill_id": "salon-booking", "title": "Salon Booking", "write": True}).json()
+    skills = client.get("/skills").json()
+    slash_commands = client.get("/slash-commands").json()
+    slash = client.post("/slash-commands/skillify/execute", json={"run_id": run.run_id, "metadata": {"skill_id": "salon-booking-preview"}}).json()
+
+    assert preview["schema"] == "grounded.skillify.v1"
+    assert preview["write_status"] == "preview"
+    assert "Client chooses a service" in preview["content"]
+    assert "browser_flow_smoke" in preview["content"]
+    assert written["write_status"] == "written"
+    assert Path(written["target_path"]).exists()
+    assert any(item["id"] == "salon-booking" and item["scope"] == "user" for item in skills["items"])
+    assert any(item["id"] == "skillify" for item in slash_commands["items"])
+    assert slash["workflow"] == "skillify_successful_run"
+    assert slash["report"]["skill_id"] == "salon-booking-preview"
+
+
+def test_session_memory_sections_are_exposed_and_embedded_in_workspace_memory(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Session Memory Workspace",
+            "description": "sectioned memory test",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    run = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Add payment flow and repair manager dashboard.",
+        intent="edit",
+        target_role_scope=["client", "manager"],
+        model_profile="test",
+        status="failed",
+        apply_status="failed",
+        current_stage="verify",
+        touched_files=["miniapp/app/static/manager/dashboard.js", "miniapp/app/routes/payments.py"],
+        acceptance_contract={
+            "required": True,
+            "flows": [
+                {"id": "pay_invoice", "name": "Pay invoice", "roles": ["client"], "api_paths": ["/api/payments"]},
+            ],
+        },
+        implementation_plan={
+            "product_task_ledger": [
+                {
+                    "id": "manager.dashboard",
+                    "role": "manager",
+                    "content": "Manager dashboard shows revenue and failed payments.",
+                    "owned_paths": ["miniapp/app/static/manager/dashboard.js"],
+                }
+            ]
+        },
+        failure_signature="manager_dashboard_missing_total",
+        failure_reason="Revenue total was not rendered after payment repair.",
+        remaining_issues=[{"details": "Payment success state needs browser proof."}],
+    )
+    app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+    for payload in [
+        {"kind": "product_decision", "text": "Payment flow must keep manager dashboard revenue in sync."},
+        {"kind": "reusable_workflow", "text": "After payment changes, run API workflow smoke before browser proof."},
+        {"kind": "failure_shield", "text": "Do not mark payment repair complete until manager revenue total is visible."},
+        {"kind": "preference", "text": "Prefer dense operational manager screens."},
+    ]:
+        response = client.post(f"/workspaces/{workspace['workspace_id']}/memory", json=payload)
+        assert response.status_code == 200
+
+    session = client.get(f"/workspaces/{workspace['workspace_id']}/session-memory").json()
+    memory = client.get(f"/workspaces/{workspace['workspace_id']}/memory").json()
+    section_ids = [section["id"] for section in session["sections"]]
+
+    assert session["schema"] == "grounded.session_memory.v1"
+    assert section_ids == [
+        "current_state",
+        "task_specification",
+        "files_and_functions",
+        "workflow",
+        "errors_and_corrections",
+        "learnings",
+        "worklog",
+    ]
+    assert "Current State" in session["text"]
+    assert "Pay invoice" in session["text"]
+    assert "miniapp/app/static/manager/dashboard.js" in session["text"]
+    assert "manager_dashboard_missing_total" in session["text"]
+    assert memory["session_memory"]["schema"] == "grounded.session_memory.v1"
+
+
+def test_rollout_trace_exposes_raw_evidence_before_interpretation(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Rollout Trace Workspace",
+            "description": "raw trace evidence test",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    run = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Repair checkout flow.",
+        intent="edit",
+        model_profile="test",
+        status="failed",
+        apply_status="failed",
+        current_stage="checks",
+        failure_class="check_failed",
+        failure_signature="checkout_total_missing",
+        failure_reason="Checkout total was not visible after repair.",
+        rollout_trace_ref=f"rollout_trace:{workspace['workspace_id']}:run_rollout",
+        tool_trace_ref=f"tool_trace:{workspace['workspace_id']}:run_rollout",
+        process_outputs_ref=f"process_outputs:{workspace['workspace_id']}:run_rollout",
+        trace_bundle_ref=f"trace_bundle:{workspace['workspace_id']}:run_rollout",
+        trace_reducer_ref=f"trace_reducer:{workspace['workspace_id']}:run_rollout",
+        worker_drafts_ref=f"worker_drafts:{workspace['workspace_id']}:run_rollout",
+        worker_branch_refs=[f"worker_drafts:{workspace['workspace_id']}:run_rollout"],
+    )
+    app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+    app.state.container.store.upsert(
+        "reports",
+        run.rollout_trace_ref,
+        {
+            "workspace_id": workspace["workspace_id"],
+            "run_id": run.run_id,
+            "events": [
+                {"sequence": 1, "event_type": "agent_turn_started", "payload": {"summary": "turn 1"}, "created_at": "2026-05-21T00:00:00+00:00"},
+                {"sequence": 2, "event_type": "model_prompt_response", "payload": {"tool_calls": [{"tool": "run_command"}]}, "created_at": "2026-05-21T00:00:01+00:00"},
+                {"sequence": 3, "event_type": "tool_failed_reason", "payload": {"details": {"status": "failed", "tool": "run_command", "reason": "pytest failed"}}, "created_at": "2026-05-21T00:00:02+00:00"},
+            ],
+            "graph": [{"sequence": 3, "event_type": "tool_failed_reason", "status": "failed", "summary": "pytest failed"}],
+        },
+    )
+    app.state.container.store.upsert(
+        "reports",
+        run.tool_trace_ref,
+        {
+            "workspace_id": workspace["workspace_id"],
+            "run_id": run.run_id,
+            "items": [{"tool_use_id": "tool_1", "tool": "run_command", "status": "failed", "command": "pytest", "exit_code": 1}],
+        },
+    )
+    app.state.container.store.upsert(
+        "reports",
+        run.process_outputs_ref,
+        {
+            "workspace_id": workspace["workspace_id"],
+            "run_id": run.run_id,
+            "items": [{"tool_use_id": "tool_1", "command": "pytest", "exit_code": 1, "stderr_tail": "checkout total missing"}],
+        },
+    )
+    app.state.container.store.upsert(
+        "reports",
+        run.trace_bundle_ref,
+        {
+            "schema": "grounded.trace_bundle.v1",
+            "workspace_id": workspace["workspace_id"],
+            "run_id": run.run_id,
+            "status": "reduced",
+            "event_count": 3,
+            "state": {
+                "schema": "grounded.trace_bundle_state.v1",
+                "workspace_id": workspace["workspace_id"],
+                "run_id": run.run_id,
+                "event_count": 3,
+                "blockers": [{"seq": 3, "event_type": "tool_failed_reason", "status": "failed"}],
+                "tool_calls": [{"seq": 3, "event_type": "tool_failed_reason", "summary": "pytest failed"}],
+                "prompt_contexts": [{"seq": 2, "event_type": "model_prompt_response"}],
+                "payload_refs": [{"seq": 3, "event_type": "tool_failed_reason", "payload_ref": "payloads/000003_tool_failed_reason.json"}],
+                "next_action": {"action": "repair", "reason": "pytest failed"},
+            },
+        },
+    )
+    app.state.container.store.upsert(
+        "reports",
+        run.worker_drafts_ref,
+        {"workspace_id": workspace["workspace_id"], "run_id": run.run_id, "items": [{"worker_id": "frontend_worker", "status": "failed"}]},
+    )
+
+    trace = client.get(f"/runs/{run.run_id}/rollout-trace").json()
+
+    assert trace["schema"] == "grounded.rollout_trace_evidence.v1"
+    assert trace["principle"] == "raw_evidence_first_interpret_later"
+    assert trace["raw_events"][0]["event_type"] == "agent_turn_started"
+    assert trace["payload_refs"][0]["payload_ref"] == "payloads/000003_tool_failed_reason.json"
+    assert trace["inference_calls"]
+    assert any(item.get("tool") == "run_command" for item in trace["tool_calls"])
+    assert any(item.get("exit_code") == 1 for item in trace["terminal_ops"])
+    assert trace["child_agents"][0]["worker_id"] == "frontend_worker"
+    assert trace["interpretations"]["run_failure"]["failure_signature"] == "checkout_total_missing"
+    assert trace["repair_learning_hooks"]["can_extract_failure_shield"] is True
+
+
+def test_simplify_pass_reviews_changed_files_after_green_gate(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Simplify Workspace",
+            "description": "post green simplify test",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    source_dir = app.state.container.workspace_service.source_dir(workspace["workspace_id"])
+    client_dir = source_dir / "miniapp" / "app" / "static" / "client"
+    manager_dir = source_dir / "miniapp" / "app" / "static" / "manager"
+    client_dir.mkdir(parents=True, exist_ok=True)
+    manager_dir.mkdir(parents=True, exist_ok=True)
+    (client_dir / "app.js").write_text(
+        """
+const stateKey = "checkout-state";
+function renderCard(item) { return `<div class="card stack row primary">${item}</div>`; }
+function renderCard(item) { return `<div class="card stack row primary">${item}</div>`; }
+const total = document.querySelector("#total");
+document.querySelector("#total");
+document.querySelector("#total");
+document.querySelector("#total");
+localStorage.setItem("checkout-state", JSON.stringify({ total: 10 }));
+fetch("/api/checkout");
+""",
+        encoding="utf-8",
+    )
+    (manager_dir / "app.js").write_text(
+        """
+const saved = localStorage.getItem("checkout-state");
+fetch("/api/checkout");
+""",
+        encoding="utf-8",
+    )
+    run = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Build checkout flow.",
+        intent="create",
+        model_profile="test",
+        status="completed",
+        apply_status="applied",
+        touched_files=["miniapp/app/static/client/app.js", "miniapp/app/static/manager/app.js"],
+    )
+    app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+    app.state.container.store.upsert("reports", f"gate:{run.run_id}", {"status": "passed", "blocking": False, "issues": []})
+
+    report = client.post(f"/runs/{run.run_id}/simplify").json()
+    slash = client.post("/slash-commands/simplify/execute", json={"run_id": run.run_id}).json()
+
+    assert report["schema"] == "grounded.simplify_pass.v1"
+    assert report["status"] == "needs_simplify"
+    categories = report["summary"]["categories"]
+    assert categories["selectors"] >= 1
+    assert categories["state_consistency"] >= 1
+    assert any(task["task_id"].startswith("simplify.") for task in report["safe_refactor_tasks"])
+    assert slash["workflow"] == "post_green_simplify"
+    assert slash["report"]["status"] == "needs_simplify"
+
+
+def test_debug_stuck_and_doctor_workflows_emit_repair_packets(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Debug Workflow Workspace",
+            "description": "debug workflow test",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    logs_dir = tmp_path / "workspaces" / workspace["workspace_id"] / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    (logs_dir / "api.log").write_text('{"level":"ERROR","message":"NameError in miniapp/app/routes/checkout.py"}\n', encoding="utf-8")
+    (logs_dir / "platform.log").write_text('{"level":"INFO","message":"agent started"}\n', encoding="utf-8")
+    failed_run = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Fix checkout API.",
+        intent="edit",
+        model_profile="test",
+        status="failed",
+        apply_status="failed",
+        current_stage="checks",
+        failure_class="api_workflow",
+        failure_signature="api_workflow_smoke.checkout_name_error",
+        touched_files=["miniapp/app/routes/checkout.py"],
+    )
+    stuck_run = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Continue checkout API.",
+        intent="edit",
+        model_profile="test",
+        status="running",
+        apply_status="pending",
+        current_stage="agent_loop",
+        touched_files=["miniapp/app/routes/checkout.py"],
+    )
+    app.state.container.store.upsert("runs", failed_run.run_id, failed_run.model_dump(mode="json"))
+    app.state.container.store.upsert("runs", stuck_run.run_id, stuck_run.model_dump(mode="json"))
+    app.state.container.store.upsert(
+        "reports",
+        f"run_artifacts:{failed_run.run_id}",
+        {
+            "check_results": [
+                {
+                    "name": "api_workflow_smoke",
+                    "status": "failed",
+                    "details": "NameError: checkout_total in miniapp/app/routes/checkout.py",
+                    "logs": ["Traceback miniapp/app/routes/checkout.py"],
+                }
+            ]
+        },
+    )
+    app.state.container.store.upsert(
+        "previews",
+        workspace["workspace_id"],
+        {
+            "workspace_id": workspace["workspace_id"],
+            "status": "error",
+            "stage": "error",
+            "runtime_mode": "local",
+            "last_error": "NameError in miniapp/app/routes/checkout.py",
+            "logs": ["Preview failed: miniapp/app/routes/checkout.py NameError"],
+        },
+    )
+
+    debug = client.get(f"/runs/{failed_run.run_id}/debug").json()
+    stuck = client.get(f"/runs/{stuck_run.run_id}/stuck").json()
+    doctor = client.get(f"/workspaces/{workspace['workspace_id']}/doctor-workspace").json()
+    debug_slash = client.post("/slash-commands/debug-run/execute", json={"run_id": failed_run.run_id}).json()
+    stuck_slash = client.post("/slash-commands/stuck-run/execute", json={"run_id": stuck_run.run_id}).json()
+    doctor_slash = client.post("/slash-commands/doctor-workspace/execute", json={"workspace_id": workspace["workspace_id"]}).json()
+
+    assert debug["schema"] == "grounded.diagnostic_workflow.v1"
+    assert debug["mode"] == "debug_run"
+    assert debug["repair_packet"]["schema"] == "grounded.repair_packet.v2"
+    assert debug["repair_packet"]["target_files"] == ["miniapp/app/routes/checkout.py"]
+    assert debug["repair_packet"]["owner"] == "backend_api_worker"
+    assert stuck["mode"] == "stuck_run"
+    assert stuck["diagnosis"]["stuck"]["kind"] == "active_not_terminal"
+    assert doctor["mode"] == "doctor_workspace"
+    assert doctor["repair_packet"]["target_files"][0] == "miniapp/app/routes/checkout.py"
+    assert debug_slash["workflow"] == "debug_run"
+    assert stuck_slash["workflow"] == "stuck_run"
+    assert doctor_slash["workflow"] == "doctor_workspace"
 
 
 def test_background_task_memory_consolidate_completes(tmp_path: Path) -> None:
@@ -3886,6 +4387,9 @@ def test_completion_gate_blocks_incomplete_product_task_ledger(tmp_path: Path) -
     assert state["strict_green"] is False
     issue = next(issue for issue in state["remaining_issues"] if issue["kind"] == "product_task_ledger" and issue["role"] == "manager")
     assert issue["target_files"] == ["miniapp/app/static/manager/app.js"]
+    runtime_issue = next(issue for issue in state["remaining_issues"] if issue["kind"] == "runtime_task_ledger")
+    assert runtime_issue["task_id"] == "manager.role_surface"
+    assert runtime_issue["proof_status"] == "passed"
 
 
 def test_repair_catalog_extracts_nested_workflow_evidence() -> None:

@@ -10,6 +10,7 @@ from app.services.code_index_service import CodeIndexService
 from app.services.engine.mode_profiles import ModeProfiles
 from app.services.generation_enhancements import ProjectInstructionBundle, SkillPackCatalog
 from app.services.memory_pipeline import WorkspaceMemoryPipeline
+from app.services.session_memory import SessionMemorySections
 from app.services.skill_registry import SkillRegistryService
 from app.services.workspace.service import WorkspaceService
 
@@ -158,7 +159,7 @@ class ContextPackBuilder:
         memory = self._workspace_memory_summary(workspace.workspace_id, prompt=prompt, paths=paths or [])
         if memory:
             parts.append(memory)
-        instruction_summary = self._project_instruction_summary()
+        instruction_summary = self._project_instruction_summary(workspace=workspace, paths=paths or [])
         if instruction_summary:
             parts.append(instruction_summary)
         skill_summary = self._runtime_skill_summary(
@@ -176,6 +177,10 @@ class ContextPackBuilder:
         if store is None:
             return ""
         payload = store.get("reports", f"workspace_memory:{workspace_id}") or {}
+        session_memory = store.get("reports", f"session_memory:{workspace_id}")
+        if not isinstance(session_memory, dict):
+            session_memory = SessionMemorySections.build(workspace_id=workspace_id, memory=payload, runs=[])
+            store.upsert("reports", f"session_memory:{workspace_id}", session_memory)
         summary = WorkspaceMemoryPipeline.summary(workspace_id, payload, prompt=prompt, paths=paths or [], top_k=10)
         retrieval = WorkspaceMemoryPipeline.retrieve(
             workspace_id,
@@ -187,9 +192,12 @@ class ContextPackBuilder:
         store.upsert("reports", f"memory_retrieval:last:{workspace_id}", retrieval)
         items = [item for item in retrieval.get("items") or [] if isinstance(item, dict)]
         summary_text = str(summary.get("text") or "").strip()
-        if not items and not summary_text:
+        session_text = SessionMemorySections.compact_text(session_memory, limit=2400)
+        if not items and not summary_text and not session_text:
             return ""
         lines = ["Workspace memory:"]
+        if session_text:
+            lines.append(session_text)
         if summary_text:
             lines.append(summary_text)
         else:
@@ -276,11 +284,12 @@ class ContextPackBuilder:
             "prefetch": {k: v for k, v in prefetch.items() if k != "items"},
         }
 
-    def _project_instruction_summary(self) -> str:
+    def _project_instruction_summary(self, *, workspace: WorkspaceRecord | None = None, paths: list[str] | None = None) -> str:
         settings = getattr(self.code_index_service, "settings", None)
         if settings is None:
             return ""
-        bundle = ProjectInstructionBundle.build(repo_root=settings.repo_root, template_dir=settings.template_dir)
+        workspace_root = self.workspace_service.source_dir(workspace.workspace_id) if workspace is not None else None
+        bundle = ProjectInstructionBundle.build(repo_root=settings.repo_root, template_dir=settings.template_dir, workspace_root=workspace_root, paths=paths or [])
         return ProjectInstructionBundle.compact_summary(bundle, limit=1400)
 
     @staticmethod

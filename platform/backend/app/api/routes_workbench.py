@@ -122,6 +122,13 @@ class SlashCommandResolveRequest(BaseModel):
     metadata: dict[str, Any] = {}
 
 
+class SkillifyRequest(BaseModel):
+    skill_id: str | None = None
+    title: str | None = None
+    write: bool = False
+    scope: str = "user"
+
+
 class BookmarkRunRequest(BaseModel):
     bookmark_id: str
     prompt: str | None = None
@@ -238,6 +245,11 @@ def get_golden_generated_app(app_id: str, container: ServiceContainer = Depends(
 @router.get("/system/worker-roles")
 def get_worker_roles(container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     return container.workbench_service.worker_roles()
+
+
+@router.get("/system/subagents")
+def get_subagent_fork_contract(container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    return container.workbench_service.subagent_fork_contract()
 
 
 @router.post("/workspaces/{workspace_id}/policy/evaluate-command")
@@ -530,6 +542,30 @@ def get_run_trace_view(run_id: str, container: ServiceContainer = Depends(get_co
 def get_run_trace_reducer(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     try:
         return container.workbench_service.trace_reducer(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/runs/{run_id}/simplify")
+def get_run_simplify(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.simplify_run(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/runs/{run_id}/simplify")
+def run_simplify(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.simplify_run(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/runs/{run_id}/rollout-trace")
+def get_run_rollout_trace(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.rollout_trace(run_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -931,6 +967,30 @@ def get_run_repair_signatures(run_id: str, container: ServiceContainer = Depends
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@router.get("/runs/{run_id}/debug")
+def get_run_debug(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.debug_run(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/runs/{run_id}/stuck")
+def get_run_stuck(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.stuck_run(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/workspaces/{workspace_id}/doctor-workspace")
+def get_doctor_workspace(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.doctor_workspace(workspace_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.get("/runs/{run_id}/repair-cases", response_model=RepairCasesReport)
 def get_run_repair_cases(run_id: str, container: ServiceContainer = Depends(get_container)) -> RepairCasesReport:
     try:
@@ -1092,6 +1152,14 @@ def get_workspace_memory_summary(workspace_id: str, container: ServiceContainer 
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@router.get("/workspaces/{workspace_id}/session-memory")
+def get_workspace_session_memory(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.session_memory(workspace_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.post("/workspaces/{workspace_id}/memory/consolidate")
 def consolidate_workspace_memory(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     try:
@@ -1151,6 +1219,16 @@ def get_skill(skill_id: str, container: ServiceContainer = Depends(get_container
         return container.workbench_service.skill(skill_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/runs/{run_id}/skillify")
+def skillify_run(run_id: str, request: SkillifyRequest, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.skillify_run(run_id, request.model_dump())
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/slash-commands")

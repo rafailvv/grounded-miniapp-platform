@@ -484,6 +484,24 @@ export type RunTimeline = RequiredKeys<ApiSchemas["RunTimelineReport"], "items">
 export type RunTraceView = RequiredKeys<ApiSchemas["RunTraceViewReport"], "timeline" | "artifact_refs" | "reduced_trace">;
 export type TraceBundleReport = RequiredKeys<ApiSchemas["TraceBundleReport"], "state">;
 export type TraceBundleState = ApiSchemas["TraceState"];
+export type RolloutTraceEvidence = {
+  schema: string;
+  run_id: string;
+  workspace_id: string;
+  status: string;
+  principle: string;
+  raw_events: Array<Record<string, unknown>>;
+  payload_refs: Array<Record<string, unknown>>;
+  evidence_streams: Record<string, unknown>;
+  reduced_graph: { nodes?: Array<Record<string, unknown>>; edges?: Array<Record<string, unknown>>; [key: string]: unknown };
+  inference_calls: Array<Record<string, unknown>>;
+  tool_calls: Array<Record<string, unknown>>;
+  terminal_ops: Array<Record<string, unknown>>;
+  child_agents: Array<Record<string, unknown>>;
+  interpretations: Record<string, unknown>;
+  repair_learning_hooks: Record<string, unknown>;
+  counts: Record<string, number>;
+};
 export type RunProtocolEvent = ApiSchemas["RunProtocolEvent"];
 export type RunBookmark = ApiSchemas["RunBookmark"];
 export type RunProtocolReport = RequiredKeys<ApiSchemas["RunProtocolReport"], "items" | "bookmarks">;
@@ -593,6 +611,35 @@ export type WorkerOrchestrationReport = {
   branch_plan?: Array<Record<string, unknown>>;
 };
 
+export type SubagentForkContract = {
+  schema: string;
+  status: string;
+  generation_mode?: string;
+  principle?: string;
+  lanes: Array<{
+    lane_id: string;
+    worker_ids: string[];
+    branch_role: string;
+    stage: string;
+    ownership: string;
+    tool_allowlist: string[];
+    file_scope: {
+      allowed_paths: string[];
+      forbidden_paths: string[];
+      exclusive_write: boolean;
+    };
+    writes: boolean;
+    dependencies: string[];
+    required_proof: string[];
+    child_lanes?: Array<Record<string, unknown>>;
+  }>;
+  execution_order: string[];
+  quality_mode_policy?: Record<string, unknown>;
+  ownership_matrix?: Array<Record<string, unknown>>;
+  conflict_policy?: Record<string, unknown>;
+  plan_bindings?: Record<string, unknown>;
+};
+
 export type RunTaskReport = {
   schema?: string;
   run_id: string;
@@ -606,6 +653,9 @@ export type RunTaskReport = {
     owner?: string;
     files?: string[];
     proof?: Record<string, unknown> | string;
+    proof_status?: string;
+    proof_checks?: string[];
+    role?: string | null;
     blocker?: Record<string, unknown> | string | null;
     artifact_refs?: Record<string, string | null | undefined>;
     updated_at?: string | null;
@@ -616,7 +666,77 @@ export type RunTaskReport = {
     output_summary?: string | null;
     linked_refs?: Record<string, unknown>;
   }>;
+  task_ledger?: {
+    schema?: string;
+    source?: string;
+    status?: string;
+    counts?: Record<string, number>;
+    items?: RunTaskReport["items"];
+    updated_at?: string;
+  };
   repair_cases?: RunRepairCases;
+};
+
+export type SkillifyReport = {
+  schema: string;
+  status: string;
+  write_status: "preview" | "written" | string;
+  run_id: string;
+  workspace_id: string;
+  skill_id: string;
+  title: string;
+  scope: string;
+  target_path: string;
+  content: string;
+  evidence?: Record<string, unknown>;
+  warnings?: Array<Record<string, unknown>>;
+  created_at?: string;
+};
+
+export type SimplifyReport = {
+  schema: string;
+  run_id: string;
+  workspace_id: string;
+  status: string;
+  green_required: boolean;
+  green_status: Record<string, unknown>;
+  changed_files: string[];
+  reviewed_files: string[];
+  summary: {
+    finding_count: number;
+    safe_task_count: number;
+    categories: Record<string, number>;
+  };
+  findings: Array<Record<string, unknown>>;
+  safe_refactor_tasks: Array<Record<string, unknown>>;
+  completion_gate: Record<string, unknown>;
+};
+
+export type DiagnosticWorkflowReport = {
+  schema: string;
+  mode: "debug_run" | "stuck_run" | "doctor_workspace" | string;
+  workspace_id: string;
+  run_id?: string | null;
+  status: string;
+  workspace_root?: string;
+  evidence: Record<string, unknown>;
+  diagnosis: Record<string, unknown>;
+  repair_packet: {
+    schema: string;
+    source: string;
+    failure_class: string;
+    failure_signature: string;
+    issue_code: string;
+    severity: string;
+    summary?: string;
+    instruction: string;
+    target_files: string[];
+    owner: string;
+    required_next_tool: string;
+    suggested_tool_after_read: string;
+    proof_required: string[];
+    evidence?: Record<string, unknown>;
+  };
 };
 
 export type BackgroundTask = {
@@ -773,8 +893,29 @@ export type WorkspaceMemory = {
   platform_constraints?: Array<string | Record<string, unknown>>;
   repeated_fixes?: Array<string | Record<string, unknown>>;
   memory_summary?: MemorySummaryReport | null;
+  session_memory?: SessionMemoryReport | null;
   pipeline?: MemoryPipelineReport;
   stale_check?: Record<string, unknown>;
+};
+
+export type SessionMemoryReport = {
+  schema?: string;
+  workspace_id: string;
+  status: string;
+  sections: Array<{
+    id: string;
+    title: string;
+    items: Array<{
+      text?: string;
+      source?: string;
+      ref?: string | null;
+      [key: string]: unknown;
+    }>;
+  }>;
+  counts?: Record<string, number>;
+  text?: string;
+  source_refs?: Record<string, unknown>;
+  generated_at?: string;
 };
 
 export type MemorySummaryReport = {
@@ -1196,6 +1337,10 @@ export async function getRunTraceView(runId: string): Promise<RunTraceView> {
   return request<RunTraceView>(`/runs/${runId}/trace-view`);
 }
 
+export async function getRunRolloutTrace(runId: string): Promise<RolloutTraceEvidence> {
+  return request<RolloutTraceEvidence>(`/runs/${runId}/rollout-trace`);
+}
+
 export async function getRunTraceBundle(runId: string): Promise<TraceBundleReport> {
   return request<TraceBundleReport>(`/runs/${runId}/trace-bundle`);
 }
@@ -1242,6 +1387,10 @@ export async function getRunBookmarks(runId: string): Promise<RunBookmarksReport
 
 export async function getRunTasks(runId: string): Promise<RunTaskReport> {
   return request<RunTaskReport>(`/runs/${runId}/tasks`);
+}
+
+export async function skillifyRun(runId: string, payload: { skill_id?: string; title?: string; write?: boolean; scope?: string } = {}): Promise<SkillifyReport> {
+  return request<SkillifyReport>(`/runs/${runId}/skillify`, { method: "POST", body: JSON.stringify(payload) });
 }
 
 export async function listBackgroundTasks(params: { workspace_id?: string; run_id?: string; status?: string } = {}): Promise<{ schema: string; status: string; items: BackgroundTask[] }> {
@@ -1466,6 +1615,26 @@ export async function getRunTraceReducer(runId: string): Promise<GeneratedReport
   return request<GeneratedReport>(`/runs/${runId}/trace-reducer`);
 }
 
+export async function getRunSimplify(runId: string): Promise<SimplifyReport> {
+  return request<SimplifyReport>(`/runs/${runId}/simplify`);
+}
+
+export async function runSimplify(runId: string): Promise<SimplifyReport> {
+  return request<SimplifyReport>(`/runs/${runId}/simplify`, { method: "POST" });
+}
+
+export async function getRunDebug(runId: string): Promise<DiagnosticWorkflowReport> {
+  return request<DiagnosticWorkflowReport>(`/runs/${runId}/debug`);
+}
+
+export async function getRunStuck(runId: string): Promise<DiagnosticWorkflowReport> {
+  return request<DiagnosticWorkflowReport>(`/runs/${runId}/stuck`);
+}
+
+export async function getDoctorWorkspace(workspaceId: string): Promise<DiagnosticWorkflowReport> {
+  return request<DiagnosticWorkflowReport>(`/workspaces/${workspaceId}/doctor-workspace`);
+}
+
 export async function extractRunMemory(runId: string): Promise<GeneratedReport> {
   return request<GeneratedReport>(`/runs/${runId}/memory/extract`, { method: "POST" });
 }
@@ -1478,6 +1647,10 @@ export async function getWorkspaceMemorySummary(workspaceId: string): Promise<Me
   return request<MemorySummaryReport>(`/workspaces/${workspaceId}/memory/summary`);
 }
 
+export async function getWorkspaceSessionMemory(workspaceId: string): Promise<SessionMemoryReport> {
+  return request<SessionMemoryReport>(`/workspaces/${workspaceId}/session-memory`);
+}
+
 export async function consolidateWorkspaceMemory(workspaceId: string): Promise<WorkspaceMemory> {
   return request<WorkspaceMemory>(`/workspaces/${workspaceId}/memory/consolidate`, { method: "POST" });
 }
@@ -1488,6 +1661,10 @@ export async function getProjectInstructions(): Promise<GeneratedReport> {
 
 export async function getWorkerRoles(): Promise<GeneratedReport> {
   return request<GeneratedReport>("/system/worker-roles");
+}
+
+export async function getSubagentForkContract(): Promise<SubagentForkContract> {
+  return request<SubagentForkContract>("/system/subagents");
 }
 
 export async function getSlashCommands(): Promise<SlashCommandList> {

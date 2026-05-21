@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 
 from app.main import create_app
 from app.models.domain import CheckExecutionRecord, RunCheckResult, RunRecord
-from app.services.generation_enhancements import SkillPackCatalog
+from app.services.generation_enhancements import ProjectInstructionBundle, SkillPackCatalog
 from app.services.skill_registry import SkillRegistryService
 from app.services.memory_pipeline import WorkspaceMemoryPipeline
 from app.services.trace_bundle import TraceBundleWriter
@@ -33,6 +33,7 @@ def test_project_instructions_skills_slash_commands_and_worker_roles(tmp_path: P
     slash = client.get("/slash-commands").json()
     resolved = client.post("/slash-commands/polish/resolve", json={"prompt": "make it cleaner"}).json()
     workers = client.get("/system/worker-roles").json()
+    subagents = client.get("/system/subagents").json()
 
     assert instructions["schema"] == "grounded.project_instructions.v1"
     assert any(source["path"] == "AGENTS.md" for source in instructions["sources"])
@@ -72,12 +73,58 @@ def test_project_instructions_skills_slash_commands_and_worker_roles(tmp_path: P
         "/deploy",
         "/babysit-pr",
         "/docs",
+        "/skillify",
+        "/simplify",
+        "/debug-run",
+        "/stuck-run",
+        "/doctor-workspace",
     ]
     assert resolved["ui_action"]["type"] == "execute_workflow"
     assert resolved["ui_action"]["workflow"] == "ui_polish_run"
     assert "Polish the current app visually" in resolved["prompt_template"]
     assert any(item["worker_id"] == "backend_api_worker" and item["alias_ids"] == [] for item in workers["items"])
     assert any(item["worker_id"] == "mobile_polish_worker" and item["alias_ids"] == [] for item in workers["items"])
+    assert subagents["schema"] == "grounded.subagent_fork_contract.v1"
+    assert [lane["lane_id"] for lane in subagents["lanes"]] == ["planner", "backend", "frontend-role-ui", "tests", "verifier", "polish", "repair"]
+    assert "patch_files" not in next(lane for lane in subagents["lanes"] if lane["lane_id"] == "verifier")["tool_allowlist"]
+    assert "patch_files" in next(lane for lane in subagents["lanes"] if lane["lane_id"] == "polish")["tool_allowlist"]
+
+
+def test_project_instructions_apply_nested_agents_by_target_path(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace_payload = _workspace(client)
+    container = app.state.container
+    workspace = container.workspace_service.get_workspace(workspace_payload["workspace_id"])
+    source_dir = container.workspace_service.source_dir(workspace.workspace_id)
+    (source_dir / "AGENTS.md").write_text(
+        "# Root Workspace Rules\n\n- Keep manager dashboard compact.\n- Shared API calls must use existing fetch helpers.\n",
+        encoding="utf-8",
+    )
+    manager_dir = source_dir / "miniapp" / "app" / "static" / "manager"
+    manager_dir.mkdir(parents=True, exist_ok=True)
+    (manager_dir / "AGENTS.md").write_text(
+        "# Manager Rules\n\n- Keep manager dashboard dense with visible revenue totals.\n- Manager dashboard repairs must include browser proof.\n",
+        encoding="utf-8",
+    )
+
+    summary = container.context_pack_builder._project_instruction_summary(
+        workspace=workspace,
+        paths=["miniapp/app/static/manager/dashboard.js"],
+    )
+    scoped = ProjectInstructionBundle.build(
+        repo_root=container.settings.repo_root,
+        template_dir=container.settings.template_dir,
+        workspace_root=source_dir,
+        paths=["miniapp/app/static/manager/dashboard.js"],
+    )
+
+    assert "Active AGENTS.md rules for current files" in summary
+    assert "visible revenue totals" in summary
+    assert any(source["scope"] == "miniapp/app/static/manager" for source in scoped["applicable_sources"])
+    manager_rule = next(rule for rule in scoped["active_rules"] if "visible revenue totals" in rule["text"])
+    root_rule = next(rule for rule in scoped["active_rules"] if "Shared API calls" in rule["text"])
+    assert manager_rule["precedence"] > root_rule["precedence"]
 
 
 def test_domain_product_skills_select_relevant_packs(tmp_path: Path) -> None:
@@ -657,6 +704,8 @@ def test_context_pack_includes_workspace_memory_and_instruction_summary(tmp_path
     )
 
     assert "Workspace memory:" in pack.workspace_summary
+    assert "Session memory (always loaded" in pack.workspace_summary
+    assert "Learnings" in pack.workspace_summary
     assert "compact operational dashboards" in pack.workspace_summary
     assert "selected:" in pack.workspace_summary
     assert "memory_retrieval" in pack.retrieval_stats

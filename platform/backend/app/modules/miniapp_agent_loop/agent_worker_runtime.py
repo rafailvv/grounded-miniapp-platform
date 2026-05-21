@@ -27,6 +27,7 @@ class WorkerDraft:
     base_run_id: str = ""
     branch_kind: str = "workspace_draft_clone"
     write_scope: dict[str, Any] = field(default_factory=dict)
+    tool_allowlist: list[str] = field(default_factory=list)
     merge_base_ref: str = ""
     status: str = "ready"
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
@@ -46,6 +47,7 @@ class WorkerDraft:
             "base_run_id": self.base_run_id,
             "branch_kind": self.branch_kind,
             "write_scope": self.write_scope,
+            "tool_allowlist": self.tool_allowlist,
             "merge_base_ref": self.merge_base_ref,
             "status": self.status,
             "created_at": self.created_at,
@@ -94,6 +96,7 @@ class AgentWorkerRuntime:
                     base_run_id=run_id,
                     branch_kind="filesystem_clone",
                     write_scope=dict(spec.get("ownership") or ownership_for_worker(worker_id)),
+                    tool_allowlist=[str(item) for item in spec.get("tool_allowlist") or []],
                     merge_base_ref=f"coordinator_draft:{run_id}",
                 )
             )
@@ -140,6 +143,7 @@ class AgentWorkerRuntime:
                     base_run_id=run_id,
                     branch_kind="workspace_draft_clone",
                     write_scope=dict(spec.get("ownership") or ownership_for_worker(worker_id)),
+                    tool_allowlist=[str(item) for item in spec.get("tool_allowlist") or []],
                     merge_base_ref=f"coordinator_draft:{workspace_id}:{run_id}",
                 )
             )
