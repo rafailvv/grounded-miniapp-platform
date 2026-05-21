@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import Field
+from pydantic import AliasChoices, ConfigDict, Field
 
 from app.models.common import StrictModel
 
@@ -10,6 +10,206 @@ from app.models.common import StrictModel
 ProtocolVersion = Literal["v1", "v2"]
 ProtocolSubject = Literal["run", "turn", "tool_call", "approval", "event", "worker_update"]
 ProtocolStatus = Literal["queued", "started", "running", "waiting", "completed", "failed", "blocked", "cancelled", "skipped"]
+RpcStability = Literal["stable", "experimental", "deprecated"]
+RpcCursorKind = Literal["none", "opaque_cursor", "sequence_cursor", "offset_cursor"]
+RpcIdempotencyMode = Literal["none", "optional", "recommended", "required"]
+
+
+class RpcErrorObject(StrictModel):
+    schema_: str = Field(default="grounded.rpc.error.v2", alias="schema")
+    code: int
+    message: str
+    data: dict[str, Any] | list[Any] | str | int | float | bool | None = None
+
+
+class RpcRequestEnvelopeV2(StrictModel):
+    schema_: str = Field(default="grounded.rpc.request.v2", alias="schema")
+    jsonrpc: Literal["2.0"] = "2.0"
+    id: int | str | None = None
+    method: str
+    params: dict[str, Any] = Field(default_factory=dict)
+    idempotency_key: str | None = Field(default=None, validation_alias=AliasChoices("idempotency_key", "idempotencyKey"))
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class RpcResponseEnvelopeV2(StrictModel):
+    schema_: str = Field(default="grounded.rpc.response.v2", alias="schema")
+    jsonrpc: Literal["2.0"] = "2.0"
+    id: int | str | None = None
+    result: Any | None = None
+    error: RpcErrorObject | None = None
+    idempotency_key: str | None = Field(default=None, validation_alias=AliasChoices("idempotency_key", "idempotencyKey"))
+
+
+class RpcNotificationEnvelopeV2(StrictModel):
+    schema_: str = Field(default="grounded.rpc.notification.v2", alias="schema")
+    jsonrpc: Literal["2.0"] = "2.0"
+    method: str
+    params: dict[str, Any] = Field(default_factory=dict)
+    sequence: int | None = None
+
+
+class RpcCursorPage(StrictModel):
+    cursor_kind: RpcCursorKind = "none"
+    cursor_param: str | None = None
+    next_cursor_field: str | None = None
+    limit_param: str = "limit"
+
+
+class RpcIdempotency(StrictModel):
+    mode: RpcIdempotencyMode = "none"
+    key_field: str = "idempotency_key"
+    header: str = "Idempotency-Key"
+    scope: Literal["request", "workspace", "thread", "run", "global"] = "request"
+
+
+class ExperimentalFieldSpec(StrictModel):
+    name: str
+    reason: str = ""
+    since: str | None = None
+    replacement: str | None = None
+
+
+class CompatibilityRule(StrictModel):
+    rule_id: str
+    description: str
+    since: str = "v2"
+    enforcement: Literal["documented", "tested", "enforced"] = "tested"
+
+
+class RpcMethodSpecV2(StrictModel):
+    method: str
+    version: Literal["v2"] = "v2"
+    transport: Literal["websocket"] = "websocket"
+    stability: RpcStability = "stable"
+    idempotent: bool = False
+    description: str = ""
+    params_model: str
+    result_model: str
+    notification_models: list[str] = Field(default_factory=list)
+    params_schema: dict[str, Any] = Field(default_factory=dict)
+    result_schema: str | None = None
+    cursor: RpcCursorPage = Field(default_factory=RpcCursorPage)
+    idempotency: RpcIdempotency = Field(default_factory=RpcIdempotency)
+    experimental: list[ExperimentalFieldSpec] = Field(
+        default_factory=list,
+        json_schema_extra={"x-grounded-experimental": True},
+    )
+
+
+class RpcProtocolReport(StrictModel):
+    schema_: str = Field(default="grounded.rpc_protocol.v2", alias="schema")
+    status: str = "ok"
+    jsonrpc: Literal["2.0"] = "2.0"
+    endpoint: str = "/rpc"
+    current_version: Literal["v2"] = "v2"
+    supported_versions: list[ProtocolVersion] = Field(default_factory=lambda: ["v1", "v2"])
+    capabilities: dict[str, Any] = Field(default_factory=dict)
+    compatibility_rules: list[CompatibilityRule] = Field(default_factory=list)
+    request_envelope_model: str = "RpcRequestEnvelopeV2"
+    response_envelope_model: str = "RpcResponseEnvelopeV2"
+    notification_envelope_model: str = "RpcNotificationEnvelopeV2"
+    methods: list[RpcMethodSpecV2] = Field(default_factory=list)
+
+
+class EmptyParams(StrictModel):
+    pass
+
+
+class InitializeParams(StrictModel):
+    client_info: dict[str, Any] = Field(default_factory=dict, validation_alias=AliasChoices("client_info", "clientInfo"))
+
+
+class InitializeResult(StrictModel):
+    server: dict[str, Any]
+    capabilities: dict[str, Any]
+    protocol: dict[str, Any]
+
+
+class ThreadListParams(StrictModel):
+    workspace_id: str | None = Field(default=None, validation_alias=AliasChoices("workspace_id", "workspaceId"))
+    include_archived: bool = Field(default=False, validation_alias=AliasChoices("include_archived", "includeArchived"))
+    limit: int = 50
+    cursor: str | None = None
+
+
+class ThreadListResult(StrictModel):
+    items: list[dict[str, Any]] = Field(default_factory=list)
+    next_cursor: str | None = None
+
+
+class ThreadStartParams(StrictModel):
+    workspace_id: str = Field(validation_alias=AliasChoices("workspace_id", "workspaceId"))
+    title: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ThreadIdParams(StrictModel):
+    thread_id: str = Field(validation_alias=AliasChoices("thread_id", "threadId"))
+
+
+class ThreadForkParams(ThreadIdParams):
+    title: str | None = None
+
+
+class TurnStartParams(StrictModel):
+    model_config = ConfigDict(extra="allow", populate_by_name=True, use_enum_values=True)
+
+    thread_id: str = Field(validation_alias=AliasChoices("thread_id", "threadId"))
+    prompt: str = ""
+    mode: str = "generate"
+    generation_mode: str = Field(default="balanced", validation_alias=AliasChoices("generation_mode", "generationMode"))
+    intent: str = "auto"
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    workspace_id: str | None = Field(default=None, validation_alias=AliasChoices("workspace_id", "workspaceId"))
+
+
+class TurnInterruptParams(ThreadIdParams):
+    turn_id: str = Field(validation_alias=AliasChoices("turn_id", "turnId"))
+
+
+class RunReplayParams(StrictModel):
+    run_id: str = Field(validation_alias=AliasChoices("run_id", "runId"))
+    after_sequence: int = Field(default=0, validation_alias=AliasChoices("after_sequence", "afterSequence"))
+    limit: int = 500
+
+
+class RunCompareParams(StrictModel):
+    base_run_id: str = Field(validation_alias=AliasChoices("base_run_id", "baseRunId"))
+    target_run_id: str = Field(validation_alias=AliasChoices("target_run_id", "targetRunId"))
+
+
+class RunBookmarkParams(StrictModel):
+    run_id: str = Field(validation_alias=AliasChoices("run_id", "runId"))
+    bookmark_id: str = Field(validation_alias=AliasChoices("bookmark_id", "bookmarkId"))
+    prompt: str | None = None
+
+
+class SlashCommandExecuteParams(StrictModel):
+    model_config = ConfigDict(extra="allow", populate_by_name=True, use_enum_values=True)
+
+    command_id: str = Field(validation_alias=AliasChoices("command_id", "commandId", "id"))
+
+
+class CommandExecParams(StrictModel):
+    workspace_id: str = Field(validation_alias=AliasChoices("workspace_id", "workspaceId"))
+    command: str
+    thread_id: str | None = Field(default=None, validation_alias=AliasChoices("thread_id", "threadId"))
+    turn_id: str | None = Field(default=None, validation_alias=AliasChoices("turn_id", "turnId"))
+    timeout: int = 30
+    approval_id: str | None = Field(default=None, validation_alias=AliasChoices("approval_id", "approvalId"))
+    preset: str = "safe_auto"
+    idempotency_key: str | None = Field(default=None, validation_alias=AliasChoices("idempotency_key", "idempotencyKey"))
+
+
+class FsReadFileParams(StrictModel):
+    workspace_id: str = Field(validation_alias=AliasChoices("workspace_id", "workspaceId"))
+    path: str
+    run_id: str | None = Field(default=None, validation_alias=AliasChoices("run_id", "runId"))
+
+
+class FsWriteFileParams(FsReadFileParams):
+    content: str
 
 
 class ProtocolRunState(StrictModel):
@@ -207,5 +407,8 @@ class AppProtocolManifest(StrictModel):
     subjects: list[ProtocolSubjectSpec] = Field(default_factory=list)
     envelope_models: list[str] = Field(default_factory=list)
     payload_models: list[str] = Field(default_factory=list)
+    rpc_protocol_model: str = "RpcProtocolReport"
+    rpc_method_models: list[str] = Field(default_factory=list)
+    compatibility_rules: list[CompatibilityRule] = Field(default_factory=list)
     fixture_root: str = "platform/backend/app/schemas/app_protocol"
     generated_types_path: str = "platform/frontend/src/lib/generated/openapi-types.ts"

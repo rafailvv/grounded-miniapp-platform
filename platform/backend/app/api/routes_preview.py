@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import HTMLResponse
 
 from app.api.deps import get_container
+from app.models.sandbox import SandboxPreviewLifecycle
 from app.services.container import ServiceContainer
 
 router = APIRouter(tags=["preview"])
@@ -62,7 +63,13 @@ def get_preview_url(workspace_id: str, container: ServiceContainer = Depends(get
         "draft_run_id": preview.draft_run_id,
         "latency_breakdown": preview.latency_breakdown,
         "last_error": preview.last_error,
+        "runtime_boundary": container.preview_service.runtime_boundary(workspace_id),
     }
+
+
+@router.get("/workspaces/{workspace_id}/preview/runtime-boundary", response_model=SandboxPreviewLifecycle)
+def get_preview_runtime_boundary(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> SandboxPreviewLifecycle:
+    return SandboxPreviewLifecycle.model_validate(container.preview_service.runtime_boundary(workspace_id))
 
 
 @router.get("/workspaces/{workspace_id}/preview/logs")

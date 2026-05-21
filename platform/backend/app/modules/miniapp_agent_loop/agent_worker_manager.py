@@ -62,15 +62,15 @@ class AgentWorkerManager:
         flag_enabled = flag_value in {"1", "true", "yes", "on"}
         enabled = (
             (flag_enabled or not flag_disabled)
-            and generation_mode == GenerationMode.QUALITY
+            and generation_mode in {GenerationMode.QUALITY, GenerationMode.PRODUCTION}
             and has_contract
         )
         disabled_reason = ""
         if not enabled:
             if flag_disabled:
                 disabled_reason = "isolated worker branches are disabled by GROUNDED_ENABLE_WORKER_BRANCHES=0"
-            elif generation_mode != GenerationMode.QUALITY:
-                disabled_reason = "isolated worker branches are available only for quality generation mode"
+            elif generation_mode not in {GenerationMode.QUALITY, GenerationMode.PRODUCTION}:
+                disabled_reason = "isolated worker branches are available only for quality/production generation mode"
             elif not has_contract:
                 disabled_reason = "isolated worker branches require an acceptance/product contract before worker planning"
             else:
@@ -87,7 +87,7 @@ class AgentWorkerManager:
             for role in PRODUCT_WORKERS
             if role.worker_id != "repair_worker"
             and not (materialized_tests and role.worker_id == "test_verifier_worker")
-            and not (generation_mode != GenerationMode.QUALITY and role.worker_id == "mobile_polish_worker")
+            and not (generation_mode not in {GenerationMode.QUALITY, GenerationMode.PRODUCTION} and role.worker_id == "mobile_polish_worker")
         ]
         return {
             "schema": "grounded.product_worker_mailbox.v1",

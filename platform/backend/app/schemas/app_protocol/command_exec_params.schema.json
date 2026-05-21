@@ -1,0 +1,79 @@
+{
+  "$id": "https://grounded.local/schemas/app_protocol/command_exec_params.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "approval_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Approval Id"
+    },
+    "command": {
+      "title": "Command",
+      "type": "string"
+    },
+    "idempotency_key": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Idempotency Key"
+    },
+    "preset": {
+      "default": "safe_auto",
+      "title": "Preset",
+      "type": "string"
+    },
+    "thread_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Thread Id"
+    },
+    "timeout": {
+      "default": 30,
+      "title": "Timeout",
+      "type": "integer"
+    },
+    "turn_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Turn Id"
+    },
+    "workspace_id": {
+      "title": "Workspace Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspace_id",
+    "command"
+  ],
+  "title": "CommandExecParams",
+  "type": "object"
+}

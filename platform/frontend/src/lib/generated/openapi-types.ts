@@ -689,6 +689,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/workspaces/{workspace_id}/preview/runtime-boundary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Preview Runtime Boundary */
+        get: operations["get_preview_runtime_boundary_workspaces__workspace_id__preview_runtime_boundary_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/workspaces/{workspace_id}/preview/logs": {
         parameters: {
             query?: never;
@@ -876,6 +893,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/system/sandbox-runtime": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Sandbox Runtime */
+        get: operations["get_sandbox_runtime_system_sandbox_runtime_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/system/tools/dynamic": {
         parameters: {
             query?: never;
@@ -936,6 +970,23 @@ export interface paths {
         };
         /** Get Project Instructions */
         get: operations["get_project_instructions_system_project_instructions_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/system/generation-modes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Generation Modes */
+        get: operations["get_generation_modes_system_generation_modes_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -2004,6 +2055,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/runs/{run_id}/completion-audit": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Run Completion Audit */
+        get: operations["get_run_completion_audit_runs__run_id__completion_audit_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/runs/{run_id}/repair-signatures": {
         parameters: {
             query?: never;
@@ -2311,6 +2379,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/system/permissions/command-audit": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Command Audit */
+        get: operations["get_command_audit_system_permissions_command_audit_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/workspaces/{workspace_id}/permissions/command-audit": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Workspace Command Audit */
+        get: operations["get_workspace_command_audit_workspaces__workspace_id__permissions_command_audit_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/workspaces/{workspace_id}/permissions/approval-grants": {
         parameters: {
             query?: never;
@@ -2355,6 +2457,23 @@ export interface paths {
         };
         /** Get Workspace Memory Pipeline */
         get: operations["get_workspace_memory_pipeline_workspaces__workspace_id__memory_pipeline_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/workspaces/{workspace_id}/memory/summary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Workspace Memory Summary */
+        get: operations["get_workspace_memory_summary_workspaces__workspace_id__memory_summary_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -3252,6 +3371,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/runs/{run_id}/visual-regression": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Run Visual Regression */
+        get: operations["get_run_visual_regression_runs__run_id__visual_regression_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -3293,6 +3429,15 @@ export interface components {
             envelope_models?: string[];
             /** Payload Models */
             payload_models?: string[];
+            /**
+             * Rpc Protocol Model
+             * @default RpcProtocolReport
+             */
+            rpc_protocol_model: string;
+            /** Rpc Method Models */
+            rpc_method_models?: string[];
+            /** Compatibility Rules */
+            compatibility_rules?: components["schemas"]["CompatibilityRule"][];
             /**
              * Fixture Root
              * @default platform/backend/app/schemas/app_protocol
@@ -3519,6 +3664,24 @@ export interface components {
             boundary_ref?: string | null;
             /** Reason */
             reason?: string | null;
+        };
+        /** CompatibilityRule */
+        CompatibilityRule: {
+            /** Rule Id */
+            rule_id: string;
+            /** Description */
+            description: string;
+            /**
+             * Since
+             * @default v2
+             */
+            since: string;
+            /**
+             * Enforcement
+             * @default tested
+             * @enum {string}
+             */
+            enforcement: "documented" | "tested" | "enforced";
         };
         /** ContextPhaseBudget */
         ContextPhaseBudget: {
@@ -3977,6 +4140,20 @@ export interface components {
                 [key: string]: unknown;
             };
         };
+        /** ExperimentalFieldSpec */
+        ExperimentalFieldSpec: {
+            /** Name */
+            name: string;
+            /**
+             * Reason
+             * @default
+             */
+            reason: string;
+            /** Since */
+            since?: string | null;
+            /** Replacement */
+            replacement?: string | null;
+        };
         /** FailureClassBucket */
         FailureClassBucket: {
             /** Failure Class */
@@ -4093,6 +4270,14 @@ export interface components {
             requirement_traceability?: {
                 [key: string]: unknown;
             };
+            /** Prompt Completion Audit */
+            prompt_completion_audit?: {
+                [key: string]: unknown;
+            };
+            /** Visual Regression */
+            visual_regression?: {
+                [key: string]: unknown;
+            };
         } & {
             [key: string]: unknown;
         };
@@ -4100,7 +4285,7 @@ export interface components {
          * GenerationMode
          * @enum {string}
          */
-        GenerationMode: "fast" | "balanced" | "quality" | "basic";
+        GenerationMode: "fast" | "balanced" | "quality" | "production" | "basic";
         /** GenerationModeQuality */
         GenerationModeQuality: {
             /** Generation Mode */
@@ -4139,6 +4324,75 @@ export interface components {
              * @default 0
              */
             estimated_cost_usd: number;
+        };
+        /** GenerationModeSlaManifest */
+        GenerationModeSlaManifest: {
+            /**
+             * Schema
+             * @default grounded.generation_sla.v1
+             */
+            schema: string;
+            /**
+             * Default Mode
+             * @default balanced
+             */
+            default_mode: string;
+            /** Modes */
+            modes?: components["schemas"]["GenerationModeSlaProfile"][];
+            /** Second Queue */
+            second_queue?: {
+                [key: string]: unknown;
+            }[];
+            /** Compatibility */
+            compatibility?: {
+                [key: string]: unknown;
+            };
+        } & {
+            [key: string]: unknown;
+        };
+        /** GenerationModeSlaProfile */
+        GenerationModeSlaProfile: {
+            /** Mode */
+            mode: string;
+            /** Label */
+            label: string;
+            /** Objective */
+            objective: string;
+            /** Required Checks */
+            required_checks?: string[];
+            /** Optional Checks */
+            optional_checks?: string[];
+            /** Proof Requirements */
+            proof_requirements?: string[];
+            /** Final Gate */
+            final_gate?: string[];
+            /**
+             * Context Policy
+             * @default standard
+             */
+            context_policy: string;
+            /**
+             * Worker Policy
+             * @default serial
+             */
+            worker_policy: string;
+            /**
+             * Max Repair Attempts
+             * @default 1
+             */
+            max_repair_attempts: number;
+            /**
+             * Audit Level
+             * @default light
+             */
+            audit_level: string;
+            /**
+             * Output Style
+             * @default concise
+             */
+            output_style: string;
+        } & {
+            [key: string]: unknown;
         };
         /** HTTPValidationError */
         HTTPValidationError: {
@@ -4318,6 +4572,11 @@ export interface components {
             include_inactive: boolean;
             /** Failure Class */
             failure_class?: string | null;
+            /**
+             * Detail Mode
+             * @default relevant
+             */
+            detail_mode: string;
         };
         /** MemoryRetrievalResult */
         MemoryRetrievalResult: {
@@ -4339,6 +4598,11 @@ export interface components {
              */
             top_k: number;
             /**
+             * Detail Mode
+             * @default relevant
+             */
+            detail_mode: string;
+            /**
              * Status
              * @default empty
              */
@@ -4353,12 +4617,73 @@ export interface components {
             skipped?: {
                 [key: string]: unknown;
             }[];
+            summary?: components["schemas"]["MemorySummaryReport"] | null;
             /** Stats */
             stats?: {
                 [key: string]: unknown;
             };
+            /** Source Refs */
+            source_refs?: {
+                [key: string]: unknown;
+            };
             /** Created At */
             created_at: string;
+        };
+        /** MemorySummaryReport */
+        MemorySummaryReport: {
+            /**
+             * Schema
+             * @default grounded.memory_summary.v1
+             */
+            schema: string;
+            /** Workspace Id */
+            workspace_id: string;
+            /**
+             * Status
+             * @default empty
+             */
+            status: string;
+            /**
+             * Always Loaded
+             * @default true
+             */
+            always_loaded: boolean;
+            /** Generated At */
+            generated_at: string;
+            /**
+             * Text
+             * @default
+             */
+            text: string;
+            /** Sections */
+            sections?: components["schemas"]["MemorySummarySection"][];
+            /** Counts */
+            counts?: {
+                [key: string]: number;
+            };
+            /** Stale */
+            stale?: {
+                [key: string]: unknown;
+            };
+            /** Detail Retrieval */
+            detail_retrieval?: {
+                [key: string]: unknown;
+            };
+            /** Source Refs */
+            source_refs?: {
+                [key: string]: unknown;
+            };
+        };
+        /** MemorySummarySection */
+        MemorySummarySection: {
+            /** Kind */
+            kind: string;
+            /** Title */
+            title: string;
+            /** Items */
+            items?: {
+                [key: string]: unknown;
+            }[];
         };
         /** MicrocompactCandidate */
         MicrocompactCandidate: {
@@ -4743,6 +5068,67 @@ export interface components {
             next_forced_action?: {
                 [key: string]: unknown;
             };
+        } & {
+            [key: string]: unknown;
+        };
+        /** PromptCompletionAuditReport */
+        PromptCompletionAuditReport: {
+            /**
+             * Schema
+             * @default grounded.prompt_completion_audit.v1
+             */
+            schema: string;
+            /** Run Id */
+            run_id: string;
+            /** Workspace Id */
+            workspace_id: string;
+            /** Status */
+            status: string;
+            /**
+             * Required
+             * @default true
+             */
+            required: boolean;
+            /**
+             * Prompt
+             * @default
+             */
+            prompt: string;
+            /**
+             * Requirement Count
+             * @default 0
+             */
+            requirement_count: number;
+            /**
+             * Covered Count
+             * @default 0
+             */
+            covered_count: number;
+            /**
+             * Uncovered Count
+             * @default 0
+             */
+            uncovered_count: number;
+            /** Rows */
+            rows?: {
+                [key: string]: unknown;
+            }[];
+            /** Uncovered */
+            uncovered?: {
+                [key: string]: unknown;
+            }[];
+            /** Changed Files */
+            changed_files?: string[];
+            /** Proof Summary */
+            proof_summary?: {
+                [key: string]: unknown;
+            };
+            /** Artifact Refs */
+            artifact_refs?: {
+                [key: string]: string | null;
+            };
+            /** Created At */
+            created_at: string;
         } & {
             [key: string]: unknown;
         };
@@ -5333,10 +5719,18 @@ export interface components {
             status: string;
             /** Source */
             source?: string | null;
+            /** Repair Catalog Version */
+            repair_catalog_version?: string | null;
             /** Failure Class */
             failure_class?: string | null;
             /** Failure Signature */
             failure_signature?: string | null;
+            /** Normalized Signature */
+            normalized_signature?: string | null;
+            /** Signature Normalization */
+            signature_normalization?: {
+                [key: string]: unknown;
+            };
             /** Issue Code */
             issue_code?: string | null;
             /** Severity */
@@ -5347,12 +5741,44 @@ export interface components {
             failed_check?: string | null;
             /** Likely Files */
             likely_files?: string[];
+            /** Probable Files */
+            probable_files?: {
+                [key: string]: unknown;
+            }[];
             /** Broken Surface */
             broken_surface?: {
                 [key: string]: unknown;
             };
             /** Post Fix Proof */
             post_fix_proof?: {
+                [key: string]: unknown;
+            };
+            /** Post Repair Proof */
+            post_repair_proof?: {
+                [key: string]: unknown;
+            };
+            /** Known Fix Recipe */
+            known_fix_recipe?: {
+                [key: string]: unknown;
+            };
+            /** Known Fix Recipes */
+            known_fix_recipes?: {
+                [key: string]: unknown;
+            }[];
+            /** Product Guardrails */
+            product_guardrails?: {
+                [key: string]: unknown;
+            };
+            /** Repair Confidence */
+            repair_confidence?: {
+                [key: string]: unknown;
+            };
+            /** Browser Replay */
+            browser_replay?: {
+                [key: string]: unknown;
+            };
+            /** Api Replay */
+            api_replay?: {
                 [key: string]: unknown;
             };
             /** Repair Packet */
@@ -5519,21 +5945,71 @@ export interface components {
              */
             created_at?: string;
         };
-        /** RpcMethodSpec */
-        RpcMethodSpec: {
+        /** RpcCursorPage */
+        RpcCursorPage: {
+            /**
+             * Cursor Kind
+             * @default none
+             * @enum {string}
+             */
+            cursor_kind: "none" | "opaque_cursor" | "sequence_cursor" | "offset_cursor";
+            /** Cursor Param */
+            cursor_param?: string | null;
+            /** Next Cursor Field */
+            next_cursor_field?: string | null;
+            /**
+             * Limit Param
+             * @default limit
+             */
+            limit_param: string;
+        };
+        /** RpcIdempotency */
+        RpcIdempotency: {
+            /**
+             * Mode
+             * @default none
+             * @enum {string}
+             */
+            mode: "none" | "optional" | "recommended" | "required";
+            /**
+             * Key Field
+             * @default idempotency_key
+             */
+            key_field: string;
+            /**
+             * Header
+             * @default Idempotency-Key
+             */
+            header: string;
+            /**
+             * Scope
+             * @default request
+             * @enum {string}
+             */
+            scope: "request" | "workspace" | "thread" | "run" | "global";
+        };
+        /** RpcMethodSpecV2 */
+        RpcMethodSpecV2: {
             /** Method */
             method: string;
             /**
+             * Version
+             * @default v2
+             * @constant
+             */
+            version: "v2";
+            /**
              * Transport
              * @default websocket
+             * @constant
              */
-            transport: string;
-            /** Params Schema */
-            params_schema?: {
-                [key: string]: unknown;
-            };
-            /** Result Schema */
-            result_schema?: string | null;
+            transport: "websocket";
+            /**
+             * Stability
+             * @default stable
+             * @enum {string}
+             */
+            stability: "stable" | "experimental" | "deprecated";
             /**
              * Idempotent
              * @default false
@@ -5544,14 +6020,28 @@ export interface components {
              * @default
              */
             description: string;
-        } & {
-            [key: string]: unknown;
+            /** Params Model */
+            params_model: string;
+            /** Result Model */
+            result_model: string;
+            /** Notification Models */
+            notification_models?: string[];
+            /** Params Schema */
+            params_schema?: {
+                [key: string]: unknown;
+            };
+            /** Result Schema */
+            result_schema?: string | null;
+            cursor?: components["schemas"]["RpcCursorPage"];
+            idempotency?: components["schemas"]["RpcIdempotency"];
+            /** Experimental */
+            experimental?: components["schemas"]["ExperimentalFieldSpec"][];
         };
         /** RpcProtocolReport */
         RpcProtocolReport: {
             /**
              * Schema
-             * @default grounded.rpc_protocol.v1
+             * @default grounded.rpc_protocol.v2
              */
             schema: string;
             /**
@@ -5562,21 +6052,45 @@ export interface components {
             /**
              * Jsonrpc
              * @default 2.0
+             * @constant
              */
-            jsonrpc: string;
+            jsonrpc: "2.0";
             /**
              * Endpoint
              * @default /rpc
              */
             endpoint: string;
+            /**
+             * Current Version
+             * @default v2
+             * @constant
+             */
+            current_version: "v2";
+            /** Supported Versions */
+            supported_versions?: ("v1" | "v2")[];
             /** Capabilities */
             capabilities?: {
                 [key: string]: unknown;
             };
+            /** Compatibility Rules */
+            compatibility_rules?: components["schemas"]["CompatibilityRule"][];
+            /**
+             * Request Envelope Model
+             * @default RpcRequestEnvelopeV2
+             */
+            request_envelope_model: string;
+            /**
+             * Response Envelope Model
+             * @default RpcResponseEnvelopeV2
+             */
+            response_envelope_model: string;
+            /**
+             * Notification Envelope Model
+             * @default RpcNotificationEnvelopeV2
+             */
+            notification_envelope_model: string;
             /** Methods */
-            methods?: components["schemas"]["RpcMethodSpec"][];
-        } & {
-            [key: string]: unknown;
+            methods?: components["schemas"]["RpcMethodSpecV2"][];
         };
         /** RunBookmark */
         RunBookmark: {
@@ -6418,6 +6932,104 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /** SandboxPreviewLifecycle */
+        SandboxPreviewLifecycle: {
+            /**
+             * Schema
+             * @default grounded.sandbox.preview_lifecycle.v1
+             */
+            schema: string;
+            /** Workspace Id */
+            workspace_id: string;
+            /**
+             * Runtime Mode
+             * @enum {string}
+             */
+            runtime_mode: "inline" | "docker" | "local";
+            /** Status */
+            status: string;
+            /** Stage */
+            stage: string;
+            /** Project Name */
+            project_name?: string | null;
+            /** Proxy Port */
+            proxy_port?: number | null;
+            /** Url */
+            url?: string | null;
+            /** Draft Run Id */
+            draft_run_id?: string | null;
+            /**
+             * Cleanup Attempted
+             * @default false
+             */
+            cleanup_attempted: boolean;
+            /**
+             * Reused Existing Runtime
+             * @default false
+             */
+            reused_existing_runtime: boolean;
+            /** Failure Kind */
+            failure_kind?: string | null;
+            /** Cooldown Until */
+            cooldown_until?: string | null;
+            /** Lifecycle Events */
+            lifecycle_events?: string[];
+            /** Diagnostics */
+            diagnostics?: {
+                [key: string]: unknown;
+            };
+        };
+        /** SandboxRuntimeManifest */
+        SandboxRuntimeManifest: {
+            /**
+             * Schema
+             * @default grounded.sandbox_runtime.manifest.v1
+             */
+            schema: string;
+            /** Profiles */
+            profiles?: {
+                [key: string]: unknown;
+            };
+            /** Provider */
+            provider: string;
+            /**
+             * Enforcement
+             * @enum {string}
+             */
+            enforcement: "hard" | "policy_only" | "unavailable";
+            /** Execution Boundary */
+            execution_boundary?: {
+                [key: string]: unknown;
+            };
+            /** Path Safety */
+            path_safety?: {
+                [key: string]: unknown;
+            };
+            /** Network Policy */
+            network_policy?: {
+                [key: string]: unknown;
+            };
+            /** Process Timeout */
+            process_timeout?: {
+                [key: string]: unknown;
+            };
+            /** Log Capture */
+            log_capture?: {
+                [key: string]: unknown;
+            };
+            /** Killed Process Diagnostics */
+            killed_process_diagnostics?: {
+                [key: string]: unknown;
+            };
+            /** Preview Lifecycle */
+            preview_lifecycle?: {
+                [key: string]: unknown;
+            };
+            /** Reproducibility */
+            reproducibility?: {
+                [key: string]: unknown;
+            };
+        };
         /** SaveDocumentRequest */
         SaveDocumentRequest: {
             /** File Name */
@@ -6592,6 +7204,9 @@ export interface components {
             tool_envelope?: components["schemas"]["ToolEnvelope"] | null;
             gate_report?: components["schemas"]["GateReport"] | null;
             product_readiness_result?: components["schemas"]["ProductReadinessResult"] | null;
+            prompt_completion_audit_report?: components["schemas"]["PromptCompletionAuditReport"] | null;
+            generation_mode_sla_manifest?: components["schemas"]["GenerationModeSlaManifest"] | null;
+            visual_regression_report?: components["schemas"]["VisualRegressionReport"] | null;
             repair_case?: components["schemas"]["RepairCase"] | null;
             trace_state?: components["schemas"]["TraceState"] | null;
         } & {
@@ -6804,6 +7419,8 @@ export interface components {
             input?: {
                 [key: string]: unknown;
             };
+            /** Capabilities */
+            capabilities?: string[];
             /** Risk */
             risk: string;
             /** Approval */
@@ -6814,12 +7431,29 @@ export interface components {
             approval_id?: string | null;
             /** Sandbox Profile */
             sandbox_profile?: string | null;
+            /** Allowed Paths */
+            allowed_paths?: {
+                [key: string]: unknown;
+            };
+            /** Side Effects */
+            side_effects?: string[];
+            /** Side Effect Class */
+            side_effect_class?: string | null;
+            /**
+             * Parallel Safe
+             * @default false
+             */
+            parallel_safe: boolean;
             /** Progress */
             progress?: {
                 [key: string]: unknown;
             }[];
             /** Result */
             result?: {
+                [key: string]: unknown;
+            };
+            /** Result Summary */
+            result_summary?: {
                 [key: string]: unknown;
             };
             /** Artifacts */
@@ -6848,6 +7482,10 @@ export interface components {
             repair_recipe_ids?: string[];
             /** Retry */
             retry?: {
+                [key: string]: unknown;
+            };
+            /** Retry Policy */
+            retry_policy?: {
                 [key: string]: unknown;
             };
             /** Truncation */
@@ -7076,6 +7714,63 @@ export interface components {
             msg: string;
             /** Error Type */
             type: string;
+        };
+        /** VisualRegressionReport */
+        VisualRegressionReport: {
+            /**
+             * Schema
+             * @default grounded.visual_regression.v1
+             */
+            schema: string;
+            /** Run Id */
+            run_id: string;
+            /** Workspace Id */
+            workspace_id: string;
+            /** Status */
+            status: string;
+            /**
+             * Blocking
+             * @default false
+             */
+            blocking: boolean;
+            /** Mobile Viewports */
+            mobile_viewports?: {
+                [key: string]: unknown;
+            }[];
+            /** Mobile Viewport Screenshots */
+            mobile_viewport_screenshots?: {
+                [key: string]: unknown;
+            }[];
+            /** Role Page Snapshots */
+            role_page_snapshots?: {
+                [key: string]: unknown;
+            }[];
+            /** Dom State Snapshots */
+            dom_state_snapshots?: {
+                [key: string]: unknown;
+            }[];
+            /** Overflow Overlap */
+            overflow_overlap?: {
+                [key: string]: unknown;
+            };
+            /** Visual Diffs */
+            visual_diffs?: {
+                [key: string]: unknown;
+            }[];
+            /** Changed Files */
+            changed_files?: string[];
+            /** Issues */
+            issues?: {
+                [key: string]: unknown;
+            }[];
+            /** Artifact Refs */
+            artifact_refs?: {
+                [key: string]: string | null;
+            };
+            /** Created At */
+            created_at: string;
+        } & {
+            [key: string]: unknown;
         };
         /** WebhookCreateRequest */
         WebhookCreateRequest: {
@@ -8688,6 +9383,37 @@ export interface operations {
             };
         };
     };
+    get_preview_runtime_boundary_workspaces__workspace_id__preview_runtime_boundary_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SandboxPreviewLifecycle"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     get_preview_logs_workspaces__workspace_id__preview_logs_get: {
         parameters: {
             query?: never;
@@ -9039,6 +9765,26 @@ export interface operations {
             };
         };
     };
+    get_sandbox_runtime_system_sandbox_runtime_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SandboxRuntimeManifest"];
+                };
+            };
+        };
+    };
     get_dynamic_tool_catalog_system_tools_dynamic_get: {
         parameters: {
             query?: never;
@@ -9136,6 +9882,26 @@ export interface operations {
                     "application/json": {
                         [key: string]: unknown;
                     };
+                };
+            };
+        };
+    };
+    get_generation_modes_system_generation_modes_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GenerationModeSlaManifest"];
                 };
             };
         };
@@ -11384,6 +12150,37 @@ export interface operations {
             };
         };
     };
+    get_run_completion_audit_runs__run_id__completion_audit_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PromptCompletionAuditReport"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     get_run_repair_signatures_runs__run_id__repair_signatures_get: {
         parameters: {
             query?: never;
@@ -11899,6 +12696,74 @@ export interface operations {
             };
         };
     };
+    get_command_audit_system_permissions_command_audit_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_workspace_command_audit_workspaces__workspace_id__permissions_command_audit_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     get_workspace_permission_grants_workspaces__workspace_id__permissions_approval_grants_get: {
         parameters: {
             query?: never;
@@ -12022,6 +12887,37 @@ export interface operations {
                     "application/json": {
                         [key: string]: unknown;
                     };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_workspace_memory_summary_workspaces__workspace_id__memory_summary_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemorySummaryReport"];
                 };
             };
             /** @description Validation Error */
@@ -13878,6 +14774,37 @@ export interface operations {
                     "application/json": {
                         [key: string]: unknown;
                     };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_run_visual_regression_runs__run_id__visual_regression_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["VisualRegressionReport"];
                 };
             };
             /** @description Validation Error */

@@ -1,0 +1,26 @@
+{
+  "$id": "https://grounded.local/schemas/app_protocol/run_replay_params.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "after_sequence": {
+      "default": 0,
+      "title": "After Sequence",
+      "type": "integer"
+    },
+    "limit": {
+      "default": 500,
+      "title": "Limit",
+      "type": "integer"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "run_id"
+  ],
+  "title": "RunReplayParams",
+  "type": "object"
+}

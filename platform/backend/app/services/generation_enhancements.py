@@ -569,6 +569,292 @@ class VisualQAGenerator:
         return dict(mobile) if isinstance(mobile, dict) else {}
 
 
+class VisualRegressionGenerator:
+    @classmethod
+    def build(cls, *, run: Any, artifacts: dict[str, Any], browser_proof: dict[str, Any]) -> dict[str, Any]:
+        proof = browser_proof if isinstance(browser_proof, dict) else {}
+        browser_check = cls._browser_check(artifacts)
+        diagnostics = browser_check.get("diagnostics") if isinstance(browser_check.get("diagnostics"), dict) else {}
+        steps = cls._first_list(
+            proof.get("steps"),
+            (proof.get("playwright_scenario") or {}).get("steps") if isinstance(proof.get("playwright_scenario"), dict) else None,
+            diagnostics.get("steps"),
+            diagnostics.get("ui_steps"),
+        )
+        mobile_layout = cls._first_dict(proof.get("mobile_layout"), diagnostics.get("mobile_layout"))
+        dom_snapshots = [dict(item) for item in cls._first_list(proof.get("dom_snapshots"), diagnostics.get("dom_snapshots")) if isinstance(item, dict)][:80]
+        layout_reports = cls._first_list(proof.get("layout_reports"), diagnostics.get("layout_reports"))
+        visual_diffs = cls._visual_diffs(proof=proof, diagnostics=diagnostics, steps=steps)
+        mobile_screenshots = cls._mobile_viewport_screenshots(proof=proof, diagnostics=diagnostics, steps=steps)
+        role_snapshots = cls._role_page_snapshots(steps=steps, screenshots=mobile_screenshots)
+        overflow_overlap = cls._overflow_overlap(mobile_layout=mobile_layout, layout_reports=layout_reports)
+        changed_files = cls._changed_files(run=run, artifacts=artifacts)
+        issues = cls._issues(
+            mobile_screenshots=mobile_screenshots,
+            role_snapshots=role_snapshots,
+            dom_snapshots=dom_snapshots,
+            visual_diffs=visual_diffs,
+            overflow_overlap=overflow_overlap,
+            run=run,
+        )
+        blocking = any(str(item.get("severity") or "") == "high" for item in issues)
+        status = "failed" if blocking else "incomplete" if issues else "passed"
+        return {
+            "schema": "grounded.visual_regression.v1",
+            "run_id": run.run_id,
+            "workspace_id": run.workspace_id,
+            "status": status,
+            "blocking": blocking,
+            "mobile_viewports": cls._mobile_viewports(proof=proof, diagnostics=diagnostics, mobile_layout=mobile_layout, steps=steps),
+            "mobile_viewport_screenshots": mobile_screenshots,
+            "role_page_snapshots": role_snapshots,
+            "dom_state_snapshots": dom_snapshots,
+            "overflow_overlap": overflow_overlap,
+            "visual_diffs": visual_diffs,
+            "changed_files": changed_files,
+            "issues": issues,
+            "artifact_refs": {
+                "run_artifacts": f"run_artifacts:{run.run_id}",
+                "browser_proof": run.browser_proof_ref,
+                "visual_regression": f"visual_regression:{run.run_id}",
+            },
+            "created_at": _now(),
+        }
+
+    @staticmethod
+    def blocking_issues(report: dict[str, Any]) -> list[dict[str, Any]]:
+        issues: list[dict[str, Any]] = []
+        for item in report.get("issues") or []:
+            if not isinstance(item, dict) or item.get("severity") != "high":
+                continue
+            issues.append(
+                {
+                    "kind": "visual_regression",
+                    "check": str(item.get("kind") or "visual_regression"),
+                    "details": str(item.get("message") or "Generated app visual regression failed."),
+                    "blocking": True,
+                    "evidence": item,
+                }
+            )
+        return issues
+
+    @staticmethod
+    def _browser_check(artifacts: dict[str, Any]) -> dict[str, Any]:
+        for item in artifacts.get("check_results") or []:
+            if isinstance(item, dict) and item.get("name") == "browser_flow_smoke":
+                return item
+        return {}
+
+    @staticmethod
+    def _first_dict(*values: Any) -> dict[str, Any]:
+        for value in values:
+            if isinstance(value, dict) and value:
+                return dict(value)
+        return {}
+
+    @staticmethod
+    def _first_list(*values: Any) -> list[Any]:
+        for value in values:
+            if isinstance(value, list) and value:
+                return list(value)
+        return []
+
+    @classmethod
+    def _mobile_viewports(cls, *, proof: dict[str, Any], diagnostics: dict[str, Any], mobile_layout: dict[str, Any], steps: list[Any]) -> list[dict[str, Any]]:
+        raw: list[Any] = []
+        raw.extend(cls._as_list(proof.get("viewports") or mobile_layout.get("viewports")))
+        for value in (proof.get("mobile_viewport"), diagnostics.get("mobile_viewport"), mobile_layout.get("viewport")):
+            if value:
+                raw.append(value)
+        for step in steps:
+            if isinstance(step, dict) and step.get("mobile_viewport"):
+                raw.append(step.get("mobile_viewport"))
+        viewports: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for value in raw or [{"width": 390, "height": 844}]:
+            viewport = cls._viewport_dict(value)
+            key = f"{viewport.get('width')}x{viewport.get('height')}"
+            if key in seen:
+                continue
+            seen.add(key)
+            viewports.append(viewport)
+        return viewports[:8]
+
+    @classmethod
+    def _mobile_viewport_screenshots(cls, *, proof: dict[str, Any], diagnostics: dict[str, Any], steps: list[Any]) -> list[dict[str, Any]]:
+        screenshots: list[dict[str, Any]] = []
+
+        def add(path: Any, *, route: Any = "", role: Any = "", phase: str = "after", viewport: Any = None, action: Any = "") -> None:
+            text = str(path or "").strip()
+            if not text:
+                return
+            screenshots.append(
+                {
+                    "path": text,
+                    "route": str(route or ""),
+                    "role": str(role or ""),
+                    "phase": phase,
+                    "action": str(action or ""),
+                    "mobile_viewport": cls._viewport_dict(viewport or proof.get("mobile_viewport") or diagnostics.get("mobile_viewport") or {"width": 390, "height": 844}),
+                }
+            )
+
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            add(step.get("screenshot_before"), route=step.get("route"), role=step.get("role"), phase="before", viewport=step.get("mobile_viewport"), action=step.get("action"))
+            add(step.get("screenshot_after"), route=step.get("route"), role=step.get("role"), phase="after", viewport=step.get("mobile_viewport"), action=step.get("action"))
+            add(step.get("screenshot"), route=step.get("route"), role=step.get("role"), phase="snapshot", viewport=step.get("mobile_viewport"), action=step.get("action"))
+        for path in cls._as_list(proof.get("screenshots") or diagnostics.get("screenshots")):
+            add(path, phase="snapshot")
+        deduped: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in screenshots:
+            key = f"{item.get('path')}:{item.get('phase')}:{item.get('route')}"
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+        return deduped[:80]
+
+    @classmethod
+    def _role_page_snapshots(cls, *, steps: list[Any], screenshots: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        by_key: dict[str, dict[str, Any]] = {}
+        for item in screenshots:
+            role = str(item.get("role") or cls._role_from_route(str(item.get("route") or "")) or "")
+            route = str(item.get("route") or (f"/{role}" if role else ""))
+            if not role and not route:
+                continue
+            key = f"{role}:{route}:{item.get('phase')}"
+            by_key.setdefault(
+                key,
+                {
+                    "role": role,
+                    "route": route,
+                    "phase": item.get("phase"),
+                    "screenshot": item.get("path"),
+                    "mobile_viewport": item.get("mobile_viewport"),
+                },
+            )
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            route = str(step.get("route") or "")
+            role = str(step.get("role") or cls._role_from_route(route) or "")
+            screenshot = step.get("screenshot_after") or step.get("screenshot")
+            if role and screenshot:
+                key = f"{role}:{route}:after"
+                by_key.setdefault(key, {"role": role, "route": route, "phase": "after", "screenshot": screenshot, "mobile_viewport": cls._viewport_dict(step.get("mobile_viewport"))})
+        return list(by_key.values())[:80]
+
+    @classmethod
+    def _visual_diffs(cls, *, proof: dict[str, Any], diagnostics: dict[str, Any], steps: list[Any]) -> list[dict[str, Any]]:
+        explicit = cls._first_list(proof.get("visual_diffs"), diagnostics.get("visual_diffs"))
+        if explicit:
+            return [item for item in explicit if isinstance(item, dict)][:80]
+        diffs: list[dict[str, Any]] = []
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            before = step.get("screenshot_before")
+            after = step.get("screenshot_after")
+            if before or after:
+                diffs.append(
+                    {
+                        "action": step.get("action") or step.get("step"),
+                        "route": step.get("route"),
+                        "role": step.get("role"),
+                        "screenshot_before": before,
+                        "screenshot_after": after,
+                        "diff_kind": "before_after_refs",
+                        "changed": bool(before and after and before != after),
+                        "mobile_viewport": cls._viewport_dict(step.get("mobile_viewport")),
+                    }
+                )
+        return diffs[:80]
+
+    @classmethod
+    def _overflow_overlap(cls, *, mobile_layout: dict[str, Any], layout_reports: list[Any]) -> dict[str, Any]:
+        normalized_reports = [dict(item) for item in layout_reports if isinstance(item, dict)]
+        overflow_items = [item for item in normalized_reports if item.get("overflow") or item.get("horizontal_overflow")]
+        overlap_items = [item for item in normalized_reports if item.get("overlaps") or item.get("critical_overlap")]
+        horizontal = bool(mobile_layout.get("horizontal_overflow") or overflow_items)
+        overlap = bool(mobile_layout.get("critical_overlap") or mobile_layout.get("overlap") or overlap_items)
+        status = "failed" if str(mobile_layout.get("status") or "").lower() == "failed" or horizontal or overlap else "passed" if mobile_layout or normalized_reports else "not_recorded"
+        return {
+            "status": status,
+            "horizontal_overflow": horizontal,
+            "critical_overlap": overlap,
+            "mobile_layout": mobile_layout,
+            "layout_reports": normalized_reports[:40],
+            "overflow_items": overflow_items[:20],
+            "overlap_items": overlap_items[:20],
+        }
+
+    @classmethod
+    def _issues(
+        cls,
+        *,
+        mobile_screenshots: list[dict[str, Any]],
+        role_snapshots: list[dict[str, Any]],
+        dom_snapshots: list[Any],
+        visual_diffs: list[dict[str, Any]],
+        overflow_overlap: dict[str, Any],
+        run: Any,
+    ) -> list[dict[str, Any]]:
+        issues: list[dict[str, Any]] = []
+        if overflow_overlap.get("status") == "failed":
+            issues.append({"kind": "overflow_overlap", "severity": "high", "message": "Mobile viewport proof found horizontal overflow or overlapping critical UI.", "evidence": overflow_overlap})
+        if not mobile_screenshots:
+            issues.append({"kind": "missing_mobile_viewport_screenshots", "severity": "medium", "message": "No mobile viewport screenshots were recorded for generated app visual proof."})
+        if not role_snapshots:
+            issues.append({"kind": "missing_role_page_snapshots", "severity": "medium", "message": "No role page screenshots were linked to client/specialist/manager routes."})
+        if not dom_snapshots:
+            issues.append({"kind": "missing_dom_state_snapshots", "severity": "medium", "message": "No DOM state snapshots were recorded after workflow actions."})
+        mode = str(getattr(run, "mode", "") or getattr(run, "intent", "") or "").lower()
+        if mode in {"edit", "fix"} and not visual_diffs:
+            issues.append({"kind": "missing_before_after_visual_diff", "severity": "medium", "message": "Edit/fix run has no before/after visual diff screenshots."})
+        return issues
+
+    @staticmethod
+    def _changed_files(*, run: Any, artifacts: dict[str, Any]) -> list[str]:
+        paths = list(getattr(run, "touched_files", []) or [])
+        for line in str(artifacts.get("diff") or "").splitlines():
+            if line.startswith("diff --git "):
+                parts = line.split()
+                if len(parts) >= 4:
+                    paths.append(parts[3][2:] if parts[3].startswith("b/") else parts[3])
+        return list(dict.fromkeys(str(path) for path in paths if str(path).strip()))[:80]
+
+    @staticmethod
+    def _viewport_dict(value: Any) -> dict[str, Any]:
+        if isinstance(value, dict):
+            width = value.get("width")
+            height = value.get("height")
+            return {"width": int(width or 390), "height": int(height or 844)}
+        text = str(value or "").lower()
+        match = re.search(r"(\d{3,4})\s*x\s*(\d{3,4})", text)
+        if match:
+            return {"width": int(match.group(1)), "height": int(match.group(2))}
+        return {"width": 390, "height": 844}
+
+    @staticmethod
+    def _as_list(value: Any) -> list[Any]:
+        if isinstance(value, list):
+            return value
+        if value in (None, ""):
+            return []
+        return [value]
+
+    @staticmethod
+    def _role_from_route(route: str) -> str:
+        text = str(route or "").strip().lower()
+        for role in ROLE_ORDER:
+            if text == role or text.startswith(f"/{role}"):
+                return role
+        return ""
+
+
 class TraceReducer:
     @staticmethod
     def build(*, run: Any, timeline: list[dict[str, Any]], tool_events: list[dict[str, Any]], artifacts: dict[str, Any]) -> dict[str, Any]:

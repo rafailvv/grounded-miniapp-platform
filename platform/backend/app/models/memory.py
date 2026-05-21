@@ -41,6 +41,37 @@ class MemoryStaleCheck(MemoryApiModel):
     items: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class MemoryFailureShield(MemoryApiModel):
+    failure_signature: str
+    symptom: str = ""
+    cause: str = ""
+    fix: str = ""
+    verification: str = ""
+    check_name: str | None = None
+    source: str = "memory_pipeline"
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class MemorySummarySection(MemoryApiModel):
+    kind: str
+    title: str
+    items: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class MemorySummaryReport(MemoryApiModel):
+    schema_: str = Field(default="grounded.memory_summary.v1", alias="schema")
+    workspace_id: str
+    status: str = "empty"
+    always_loaded: bool = True
+    generated_at: str
+    text: str = ""
+    sections: list[MemorySummarySection] = Field(default_factory=list)
+    counts: dict[str, int] = Field(default_factory=dict)
+    stale: dict[str, Any] = Field(default_factory=dict)
+    detail_retrieval: dict[str, Any] = Field(default_factory=dict)
+    source_refs: dict[str, Any] = Field(default_factory=dict)
+
+
 class RawMemoryItem(MemoryApiModel):
     memory_id: str
     kind: str
@@ -100,10 +131,13 @@ class WorkspaceMemoryReport(MemoryApiModel):
     accepted_ux_rules: list[dict[str, Any]] = Field(default_factory=list)
     architecture_summary: list[dict[str, Any]] = Field(default_factory=list)
     known_failures: list[dict[str, Any]] = Field(default_factory=list)
+    failure_shields: list[dict[str, Any]] = Field(default_factory=list)
     rejected_approaches: list[dict[str, Any]] = Field(default_factory=list)
+    reusable_workflows: list[dict[str, Any]] = Field(default_factory=list)
     do_not_change: list[dict[str, Any]] = Field(default_factory=list)
     platform_constraints: list[dict[str, Any]] = Field(default_factory=list)
     repeated_fixes: list[dict[str, Any]] = Field(default_factory=list)
+    memory_summary: MemorySummaryReport | None = None
 
 
 class MemoryConsolidationReport(MemoryApiModel):
@@ -126,6 +160,7 @@ class MemoryRetrievalRequest(MemoryApiModel):
     top_k: int = 10
     include_inactive: bool = False
     failure_class: str | None = None
+    detail_mode: str = "relevant"
 
 
 class MemoryRetrievalHit(MemoryApiModel):
@@ -139,9 +174,12 @@ class MemoryRetrievalResult(MemoryApiModel):
     workspace_id: str
     prompt_excerpt: str = ""
     top_k: int = 10
+    detail_mode: str = "relevant"
     status: str = "empty"
     hits: list[MemoryRetrievalHit] = Field(default_factory=list)
     items: list[dict[str, Any]] = Field(default_factory=list)
     skipped: list[dict[str, Any]] = Field(default_factory=list)
+    summary: MemorySummaryReport | None = None
     stats: dict[str, Any] = Field(default_factory=dict)
+    source_refs: dict[str, Any] = Field(default_factory=dict)
     created_at: str

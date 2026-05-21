@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sys
 import time
 from typing import Any
 import zipfile
@@ -22,6 +23,7 @@ from app.models.output_artifacts import CommandOutputArtifact, OutputArtifactInd
 from app.models.prompt_suggestions import PromptSuggestionsReport
 from app.models.workbench import (
     GateReport,
+    PromptCompletionAuditReport,
     RepairAttemptsReport,
     RepairCase,
     RepairCasesReport,
@@ -33,12 +35,13 @@ from app.models.workbench import (
     ToolEnvelope,
     TraceBundleReport,
     TraceState,
+    VisualRegressionReport,
 )
 from app.modules.miniapp_agent_loop.agent_command_policy import AgentCommandPolicy, CommandPolicyDecision, CommandPolicyRule
 from app.modules.miniapp_agent_loop.agent_process_manager import AgentProcessManager
 from app.modules.miniapp_agent_loop.agent_tool_call_loop import AgentToolCallLoop
 from app.modules.miniapp_agent_loop.agent_transcript import AgentTranscriptStore
-from app.modules.workspace_code_agent_runtime.budget import completion_budget_status
+from app.modules.workspace_code_agent_runtime.budget import completion_budget_for_mode, completion_budget_status
 from app.openapi_export import export_openapi
 from app.repositories.platform_db import PlatformDb
 from app.services.repair_catalog import RepairCatalog
@@ -105,6 +108,11 @@ def test_tool_protocol_normalizes_aliases() -> None:
     assert envelope["status"] == "started"
     assert envelope["risk"] == "mutating"
     assert envelope["sandbox_profile"] == "agent_draft_write"
+    assert envelope["capabilities"]
+    assert envelope["side_effect_class"] == "write_draft"
+    assert envelope["allowed_paths"]["write"]
+    assert envelope["parallel_safe"] is False
+    assert envelope["retry_policy"]["first_retry_tool"] == "read_files"
     assert "changed_files" in envelope
     assert envelope["approval"]["status"] == "not_required"
 
@@ -184,6 +192,8 @@ def test_exec_policy_classifies_and_redacts_commands() -> None:
 
     assert allowed["decision"]["action"] == "allow"
     assert allowed["decision"]["risk"] == "read_only"
+    assert allowed["command_class"] == "read_only"
+    assert allowed["approval_gate"]["gate"] == "auto"
     assert allowed["decision"]["shell_parse"]["kind"] == "simple_command"
     assert allowed["decision"]["network_policy"]["blocked"] is False
     assert allowed["decision"]["resolved_argv"]
@@ -197,14 +207,28 @@ def test_exec_policy_classifies_and_redacts_commands() -> None:
     assert git_write["safety"]["class"] == "workspace_write"
     assert blocked["decision"]["action"] == "forbidden"
     assert blocked["decision"]["risk"] == "destructive"
+    assert blocked["command_class"] == "destructive"
     assert blocked["safety"]["class"] == "destructive"
     assert blocked["approval"]["status"] == "blocked"
+    assert blocked["approval_gate"]["gate"] == "block"
+    assert blocked["block_explanation"]["blocked"] is True
+    assert "delete" in blocked["block_explanation"]["remediation"].lower() or "reset" in blocked["block_explanation"]["remediation"].lower()
     assert package_network["decision"]["risk"] == "network"
+    assert package_network["command_class"] == "network"
     assert package_network["safety"]["class"] == "network"
     assert redirection["decision"]["action"] == "forbidden"
     assert redirection["decision"]["blocked_syntax"]["code"] == "shell_metacharacter"
     assert git_internal["decision"]["action"] == "forbidden"
     assert "sk-secretvalue" not in redacted["command"]
+
+
+def test_exec_policy_snapshot_exposes_command_classes_gates_and_per_tool_policy() -> None:
+    snapshot = ExecPolicyService().snapshot()
+
+    assert {"read_only", "build_test", "network", "mutation", "destructive"} <= set(snapshot["command_class_model"])
+    assert snapshot["approval_gates"]["block"]["classes"] == ["network", "destructive", "unknown"]
+    assert snapshot["generated_command_default"]["action"] == "forbidden"
+    assert snapshot["per_tool_policy"]["shell.exec"]["dangerous_generated_default"] == "forbidden"
 
 
 def test_workspace_policy_records_denials_and_scoped_approval_grants(tmp_path: Path) -> None:
@@ -216,10 +240,16 @@ def test_workspace_policy_records_denials_and_scoped_approval_grants(tmp_path: P
         json={"command": "rm -rf miniapp", "run_id": run.run_id},
     ).json()
     recent = client.get("/system/permissions/recent-denials").json()
+    audit = client.get(f"/workspaces/{workspace_id}/permissions/command-audit").json()
 
     assert denied["decision"]["action"] == "forbidden"
     assert denied["decision"]["risk"] == "destructive"
+    assert denied["command_class"] == "destructive"
+    assert denied["block_explanation"]["code"]
     assert any(item.get("workspace_id") == workspace_id and item.get("safety_class") == "destructive" for item in recent["items"])
+    assert audit["schema"] == "grounded.command_audit.v1"
+    assert audit["items"][0]["outcome"] == "blocked"
+    assert audit["items"][0]["command_class"] == "destructive"
 
     app.state.container.exec_policy_service.policy = AgentCommandPolicy(
         [
@@ -248,6 +278,7 @@ def test_workspace_policy_records_denials_and_scoped_approval_grants(tmp_path: P
         f"/workspaces/{workspace_id}/policy/evaluate-command",
         json={"command": "python -m pytest miniapp/tests", "run_id": run.run_id},
     ).json()
+    audit_after_grant = client.get(f"/workspaces/{workspace_id}/permissions/command-audit").json()
 
     assert approved["status"] == "approved"
     assert grants["items"][0]["command_fingerprint"] == prompt_eval["command_fingerprint"]
@@ -255,6 +286,7 @@ def test_workspace_policy_records_denials_and_scoped_approval_grants(tmp_path: P
     assert granted_eval["approval"]["status"] == "approved_by_workspace_grant"
     assert granted_eval["decision"]["action"] == "allow"
     assert granted_eval["decision"]["original_action"] == "prompt"
+    assert any(item["outcome"] == "allowed" and item["command_fingerprint"] == granted_eval["command_fingerprint"] for item in audit_after_grant["items"])
 
 
 def test_sandbox_service_blocks_traversal_symlinks_and_hardlink_writes(tmp_path: Path) -> None:
@@ -294,6 +326,50 @@ def test_sandbox_execution_fails_closed_without_hard_network_provider(tmp_path: 
     assert plan.allowed is False
     assert plan.enforcement == "unavailable"
     assert any(item.code == "network_provider_unavailable" for item in plan.violations)
+
+
+def test_sandbox_runtime_manifest_exposes_execution_boundary_contract() -> None:
+    manifest = SandboxService().manifest()
+
+    assert manifest["schema"] == "grounded.sandbox_runtime.manifest.v1"
+    assert manifest["execution_boundary"]["isolated_generated_app_workspace"]
+    assert manifest["network_policy"]["default"] == "blocked"
+    assert manifest["process_timeout"]["termination"] == ["SIGTERM process group", "SIGKILL process group after grace"]
+    assert "stdout" in manifest["log_capture"]
+    assert "timeout" in manifest["killed_process_diagnostics"]["reasons"]
+    assert manifest["preview_lifecycle"]["destroy"]
+
+
+def test_agent_process_manager_returns_runtime_boundary_and_timeout_diagnostics(tmp_path: Path) -> None:
+    draft = tmp_path / "draft"
+    (draft / "miniapp").mkdir(parents=True)
+    decision = CommandPolicyDecision(
+        action="allow",
+        reason="test command",
+        command="sleep via python",
+        normalized_command="sleep via python",
+        argv=(sys.executable, "-c", "import time; time.sleep(2)"),
+        resolved_argv=(sys.executable, "-c", "import time; time.sleep(2)"),
+        matched_prefix=(Path(sys.executable).name,),
+        cwd_policy="miniapp",
+        safety_class="read_only",
+    )
+
+    result = AgentProcessManager(sandbox_service=SandboxService(strict_network=False)).run(
+        draft_source=draft,
+        command=decision.command,
+        decision=decision,
+        timeout_seconds=1,
+        max_output_chars=4000,
+    ).as_dict()
+
+    assert result["semantic_status"] == "timeout"
+    assert result["sandbox_boundary"]["schema"] == "grounded.sandbox.runtime_boundary.v1"
+    assert result["sandbox_boundary"]["filesystem"]["write_roots"]
+    assert result["environment_snapshot"]["env_sha256"]
+    assert result["log_capture"]["stdout"]["stream"] == "stdout"
+    assert result["killed_diagnostics"]["reason"] == "timeout"
+    assert result["killed_diagnostics"]["requested_signal"] == "SIGTERM"
 
 
 def test_sandbox_exec_blocks_raw_socket_on_macos(tmp_path: Path) -> None:
@@ -1020,6 +1096,7 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
     ).json()
     extracted_memory = client.post(f"/runs/{run.run_id}/memory/extract").json()
     memory_pipeline = client.get(f"/workspaces/{workspace['workspace_id']}/memory/pipeline").json()
+    memory_summary = client.get(f"/workspaces/{workspace['workspace_id']}/memory/summary").json()
     consolidated_memory = client.post(f"/workspaces/{workspace['workspace_id']}/memory/consolidate").json()
     retrieved_memory = client.post(
         f"/workspaces/{workspace['workspace_id']}/memory/retrieve",
@@ -1072,6 +1149,8 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
 
     assert policy["tool_protocol_version"] == TOOL_PROTOCOL_VERSION
     assert policy["tool_registry"]["router"]["dynamic_tool_discovery"]["default_visible_tool"] == "tool_search"
+    assert policy["tool_registry"]["router"]["schema"] == "grounded.tool_router.manifest.v2"
+    assert policy["tool_registry"]["router"]["parallel_execution_policy"]["parallel_safe_field"] == "parallel_safe"
     assert dynamic_tools["schema"] == "grounded.dynamic_tool_catalog.v1"
     assert {"deploy", "browser", "database", "payments", "cms", "github", "vercel"}.issubset(set(dynamic_tools["domains"]))
     assert evaluation["decision"]["action"] == "allow"
@@ -1114,7 +1193,11 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
     assert memory_pipeline["schema"] == "grounded.memory_pipeline.v1"
     assert memory_pipeline["phase1"]["raw_count"] >= len(extracted_memory["items"])
     assert memory_pipeline["phase2"]["retrieval_schema"] == "grounded.memory_retrieval.v1"
+    assert memory_pipeline["phase2"]["summary_schema"] == "grounded.memory_summary.v1"
+    assert memory_summary["schema"] == "grounded.memory_summary.v1"
+    assert memory_summary["always_loaded"] is True
     assert consolidated_memory["pipeline"]["schema"] == "grounded.memory_pipeline.v1"
+    assert consolidated_memory["memory_summary"]["schema"] == "grounded.memory_summary.v1"
     MemoryRetrievalResult.model_validate(retrieved_memory)
     assert retrieved_memory["schema"] == "grounded.memory_retrieval.v1"
     assert retrieved_memory["hits"][0]["selection_reason"]
@@ -1340,7 +1423,7 @@ def test_typed_event_replay_reconstructs_run_resume_and_compare(tmp_path: Path) 
     replay = client.get(f"/runs/{base.run_id}/event-replay").json()
     compare = client.get(f"/runs/{base.run_id}/compare/{target.run_id}").json()
 
-    assert protocol["schema"] == "grounded.rpc_protocol.v1"
+    assert protocol["schema"] == "grounded.rpc_protocol.v2"
     assert {"run/replay", "run/compare", "run/fork_from_bookmark"}.issubset({item["method"] for item in protocol["methods"]})
     assert replay["schema"] == "grounded.run_event_replay.v1"
     assert replay["failure_point"]["check"] == "browser_flow_smoke"
@@ -1825,11 +1908,21 @@ def test_requirement_traceability_matrix_links_prompt_to_route_api_state_tests_a
     )
 
     matrix = client.get(f"/runs/{run.run_id}/requirement-traceability").json()
+    audit = client.get(f"/runs/{run.run_id}/completion-audit").json()
     gate = client.get(f"/runs/{run.run_id}/gate").json()
     final_report = client.get(f"/runs/{run.run_id}/final-report").json()
 
     row = matrix["rows"][0]
+    audit_row = audit["rows"][0]
     assert matrix["schema"] == "grounded.requirement_traceability_matrix.v1"
+    PromptCompletionAuditReport.model_validate(audit)
+    assert audit["schema"] == "grounded.prompt_completion_audit.v1"
+    assert audit["status"] == "passed"
+    assert audit_row["implemented"]["files"] == ["miniapp/app/static/client/app.js", "miniapp/app/routes/tasks.py"]
+    assert audit_row["proof"]["api"]["status"] == "passed"
+    assert audit_row["proof"]["browser"]["status"] == "passed"
+    assert audit_row["proof"]["tests"]["status"] == "passed"
+    assert audit_row["uncovered"] == []
     assert matrix["status"] == "passed"
     assert row["route_page"]["status"] == "passed"
     assert row["api"]["paths"] == ["/api/tasks"]
@@ -1838,7 +1931,10 @@ def test_requirement_traceability_matrix_links_prompt_to_route_api_state_tests_a
     assert row["browser_proof"]["status"] == "passed"
     assert gate["status"] == "passed"
     assert gate["artifact_refs"]["requirement_traceability"] == f"requirement_traceability:{run.run_id}"
+    assert gate["artifact_refs"]["prompt_completion_audit"] == f"prompt_completion_audit:{run.run_id}"
+    assert gate["prompt_completion_audit"]["status"] == "passed"
     assert final_report["requirement_traceability"]["status"] == "passed"
+    assert final_report["prompt_completion_audit"]["status"] == "passed"
 
 
 def test_requirement_traceability_blocks_gate_when_requirement_proof_chain_is_missing(tmp_path: Path) -> None:
@@ -1880,12 +1976,16 @@ def test_requirement_traceability_blocks_gate_when_requirement_proof_chain_is_mi
     )
 
     matrix = client.get(f"/runs/{run.run_id}/requirement-traceability").json()
+    audit = client.get(f"/runs/{run.run_id}/completion-audit").json()
     gate = client.get(f"/runs/{run.run_id}/gate").json()
 
     assert matrix["status"] == "blocked"
+    assert audit["status"] == "blocked"
+    assert {"api", "state", "browser_proof"}.issubset(set(audit["rows"][0]["uncovered"]))
     assert {"api", "state", "browser_proof"}.issubset(set(matrix["rows"][0]["missing"]))
     assert gate["status"] == "blocked"
     assert any(issue["kind"] == "requirement_traceability" for issue in gate["issues"])
+    assert any(issue["kind"] == "prompt_completion_audit" for issue in gate["issues"])
 
 
 def _readiness_check_results(
@@ -2084,6 +2184,28 @@ def test_workspace_creation_does_not_start_preview_before_generated_app_exists(t
     assert preview.stage == "idle"
     assert preview.proxy_port is None
     assert not any("Preview ensure requested" in item for item in preview.logs)
+
+
+def test_preview_runtime_boundary_endpoint_describes_clean_lifecycle(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Preview Boundary",
+            "description": "preview boundary test",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+
+    boundary = client.get(f"/workspaces/{workspace['workspace_id']}/preview/runtime-boundary").json()
+
+    assert boundary["schema"] == "grounded.sandbox.preview_lifecycle.v1"
+    assert boundary["status"] == "stopped"
+    assert boundary["diagnostics"]["destroyed_with_workspace"] is True
+    assert boundary["diagnostics"]["isolated_generated_app_workspace"].endswith("/source")
+    assert "reset stops local processes or docker compose resources" in boundary["lifecycle_events"]
 
 
 def test_local_preview_reconciles_live_process_without_resetting_to_stopped(tmp_path: Path) -> None:
@@ -2472,6 +2594,34 @@ def test_browser_proof_final_artifact_includes_scenarios_errors_and_screenshots(
                         "mobile_viewport": {"width": 390, "height": 844},
                         "persisted_state_marker": "entity-1",
                         "screenshots": [str(screenshot)],
+                        "dom_snapshots": [
+                            {
+                                "route": "/client",
+                                "role": "client",
+                                "phase": "client_create_after",
+                                "screenshot": str(screenshot),
+                                "snapshot": {"title": "Client", "controlCount": 2, "forms": 1},
+                            }
+                        ],
+                        "layout_reports": [
+                            {
+                                "route": "/client",
+                                "role": "client",
+                                "mobile_viewport": {"width": 390, "height": 844},
+                                "overflow": False,
+                                "overlaps": [],
+                            }
+                        ],
+                        "visual_diffs": [
+                            {
+                                "action": "client_create",
+                                "route": "/client",
+                                "role": "client",
+                                "screenshot_before": str(screenshot),
+                                "screenshot_after": str(screenshot),
+                                "changed": False,
+                            }
+                        ],
                         "console_errors": [],
                         "network_errors": ["500 http://localhost/api/items"],
                         "mobile_layout": {"status": "passed", "viewports": ["390x844"]},
@@ -2482,6 +2632,7 @@ def test_browser_proof_final_artifact_includes_scenarios_errors_and_screenshots(
     )
 
     proof = client.get(f"/runs/{run.run_id}/browser-proof").json()
+    visual = client.get(f"/runs/{run.run_id}/visual-regression").json()
     final_report = client.get(f"/runs/{run.run_id}/final-report").json()
     export = client.post(f"/workspaces/{workspace['workspace_id']}/export/browser-proof-bundle").json()
 
@@ -2496,12 +2647,113 @@ def test_browser_proof_final_artifact_includes_scenarios_errors_and_screenshots(
     assert proof["screenshot_after"] == str(screenshot)
     assert any(item["scenario_id"] == "browser_step_1" for item in proof["scenarios"])
     assert any(item["scenario_id"] == "mobile_viewport_layout" for item in proof["scenarios"])
+    VisualRegressionReport.model_validate(visual)
+    assert visual["schema"] == "grounded.visual_regression.v1"
+    assert visual["mobile_viewport_screenshots"][0]["path"] == str(screenshot)
+    assert visual["dom_state_snapshots"][0]["snapshot"]["controlCount"] == 2
+    assert visual["visual_diffs"][0]["action"] == "client_create"
+    assert visual["overflow_overlap"]["status"] == "passed"
+    assert final_report["visual_regression"]["schema"] == "grounded.visual_regression.v1"
     assert final_report["browser_proof"]["artifact_refs"]["export_browser_proof_bundle"].endswith("/export/browser-proof-bundle")
     with zipfile.ZipFile(export["file_path"]) as archive:
         names = set(archive.namelist())
         assert "manifest.json" in names
         assert f"reports/browser_proof:{run.run_id}.json" in names
         assert any(name.startswith(f"screenshots/{run.run_id}/") for name in names)
+
+
+def test_visual_regression_blocks_gate_on_mobile_overflow_and_overlap(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Visual Regression Gate",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    screenshot = tmp_path / "overflow-shot.png"
+    screenshot.write_bytes(b"not-a-real-png-but-exportable")
+    run = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Build a mobile-safe request workflow",
+        intent="create",
+        target_role_scope=["client"],
+        model_profile="test",
+        status="completed",
+        apply_status="applied",
+        touched_files=["miniapp/app/static/client/app.css"],
+        acceptance_contract={"required": True},
+        mobile_layout_report={"status": "failed", "horizontal_overflow": True, "critical_overlap": True},
+    )
+    app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+    app.state.container.store.upsert(
+        "reports",
+        f"run_artifacts:{run.run_id}",
+        {
+            "diff": "diff --git a/miniapp/app/static/client/app.css b/miniapp/app/static/client/app.css\n",
+            "check_results": [
+                {"name": "backend_static_validators", "status": "passed", "details": "ok"},
+                {
+                    "name": "api_workflow_smoke",
+                    "status": "passed",
+                    "details": "ok",
+                    "diagnostics": {"persisted_state_marker": "request-1", "api_after": [{"id": "request-1"}]},
+                },
+                {
+                    "name": "browser_flow_smoke",
+                    "status": "passed",
+                    "details": "ok",
+                    "diagnostics": {
+                        "roles_checked": ["client"],
+                        "ui_steps": [
+                            {
+                                "action": "client_create",
+                                "role": "client",
+                                "route": "/client",
+                                "status": "passed",
+                                "screenshot_after": str(screenshot),
+                                "mobile_viewport": {"width": 390, "height": 844},
+                            }
+                        ],
+                        "persisted_state_marker": "request-1",
+                        "screenshots": [str(screenshot)],
+                        "dom_snapshots": [
+                            {"route": "/client", "role": "client", "phase": "after", "snapshot": {"controlCount": 3}}
+                        ],
+                        "layout_reports": [
+                            {
+                                "route": "/client",
+                                "role": "client",
+                                "mobile_viewport": {"width": 390, "height": 844},
+                                "overflow": True,
+                                "scrollWidth": 520,
+                                "clientWidth": 390,
+                                "overlaps": [{"a": ".request-card", "b": ".submit-row"}],
+                            }
+                        ],
+                        "mobile_layout": {"status": "failed", "horizontal_overflow": True, "critical_overlap": True, "viewports": ["390x844"]},
+                    },
+                },
+                {"name": "generated_app_python_tests", "status": "passed", "details": "ok"},
+                {"name": "generated_app_js_tests", "status": "passed", "details": "ok"},
+            ],
+        },
+    )
+
+    visual = client.get(f"/runs/{run.run_id}/visual-regression").json()
+    gate = client.get(f"/runs/{run.run_id}/gate").json()
+
+    VisualRegressionReport.model_validate(visual)
+    assert visual["status"] == "failed"
+    assert visual["blocking"] is True
+    assert visual["overflow_overlap"]["horizontal_overflow"] is True
+    assert visual["overflow_overlap"]["critical_overlap"] is True
+    assert gate["status"] == "blocked"
+    assert gate["visual_regression"]["status"] == "failed"
+    assert gate["artifact_refs"]["visual_regression"] == f"visual_regression:{run.run_id}"
+    assert any(issue["kind"] == "visual_regression" for issue in gate["issues"])
 
 
 def test_reliability_gate_blocks_missing_browser_proof(tmp_path: Path) -> None:
@@ -2945,10 +3197,18 @@ def test_repair_case_service_promotes_precise_repair_packet_fields(tmp_path: Pat
     assert active["broken_surface"]["api_route"] == "/api/orders"
     assert "miniapp/app/static/manager/app.js" in active["likely_files"]
     assert "miniapp/app/routes/api.py" in active["likely_files"]
+    assert active["normalized_signature"] == "preview.browser_flow_failed"
+    assert active["probable_files"]
+    assert active["product_guardrails"]["do_not_redesign_product"] is True
+    assert active["known_fix_recipe"]["steps"]
+    assert active["repair_confidence"]["score"] >= 0.8
     assert active["post_fix_proof"]["check"] == "browser_flow_smoke"
+    assert active["post_repair_proof"]["check"] == "browser_flow_smoke"
     assert "console and network errors are empty" in active["post_fix_proof"]["evidence_required"]
     assert prompt_sections["failed_check"] == "browser_flow_smoke"
     assert prompt_sections["broken_surface"]["selector"] == "#approve-order"
+    assert prompt_sections["product_guardrails"]["do_not_redesign_product"] is True
+    assert prompt_sections["repair_confidence"]["score"] >= 0.8
     assert prompt_sections["post_fix_proof"]["check"] == "browser_flow_smoke"
 
 
@@ -3279,6 +3539,30 @@ def test_completion_budget_status_enforces_turn_cap() -> None:
     assert status["reason"] == "turn_budget_exhausted"
 
 
+def test_generation_mode_sla_manifest_exposes_product_profiles_and_second_queue(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+
+    manifest = client.get("/system/generation-modes").json()
+    modes = {item["mode"]: item for item in manifest["modes"]}
+
+    assert manifest["schema"] == "grounded.generation_sla.v1"
+    assert modes["fast"]["required_checks"] == ["api_workflow_smoke", "browser_flow_smoke"]
+    assert "mobile layout" in " ".join(modes["balanced"]["proof_requirements"])
+    assert "visual snapshots" in modes["quality"]["proof_requirements"]
+    assert "security/privacy review" in modes["production"]["proof_requirements"]
+    assert any(item["id"] == "structured_diff" for item in manifest["second_queue"])
+
+
+def test_completion_budget_for_production_mode_carries_release_sla() -> None:
+    budget = completion_budget_for_mode(GenerationMode.PRODUCTION)
+
+    assert budget["mode"] == "production"
+    assert budget["policy"] == "time_or_token_budget_plus_product_sla"
+    assert budget["sla_profile"]["audit_level"] == "release"
+    assert "browser_flow_smoke" in budget["required_checks"]
+
+
 def test_repair_continuation_inherits_source_product_contract(tmp_path: Path, monkeypatch) -> None:
     app = create_app(data_dir=tmp_path)
     client = TestClient(app)
@@ -3509,9 +3793,8 @@ def test_runtime_repair_lineage_keeps_acceptance_gate_required(tmp_path: Path) -
     assert {issue["check"] for issue in state["remaining_issues"] if issue["kind"] == "required_product_proof"} == {
         "api_workflow_smoke",
         "browser_flow_smoke",
-        "generated_app_python_tests",
-        "generated_app_js_tests",
     }
+    assert state["product_readiness"]["evidence"]["generation_sla"]["mode"] == "fast"
 
 
 def test_completion_gate_blocks_test_only_acceptance_diff(tmp_path: Path) -> None:
@@ -3650,16 +3933,51 @@ def test_repair_catalog_emits_precise_repair_packet_contract() -> None:
         }
     )
 
-    assert packet["repair_packet"]["schema"] == "grounded.repair_packet.v1"
+    assert packet["repair_packet"]["schema"] == "grounded.repair_packet.v2"
     assert packet["failed_check"] == "browser_flow_smoke"
+    assert packet["normalized_signature"] == "preview.browser_flow_failed"
     assert packet["broken_surface"]["role"] == "manager"
     assert packet["broken_surface"]["route"] == "/manager"
     assert packet["broken_surface"]["selector"] == "#manager-submit"
     assert packet["broken_surface"]["api_route"] == "/api/requests"
     assert "miniapp/app/static/manager/app.js" in packet["likely_files"]
     assert "miniapp/app/routes/api.py" in packet["likely_files"]
+    assert packet["probable_files"][0]["path"].startswith("miniapp/")
+    assert packet["known_fix_recipe"]["recipe_id"] == packet["repair_recipe_id"]
+    assert packet["retry_strategy"]["steps"]
+    assert packet["product_guardrails"]["do_not_redesign_product"] is True
+    assert packet["repair_confidence"]["score"] >= 0.8
     assert packet["post_fix_proof"]["check"] == "browser_flow_smoke"
+    assert packet["post_repair_proof"]["check"] == "browser_flow_smoke"
     assert "console and network errors are empty" in packet["post_fix_proof"]["evidence_required"]
+
+
+def test_repair_catalog_v2_normalizes_dynamic_error_signatures_and_dedupes() -> None:
+    packets = RepairCatalog.classify_many(
+        [
+            {
+                "check": "custom_quality_check",
+                "failure_signature": "custom_quality_check: line 42 http://127.0.0.1:8010/api/items run_abc123 expected 500",
+                "details": "Prompt-specific invariant failed.",
+                "paths": ["miniapp/app/static/client/app.js"],
+            },
+            {
+                "check": "custom_quality_check",
+                "failure_signature": "custom_quality_check: line 77 http://127.0.0.1:9010/api/items run_def456 expected 500",
+                "details": "Prompt-specific invariant failed.",
+                "paths": ["miniapp/app/static/client/app.js"],
+            },
+        ]
+    )
+
+    assert len(packets) == 1
+    packet = packets[0]
+    assert packet["repair_catalog_version"] == "v2"
+    assert packet["signature_normalization"]["algorithm"] == "repair_signature_normalizer.v2"
+    assert packet["normalized_signature"] == "custom_quality_check: line <n> <url> run_<id> expected <n>"
+    assert packet["repair_confidence"]["score"] < 0.7
+    assert packet["retry_strategy"]["policy_id"] == "evidence_driven_repair_case"
+    assert packet["post_repair_proof"]["check"] == "custom_quality_check"
 
 
 def test_repair_catalog_prefers_embedded_validator_recipe_over_broad_static_failure() -> None:
@@ -3743,7 +4061,9 @@ def test_exec_runtime_streams_and_blocks_workspace_escape(tmp_path: Path) -> Non
     started = service.exec_command(workspace_id=workspace["workspace_id"], command="ls miniapp", timeout=5)
     process_id = started["process_id"]
     output = _wait_for_exec_output(service, process_id)
+    completed_session = _wait_for_exec_session(app, process_id)
     resized = service.resize_exec(process_id, cols=100, rows=32)
+    audit = client.get(f"/workspaces/{workspace['workspace_id']}/permissions/command-audit").json()
 
     escaped_error = ""
     try:
@@ -3764,8 +4084,13 @@ def test_exec_runtime_streams_and_blocks_workspace_escape(tmp_path: Path) -> Non
     assert started["status"] in {"starting", "running"}
     assert started["policy_decision"]["resolved_argv"]
     assert Path(started["policy_decision"]["resolved_argv"][0]).is_absolute()
+    assert {item["source"] for item in audit["items"]} >= {"command.exec.evaluate", "command.exec.start"}
     assert output["status"] == "completed"
     assert "app" in output["content"]
+    assert completed_session["sandbox_boundary"]["schema"] == "grounded.sandbox.runtime_boundary.v1"
+    assert completed_session["environment_snapshot"]["snapshot_sha256"]
+    assert completed_session["log_capture"]["stdout"]["total_chars"] >= len(output["content"])
+    assert completed_session["result"]["killed_diagnostics"]["reason"] == "none"
     assert resized["ok"] is True
     assert "Absolute and home-relative paths are blocked" in escaped_error
     if symlink_session is not None:

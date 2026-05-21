@@ -6,6 +6,7 @@ from typing import Any
 
 from app.models.protocol import (
     AppProtocolManifest,
+    InitializeResult,
     ProtocolApprovalState,
     ProtocolEnvelopeV1,
     ProtocolEnvelopeV2,
@@ -18,7 +19,26 @@ from app.models.protocol import (
     ProtocolTurnState,
     ProtocolVersionSpec,
     ProtocolWorkerUpdate,
+    RpcCursorPage,
+    RpcErrorObject,
+    RpcIdempotency,
+    RpcMethodSpecV2,
+    RpcNotificationEnvelopeV2,
+    RpcProtocolReport,
+    RpcRequestEnvelopeV2,
+    RpcResponseEnvelopeV2,
+    ThreadListResult,
 )
+from app.models.sandbox import (
+    SandboxEnvironmentSnapshot,
+    SandboxFilesystemAllowlist,
+    SandboxKillDiagnostics,
+    SandboxLogCapture,
+    SandboxPreviewLifecycle,
+    SandboxRuntimeBoundary,
+    SandboxRuntimeManifest,
+)
+from app.services.rpc_protocol import RPC_PARAM_MODELS
 
 
 APP_PROTOCOL_SCHEMA_ROOT = Path(__file__).resolve().parents[1] / "schemas" / "app_protocol"
@@ -35,6 +55,24 @@ APP_PROTOCOL_MODELS: dict[str, type] = {
     "ProtocolApprovalState": ProtocolApprovalState,
     "ProtocolEventState": ProtocolEventState,
     "ProtocolWorkerUpdate": ProtocolWorkerUpdate,
+    "RpcErrorObject": RpcErrorObject,
+    "RpcRequestEnvelopeV2": RpcRequestEnvelopeV2,
+    "RpcResponseEnvelopeV2": RpcResponseEnvelopeV2,
+    "RpcNotificationEnvelopeV2": RpcNotificationEnvelopeV2,
+    "RpcProtocolReport": RpcProtocolReport,
+    "RpcMethodSpecV2": RpcMethodSpecV2,
+    "RpcCursorPage": RpcCursorPage,
+    "RpcIdempotency": RpcIdempotency,
+    "InitializeResult": InitializeResult,
+    "ThreadListResult": ThreadListResult,
+    "SandboxRuntimeManifest": SandboxRuntimeManifest,
+    "SandboxRuntimeBoundary": SandboxRuntimeBoundary,
+    "SandboxFilesystemAllowlist": SandboxFilesystemAllowlist,
+    "SandboxEnvironmentSnapshot": SandboxEnvironmentSnapshot,
+    "SandboxLogCapture": SandboxLogCapture,
+    "SandboxKillDiagnostics": SandboxKillDiagnostics,
+    "SandboxPreviewLifecycle": SandboxPreviewLifecycle,
+    **{model.__name__: model for model in RPC_PARAM_MODELS.values()},
 }
 
 APP_PROTOCOL_FIXTURE_NAMES: tuple[str, ...] = (
@@ -48,6 +86,24 @@ APP_PROTOCOL_FIXTURE_NAMES: tuple[str, ...] = (
     "ProtocolApprovalState",
     "ProtocolEventState",
     "ProtocolWorkerUpdate",
+    "RpcErrorObject",
+    "RpcRequestEnvelopeV2",
+    "RpcResponseEnvelopeV2",
+    "RpcNotificationEnvelopeV2",
+    "RpcProtocolReport",
+    "RpcMethodSpecV2",
+    "RpcCursorPage",
+    "RpcIdempotency",
+    "InitializeResult",
+    "ThreadListResult",
+    "SandboxRuntimeManifest",
+    "SandboxRuntimeBoundary",
+    "SandboxFilesystemAllowlist",
+    "SandboxEnvironmentSnapshot",
+    "SandboxLogCapture",
+    "SandboxKillDiagnostics",
+    "SandboxPreviewLifecycle",
+    *tuple(dict.fromkeys(model.__name__ for model in RPC_PARAM_MODELS.values())),
 )
 
 
@@ -58,6 +114,8 @@ def app_protocol_manifest() -> AppProtocolManifest:
             "schema_catalog": "/system/app-protocol/schemas",
             "openapi": "/openapi.json",
             "rpc_protocol": "/system/rpc-protocol",
+            "sandbox_runtime": "/system/sandbox-runtime",
+            "preview_runtime_boundary": "/workspaces/{workspace_id}/preview/runtime-boundary",
             "system_schema": "/system/schema",
             "run_protocol": "/runs/{run_id}/protocol",
             "run_events_v2": "/runs/{run_id}/events-v2",
@@ -103,7 +161,7 @@ def app_protocol_manifest() -> AppProtocolManifest:
                 purpose="Canonical model-facing tool request/result envelopes with risk, sandbox, artifacts, and repair metadata.",
                 v1_payload_model="ToolEnvelope",
                 v2_payload_model="ProtocolToolCallState",
-                source_models=["ToolEnvelope", "ToolEventsReport"],
+                source_models=["ToolEnvelope", "ToolEventsReport", "SandboxRuntimeBoundary", "SandboxEnvironmentSnapshot", "SandboxLogCapture", "SandboxKillDiagnostics"],
                 event_types=["tool.requested", "tool.progress", "tool.completed", "tool.failed"],
                 legacy_endpoints=["/runs/{run_id}/tool-events", "/system/tools/dynamic", "/system/policies/exec"],
             ),
@@ -148,6 +206,27 @@ def app_protocol_manifest() -> AppProtocolManifest:
             "ProtocolApprovalState",
             "ProtocolEventState",
             "ProtocolWorkerUpdate",
+            "SandboxRuntimeBoundary",
+            "SandboxEnvironmentSnapshot",
+            "SandboxLogCapture",
+            "SandboxKillDiagnostics",
+            "SandboxPreviewLifecycle",
+        ],
+        rpc_protocol_model="RpcProtocolReport",
+        rpc_method_models=list(dict.fromkeys(["RpcRequestEnvelopeV2", "RpcResponseEnvelopeV2", "RpcNotificationEnvelopeV2", *[model.__name__ for model in RPC_PARAM_MODELS.values()]])),
+        compatibility_rules=[
+            {
+                "rule_id": "app_protocol.v2.additive",
+                "description": "v2 is additive over v1; existing fields remain stable and readable.",
+                "since": "v2",
+                "enforcement": "tested",
+            },
+            {
+                "rule_id": "app_protocol.v3_for_breaking_changes",
+                "description": "Breaking payload, envelope, or RPC method changes require a future v3 protocol.",
+                "since": "v2",
+                "enforcement": "documented",
+            },
         ],
     )
 

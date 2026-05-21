@@ -10,6 +10,7 @@ from app.main import create_app
 from app.openapi_export import export_openapi
 from app.models.protocol import ProtocolEnvelopeV1, ProtocolEnvelopeV2
 from app.services.app_protocol import APP_PROTOCOL_SCHEMA_ROOT, app_protocol_json_schemas, app_protocol_manifest
+from app.services.rpc_protocol import RPC_PARAM_MODELS, rpc_protocol_manifest
 
 
 def _response_schema_refs(openapi: dict[str, Any], path: str, method: str) -> set[str]:
@@ -46,7 +47,11 @@ def test_openapi_keeps_typed_workbench_response_models(tmp_path: Path) -> None:
         ("/runs/{run_id}/context-pressure", "get"): "ContextPressureReport",
         ("/runs/{run_id}/output-artifacts", "get"): "OutputArtifactIndex",
         ("/runs/{run_id}/prompt-suggestions", "get"): "PromptSuggestionsReport",
+        ("/runs/{run_id}/completion-audit", "get"): "PromptCompletionAuditReport",
+        ("/runs/{run_id}/visual-regression", "get"): "VisualRegressionReport",
+        ("/system/generation-modes", "get"): "GenerationModeSlaManifest",
         ("/workspaces/{workspace_id}/memory/retrieve", "post"): "MemoryRetrievalResult",
+        ("/workspaces/{workspace_id}/memory/summary", "get"): "MemorySummaryReport",
         ("/system/schema", "get"): "SystemSchemaManifest",
     }
 
@@ -79,6 +84,10 @@ def test_schema_manifest_and_generated_types_contract_stay_in_sync(tmp_path: Pat
         "ProtocolApprovalState",
         "ProtocolEventState",
         "ProtocolWorkerUpdate",
+        "RpcProtocolReport",
+        "RpcMethodSpecV2",
+        "RpcIdempotency",
+        "RpcCursorPage",
         "ToolEnvelope",
         "RunEventsReport",
         "GateReport",
@@ -89,8 +98,12 @@ def test_schema_manifest_and_generated_types_contract_stay_in_sync(tmp_path: Pat
         "RunJournalState",
         "ThreadJournalState",
         "ContextPressureReport",
-        "PromptSuggestionsReport",
-    }:
+            "PromptSuggestionsReport",
+            "PromptCompletionAuditReport",
+            "VisualRegressionReport",
+            "GenerationModeSlaManifest",
+            "MemorySummaryReport",
+        }:
         assert model_name in manifest_names
         assert model_name in component_names
 
@@ -139,6 +152,41 @@ def test_protocol_v2_envelope_is_additive_over_v1() -> None:
     assert version_specs["v1"]["status"] == "supported"
     assert version_specs["v2"]["status"] == "current"
     assert "additive" in manifest["compatibility_policy"]
+
+
+def test_typed_rpc_protocol_declares_models_idempotency_and_cursors(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    protocol = TestClient(app).get("/system/rpc-protocol").json()
+
+    assert protocol["schema"] == "grounded.rpc_protocol.v2"
+    assert protocol["request_envelope_model"] == "RpcRequestEnvelopeV2"
+    assert protocol["response_envelope_model"] == "RpcResponseEnvelopeV2"
+    assert protocol["notification_envelope_model"] == "RpcNotificationEnvelopeV2"
+
+    methods = {item["method"]: item for item in protocol["methods"]}
+    assert set(RPC_PARAM_MODELS) <= set(methods)
+    assert methods["thread/list"]["cursor"]["cursor_kind"] == "opaque_cursor"
+    assert methods["run/replay"]["cursor"]["cursor_kind"] == "sequence_cursor"
+    assert methods["thread/list"]["idempotent"] is True
+    assert methods["thread/start"]["idempotency"]["mode"] == "recommended"
+    assert methods["command/exec"]["stability"] == "experimental"
+    assert methods["command/exec"]["experimental"][0]["name"] == "preset"
+
+    compatibility_rules = {item["rule_id"] for item in protocol["compatibility_rules"]}
+    assert {"rpc.v2.additive", "rpc.params.aliases", "rpc.breaking_changes"} <= compatibility_rules
+
+
+def test_app_protocol_links_typed_rpc_catalog() -> None:
+    manifest = app_protocol_manifest().model_dump(mode="json", by_alias=True)
+    rpc = rpc_protocol_manifest()
+
+    assert manifest["endpoint_refs"]["rpc_protocol"] == "/system/rpc-protocol"
+    assert manifest["endpoint_refs"]["sandbox_runtime"] == "/system/sandbox-runtime"
+    assert manifest["rpc_protocol_model"] == "RpcProtocolReport"
+    assert "RpcRequestEnvelopeV2" in manifest["rpc_method_models"]
+    assert "SandboxRuntimeBoundary" in manifest["payload_models"]
+    assert {item["rule_id"] for item in manifest["compatibility_rules"]}
+    assert rpc["schema"] == "grounded.rpc_protocol.v2"
 
 
 def test_legacy_doctor_shape_remains_additive(tmp_path: Path) -> None:

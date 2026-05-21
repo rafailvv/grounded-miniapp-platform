@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from app.services.tool_protocol import canonical_tool_name, tool_protocol_spec
+
 
 AgentToolKind = Literal["read_only", "mutating", "verification", "unknown"]
 AgentActivityKind = Literal[
@@ -436,6 +438,9 @@ class AgentToolRegistry:
                 unknown.append(request)
                 append_batch(request, concurrency_safe=False)
                 continue
+            protocol = tool_protocol_spec(canonical_tool_name(request.get("tool")))
+            contract = protocol.as_contract()
+            parallel_safe = bool(contract.get("parallel_safe")) and str(contract.get("side_effect_class") or "") in {"none", "read_workspace"}
             if spec.kind == "mutating":
                 mutating.append(request)
             elif spec.kind == "verification":
@@ -443,7 +448,7 @@ class AgentToolRegistry:
                 read_only.append(request)
             else:
                 read_only.append(request)
-            append_batch(request, concurrency_safe=spec.concurrency_safe and spec.kind == "read_only")
+            append_batch(request, concurrency_safe=parallel_safe and spec.kind == "read_only")
 
         return AgentToolBatchPlan(
             read_only_requests=read_only,
@@ -462,6 +467,7 @@ class AgentToolRegistry:
             if allowed_names is not None and name not in allowed_names:
                 continue
             spec = cls._SPECS[name]
+            contract = tool_protocol_spec(canonical_tool_name(name)).as_contract()
             if name == "apply_patch_to_draft":
                 properties = {
                     "file_path": {
@@ -544,6 +550,8 @@ class AgentToolRegistry:
                     "name": name,
                     "description": (
                         f"{spec.progress_label}. Kind: {spec.kind}. "
+                        f"Capabilities: {', '.join(contract.get('capabilities') or [])}. "
+                        f"Side effects: {contract.get('side_effect_class')}; parallel_safe={str(contract.get('parallel_safe')).lower()}. "
                         "Use this product-neutral code-agent tool only when it directly advances the current plan. "
                         + (
                             "This mutating tool applies exactly one app-owned file_path per call; for multiple files, call the tool once per file with that file's own content or diff. Generated/platform-owned paths are rejected."

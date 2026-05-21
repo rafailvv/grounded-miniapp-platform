@@ -176,6 +176,7 @@ class ContextPackBuilder:
         if store is None:
             return ""
         payload = store.get("reports", f"workspace_memory:{workspace_id}") or {}
+        summary = WorkspaceMemoryPipeline.summary(workspace_id, payload, prompt=prompt, paths=paths or [], top_k=10)
         retrieval = WorkspaceMemoryPipeline.retrieve(
             workspace_id,
             payload,
@@ -185,14 +186,21 @@ class ContextPackBuilder:
         )
         store.upsert("reports", f"memory_retrieval:last:{workspace_id}", retrieval)
         items = [item for item in retrieval.get("items") or [] if isinstance(item, dict)]
-        if not items:
+        summary_text = str(summary.get("text") or "").strip()
+        if not items and not summary_text:
             return ""
         lines = ["Workspace memory:"]
+        if summary_text:
+            lines.append(summary_text)
+        else:
+            lines.append("Workspace memory summary (always loaded; retrieve details on demand):")
         hits_by_id = {
             str((hit.get("item") or {}).get("memory_id") or ""): hit
             for hit in retrieval.get("hits") or []
             if isinstance(hit, dict) and isinstance(hit.get("item"), dict)
         }
+        if items:
+            lines.append("Relevant memory details:")
         for item in items:
             text = str(item.get("text") or "").strip()
             if text:

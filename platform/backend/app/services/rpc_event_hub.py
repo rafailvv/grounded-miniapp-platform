@@ -5,6 +5,8 @@ from dataclasses import dataclass
 import threading
 from typing import Any
 
+from app.models.protocol import RpcNotificationEnvelopeV2
+
 
 @dataclass(frozen=True)
 class RpcSubscription:
@@ -28,9 +30,8 @@ class RpcEventHub:
             self._subscribers.discard(subscription)
 
     def publish(self, method: str, params: dict[str, Any]) -> None:
-        message = {"method": method, "params": params}
+        message = RpcNotificationEnvelopeV2(method=method, params=params).model_dump(mode="json", by_alias=True, exclude_none=True)
         with self._lock:
             subscribers = list(self._subscribers)
         for subscription in subscribers:
             subscription.loop.call_soon_threadsafe(subscription.queue.put_nowait, message)
-

@@ -246,7 +246,11 @@ def test_trace_bundle_writes_payloads_and_reduces_state(tmp_path: Path) -> None:
 def test_memory_pipeline_extracts_consolidates_dedupes_and_rejects_secrets(tmp_path: Path) -> None:
     run = RunRecord(
         workspace_id="ws_1",
-        prompt="Build a prompt-defined product api_key=secret",
+        prompt=(
+            "Build a prompt-defined product api_key=secret. "
+            "I prefer dense operational UI and do not like marketing hero pages. "
+            "My goal is a fast reliable generation workflow that is easy to fix."
+        ),
         intent="create",
         target_role_scope=["client", "specialist", "manager"],
         model_profile="test",
@@ -268,12 +272,19 @@ def test_memory_pipeline_extracts_consolidates_dedupes_and_rejects_secrets(tmp_p
         "ws_1",
         consolidated,
         prompt="Fix preview boot NameError without repeating the old failure",
-        top_k=2,
+        top_k=8,
     )
+    summary = WorkspaceMemoryPipeline.summary("ws_1", consolidated, prompt="repair NameError")
 
     assert stage1["status"] == "extracted"
     assert stage1["phase"] == "raw"
-    assert {item["kind"] for item in stage1["items"]} >= {"product_decision", "failure_signature", "avoidance"}
+    assert {item["kind"] for item in stage1["items"]} >= {"preference", "product_decision", "failure_signature", "failure_shield", "avoidance"}
+    shield = next(item for item in stage1["items"] if item["kind"] == "failure_shield")
+    assert shield["payload"]["failure_signature"]
+    assert shield["payload"]["symptom"]
+    assert shield["payload"]["cause"]
+    assert shield["payload"]["fix"]
+    assert shield["payload"]["verification"]
     assert all("api_key=secret" not in item["text"] for item in stage1["items"])
     assert all(item["fingerprint"] and item["citations"] for item in stage1["items"])
     assert all(item["confidence"]["score"] > 0 for item in stage1["items"])
@@ -285,7 +296,49 @@ def test_memory_pipeline_extracts_consolidates_dedupes_and_rejects_secrets(tmp_p
     assert retrieval["schema"] == "grounded.memory_retrieval.v1"
     assert retrieval["hits"]
     assert retrieval["hits"][0]["selection_reason"]
+    assert retrieval["summary"]["schema"] == "grounded.memory_summary.v1"
     assert any(item["kind"] == "failure_signature" for item in retrieval["items"])
+    assert summary["schema"] == "grounded.memory_summary.v1"
+    assert summary["always_loaded"] is True
+    assert any(section["kind"] == "failure_shield" for section in summary["sections"])
+
+
+def test_memory_summary_hides_stale_items_and_details_can_opt_in(tmp_path: Path) -> None:
+    active = {
+        "memory_id": "pref_1",
+        "kind": "preference",
+        "text": "User preference (like): Prefer dense operational interfaces.",
+        "fingerprint": "pref_1",
+        "status": "active",
+        "confidence": {"score": 0.9, "level": "high", "signals": ["test"]},
+        "created_at": "2026-05-20T00:00:00+00:00",
+        "payload": {"polarity": "like"},
+    }
+    stale = {
+        "memory_id": "stale_1",
+        "kind": "working_pattern",
+        "text": "Old workflow used miniapp/app/missing.py.",
+        "fingerprint": "stale_1",
+        "status": "active",
+        "confidence": {"score": 0.9, "level": "high", "signals": ["test"]},
+        "created_at": "2026-05-20T00:00:00+00:00",
+        "payload": {"touched_files": ["miniapp/app/missing.py"]},
+    }
+
+    memory = WorkspaceMemoryPipeline.consolidate(
+        "ws_1",
+        [],
+        {"workspace_id": "ws_1", "items": [active, stale]},
+        workspace_root=tmp_path,
+    )
+    summary = WorkspaceMemoryPipeline.summary("ws_1", memory)
+    relevant = WorkspaceMemoryPipeline.retrieve("ws_1", memory, prompt="dense interface", top_k=10)
+    audit = WorkspaceMemoryPipeline.retrieve("ws_1", memory, prompt="missing workflow", top_k=10, include_inactive=True)
+
+    assert summary["counts"]["stale_count"] == 1
+    assert "missing.py" not in summary["text"]
+    assert all(item["memory_id"] != "stale_1" for item in relevant["items"])
+    assert any(item["memory_id"] == "stale_1" for item in audit["items"])
 
 
 def test_skill_frontmatter_parser_and_activation(tmp_path: Path) -> None:

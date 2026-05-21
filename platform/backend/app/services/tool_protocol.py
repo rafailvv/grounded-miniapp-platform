@@ -13,6 +13,7 @@ TOOL_PROTOCOL_VERSION = "grounded.tool.v2"
 ToolRisk = Literal["safe", "read_only", "mutating", "network", "destructive", "forbidden", "unknown"]
 ToolApprovalClass = Literal["none", "policy", "human", "forbidden"]
 ToolArtifactSpillPolicy = Literal["never", "on_truncation", "always"]
+ToolSideEffectClass = Literal["none", "read_workspace", "write_draft", "execute_process", "verification", "external_browser", "approval_request", "unknown"]
 SandboxProfile = Literal["analysis_readonly", "agent_draft_write", "source_apply_gate", "developer_bypass", "analysis_only", "agent_draft", "apply_gate"]
 
 
@@ -32,19 +33,36 @@ class ToolProtocolSpec:
     output_schema: dict[str, Any]
     deferred: bool = False
     dynamic: bool = False
+    description: str = ""
+    capability_tags: tuple[str, ...] = ()
+    allowed_paths: dict[str, Any] | None = None
+    side_effects: tuple[ToolSideEffectClass, ...] = ()
+    parallel_safe: bool | None = None
+    result_summarization: dict[str, Any] | None = None
+    retry_policy: dict[str, Any] | None = None
+    failure_signatures: dict[str, Any] | None = None
 
     def as_contract(self) -> dict[str, Any]:
         return {
             "canonical": self.canonical,
             "version": self.version,
+            "description": self.description,
             "aliases": list(self.aliases),
+            "capabilities": list(self.capability_tags),
             "risk": self.risk,
             "approval_class": self.approval_class,
             "sandbox_profile": self.sandbox_profile,
             "concurrency_safe": self.concurrency_safe,
+            "parallel_safe": bool(self.parallel_safe if self.parallel_safe is not None else self.concurrency_safe),
             "timeout_seconds": self.timeout_seconds,
             "output_cap_chars": self.output_cap_chars,
             "artifact_spill_policy": self.artifact_spill_policy,
+            "allowed_paths": self.allowed_paths or default_tool_allowed_paths(self.canonical),
+            "side_effects": list(self.side_effects or default_tool_side_effects(self.canonical)),
+            "side_effect_class": tool_side_effect_class(self.side_effects or default_tool_side_effects(self.canonical)),
+            "result_summarization": self.result_summarization or default_tool_result_summarization(self.canonical),
+            "retry_policy": self.retry_policy or default_tool_retry_policy(self.canonical),
+            "failure_signatures": self.failure_signatures or default_tool_failure_signatures(self.canonical),
             "deferred": self.deferred,
             "dynamic": self.dynamic,
             "input_schema": self.input_schema,
@@ -154,6 +172,137 @@ TOOL_EXECUTION_DEFAULTS: dict[str, dict[str, Any]] = {
     "review.start": {"concurrency_safe": False, "timeout_seconds": 120, "output_cap_chars": 10000, "approval_class": "policy"},
 }
 
+TOOL_CAPABILITY_METADATA: dict[str, dict[str, Any]] = {
+    "file.list": {"description": "List visible workspace files.", "capabilities": ["filesystem.list", "workspace.context", "read_only"]},
+    "file.read": {"description": "Read selected visible workspace files.", "capabilities": ["filesystem.read", "workspace.context", "read_only"]},
+    "artifact.read": {"description": "Read stored run/tool artifacts by ref.", "capabilities": ["artifact.read", "trace.context", "read_only"]},
+    "search.grep": {"description": "Search visible workspace files by text pattern.", "capabilities": ["filesystem.search", "workspace.context", "read_only"]},
+    "semantic.scan": {"description": "Build a semantic source graph for app code.", "capabilities": ["semantic.index", "code_graph", "read_only"]},
+    "tool.search": {"description": "Discover optional deferred tools without enabling them by default.", "capabilities": ["tool.discovery", "capability.routing", "read_only"]},
+    "lsp.diagnostics": {"description": "Collect targeted language diagnostics.", "capabilities": ["lsp.diagnostics", "code_health", "read_only"]},
+    "lsp.symbol_context": {"description": "Read symbol-adjacent context.", "capabilities": ["lsp.symbols", "code_context", "read_only"]},
+    "lsp.definition": {"description": "Find symbol definitions.", "capabilities": ["lsp.definition", "code_navigation", "read_only"]},
+    "lsp.find_references": {"description": "Find symbol references.", "capabilities": ["lsp.references", "code_navigation", "read_only"]},
+    "lsp.route_graph": {"description": "Build route graph context.", "capabilities": ["route_graph", "backend_frontend_contract", "read_only"]},
+    "lsp.route_static_context": {"description": "Read route and static UI cross-links.", "capabilities": ["route_static_context", "backend_frontend_contract", "read_only"]},
+    "diff.inspect": {"description": "Inspect draft/source diff.", "capabilities": ["diff.read", "change_review", "read_only"]},
+    "checks.run": {"description": "Run serialized validation checks.", "capabilities": ["validation", "checks", "verification"]},
+    "browser.verify": {"description": "Run browser/API workflow verification against preview.", "capabilities": ["browser", "preview", "verification"]},
+    "shell.exec": {"description": "Run governed diagnostic shell commands.", "capabilities": ["shell.exec", "diagnostics", "process"]},
+    "file.write": {"description": "Propose one draft file replacement.", "capabilities": ["filesystem.write", "draft_mutation", "deferred"]},
+    "file.edit": {"description": "Propose one exact-string draft file edit.", "capabilities": ["filesystem.edit", "draft_mutation", "deferred"]},
+    "patch.apply": {"description": "Propose one strict patch to a draft file.", "capabilities": ["patch.apply", "draft_mutation", "deferred"]},
+    "contract.compile": {"description": "Compile a typed mini-app contract.", "capabilities": ["contract.compile", "planning"]},
+    "registry.sync": {"description": "Synchronize generated registry metadata.", "capabilities": ["registry.sync", "draft_mutation", "deferred"]},
+    "todo.write": {"description": "Update agent task state.", "capabilities": ["todo", "planning"]},
+    "user.ask": {"description": "Request user input.", "capabilities": ["user_input", "approval_request"]},
+    "review.start": {"description": "Start automated review.", "capabilities": ["review", "verification"]},
+}
+
+TOOL_SIDE_EFFECTS: dict[str, tuple[ToolSideEffectClass, ...]] = {
+    "file.list": ("read_workspace",),
+    "file.read": ("read_workspace",),
+    "artifact.read": ("read_workspace",),
+    "search.grep": ("read_workspace",),
+    "semantic.scan": ("read_workspace",),
+    "tool.search": ("none",),
+    "lsp.diagnostics": ("read_workspace",),
+    "lsp.symbol_context": ("read_workspace",),
+    "lsp.definition": ("read_workspace",),
+    "lsp.find_references": ("read_workspace",),
+    "lsp.route_graph": ("read_workspace",),
+    "lsp.route_static_context": ("read_workspace",),
+    "diff.inspect": ("read_workspace",),
+    "checks.run": ("verification", "execute_process"),
+    "browser.verify": ("verification", "external_browser"),
+    "shell.exec": ("execute_process",),
+    "file.write": ("write_draft", "approval_request"),
+    "file.edit": ("write_draft", "approval_request"),
+    "patch.apply": ("write_draft", "approval_request"),
+    "contract.compile": ("none",),
+    "registry.sync": ("write_draft", "approval_request"),
+    "todo.write": ("none",),
+    "user.ask": ("approval_request",),
+    "review.start": ("verification",),
+}
+
+DEFAULT_READ_PATH_POLICY = {
+    "read": ["miniapp/**", "README.md", "docs/**"],
+    "write": [],
+    "deny": [
+        ".git/**",
+        "node_modules/**",
+        "dist/**",
+        "build/**",
+        ".sandbox/**",
+        "miniapp/app/generated/**",
+        "miniapp/app/main.py",
+        "miniapp/app/routes/role_pages.py",
+        "miniapp/app/routes/role_routes.py",
+    ],
+}
+DEFAULT_WRITE_PATH_POLICY = {
+    "read": DEFAULT_READ_PATH_POLICY["read"],
+    "write": ["miniapp/app/static/**", "miniapp/app/routes/**", "miniapp/app/services/**", "miniapp/tests/**", "miniapp/requirements.txt", "miniapp/package*.json", "README.md", "docs/**"],
+    "deny": DEFAULT_READ_PATH_POLICY["deny"],
+    "write_mode": "deferred_draft_action_only",
+}
+
+TOOL_PATH_POLICIES: dict[str, dict[str, Any]] = {
+    "file.write": DEFAULT_WRITE_PATH_POLICY,
+    "file.edit": DEFAULT_WRITE_PATH_POLICY,
+    "patch.apply": DEFAULT_WRITE_PATH_POLICY,
+    "registry.sync": {
+        **DEFAULT_WRITE_PATH_POLICY,
+        "write": ["miniapp/app/generated/**"],
+        "deny": [item for item in DEFAULT_READ_PATH_POLICY["deny"] if item != "miniapp/app/generated/**"],
+    },
+    "shell.exec": {
+        "read": DEFAULT_READ_PATH_POLICY["read"],
+        "write": [".sandbox/tmp/**", ".sandbox/home/**"],
+        "deny": DEFAULT_READ_PATH_POLICY["deny"],
+        "command_policy": "exec_policy_service_prefix_rules",
+    },
+    "checks.run": {**DEFAULT_READ_PATH_POLICY, "write": [".sandbox/**", "miniapp/.pytest_cache/**"]},
+    "browser.verify": {**DEFAULT_READ_PATH_POLICY, "write": [".sandbox/**"]},
+}
+
+TOOL_RESULT_SUMMARIZATION: dict[str, dict[str, Any]] = {
+    "default": {
+        "mode": "structured_summary",
+        "include": ["status", "counts", "targets", "changed_files", "artifacts", "failure_signature"],
+        "max_inline_chars": 1200,
+        "spill_full_result": "on_truncation",
+    },
+    "file.read": {"mode": "file_excerpt_summary", "include": ["file_count", "paths", "omitted_chars"], "max_inline_chars": 1800, "spill_full_result": "on_truncation"},
+    "search.grep": {"mode": "match_summary", "include": ["match_count", "paths"], "max_inline_chars": 1400, "spill_full_result": "on_truncation"},
+    "shell.exec": {"mode": "process_summary", "include": ["semantic_status", "exit_code", "stdout_ref", "stderr_ref", "killed_diagnostics"], "max_inline_chars": 1600, "spill_full_result": "always_for_large_output"},
+    "checks.run": {"mode": "validation_summary", "include": ["failed_checks", "preview", "failure_signature"], "max_inline_chars": 1800, "spill_full_result": "on_truncation"},
+    "browser.verify": {"mode": "workflow_summary", "include": ["workflow_results", "preview", "failure_signature"], "max_inline_chars": 1800, "spill_full_result": "on_truncation"},
+}
+
+TOOL_RETRY_POLICIES: dict[str, dict[str, Any]] = {
+    "default": {"retryable": True, "max_attempts": 2, "backoff": "none", "requires_fresh_context": False, "stop_on_same_failure_signature": True},
+    "tool.search": {"retryable": False, "max_attempts": 1, "backoff": "none", "requires_fresh_context": False, "stop_on_same_failure_signature": True},
+    "shell.exec": {"retryable": True, "max_attempts": 1, "backoff": "none", "requires_fresh_context": False, "stop_on_same_failure_signature": True},
+    "file.write": {"retryable": True, "max_attempts": 2, "backoff": "none", "requires_fresh_context": True, "first_retry_tool": "read_files", "stop_on_same_failure_signature": True},
+    "file.edit": {"retryable": True, "max_attempts": 2, "backoff": "none", "requires_fresh_context": True, "first_retry_tool": "read_files", "stop_on_same_failure_signature": True},
+    "patch.apply": {"retryable": True, "max_attempts": 2, "backoff": "none", "requires_fresh_context": True, "first_retry_tool": "read_files", "stop_on_same_failure_signature": True},
+    "checks.run": {"retryable": True, "max_attempts": 1, "backoff": "none", "requires_fresh_context": False, "stop_on_same_failure_signature": True},
+    "browser.verify": {"retryable": True, "max_attempts": 1, "backoff": "none", "requires_fresh_context": False, "stop_on_same_failure_signature": True},
+    "user.ask": {"retryable": False, "max_attempts": 1, "backoff": "none", "requires_fresh_context": False, "stop_on_same_failure_signature": True},
+}
+
+TOOL_FAILURE_SIGNATURES: dict[str, dict[str, Any]] = {
+    "default": {"format": "{tool}:{error_code}:{stable_detail_hash}", "fields": ["tool", "error.code", "details"]},
+    "file.edit": {"format": "file.edit:{error_code}:{file_path}", "fields": ["tool", "error.code", "input.file_path"]},
+    "file.write": {"format": "file.write:{error_code}:{file_path}", "fields": ["tool", "error.code", "input.file_path"]},
+    "patch.apply": {"format": "patch.apply:{error_code}:{file_path}", "fields": ["tool", "error.code", "input.file_path"]},
+    "shell.exec": {"format": "shell.exec:{semantic_status}:{command_hash}", "fields": ["tool", "result.semantic_status", "input.command"]},
+    "checks.run": {"format": "checks.run:{first_failed_check}", "fields": ["tool", "result.failed_checks.0.name"]},
+    "browser.verify": {"format": "browser.verify:{first_failed_workflow}", "fields": ["tool", "result.workflow_results.0.name"]},
+}
+
 
 def canonical_tool_name(tool: object) -> str:
     raw = str(tool or "").strip().lower()
@@ -192,6 +341,70 @@ def default_tool_sandbox_profile(tool: object) -> str:
     return "analysis_readonly"
 
 
+def default_tool_capability_metadata(tool: object) -> dict[str, Any]:
+    canonical = canonical_tool_name(tool)
+    metadata = TOOL_CAPABILITY_METADATA.get(canonical)
+    if metadata is not None:
+        return {"description": str(metadata.get("description") or canonical), "capabilities": list(metadata.get("capabilities") or [])}
+    return {"description": canonical, "capabilities": [canonical.replace(".", "_")]}
+
+
+def default_tool_side_effects(tool: object) -> tuple[ToolSideEffectClass, ...]:
+    canonical = canonical_tool_name(tool)
+    configured = TOOL_SIDE_EFFECTS.get(canonical)
+    if configured:
+        return configured
+    risk = default_tool_risk(canonical)
+    if risk == "mutating":
+        return ("write_draft", "approval_request")
+    if risk in {"read_only", "safe"}:
+        return ("read_workspace",) if risk == "read_only" else ("none",)
+    return ("unknown",)
+
+
+def tool_side_effect_class(side_effects: tuple[ToolSideEffectClass, ...] | list[str]) -> ToolSideEffectClass:
+    ordered: list[ToolSideEffectClass] = [
+        "write_draft",
+        "external_browser",
+        "verification",
+        "execute_process",
+        "approval_request",
+        "read_workspace",
+        "none",
+        "unknown",
+    ]
+    values = {str(item) for item in side_effects}
+    for candidate in ordered:
+        if candidate in values:
+            return candidate
+    return "unknown"
+
+
+def default_tool_allowed_paths(tool: object) -> dict[str, Any]:
+    canonical = canonical_tool_name(tool)
+    configured = TOOL_PATH_POLICIES.get(canonical)
+    if configured is not None:
+        return dict(configured)
+    if default_tool_risk(canonical) == "mutating":
+        return dict(DEFAULT_WRITE_PATH_POLICY)
+    return dict(DEFAULT_READ_PATH_POLICY)
+
+
+def default_tool_result_summarization(tool: object) -> dict[str, Any]:
+    canonical = canonical_tool_name(tool)
+    return dict(TOOL_RESULT_SUMMARIZATION.get(canonical) or TOOL_RESULT_SUMMARIZATION["default"])
+
+
+def default_tool_retry_policy(tool: object) -> dict[str, Any]:
+    canonical = canonical_tool_name(tool)
+    return dict(TOOL_RETRY_POLICIES.get(canonical) or TOOL_RETRY_POLICIES["default"])
+
+
+def default_tool_failure_signatures(tool: object) -> dict[str, Any]:
+    canonical = canonical_tool_name(tool)
+    return dict(TOOL_FAILURE_SIGNATURES.get(canonical) or TOOL_FAILURE_SIGNATURES["default"])
+
+
 def tool_protocol_spec(tool: object) -> ToolProtocolSpec:
     canonical = canonical_tool_name(tool)
     configured = TOOL_EXECUTION_DEFAULTS.get(canonical, {})
@@ -199,6 +412,8 @@ def tool_protocol_spec(tool: object) -> ToolProtocolSpec:
     spill_policy = configured.get("artifact_spill_policy") or ("never" if risk in {"safe", "forbidden"} else "on_truncation")
     if spill_policy not in {"never", "on_truncation", "always"}:
         spill_policy = "on_truncation"
+    metadata = default_tool_capability_metadata(canonical)
+    side_effects = default_tool_side_effects(canonical)
     return ToolProtocolSpec(
         canonical=canonical,
         version=TOOL_PROTOCOL_VERSION,
@@ -214,6 +429,14 @@ def tool_protocol_spec(tool: object) -> ToolProtocolSpec:
         output_schema=TOOL_OUTPUT_SCHEMAS.get(canonical, {}),
         deferred=bool(configured.get("deferred") or risk in {"mutating", "destructive"}),
         dynamic=bool(configured.get("dynamic")),
+        description=str(metadata.get("description") or canonical),
+        capability_tags=tuple(str(item) for item in metadata.get("capabilities") or []),
+        allowed_paths=default_tool_allowed_paths(canonical),
+        side_effects=side_effects,
+        parallel_safe=bool(configured.get("concurrency_safe", False)) and tool_side_effect_class(side_effects) in {"none", "read_workspace"},
+        result_summarization=default_tool_result_summarization(canonical),
+        retry_policy=default_tool_retry_policy(canonical),
+        failure_signatures=default_tool_failure_signatures(canonical),
     )
 
 
@@ -271,14 +494,31 @@ def tool_registry_contract() -> dict[str, Any]:
             "size_bytes": 0,
         },
         "governance_fields": [
+            "capabilities",
             "risk",
             "approval_class",
             "sandbox_profile",
+            "allowed_paths",
+            "side_effects",
+            "side_effect_class",
             "concurrency_safe",
+            "parallel_safe",
             "timeout_seconds",
             "output_cap_chars",
             "artifact_spill_policy",
+            "result_summarization",
+            "retry_policy",
+            "failure_signatures",
         ],
+        "json_schema_tools": {
+            "input_schema_field": "input_schema",
+            "output_schema_field": "output_schema",
+            "additional_properties_default": False,
+        },
+        "parallel_execution_policy": {
+            "parallel_safe_field": "parallel_safe",
+            "router_rule": "Only read-workspace/none side-effect tools marked parallel_safe may run in concurrent batches.",
+        },
         "tools": tools,
     }
 
@@ -594,8 +834,16 @@ def tool_envelope(
     failure_class: str | None = None,
     failure_signature: str | None = None,
     repair_recipe_ids: list[str] | None = None,
+    result_summary: dict[str, Any] | None = None,
+    capabilities: list[str] | None = None,
+    allowed_paths: dict[str, Any] | None = None,
+    side_effects: list[str] | None = None,
+    side_effect_class: str | None = None,
+    parallel_safe: bool | None = None,
+    retry_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     canonical = canonical_tool_name(tool)
+    spec = tool_protocol_spec(canonical)
     created_at = datetime.now(timezone.utc).isoformat()
     resolved_status = status or ("failed" if error else "completed" if result is not None else "started")
     resolved_timing = dict(timing or {})
@@ -611,18 +859,31 @@ def tool_envelope(
         }
     approval_payload = dict(approval or {"required": False, "status": "not_required"})
     approval_payload.setdefault("class", default_tool_approval_class(canonical))
+    resolved_retry = dict(retry or retry_policy or spec.retry_policy or {})
+    if normalized_error is not None:
+        resolved_retry["retryable"] = bool(normalized_error.get("retryable"))
+    else:
+        resolved_retry.setdefault("retryable", bool(normalized_error and normalized_error.get("retryable")))
+    resolved_retry.setdefault("attempt", 1)
+    resolved_retry.setdefault("max_attempts", (retry_policy or spec.retry_policy or {}).get("max_attempts", 1))
     payload = {
         "tool_call_id": tool_call_id or f"tool_{uuid4().hex}",
         "tool": canonical,
         "version": TOOL_PROTOCOL_VERSION,
         "status": resolved_status,
         "input": input_payload or {},
+        "capabilities": capabilities if capabilities is not None else list(spec.capability_tags),
         "risk": risk or default_tool_risk(canonical),
         "approval": approval_payload,
         "approval_id": approval_payload.get("approval_id"),
         "sandbox_profile": sandbox_profile or default_tool_sandbox_profile(canonical),
+        "allowed_paths": allowed_paths if allowed_paths is not None else (spec.allowed_paths or default_tool_allowed_paths(canonical)),
+        "side_effects": side_effects if side_effects is not None else list(spec.side_effects or default_tool_side_effects(canonical)),
+        "side_effect_class": side_effect_class or tool_side_effect_class(spec.side_effects or default_tool_side_effects(canonical)),
+        "parallel_safe": bool(parallel_safe if parallel_safe is not None else spec.parallel_safe),
         "progress": progress or [],
         "result": result or {},
+        "result_summary": result_summary or {},
         "artifacts": artifacts or [],
         "timing": resolved_timing,
         "started_at": started_at or created_at,
@@ -634,7 +895,8 @@ def tool_envelope(
         "failure_class": failure_class,
         "failure_signature": failure_signature,
         "repair_recipe_ids": repair_recipe_ids or [],
-        "retry": retry or {"retryable": bool(normalized_error and normalized_error.get("retryable")), "attempt": 1},
+        "retry": resolved_retry,
+        "retry_policy": retry_policy or spec.retry_policy or default_tool_retry_policy(canonical),
         "truncation": truncation or {"truncated": False},
         "error": normalized_error,
         "created_at": created_at,

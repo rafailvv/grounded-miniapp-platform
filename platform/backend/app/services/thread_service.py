@@ -357,6 +357,16 @@ class ThreadService:
         evaluation = self.exec_policy_service.evaluate_command(command, preset=preset, root=source_dir, workspace_id=workspace_id)
         decision = evaluation.get("decision") if isinstance(evaluation.get("decision"), dict) else {}
         approval = evaluation.get("approval") if isinstance(evaluation.get("approval"), dict) else {}
+        self.exec_policy_service.append_audit_record(
+            self.store,
+            workspace_id=workspace_id,
+            command=command,
+            evaluation=evaluation,
+            run_id=linked_run_id,
+            thread_id=thread_id,
+            turn_id=turn_id,
+            source="command.exec.evaluate",
+        )
         if linked_run_id:
             self._record_run_tool_event(
                 linked_run_id,
@@ -403,6 +413,18 @@ class ThreadService:
             turn_id=turn_id,
             run_id=linked_run_id,
             timeout_seconds=timeout,
+        )
+        self.exec_policy_service.append_audit_record(
+            self.store,
+            workspace_id=workspace_id,
+            command=command,
+            evaluation=evaluation,
+            run_id=linked_run_id,
+            thread_id=thread_id,
+            turn_id=turn_id,
+            process_id=payload.get("process_id"),
+            source="command.exec.start",
+            outcome=str(payload.get("status") or "started"),
         )
         if linked_run_id:
             self._record_run_tool_event(

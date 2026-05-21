@@ -123,6 +123,7 @@ PLATFORM_SHELL_TEMPLATE_PATHS = (
 QUALITY_FIDELITY = {
     GenerationMode.FAST: "fast_app",
     GenerationMode.QUALITY: "quality_app",
+    GenerationMode.PRODUCTION: "production_app",
     GenerationMode.BALANCED: "balanced_app",
     GenerationMode.BASIC: "basic_app",
 }
@@ -1108,7 +1109,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         requires_prompt_analysis = (
             create_intent
             or focused_edit_kind == "behavior_workflow_edit"
-            or generation_mode in {GenerationMode.BALANCED, GenerationMode.QUALITY}
+            or generation_mode in {GenerationMode.BALANCED, GenerationMode.QUALITY, GenerationMode.PRODUCTION}
         ) and not stored_contract_is_authoritative
         if requires_prompt_analysis:
             prompt_analysis = self.openai_client.analyze_miniapp_prompt(
@@ -3484,10 +3485,10 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             compact_edit_turn = edit_turn and focused_edit_kind in {"small_copy_edit", "behavior_edit", "standard"}
             agentic_workflow_turn = (
                 focused_edit_kind == "behavior_workflow_edit"
-                and generation_mode in {GenerationMode.BALANCED, GenerationMode.QUALITY}
+                and generation_mode in {GenerationMode.BALANCED, GenerationMode.QUALITY, GenerationMode.PRODUCTION}
             ) or (
                 create_turn
-                and generation_mode in {GenerationMode.BALANCED, GenerationMode.QUALITY}
+                and generation_mode in {GenerationMode.BALANCED, GenerationMode.QUALITY, GenerationMode.PRODUCTION}
             )
             primary_model = models_for_role(
                 "agent_turn",
@@ -4011,7 +4012,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         requires_prompt_analysis = (
             intent_value == "create"
             or focused_edit_kind == "behavior_workflow_edit"
-            or request.generation_mode in {GenerationMode.BALANCED, GenerationMode.QUALITY}
+            or request.generation_mode in {GenerationMode.BALANCED, GenerationMode.QUALITY, GenerationMode.PRODUCTION}
         )
         if requires_prompt_analysis and not isinstance(stored_acceptance_contract.get("prompt_hints"), dict):
             prompt_analysis = self.openai_client.analyze_miniapp_prompt(
@@ -4165,7 +4166,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                     generation_mode=generation_mode,
                     implementation_plan=implementation_plan,
                 )
-                if generation_mode in {GenerationMode.BALANCED, GenerationMode.QUALITY}
+                if generation_mode in {GenerationMode.BALANCED, GenerationMode.QUALITY, GenerationMode.PRODUCTION}
                 else {"enabled": False, "mode": "single_agent_loop"}
             ),
             "orchestration": (
@@ -6251,12 +6252,12 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             if repair_turn:
                 if generation_mode == GenerationMode.FAST:
                     return {"reasoning": {"effort": "low"}, "max_output_tokens": 18000}
-                if generation_mode == GenerationMode.QUALITY:
+                if generation_mode in {GenerationMode.QUALITY, GenerationMode.PRODUCTION}:
                     return {"reasoning": {"effort": "low"}, "max_output_tokens": 26000}
                 return {"reasoning": {"effort": "low"}, "max_output_tokens": 22000}
             if generation_mode == GenerationMode.FAST:
                 return {"reasoning": {"effort": "low"}, "max_output_tokens": 28000}
-            if generation_mode == GenerationMode.QUALITY:
+            if generation_mode in {GenerationMode.QUALITY, GenerationMode.PRODUCTION}:
                 return {"reasoning": {"effort": "high"}, "max_output_tokens": 52000}
             return {
                 "reasoning": {"effort": "medium"},
@@ -6264,7 +6265,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             }
         if generation_mode == GenerationMode.FAST:
             return {"reasoning": {"effort": "low"}, "max_output_tokens": 24000}
-        if generation_mode == GenerationMode.QUALITY:
+        if generation_mode in {GenerationMode.QUALITY, GenerationMode.PRODUCTION}:
             return {"reasoning": {"effort": "high"}, "max_output_tokens": 42000}
         return {"reasoning": {"effort": "medium"}, "max_output_tokens": 32000}
 
@@ -8670,6 +8671,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             GenerationMode.FAST: "WORKSPACE_AGENT_FAST_TOOL_ROUND_LIMIT",
             GenerationMode.BALANCED: "WORKSPACE_AGENT_BALANCED_TOOL_ROUND_LIMIT",
             GenerationMode.QUALITY: "WORKSPACE_AGENT_QUALITY_TOOL_ROUND_LIMIT",
+            GenerationMode.PRODUCTION: "WORKSPACE_AGENT_PRODUCTION_TOOL_ROUND_LIMIT",
         }.get(generation_mode, "WORKSPACE_AGENT_BALANCED_TOOL_ROUND_LIMIT")
         env_value = os.getenv(env_name) or os.getenv("WORKSPACE_AGENT_TOOL_ROUND_LIMIT")
         if env_value:
@@ -8679,7 +8681,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                 pass
         if generation_mode == GenerationMode.FAST:
             return 2
-        if generation_mode == GenerationMode.QUALITY:
+        if generation_mode in {GenerationMode.QUALITY, GenerationMode.PRODUCTION}:
             return 6
         return 4
 
@@ -8695,6 +8697,8 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             return 300.0
         if generation_mode == GenerationMode.QUALITY:
             return 720.0
+        if generation_mode == GenerationMode.PRODUCTION:
+            return 900.0
         return 480.0
 
     @staticmethod

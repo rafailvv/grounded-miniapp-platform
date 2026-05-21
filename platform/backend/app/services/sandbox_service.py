@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import hashlib
+import json
 import os
 import platform
 import re
@@ -13,10 +15,16 @@ from typing import Iterable
 from app.models.sandbox import (
     ApplySafetyItem,
     ApplySafetyReport,
+    SandboxEnvironmentSnapshot,
     SandboxExecutionPlan,
+    SandboxFilesystemAllowlist,
+    SandboxLogCapture,
+    SandboxLogStreamCapture,
     SandboxNetworkDecision,
     SandboxOperation,
     SandboxPathDecision,
+    SandboxRuntimeBoundary,
+    SandboxRuntimeManifest,
     SandboxProfile,
     SandboxViolation,
 )
@@ -62,22 +70,60 @@ class SandboxService:
 
     def manifest(self) -> dict[str, object]:
         provider = self.network_provider()
-        return {
-            "profiles": {
+        enforcement = "hard" if provider in {"sandbox-exec", "unshare"} else "unavailable"
+        return SandboxRuntimeManifest(
+            profiles={
                 "analysis_readonly": {"writes": "none", "network": "blocked", "description": "Read-only diagnostics and workspace inspection."},
                 "agent_draft_write": {"writes": "draft_workspace", "network": "blocked", "description": "Guarded agent writes into draft source only."},
                 "source_apply_gate": {"writes": "source_workspace", "network": "blocked", "description": "Validated draft/patch apply into source."},
                 "developer_bypass": {"writes": "workspace", "network": "allowed", "description": "Human/dev mode; path safety remains enforced."},
             },
-            "provider": provider,
-            "enforcement": "hard" if provider in {"sandbox-exec", "unshare"} else "unavailable",
-            "path_safety": {
+            provider=provider,
+            enforcement=enforcement,  # type: ignore[arg-type]
+            execution_boundary={
+                "mode": "workspace_process_group",
+                "isolated_generated_app_workspace": "workspace source or per-run draft source",
+                "filesystem_allowlist": "read roots + explicit write roots from SandboxExecutionPlan",
+                "environment": "deterministic minimal env with isolated HOME/TMPDIR under .sandbox",
+                "process_group_kill": os.name == "posix",
+            },
+            path_safety={
                 "path_traversal": "blocked",
                 "symlink_ancestors": "blocked",
                 "symlink_writes": "blocked",
                 "hardlink_writes": "blocked",
             },
-        }
+            network_policy={
+                "default": "blocked",
+                "provider": provider,
+                "enforcement": enforcement,
+                "strict_network": self.strict_network,
+                "fail_closed_without_provider": self.strict_network,
+            },
+            process_timeout={
+                "required": True,
+                "termination": ["SIGTERM process group", "SIGKILL process group after grace"],
+                "grace_seconds": 2,
+            },
+            log_capture={
+                "stdout": "head/tail excerpt + bounded full spool + sha256 + optional artifact ref",
+                "stderr": "head/tail excerpt + bounded full spool + sha256 + optional artifact ref",
+                "streaming": "output_delta events include bounded tail chunks",
+            },
+            killed_process_diagnostics={
+                "fields": ["reason", "timed_out", "timeout_seconds", "requested_signal", "final_signal", "exit_code", "return_signal"],
+                "reasons": ["timeout", "manual_terminate", "signal", "startup_failed", "sandbox_blocked", "policy_blocked"],
+            },
+            preview_lifecycle={
+                "start": "allocated port, runtime mode, health probe, logs",
+                "reset": "stop local process or docker compose down with stale resource cleanup",
+                "destroy": "workspace deletion destroys preview containers/networks/volumes and clears preview state",
+            },
+            reproducibility={
+                "environment_snapshot": "cwd, argv, wrapped argv, env keys/hash, resource limits, provider, enforcement",
+                "workspace_snapshot": "isolated source/draft root with path safety and ignored runtime artifacts",
+            },
+        ).model_dump(mode="json", by_alias=True)
 
     def network_provider(self) -> str:
         if platform.system() == "Darwin" and shutil.which("sandbox-exec"):
@@ -420,6 +466,125 @@ class SandboxService:
             allowed=allowed,
             reason="Execution allowed by sandbox." if allowed else "; ".join(item.message for item in violations),
             violations=violations,
+        )
+
+    def filesystem_allowlist(self, *, root: Path, cwd: Path, execution_plan: SandboxExecutionPlan) -> SandboxFilesystemAllowlist:
+        allowed_operations: list[SandboxOperation]
+        if execution_plan.profile == "analysis_readonly":
+            allowed_operations = ["read", "exec"]
+        elif execution_plan.profile == "developer_bypass":
+            allowed_operations = ["read", "write", "delete", "copy", "apply", "exec"]
+        else:
+            allowed_operations = ["read", "write", "copy", "apply", "exec"]
+        return SandboxFilesystemAllowlist(
+            root=str(root.resolve(strict=False)),
+            cwd=str(cwd.resolve(strict=False)),
+            read_roots=list(execution_plan.read_roots),
+            write_roots=list(execution_plan.write_roots),
+            denied_parts=sorted(self.IGNORED_PARTS),
+            denied_names=sorted(self.IGNORED_NAMES),
+            denied_suffixes=list(self.IGNORED_SUFFIXES),
+            generated_prefix=self.GENERATED_PREFIX,
+            path_safety={
+                "path_traversal": "blocked",
+                "symlink_ancestors": "blocked",
+                "symlink_writes": "blocked",
+                "hardlink_writes": "blocked",
+                "absolute_paths": "blocked for workspace file operations; execution args must resolve inside root",
+            },
+            allowed_operations=allowed_operations,
+        )
+
+    def environment_snapshot(
+        self,
+        *,
+        process_id: str,
+        root: Path,
+        cwd: Path,
+        argv: list[str],
+        resolved_argv: list[str],
+        wrapped_argv: list[str],
+        env: dict[str, str],
+        tmp_dir: Path,
+        home_dir: Path,
+        resource_limits: dict[str, int],
+        execution_plan: SandboxExecutionPlan,
+        host_pid: int | None = None,
+    ) -> SandboxEnvironmentSnapshot:
+        env_keys = sorted(str(key) for key in env)
+        env_material = {key: env.get(key, "") for key in env_keys}
+        env_sha256 = hashlib.sha256(json.dumps(env_material, sort_keys=True, separators=(",", ":")).encode("utf-8", errors="replace")).hexdigest()
+        base_payload = {
+            "process_id": process_id,
+            "host_pid": host_pid,
+            "workspace_root": str(root.resolve(strict=False)),
+            "isolated_workspace": str(root.resolve(strict=False)),
+            "cwd": str(cwd.resolve(strict=False)),
+            "argv": list(argv),
+            "resolved_argv": list(resolved_argv),
+            "wrapped_argv": list(wrapped_argv),
+            "env_keys": env_keys,
+            "env_sha256": env_sha256,
+            "tmp_dir": str(tmp_dir),
+            "home_dir": str(home_dir),
+            "resource_limits": dict(resource_limits),
+            "os_name": platform.system() or os.name,
+            "profile": execution_plan.profile,
+            "provider": execution_plan.provider,
+            "enforcement": execution_plan.enforcement,
+            "network_mode": execution_plan.network.mode,
+        }
+        snapshot_sha256 = hashlib.sha256(json.dumps(base_payload, sort_keys=True, separators=(",", ":")).encode("utf-8", errors="replace")).hexdigest()
+        return SandboxEnvironmentSnapshot(
+            **base_payload,
+            created_at=datetime.now(timezone.utc).isoformat(),
+            snapshot_sha256=snapshot_sha256,
+        )
+
+    def runtime_boundary(
+        self,
+        *,
+        process_id: str,
+        root: Path,
+        cwd: Path,
+        execution_plan: SandboxExecutionPlan,
+        timeout_seconds: int,
+        resource_limits: dict[str, int],
+        environment: SandboxEnvironmentSnapshot,
+        max_excerpt_chars: int,
+        full_spool_max_chars: int,
+    ) -> SandboxRuntimeBoundary:
+        return SandboxRuntimeBoundary(
+            process_id=process_id,
+            profile=execution_plan.profile,
+            provider=execution_plan.provider,
+            enforcement=execution_plan.enforcement,
+            workspace_root=str(root.resolve(strict=False)),
+            isolated_workspace=str(root.resolve(strict=False)),
+            cwd=str(cwd.resolve(strict=False)),
+            filesystem=self.filesystem_allowlist(root=root, cwd=cwd, execution_plan=execution_plan),
+            network=execution_plan.network,
+            timeout_seconds=timeout_seconds,
+            resource_limits=dict(resource_limits),
+            process_group_kill=os.name == "posix",
+            environment=environment,
+            log_capture_policy={
+                "max_excerpt_chars": max_excerpt_chars,
+                "full_spool_max_chars": full_spool_max_chars,
+                "streams": ["stdout", "stderr"],
+                "captures_sha256": True,
+                "artifact_refs": "stored when an output artifact writer is provided",
+            },
+            violations=list(execution_plan.violations),
+        )
+
+    @staticmethod
+    def empty_log_capture(*, max_excerpt_chars: int, full_spool_max_chars: int) -> SandboxLogCapture:
+        return SandboxLogCapture(
+            max_excerpt_chars=max_excerpt_chars,
+            full_spool_max_chars=full_spool_max_chars,
+            stdout=SandboxLogStreamCapture(stream="stdout"),
+            stderr=SandboxLogStreamCapture(stream="stderr"),
         )
 
     def path_snapshot(self, path: Path) -> dict[str, object]:

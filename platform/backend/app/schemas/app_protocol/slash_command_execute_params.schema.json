@@ -1,0 +1,16 @@
+{
+  "$id": "https://grounded.local/schemas/app_protocol/slash_command_execute_params.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "properties": {
+    "command_id": {
+      "title": "Command Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "command_id"
+  ],
+  "title": "SlashCommandExecuteParams",
+  "type": "object"
+}

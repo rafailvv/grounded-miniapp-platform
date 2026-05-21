@@ -6,6 +6,7 @@ from typing import Any
 
 from app.models.common import GenerationMode
 from app.models.domain import JobRecord
+from app.services.generation_sla import GenerationSla
 
 
 def _env_int(name: str, default: int) -> int:
@@ -31,6 +32,11 @@ COMPLETION_BUDGETS = {
         "token_limit": _env_int("CODE_AGENT_QUALITY_TOKEN_LIMIT", 2_200_000),
         "turn_budget_cap": 280,
     },
+    GenerationMode.PRODUCTION: {
+        "time_limit_ms": _env_int("CODE_AGENT_PRODUCTION_TIME_LIMIT_MS", 60 * 60 * 1000),
+        "token_limit": _env_int("CODE_AGENT_PRODUCTION_TOKEN_LIMIT", 3_000_000),
+        "turn_budget_cap": 360,
+    },
     GenerationMode.BASIC: {
         "time_limit_ms": _env_int("CODE_AGENT_FAST_TIME_LIMIT_MS", 16 * 60 * 1000),
         "token_limit": _env_int("CODE_AGENT_FAST_TOKEN_LIMIT", 1_200_000),
@@ -54,7 +60,11 @@ def completion_budget_for_mode(mode_value: GenerationMode | str | None) -> dict[
     mode = generation_mode(mode_value)
     budget = dict(COMPLETION_BUDGETS.get(mode) or COMPLETION_BUDGETS[GenerationMode.BALANCED])
     budget["mode"] = mode.value
-    budget["policy"] = "time_or_token_budget"
+    profile = GenerationSla.profile(mode)
+    budget["policy"] = "time_or_token_budget_plus_product_sla"
+    budget["sla_profile"] = profile.to_dict()
+    budget["required_checks"] = list(profile.required_checks)
+    budget["audit_level"] = profile.audit_level
     return budget
 
 

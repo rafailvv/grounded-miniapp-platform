@@ -2519,6 +2519,10 @@ class RunService:
             artifacts = {}
         payload = WorkspaceMemoryPipeline.extract_run(run, artifacts)
         self.store.upsert("reports", f"memory_stage1:{run.workspace_id}:{run.run_id}", payload)
+        try:
+            self._auto_consolidate_workspace_memory(run.workspace_id)
+        except Exception:
+            logger.exception("memory_auto_consolidate_failed run_id=%s workspace_id=%s", run.run_id, run.workspace_id)
         if self.event_journal_service is not None:
             try:
                 self.event_journal_service.append_run(
@@ -2533,6 +2537,44 @@ class RunService:
                 )
             except Exception:
                 pass
+
+    def _auto_consolidate_workspace_memory(self, workspace_id: str) -> None:
+        stage1 = [
+            payload
+            for key, payload in self.store.items("reports")
+            if key.startswith(f"memory_stage1:{workspace_id}:") and isinstance(payload, dict)
+        ]
+        current = self.store.get("reports", f"workspace_memory:{workspace_id}") or {"workspace_id": workspace_id, "items": []}
+        source_dir = self.workspace_service.source_dir(workspace_id)
+        consolidated = WorkspaceMemoryPipeline.consolidate(
+            workspace_id,
+            stage1,
+            current,
+            workspace_root=source_dir,
+        )
+        stale_check = WorkspaceMemoryPipeline.stale_check(source_dir, consolidated)
+        consolidated["stale_check"] = stale_check
+        WorkspaceMemoryPipeline.apply_stale_status(consolidated, stale_check)
+        consolidated["memory_summary"] = WorkspaceMemoryPipeline.summary(workspace_id, consolidated)
+        self.store.upsert("reports", f"workspace_memory:{workspace_id}", consolidated)
+        pipeline = consolidated.get("pipeline") if isinstance(consolidated.get("pipeline"), dict) else {}
+        self.store.upsert(
+            "reports",
+            f"memory_consolidation:{workspace_id}",
+            {
+                "schema": "grounded.memory_consolidation.v1",
+                "workspace_id": workspace_id,
+                "status": "auto_consolidated",
+                "stage1_count": len(stage1),
+                "raw_count": int(pipeline.get("stage1_items", 0) or 0),
+                "active_count": int(pipeline.get("active_count", 0) or 0),
+                "stale_count": int(pipeline.get("stale_count", 0) or 0),
+                "expired_count": int(pipeline.get("expired_count", 0) or 0),
+                "superseded_count": int(pipeline.get("superseded_count", 0) or 0),
+                "deduped_count": int(pipeline.get("deduped_count", 0) or 0),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
 
     def _schedule_auto_repair_continuation_if_needed(self, run: RunRecord) -> None:
         try:

@@ -147,10 +147,18 @@ class ToolRouteDecision:
     risk: str
     approval_class: str
     concurrency_safe: bool
+    parallel_safe: bool
     timeout_seconds: int
     output_cap_chars: int
     sandbox_profile: str
     artifact_spill_policy: str
+    capabilities: list[str] = field(default_factory=list)
+    allowed_paths: dict[str, Any] = field(default_factory=dict)
+    side_effects: list[str] = field(default_factory=list)
+    side_effect_class: str = "unknown"
+    result_summarization: dict[str, Any] = field(default_factory=dict)
+    retry_policy: dict[str, Any] = field(default_factory=dict)
+    failure_signatures: dict[str, Any] = field(default_factory=dict)
     deferred: bool = False
     dynamic: bool = False
 
@@ -328,33 +336,51 @@ class ToolRouter:
                 continue
             canonical = canonical_tool_name(name)
             protocol = tool_protocol_spec(canonical)
+            contract = protocol.as_contract()
             tools.append(
                 {
                     "name": name,
                     "canonical": canonical,
                     "kind": spec.kind,
-                    "risk": protocol.risk,
-                    "approval_class": protocol.approval_class,
-                    "sandbox_profile": protocol.sandbox_profile,
-                    "concurrency_safe": protocol.concurrency_safe,
-                    "timeout_seconds": protocol.timeout_seconds,
-                    "output_cap_chars": protocol.output_cap_chars,
-                    "artifact_spill_policy": protocol.artifact_spill_policy,
+                    "risk": contract["risk"],
+                    "capabilities": contract["capabilities"],
+                    "approval_class": contract["approval_class"],
+                    "sandbox_profile": contract["sandbox_profile"],
+                    "allowed_paths": contract["allowed_paths"],
+                    "side_effects": contract["side_effects"],
+                    "side_effect_class": contract["side_effect_class"],
+                    "concurrency_safe": contract["concurrency_safe"],
+                    "parallel_safe": contract["parallel_safe"],
+                    "timeout_seconds": contract["timeout_seconds"],
+                    "output_cap_chars": contract["output_cap_chars"],
+                    "artifact_spill_policy": contract["artifact_spill_policy"],
+                    "result_summarization": contract["result_summarization"],
+                    "retry_policy": contract["retry_policy"],
+                    "failure_signatures": contract["failure_signatures"],
                     "activity": spec.activity,
                     "progress_label": spec.progress_label,
                     "aliases": list(spec.aliases),
                     "mode_visibility": list(spec.mode_visibility),
-                    "dynamic": bool(protocol.dynamic or spec.dynamic),
-                    "deferred": bool(protocol.deferred or spec.deferred or spec.kind == "mutating"),
-                    "input_schema": protocol.input_schema,
-                    "output_schema": protocol.output_schema,
+                    "dynamic": bool(contract["dynamic"] or spec.dynamic),
+                    "deferred": bool(contract["deferred"] or spec.deferred or spec.kind == "mutating"),
+                    "input_schema": contract["input_schema"],
+                    "output_schema": contract["output_schema"],
                 }
             )
         return {
-            "schema": "grounded.tool_router.manifest.v1",
+            "schema": "grounded.tool_router.manifest.v2",
             "boundary": "model_facing_agent_tools",
             "mutation_boundary": "validate_and_defer_to_draft_apply_pipeline",
             "allowed_modes": ["default", "read_only", "mutation_required", "verification", "worker_branch"],
+            "parallel_execution_policy": {
+                "parallel_safe_field": "parallel_safe",
+                "concurrent_batch_rule": "Only read-only tools with side_effect_class in none/read_workspace and parallel_safe=true are batched concurrently.",
+            },
+            "result_policy": {
+                "summary_field": "result_summary",
+                "spill_policy_field": "artifact_spill_policy",
+                "failure_signature_field": "failure_signature",
+            },
             "dynamic_tool_discovery": DynamicToolCatalog.manifest(),
             "tools": tools,
         }
@@ -487,13 +513,13 @@ class ToolRouter:
             {
                 "tool": "agent_tool_batch",
                 "contract": "ToolRouter batches safe read-only tools concurrently; verification and deferred mutations are serialized.",
-                "router": "tool_router.v1",
+                "router": "tool_router.v2",
                 "read_only_count": len(plan.read_only_requests),
                 "mutating_count": len(plan.mutating_requests),
                 "verification_count": len(plan.verification_requests),
                 "unknown_count": len(plan.unknown_requests),
                 "ordered_batches": [
-                    {"concurrency_safe": batch.concurrency_safe, "tools": batch.tools}
+                    {"concurrency_safe": batch.concurrency_safe, "parallel_safe": batch.concurrency_safe, "tools": batch.tools}
                     for batch in plan.ordered_batches
                 ],
             }
@@ -543,10 +569,11 @@ class ToolRouter:
             envelopes=envelopes,
             deferred_changes=deferred_changes,
             batch_summary={
-                "schema": "grounded.tool_router.batch.v1",
+                "schema": "grounded.tool_router.batch.v2",
                 "tool_count": len(requests),
                 "duration_ms": int((time.perf_counter() - started_at) * 1000),
                 "envelope_count": len(envelopes),
+                "parallel_safe_count": sum(1 for item in envelopes if item.get("parallel_safe") is True),
                 "hook_context_count": sum(
                     len(item.get("hook_contexts") or [])
                     for item in model_results
@@ -631,6 +658,7 @@ class ToolRouter:
         allowed_names = self.allowed_tool_names(mode=self.context.mode, forced_allowed=self.context.forced_allowed_tools)
         allowed = spec is not None and request.tool in allowed_names
         reason = "allowed" if allowed else f"{request.tool or canonical} is not allowed in {self.context.mode or 'default'} mode."
+        contract = protocol.as_contract()
         return ToolRouteDecision(
             allowed=allowed,
             reason=reason,
@@ -638,10 +666,18 @@ class ToolRouter:
             risk=protocol.risk,
             approval_class=protocol.approval_class,
             concurrency_safe=protocol.concurrency_safe,
+            parallel_safe=bool(contract["parallel_safe"]),
             timeout_seconds=protocol.timeout_seconds,
             output_cap_chars=protocol.output_cap_chars,
             sandbox_profile=protocol.sandbox_profile,
             artifact_spill_policy=protocol.artifact_spill_policy,
+            capabilities=list(contract["capabilities"]),
+            allowed_paths=dict(contract["allowed_paths"]),
+            side_effects=list(contract["side_effects"]),
+            side_effect_class=str(contract["side_effect_class"]),
+            result_summarization=dict(contract["result_summarization"]),
+            retry_policy=dict(contract["retry_policy"]),
+            failure_signatures=dict(contract["failure_signatures"]),
             deferred=bool(protocol.deferred or kind == "mutating"),
             dynamic=bool(protocol.dynamic or (spec.dynamic if spec else False)),
         )
@@ -1060,6 +1096,8 @@ class ToolRouter:
             "trace": trace,
             "reason": request.reason,
         }
+        result_summary = self._result_summary(request, decision, result, status="deferred")
+        result["result_summary"] = result_summary
         envelope = self._make_envelope(
             request,
             decision,
@@ -1067,6 +1105,7 @@ class ToolRouter:
             status="deferred",
             approval={"required": True, "status": "deferred", "mode": "draft_action_proposal"},
             changed_files=[item.file_path for item in changes],
+            result_summary=result_summary,
         )
         return ToolRouterResult(
             request=request,
@@ -1215,7 +1254,9 @@ class ToolRouter:
         loaded_context: dict[str, str] | None = None,
         duration_ms: int | None = None,
     ) -> ToolRouterResult:
+        result_summary = self._result_summary(request, decision, result, status="completed")
         compacted, truncation, artifacts = self._compact_result(request, decision, result)
+        compacted = {**compacted, "result_summary": result_summary}
         envelope = self._make_envelope(
             request,
             decision,
@@ -1224,6 +1265,7 @@ class ToolRouter:
             artifacts=artifacts,
             truncation=truncation,
             duration_ms=duration_ms,
+            result_summary=result_summary,
         )
         return ToolRouterResult(
             request=request,
@@ -1247,7 +1289,20 @@ class ToolRouter:
             "error_code": error.get("code"),
             "details": error.get("details") or {},
         }
-        envelope = self._make_envelope(request, decision, result=result, error=error, status="failed")
+        failure_signature = self._failure_signature(request, error, result=result)
+        result_summary = self._result_summary(request, decision, result, status="failed", error=error, failure_signature=failure_signature)
+        result["failure_signature"] = failure_signature
+        result["result_summary"] = result_summary
+        envelope = self._make_envelope(
+            request,
+            decision,
+            result=result,
+            error=error,
+            status="failed",
+            result_summary=result_summary,
+            failure_class=str(error.get("code") or "tool_error"),
+            failure_signature=failure_signature,
+        )
         return ToolRouterResult(
             request=request,
             decision=decision,
@@ -1268,6 +1323,9 @@ class ToolRouter:
         truncation: dict[str, Any] | None = None,
         duration_ms: int | None = None,
         changed_files: list[str] | None = None,
+        result_summary: dict[str, Any] | None = None,
+        failure_class: str | None = None,
+        failure_signature: str | None = None,
     ) -> dict[str, Any]:
         resolved_approval = self._approval_payload(decision, approval)
         return tool_envelope(
@@ -1284,6 +1342,15 @@ class ToolRouter:
             tool_call_id=request.tool_call_id,
             duration_ms=duration_ms,
             changed_files=changed_files,
+            result_summary=result_summary,
+            capabilities=decision.capabilities,
+            allowed_paths=decision.allowed_paths,
+            side_effects=decision.side_effects,
+            side_effect_class=decision.side_effect_class,
+            parallel_safe=decision.parallel_safe,
+            retry_policy=decision.retry_policy,
+            failure_class=failure_class,
+            failure_signature=failure_signature,
         )
 
     @staticmethod
@@ -1310,6 +1377,79 @@ class ToolRouter:
         payload["envelope"] = envelope
         payload["tool_envelope"] = envelope
         return payload
+
+    def _result_summary(
+        self,
+        request: ToolCallRequest,
+        decision: ToolRouteDecision,
+        result: dict[str, Any],
+        *,
+        status: str,
+        error: dict[str, Any] | None = None,
+        failure_signature: str | None = None,
+    ) -> dict[str, Any]:
+        targets = self._visible_targets(request)
+        blocked_targets = self._blocked_targets(request)
+        result_keys = sorted(str(key) for key in result.keys())[:24]
+        counts: dict[str, int] = {}
+        for key, value in result.items():
+            if isinstance(value, list):
+                counts[f"{key}_count"] = len(value)
+            elif isinstance(value, dict):
+                counts[f"{key}_keys"] = len(value)
+        changed_files = [
+            str(item.get("file_path") or "")
+            for item in result.get("deferred_changes", [])
+            if isinstance(item, dict) and item.get("file_path")
+        ]
+        if not changed_files and isinstance(result.get("changed_files"), list):
+            changed_files = [str(item) for item in result["changed_files"] if str(item or "").strip()]
+        artifacts = result.get("artifacts") if isinstance(result.get("artifacts"), list) else []
+        summary = {
+            "schema": "grounded.tool_result_summary.v1",
+            "tool": request.canonical_tool,
+            "model_tool": request.tool,
+            "status": status,
+            "capabilities": list(decision.capabilities),
+            "side_effect_class": decision.side_effect_class,
+            "parallel_safe": decision.parallel_safe,
+            "targets": targets,
+            "blocked_targets": blocked_targets,
+            "changed_files": changed_files,
+            "result_keys": result_keys,
+            "counts": counts,
+            "artifact_count": len(artifacts),
+            "failure_signature": failure_signature,
+            "retry_policy": decision.retry_policy,
+            "summarization_policy": decision.result_summarization,
+        }
+        if error is not None:
+            summary["error_code"] = error.get("code")
+            summary["retryable"] = bool(error.get("retryable"))
+        if "semantic_status" in result:
+            summary["semantic_status"] = result.get("semantic_status")
+            summary["exit_code"] = result.get("exit_code")
+        if "failed_checks" in result:
+            summary["failed_check_count"] = len(result.get("failed_checks") or [])
+        if "workflow_results" in result:
+            summary["workflow_result_count"] = len(result.get("workflow_results") or [])
+        return summary
+
+    def _failure_signature(self, request: ToolCallRequest, error: dict[str, Any], *, result: dict[str, Any] | None = None) -> str:
+        details = error.get("details") if isinstance(error.get("details"), dict) else {}
+        file_path = str(request.input.get("file_path") or details.get("file_path") or "").strip()
+        code = str(error.get("code") or "tool_error")
+        if file_path:
+            return f"{request.canonical_tool}:{code}:{file_path}"
+        stable_payload = {
+            "tool": request.canonical_tool,
+            "code": code,
+            "details": details,
+            "input": self._protocol_input(request),
+            "status": (result or {}).get("status"),
+        }
+        digest = hashlib.sha256(json.dumps(stable_payload, sort_keys=True, default=str).encode("utf-8", errors="replace")).hexdigest()[:16]
+        return f"{request.canonical_tool}:{code}:{digest}"
 
     def _compact_result(
         self,

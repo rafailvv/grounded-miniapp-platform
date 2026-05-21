@@ -11,20 +11,62 @@ from app.models.memory import (
     MemoryCitation,
     MemoryConfidence,
     MemoryExpiry,
+    MemoryFailureShield,
     MemoryRetrievalResult,
+    MemorySummaryReport,
+    MemorySummarySection,
     MemoryStaleCheck,
     RawMemoryItem,
     RunMemoryBatch,
 )
+from app.services.repair_catalog import RepairCatalog
 
 
-MEMORY_KINDS = {"preference", "product_decision", "working_pattern", "failure_signature", "avoidance"}
+MEMORY_KINDS = {
+    "preference",
+    "product_decision",
+    "working_pattern",
+    "reusable_workflow",
+    "failure_signature",
+    "failure_shield",
+    "avoidance",
+}
 SECRET_PATTERNS = (
     re.compile(r"(api[_-]?key|token|secret|password)\s*=", re.I),
     re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"),
 )
 PATH_PATTERN = re.compile(r"\b(?:miniapp|app|tests|runtime)/[A-Za-z0-9_./-]+\.[A-Za-z0-9]+\b")
 TOKEN_PATTERN = re.compile(r"[A-Za-zА-Яа-я0-9_]{3,}")
+SENTENCE_SPLIT_RE = re.compile(r"[\n\r.!?;]+")
+PREFERENCE_POSITIVE_RE = re.compile(
+    r"\b(prefer|i like|we like|make sure|important|must keep)\b|"
+    r"(предпочитаю|люблю|нравится|важно|хочу|мне нужно|нужно чтобы)",
+    re.I,
+)
+PREFERENCE_NEGATIVE_RE = re.compile(
+    r"\b(avoid|do not|don't|never|dislike|hate|without)\b|"
+    r"(не\s+люблю|не\s+нравится|не\s+хочу|избегай|без\s+лишн|не\s+делай)",
+    re.I,
+)
+PRODUCT_DECISION_RE = re.compile(
+    r"\b(my goal|goal is|product should|the app should|the task is)\b|"
+    r"(моя задача|цель|задача|продукт должен|приложение должно|нужно быстро)",
+    re.I,
+)
+WORKFLOW_RE = re.compile(
+    r"\b(workflow|pipeline|repeatable|reusable|step|repair loop|generation loop)\b|"
+    r"(воркфлоу|пайплайн|процесс|сценарий|повторн|легко.*исправ|быстро.*создавать)",
+    re.I,
+)
+SUMMARY_KIND_ORDER = (
+    "preference",
+    "product_decision",
+    "failure_shield",
+    "reusable_workflow",
+    "working_pattern",
+    "failure_signature",
+    "avoidance",
+)
 STOP_WORDS = {
     "the",
     "and",
@@ -118,6 +160,9 @@ class WorkspaceMemoryPipeline:
             )
             items.append(raw.model_dump(mode="json", by_alias=True))
 
+        for kind, text, payload, evidence in WorkspaceMemoryPipeline._prompt_memory_candidates(getattr(run, "prompt", "")):
+            add(kind, text, payload, evidence)
+
         contract = dict(run.acceptance_contract or {})
         prompt_hints = contract.get("prompt_hints") if isinstance(contract.get("prompt_hints"), dict) else {}
         primary_entities = (run.implementation_plan or {}).get("primary_entities") if isinstance(run.implementation_plan, dict) else []
@@ -136,6 +181,13 @@ class WorkspaceMemoryPipeline:
                 {"touched_files": list(run.touched_files or [])[:20]},
                 {"source": "run_terminal_state", "status": run.status, "apply_status": run.apply_status},
             )
+            workflow_payload = WorkspaceMemoryPipeline._successful_workflow_payload(run, artifacts)
+            add(
+                "reusable_workflow",
+                WorkspaceMemoryPipeline._successful_workflow_text(workflow_payload),
+                workflow_payload,
+                {"source": "run_success_workflow", "status": run.status, "apply_status": run.apply_status},
+            )
         failure_signature = run.failure_signature or run.failure_class
         if failure_signature:
             add(
@@ -150,6 +202,19 @@ class WorkspaceMemoryPipeline:
                 {"failure_class": run.failure_class, "failure_signature": run.failure_signature},
                 {"source": "run_failure", "failure_class": run.failure_class, "failure_signature": run.failure_signature},
             )
+            shield = WorkspaceMemoryPipeline._failure_shield(
+                {
+                    "failure_signature": failure_signature,
+                    "failure_class": run.failure_class,
+                    "details": run.failure_reason,
+                    "message": run.failure_reason,
+                    "root_cause_summary": run.root_cause_summary,
+                    "paths": list(run.fix_targets or run.touched_files or [])[:20],
+                },
+                run=run,
+                source="run_failure",
+            )
+            add("failure_shield", WorkspaceMemoryPipeline._failure_shield_text(shield), shield, {"source": "run_failure", "failure_signature": failure_signature})
         for item in run.repair_issue_signatures or []:
             if isinstance(item, dict) and item.get("signature"):
                 add(
@@ -158,6 +223,12 @@ class WorkspaceMemoryPipeline:
                     item,
                     {"source": "repair_issue_signature", **item},
                 )
+                shield = WorkspaceMemoryPipeline._failure_shield(item, run=run, source="repair_issue_signature")
+                add("failure_shield", WorkspaceMemoryPipeline._failure_shield_text(shield), shield, {"source": "repair_issue_signature", **item})
+        for iteration in run.repair_iterations or []:
+            if isinstance(iteration, dict) and (iteration.get("failure_signature") or iteration.get("signature") or iteration.get("failed_check")):
+                shield = WorkspaceMemoryPipeline._failure_shield(iteration, run=run, source="repair_iteration")
+                add("failure_shield", WorkspaceMemoryPipeline._failure_shield_text(shield), shield, {"source": "repair_iteration"})
         for check in artifacts.get("check_results") or []:
             if isinstance(check, dict) and str(check.get("status") or "") in {"failed", "blocked"}:
                 add(
@@ -166,6 +237,20 @@ class WorkspaceMemoryPipeline:
                     {"check": check.get("name"), "logs": list(check.get("logs") or [])[-5:]},
                     {"source": "check_result", "check_name": check.get("name"), "status": check.get("status")},
                 )
+                shield = WorkspaceMemoryPipeline._failure_shield(
+                    {
+                        "signature": check.get("signature"),
+                        "failure_signature": check.get("failure_signature") or f"check_failed:{check.get('name') or 'unknown'}",
+                        "failure_class": check.get("name"),
+                        "check": check.get("name"),
+                        "details": check.get("details"),
+                        "message": check.get("details"),
+                        "logs": list(check.get("logs") or [])[-5:],
+                    },
+                    run=run,
+                    source="check_result",
+                )
+                add("failure_shield", WorkspaceMemoryPipeline._failure_shield_text(shield), shield, {"source": "check_result", "check_name": check.get("name")})
         status = "empty" if not items else "extracted"
         deduped = WorkspaceMemoryPipeline._dedupe(items)
         batch = RunMemoryBatch(
@@ -246,6 +331,7 @@ class WorkspaceMemoryPipeline:
             "updated_at": _now(),
         }
         WorkspaceMemoryPipeline._populate_buckets(current)
+        current["memory_summary"] = WorkspaceMemoryPipeline.summary(workspace_id, current)
         return current
 
     @staticmethod
@@ -273,6 +359,7 @@ class WorkspaceMemoryPipeline:
         top_k: int = 10,
         include_inactive: bool = False,
         failure_class: str | None = None,
+        detail_mode: str = "relevant",
     ) -> dict[str, Any]:
         prompt_tokens = _tokens(prompt)
         requested_paths = {str(path or "").strip().replace("\\", "/") for path in (paths or []) if str(path or "").strip()}
@@ -309,19 +396,290 @@ class WorkspaceMemoryPipeline:
             workspace_id=workspace_id,
             prompt_excerpt=_clean(prompt, limit=240),
             top_k=top_k,
+            detail_mode=detail_mode,
             status="retrieved" if selected else "empty",
             hits=selected,
             items=[hit["item"] for hit in selected],
             skipped=skipped[:50],
+            summary=MemorySummaryReport.model_validate(WorkspaceMemoryPipeline.summary(workspace_id, memory, prompt=prompt, paths=paths or [], top_k=min(top_k, 12))),
             stats={
                 "candidate_count": len([item for item in memory.get("items") or [] if isinstance(item, dict)]),
                 "selected_count": len(selected),
                 "skipped_count": len(skipped),
                 "include_inactive": include_inactive,
             },
+            source_refs={"workspace_memory": f"workspace_memory:{workspace_id}"},
             created_at=_now(),
         )
         return result.model_dump(mode="json", by_alias=True)
+
+    @staticmethod
+    def summary(
+        workspace_id: str,
+        memory: dict[str, Any],
+        *,
+        prompt: str = "",
+        paths: list[str] | None = None,
+        top_k: int = 12,
+    ) -> dict[str, Any]:
+        items: list[dict[str, Any]] = []
+        stale_items: list[dict[str, Any]] = []
+        expired_count = 0
+        superseded_count = 0
+        for raw_item in memory.get("items") or []:
+            if not isinstance(raw_item, dict):
+                continue
+            item = WorkspaceMemoryPipeline._normalize_consolidated_item(raw_item)
+            text = str(item.get("text") or "")
+            status = str(item.get("status") or "active")
+            stale = status == "stale" or (item.get("stale_check") or {}).get("status") == "stale"
+            expired = status == "expired" or bool((item.get("expiry") or {}).get("expired"))
+            if status == "superseded":
+                superseded_count += 1
+                continue
+            if expired:
+                expired_count += 1
+                continue
+            if stale:
+                stale_items.append(WorkspaceMemoryPipeline._skip(item, "stale_reference"))
+                continue
+            if not _secret_free(text) or not _secret_free(str(item.get("payload") or "")):
+                continue
+            items.append(item)
+
+        top_k = max(1, min(int(top_k or 12), 30))
+        sections: list[dict[str, Any]] = []
+        lines = ["Workspace memory summary (always loaded; retrieve details on demand):"]
+        used = 0
+        for kind in SUMMARY_KIND_ORDER:
+            candidates = [item for item in items if item.get("kind") == kind]
+            if not candidates:
+                continue
+            candidates.sort(key=WorkspaceMemoryPipeline._summary_rank)
+            selected = candidates[:3 if kind in {"preference", "failure_shield"} else 2]
+            if used >= top_k:
+                break
+            selected = selected[: max(0, top_k - used)]
+            used += len(selected)
+            section_items = [WorkspaceMemoryPipeline._summary_item(item) for item in selected]
+            if not section_items:
+                continue
+            title = WorkspaceMemoryPipeline._summary_title(kind)
+            sections.append({"kind": kind, "title": title, "items": section_items})
+            rendered = "; ".join(str(item.get("summary") or item.get("text") or "") for item in section_items if item.get("summary") or item.get("text"))
+            if rendered:
+                lines.append(f"- {title}: {rendered[:520]}")
+
+        if len(lines) == 1:
+            lines.append("- No active workspace memory yet.")
+        if stale_items:
+            lines.append(f"- Stale memory hidden: {len(stale_items)} item(s); use memory retrieval with include_inactive for audit details.")
+
+        counts = {
+            "active_count": len(items),
+            "section_count": len(sections),
+            "selected_count": sum(len(section.get("items") or []) for section in sections),
+            "stale_count": len(stale_items),
+            "expired_count": expired_count,
+            "superseded_count": superseded_count,
+        }
+        detail_query = {
+            "schema": "grounded.memory_retrieval.v1",
+            "endpoint": f"/workspaces/{workspace_id}/memory/retrieve",
+            "mode": "details_on_demand",
+            "prompt_excerpt": _clean(prompt, limit=160),
+            "paths": list(paths or [])[:20],
+        }
+        report = MemorySummaryReport(
+            workspace_id=workspace_id,
+            status="summarized" if sections else "empty",
+            generated_at=_now(),
+            text="\n".join(lines),
+            sections=[MemorySummarySection.model_validate(section) for section in sections],
+            counts=counts,
+            stale={"status": "stale_hidden" if stale_items else "fresh", "items": stale_items[:20], "count": len(stale_items)},
+            detail_retrieval=detail_query,
+            source_refs={"workspace_memory": f"workspace_memory:{workspace_id}"},
+        )
+        return report.model_dump(mode="json", by_alias=True)
+
+    @staticmethod
+    def apply_stale_status(payload: dict[str, Any], stale_check: dict[str, Any]) -> dict[str, Any]:
+        checks_by_id: dict[str, list[dict[str, Any]]] = {}
+        for check in stale_check.get("checks") or []:
+            if isinstance(check, dict) and check.get("memory_id"):
+                checks_by_id.setdefault(str(check.get("memory_id")), []).append(check)
+        for item in payload.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            memory_id = str(item.get("memory_id") or "")
+            checks = checks_by_id.get(memory_id, [])
+            if not checks:
+                continue
+            is_stale = any(not bool(check.get("exists", True)) for check in checks)
+            item["stale_check"] = MemoryStaleCheck(
+                status="stale" if is_stale else "fresh_or_unreferenced",
+                checks=checks,
+                items=checks[:40],
+            ).model_dump(mode="json", by_alias=True)
+            if item.get("status") == "superseded" or (item.get("expiry") or {}).get("expired"):
+                continue
+            item["status"] = "stale" if is_stale else "active"
+        return payload
+
+    @staticmethod
+    def _prompt_memory_candidates(prompt: object) -> list[tuple[str, str, dict[str, Any], dict[str, Any]]]:
+        candidates: list[tuple[str, str, dict[str, Any], dict[str, Any]]] = []
+        for sentence in WorkspaceMemoryPipeline._prompt_sentences(prompt):
+            lowered = sentence.lower()
+            if PREFERENCE_NEGATIVE_RE.search(sentence) or PREFERENCE_POSITIVE_RE.search(sentence):
+                polarity = "dislike" if PREFERENCE_NEGATIVE_RE.search(sentence) else "like"
+                candidates.append(
+                    (
+                        "preference",
+                        f"User preference ({polarity}): {sentence}",
+                        {"polarity": polarity, "source_text": sentence},
+                        {"source": "prompt_preference", "polarity": polarity},
+                    )
+                )
+            if PRODUCT_DECISION_RE.search(sentence):
+                candidates.append(
+                    (
+                        "product_decision",
+                        f"Product decision from prompt: {sentence}",
+                        {"source_text": sentence},
+                        {"source": "prompt_product_decision"},
+                    )
+                )
+            if WORKFLOW_RE.search(sentence) or ("созда" in lowered and "исправ" in lowered):
+                candidates.append(
+                    (
+                        "reusable_workflow",
+                        f"Reusable workflow expectation from prompt: {sentence}",
+                        {"source_text": sentence, "workflow_steps": WorkspaceMemoryPipeline._workflow_steps_from_text(sentence)},
+                        {"source": "prompt_reusable_workflow"},
+                    )
+                )
+        return candidates
+
+    @staticmethod
+    def _prompt_sentences(prompt: object) -> list[str]:
+        text = str(prompt or "").strip()
+        sentences: list[str] = []
+        for raw in SENTENCE_SPLIT_RE.split(text):
+            sentence = _clean(raw, limit=520)
+            if len(sentence) < 12:
+                continue
+            if not _secret_free(sentence):
+                continue
+            sentences.append(sentence)
+        return sentences[:12]
+
+    @staticmethod
+    def _workflow_steps_from_text(text: str) -> list[str]:
+        lowered = text.lower()
+        steps: list[str] = []
+        if "созда" in lowered or "generate" in lowered or "generation" in lowered:
+            steps.append("Generate the app from the prompt contract.")
+        if "работ" in lowered or "fully working" in lowered or "quality" in lowered:
+            steps.append("Verify the product is fully working before completion.")
+        if "исправ" in lowered or "repair" in lowered or "fix" in lowered:
+            steps.append("Use failure evidence to repair without changing unrelated behavior.")
+        if "улучш" in lowered or "improve" in lowered:
+            steps.append("Keep the implementation easy to extend in later iterations.")
+        return steps or ["Preserve this prompt-level workflow expectation during future runs."]
+
+    @staticmethod
+    def _successful_workflow_payload(run: Any, artifacts: dict[str, Any]) -> dict[str, Any]:
+        checks = [item for item in artifacts.get("check_results") or [] if isinstance(item, dict)]
+        passed_checks = [str(item.get("name") or "") for item in checks if str(item.get("status") or "") in {"passed", "success"} and item.get("name")]
+        touched_files = list(getattr(run, "touched_files", []) or [])[:30]
+        return {
+            "run_id": getattr(run, "run_id", None),
+            "workflow_steps": [
+                "Start from the prompt-derived acceptance contract.",
+                "Preserve touched workflow files unless the new prompt changes the contract.",
+                "Rerun the successful checks or equivalent proof before applying.",
+            ],
+            "touched_files": touched_files,
+            "passed_checks": passed_checks[:20],
+            "verification_refs": {
+                "verification": getattr(run, "verification_report_ref", None),
+                "trace_bundle": getattr(run, "trace_bundle_ref", None),
+            },
+        }
+
+    @staticmethod
+    def _successful_workflow_text(payload: dict[str, Any]) -> str:
+        files = ", ".join(str(path) for path in (payload.get("touched_files") or [])[:4])
+        checks = ", ".join(str(name) for name in (payload.get("passed_checks") or [])[:4])
+        parts = ["Successful applied run forms a reusable workflow."]
+        if files:
+            parts.append(f"Preserve changed files such as {files}.")
+        if checks:
+            parts.append(f"Verify with checks such as {checks}.")
+        return " ".join(parts)
+
+    @staticmethod
+    def _failure_shield(issue: dict[str, Any], *, run: Any, source: str) -> dict[str, Any]:
+        packet = RepairCatalog.classify_issue(issue)
+        signature = str(
+            issue.get("failure_signature")
+            or issue.get("signature")
+            or packet.get("failure_signature")
+            or packet.get("signature")
+            or getattr(run, "failure_signature", None)
+            or getattr(run, "failure_class", None)
+            or "uncatalogued_failure"
+        )
+        symptom = _clean(
+            issue.get("details")
+            or issue.get("message")
+            or issue.get("failure_reason")
+            or getattr(run, "failure_reason", None)
+            or packet.get("failed_check")
+            or signature,
+            limit=520,
+        )
+        cause = _clean(
+            issue.get("root_cause_summary")
+            or getattr(run, "root_cause_summary", None)
+            or packet.get("likely_root_cause")
+            or "Cause is not proven yet; collect focused evidence before patching.",
+            limit=520,
+        )
+        fix = _clean(packet.get("instruction") or "Read implicated files, patch the smallest failing slice, then rerun the failing check.", limit=620)
+        verification = _clean(
+            " ".join(str(value or "") for value in (packet.get("verification_command"), packet.get("verification_check"))).strip()
+            or str(packet.get("expected_proof") or "rerun failing check successfully"),
+            limit=240,
+        )
+        shield = MemoryFailureShield(
+            failure_signature=signature,
+            symptom=symptom,
+            cause=cause,
+            fix=fix,
+            verification=verification,
+            check_name=str(issue.get("check") or issue.get("failed_check") or packet.get("failed_check") or "") or None,
+            source=source,
+            payload={
+                "repair_packet": packet.get("repair_packet") if isinstance(packet.get("repair_packet"), dict) else {},
+                "target_files": list(packet.get("target_files") or packet.get("likely_files") or [])[:20],
+                "retry_policy": packet.get("retry_policy"),
+                "required_next_tool": packet.get("required_next_tool"),
+                "expected_proof": packet.get("expected_proof") or packet.get("post_fix_proof"),
+            },
+        )
+        return shield.model_dump(mode="json", by_alias=True)
+
+    @staticmethod
+    def _failure_shield_text(shield: dict[str, Any]) -> str:
+        signature = shield.get("failure_signature") or "uncatalogued_failure"
+        symptom = shield.get("symptom") or "unknown symptom"
+        cause = shield.get("cause") or "unknown cause"
+        fix = shield.get("fix") or "repair from evidence"
+        verification = shield.get("verification") or "rerun failing check"
+        return f"Failure shield `{signature}`: symptom {symptom}; cause {cause}; fix {fix}; verification {verification}."
 
     @staticmethod
     def _artifact_refs(run: Any) -> dict[str, Any]:
@@ -359,7 +717,9 @@ class WorkspaceMemoryPipeline:
             "preference": 0.7,
             "product_decision": 0.66,
             "working_pattern": 0.82,
+            "reusable_workflow": 0.78,
             "failure_signature": 0.76,
+            "failure_shield": 0.8,
             "avoidance": 0.72,
         }.get(kind, 0.5)
         signals = [str(evidence.get("source") or "extracted")]
@@ -383,7 +743,7 @@ class WorkspaceMemoryPipeline:
 
     @staticmethod
     def _expiry_for_kind(kind: str, created_at: str) -> MemoryExpiry:
-        ttl_by_kind = {"failure_signature": 30, "avoidance": 45, "working_pattern": 120}
+        ttl_by_kind = {"failure_signature": 30, "failure_shield": 60, "avoidance": 45, "working_pattern": 120, "reusable_workflow": 120}
         ttl = ttl_by_kind.get(kind)
         expires_at = None
         if ttl:
@@ -559,7 +919,15 @@ class WorkspaceMemoryPipeline:
             score += 5.0
             reasons.append("failure_match")
         kind = str(item.get("kind") or "")
-        kind_weight = {"product_decision": 2.2, "preference": 2.0, "working_pattern": 1.8, "failure_signature": 1.6, "avoidance": 1.4}.get(kind, 0.7)
+        kind_weight = {
+            "product_decision": 2.2,
+            "preference": 2.0,
+            "failure_shield": 1.95,
+            "reusable_workflow": 1.9,
+            "working_pattern": 1.8,
+            "failure_signature": 1.6,
+            "avoidance": 1.4,
+        }.get(kind, 0.7)
         score += kind_weight
         confidence = item.get("confidence") if isinstance(item.get("confidence"), dict) else {}
         confidence_score = float(confidence.get("score") or 0.5)
@@ -578,6 +946,75 @@ class WorkspaceMemoryPipeline:
         return score, list(dict.fromkeys(reasons))
 
     @staticmethod
+    def _summary_rank(item: dict[str, Any]) -> tuple[float, str]:
+        confidence = item.get("confidence") if isinstance(item.get("confidence"), dict) else {}
+        score = float(confidence.get("score") or 0.5)
+        created = str(item.get("updated_at") or item.get("consolidated_at") or item.get("created_at") or "")
+        return (-score, created)
+
+    @staticmethod
+    def _summary_item(item: dict[str, Any]) -> dict[str, Any]:
+        payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+        text = str(item.get("text") or "").strip()
+        kind = str(item.get("kind") or "")
+        summary = text[:260]
+        if kind == "preference" and payload.get("polarity"):
+            summary = f"{payload.get('polarity')}: {text[:220]}"
+        elif kind == "failure_shield":
+            signature = payload.get("failure_signature") or item.get("failure_signature")
+            if not signature:
+                match = re.search(r"`([^`]+)`", text)
+                signature = match.group(1) if match else item.get("memory_id")
+            fix = payload.get("fix") or WorkspaceMemoryPipeline._nested_payload_value(payload, ("fix", "instruction"))
+            verification = payload.get("verification") or WorkspaceMemoryPipeline._nested_payload_value(payload, ("verification_check", "verification_command"))
+            parts = [str(signature or "failure")]
+            if fix:
+                parts.append(f"fix: {str(fix)[:160]}")
+            if verification:
+                parts.append(f"verify: {str(verification)[:120]}")
+            summary = " -> ".join(parts)
+        elif kind == "reusable_workflow" and payload.get("workflow_steps"):
+            summary = " / ".join(str(step) for step in list(payload.get("workflow_steps") or [])[:3])[:280]
+        return {
+            "memory_id": item.get("memory_id"),
+            "kind": kind,
+            "summary": summary,
+            "text": text[:320],
+            "confidence": item.get("confidence") or {},
+            "payload": {key: payload.get(key) for key in ("polarity", "failure_signature", "workflow_steps", "touched_files", "passed_checks") if key in payload},
+        }
+
+    @staticmethod
+    def _nested_payload_value(value: Any, keys: tuple[str, ...]) -> str:
+        if isinstance(value, dict):
+            for key in keys:
+                raw = value.get(key)
+                if raw:
+                    return _clean(raw, limit=180)
+            for nested in value.values():
+                found = WorkspaceMemoryPipeline._nested_payload_value(nested, keys)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for nested in value:
+                found = WorkspaceMemoryPipeline._nested_payload_value(nested, keys)
+                if found:
+                    return found
+        return ""
+
+    @staticmethod
+    def _summary_title(kind: str) -> str:
+        return {
+            "preference": "User likes and dislikes",
+            "product_decision": "Product decisions",
+            "failure_shield": "Failure shields",
+            "reusable_workflow": "Reusable workflows",
+            "working_pattern": "Working patterns",
+            "failure_signature": "Known failures",
+            "avoidance": "Avoidance rules",
+        }.get(kind, kind.replace("_", " ").title())
+
+    @staticmethod
     def _skip(item: dict[str, Any], reason: str) -> dict[str, Any]:
         return {
             "memory_id": item.get("memory_id"),
@@ -593,7 +1030,9 @@ class WorkspaceMemoryPipeline:
             "preference": "user_preferences",
             "product_decision": "product_decisions",
             "working_pattern": "architecture_summary",
+            "reusable_workflow": "reusable_workflows",
             "failure_signature": "known_failures",
+            "failure_shield": "failure_shields",
             "avoidance": "rejected_approaches",
         }
         for bucket in bucket_map.values():

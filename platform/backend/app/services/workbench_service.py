@@ -24,6 +24,7 @@ from app.models.prompt_suggestions import PromptSuggestionsReport
 from app.models.webhooks import WebhookCreateRequest, WebhookUpdateRequest
 from app.models.workbench import (
     GateReport,
+    PromptCompletionAuditReport,
     RepairAttemptsReport,
     RepairCase,
     RepairCasesReport,
@@ -38,6 +39,7 @@ from app.models.workbench import (
     ToolEventsReport,
     TraceBundleReport,
     TraceState,
+    VisualRegressionReport,
     WorkbenchApiModel,
 )
 from app.modules.miniapp_agent_loop.lsp_tools import LspToolService
@@ -64,9 +66,11 @@ from app.services.generation_enhancements import (
     SkillPackCatalog,
     SlashCommandCatalog,
     TraceReducer,
+    VisualRegressionGenerator,
     VisualQAGenerator,
     WorkerRoleCatalog,
 )
+from app.services.generation_sla import GenerationSla
 from app.services.golden_generated_apps import GoldenGeneratedAppCatalog
 from app.services.skill_registry import SkillRegistryService
 from app.services.miniapp_contract import MiniAppContractMaterializer, MiniAppRouteRegistry
@@ -81,7 +85,7 @@ from app.services.output_artifact_service import OutputArtifactService
 from app.services.pr_babysitter import PrBabysitterService
 from app.services.prompt_suggestions import PromptSuggestionService
 from app.services.product_readiness import ProductReadinessContract
-from app.services.requirement_traceability import RequirementTraceabilityMatrix
+from app.services.requirement_traceability import PromptArtifactCompletionAudit, RequirementTraceabilityMatrix
 from app.services.run_compaction import RunCompactionService
 from app.services.run_protocol import RunProtocolConflict, RunProtocolService, diff_sha256
 from app.services.trace_bundle import TraceBundleReducer
@@ -733,6 +737,14 @@ class WorkbenchService:
             root = self.workspace_service.source_dir(workspace_id)
         evaluation = self.exec_policy_service.evaluate_command(command, preset=preset, root=root, workspace_id=workspace_id)
         evaluation = self._apply_workspace_approval_grant(workspace_id, evaluation)
+        self.exec_policy_service.append_audit_record(
+            self.store,
+            workspace_id=workspace_id,
+            command=command,
+            evaluation=evaluation,
+            run_id=run_id,
+            source="policy.evaluate",
+        )
         approval = dict(evaluation.get("approval") or {})
         decision = evaluation.get("decision") if isinstance(evaluation.get("decision"), dict) else {}
         if decision.get("action") == "forbidden" or approval.get("status") == "blocked":
@@ -1742,6 +1754,33 @@ class WorkbenchService:
         self.store.upsert("reports", f"requirement_traceability:{run_id}", payload)
         return payload
 
+    def prompt_completion_audit(
+        self,
+        run_id: str,
+        *,
+        run: RunRecord | None = None,
+        artifacts: dict[str, Any] | None = None,
+        traceability: dict[str, Any] | None = None,
+        browser_proof: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        resolved_run = run or self.run_service.get_run(run_id)
+        resolved_artifacts = artifacts if isinstance(artifacts, dict) else self._run_artifacts_or_empty(run_id)
+        resolved_browser = browser_proof if isinstance(browser_proof, dict) else self._normalize_browser_proof_payload(resolved_run, resolved_artifacts)
+        resolved_traceability = traceability if isinstance(traceability, dict) else self.requirement_traceability(
+            run_id,
+            run=resolved_run,
+            artifacts=resolved_artifacts,
+            browser_proof=resolved_browser,
+        )
+        payload = PromptArtifactCompletionAudit.build(
+            run=resolved_run,
+            artifacts=resolved_artifacts,
+            traceability=resolved_traceability,
+            browser_proof=resolved_browser,
+        )
+        self.store.upsert("reports", f"prompt_completion_audit:{run_id}", payload)
+        return self._typed_payload(PromptCompletionAuditReport, payload)
+
     def acceptance_scenarios(self, run_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
         payload = AcceptanceScenarioGenerator.build(run, self._run_artifacts_or_empty(run_id))
@@ -1758,6 +1797,25 @@ class WorkbenchService:
         payload = VisualQAGenerator.build(run=run, artifacts=self._run_artifacts_or_empty(run_id), source_dir=source_dir)
         self.store.upsert("reports", f"visual_qa:{run_id}", payload)
         return payload
+
+    def visual_regression(
+        self,
+        run_id: str,
+        *,
+        run: RunRecord | None = None,
+        artifacts: dict[str, Any] | None = None,
+        browser_proof: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        resolved_run = run or self.run_service.get_run(run_id)
+        resolved_artifacts = artifacts if isinstance(artifacts, dict) else self._run_artifacts_or_empty(run_id)
+        resolved_browser = browser_proof if isinstance(browser_proof, dict) else self._normalize_browser_proof_payload(resolved_run, resolved_artifacts)
+        payload = VisualRegressionGenerator.build(
+            run=resolved_run,
+            artifacts=resolved_artifacts,
+            browser_proof=resolved_browser,
+        )
+        self.store.upsert("reports", f"visual_regression:{run_id}", payload)
+        return self._typed_payload(VisualRegressionReport, payload)
 
     def trace_reducer(self, run_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
@@ -1876,6 +1934,8 @@ class WorkbenchService:
         diff_text = str(artifacts.get("diff") or "")
         check_results = [item for item in artifacts.get("check_results") or [] if isinstance(item, dict)]
         mode_value = str(getattr(run.generation_mode, "value", run.generation_mode) or "").lower()
+        generation_sla = GenerationSla.profile(mode_value)
+        full_audit_required = GenerationSla.requires_full_audit(mode_value)
         readiness = ProductReadinessContract.evaluate(
             run_mode=run.mode,
             generation_mode=mode_value,
@@ -1905,7 +1965,24 @@ class WorkbenchService:
         apply_ok = run.apply_status == "applied"
         browser_proof = self._normalize_browser_proof_payload(run, artifacts)
         traceability = self.requirement_traceability(run_id, run=run, artifacts=artifacts, browser_proof=browser_proof)
-        issues.extend(RequirementTraceabilityMatrix.blocking_issues(traceability))
+        if full_audit_required:
+            issues.extend(RequirementTraceabilityMatrix.blocking_issues(traceability))
+        completion_audit = self.prompt_completion_audit(
+            run_id,
+            run=run,
+            artifacts=artifacts,
+            traceability=traceability,
+            browser_proof=browser_proof,
+        )
+        if full_audit_required:
+            issues.extend(PromptArtifactCompletionAudit.blocking_issues(completion_audit))
+        visual_regression = self.visual_regression(
+            run_id,
+            run=run,
+            artifacts=artifacts,
+            browser_proof=browser_proof,
+        )
+        issues.extend(VisualRegressionGenerator.blocking_issues(visual_regression))
 
         checkpoint = self.store.get("reports", run.resume_checkpoint_ref) if run.resume_checkpoint_ref else None
         checkpoint_packets = list((checkpoint or {}).get("repair_packets") or []) if isinstance(checkpoint, dict) else []
@@ -1951,6 +2028,22 @@ class WorkbenchService:
             "coverage": traceability.get("coverage") or {},
             "report_ref": f"requirement_traceability:{run_id}",
         }
+        readiness_evidence["prompt_completion_audit"] = {
+            "status": completion_audit.get("status"),
+            "coverage": {
+                "requirements": completion_audit.get("requirement_count"),
+                "covered": completion_audit.get("covered_count"),
+                "uncovered": completion_audit.get("uncovered_count"),
+            },
+            "report_ref": f"prompt_completion_audit:{run_id}",
+        }
+        readiness_evidence["generation_sla"] = generation_sla.to_dict()
+        readiness_evidence["visual_regression"] = {
+            "status": visual_regression.get("status"),
+            "blocking": visual_regression.get("blocking"),
+            "issue_count": len(visual_regression.get("issues") or []),
+            "report_ref": f"visual_regression:{run_id}",
+        }
         readiness_payload["evidence"] = readiness_evidence
         status = "passed" if not blocking and apply_ok else "blocked" if blocking else "pending"
         payload = {
@@ -1966,9 +2059,15 @@ class WorkbenchService:
             "blocking_repair_packet": repair_packets[0] if blocking and repair_packets else {},
             "product_readiness": readiness_payload,
             "requirement_traceability": traceability,
+            "prompt_completion_audit": completion_audit,
+            "visual_regression": visual_regression,
             "requirements": {
                 "acceptance_required": acceptance_required,
-                "requirement_traceability": acceptance_required,
+                "generation_sla": generation_sla.to_dict(),
+                "required_checks": list(generation_sla.required_checks),
+                "requirement_traceability": full_audit_required,
+                "prompt_completion_audit": full_audit_required,
+                "visual_regression": acceptance_required,
                 "meaningful_diff": True,
                 "api_workflow_smoke": acceptance_required,
                 "browser_flow_smoke": acceptance_required,
@@ -1982,6 +2081,8 @@ class WorkbenchService:
                 "run_artifacts": f"run_artifacts:{run_id}",
                 "browser_proof": run.browser_proof_ref,
                 "requirement_traceability": f"requirement_traceability:{run_id}",
+                "prompt_completion_audit": f"prompt_completion_audit:{run_id}",
+                "visual_regression": f"visual_regression:{run_id}",
                 "repair_recipes": run.repair_recipes_ref,
                 "final_report": f"final_report:{run_id}",
                 "resume_checkpoint": run.resume_checkpoint_ref,
@@ -2244,6 +2345,8 @@ class WorkbenchService:
             "checks": artifacts.get("check_results") or [],
             "product_readiness": gate.get("product_readiness") or {},
             "requirement_traceability": gate.get("requirement_traceability") or self.requirement_traceability(run_id),
+            "prompt_completion_audit": gate.get("prompt_completion_audit") or self.prompt_completion_audit(run_id),
+            "visual_regression": gate.get("visual_regression") or self.visual_regression(run_id),
             "browser_proof": self.browser_proof(run_id),
             "repair_signatures": self.repair_signatures(run_id).get("items", []),
             "repair_packets": gate.get("repair_packets", []),
@@ -2263,6 +2366,8 @@ class WorkbenchService:
                 "gate": f"gate:{run_id}",
                 "browser_proof": run.browser_proof_ref,
                 "requirement_traceability": f"requirement_traceability:{run_id}",
+                "prompt_completion_audit": f"prompt_completion_audit:{run_id}",
+                "visual_regression": f"visual_regression:{run_id}",
                 "repair_recipes": run.repair_recipes_ref,
                 "resume_checkpoint": run.resume_checkpoint_ref,
             },
@@ -2326,19 +2431,25 @@ class WorkbenchService:
             "accepted_ux_rules": [],
             "architecture_summary": [],
             "known_failures": [],
+            "failure_shields": [],
             "rejected_approaches": [],
+            "reusable_workflows": [],
             "do_not_change": [],
             "platform_constraints": [],
             "repeated_fixes": [],
         }
-        current["stale_check"] = WorkspaceMemoryPipeline.stale_check(self.workspace_service.source_dir(workspace_id), current)
+        stale_check = WorkspaceMemoryPipeline.stale_check(self.workspace_service.source_dir(workspace_id), current)
+        current["stale_check"] = stale_check
+        WorkspaceMemoryPipeline.apply_stale_status(current, stale_check)
         current["pipeline"] = self.memory_pipeline(workspace_id)
+        current["memory_summary"] = WorkspaceMemoryPipeline.summary(workspace_id, current)
         return current
 
     def extract_run_memory(self, run_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
         payload = WorkspaceMemoryPipeline.extract_run(run, self._run_artifacts_or_empty(run_id))
         self.store.upsert("reports", f"memory_stage1:{run.workspace_id}:{run_id}", payload)
+        self._auto_consolidate_workspace_memory(run.workspace_id)
         self._journal_run_event(
             run_id,
             "memory.raw_extracted",
@@ -2363,6 +2474,7 @@ class WorkbenchService:
         stale_count = sum(1 for item in items if item.get("status") == "stale")
         expired_count = sum(1 for item in items if item.get("status") == "expired" or (item.get("expiry") or {}).get("expired"))
         superseded_count = sum(1 for item in items if item.get("status") == "superseded")
+        memory_summary = WorkspaceMemoryPipeline.summary(workspace_id, workspace_memory)
         return {
             "schema": "grounded.memory_pipeline.v1",
             "workspace_id": workspace_id,
@@ -2379,6 +2491,7 @@ class WorkbenchService:
                 "expired_count": expired_count,
                 "superseded_count": superseded_count,
                 "retrieval_schema": "grounded.memory_retrieval.v1",
+                "summary_schema": "grounded.memory_summary.v1",
             },
             "stage1_count": len(stage1),
             "stage1_items": sum(len(payload.get("items") or []) for payload in stage1),
@@ -2388,6 +2501,8 @@ class WorkbenchService:
             "superseded_count": superseded_count,
             "consolidated_at": consolidated.get("updated_at") or consolidated.get("created_at"),
             "retrieval_schema": "grounded.memory_retrieval.v1",
+            "summary_schema": "grounded.memory_summary.v1",
+            "summary": memory_summary,
             "items": stage1[-20:],
         }
 
@@ -2447,9 +2562,34 @@ class WorkbenchService:
             top_k=request.top_k,
             include_inactive=request.include_inactive,
             failure_class=request.failure_class,
+            detail_mode=request.detail_mode,
         )
         self.store.upsert("reports", f"memory_retrieval:last:{workspace_id}", result)
         return result
+
+    def memory_summary(self, workspace_id: str) -> dict[str, Any]:
+        self.workspace_service.get_workspace(workspace_id)
+        current = self.memory(workspace_id)
+        return WorkspaceMemoryPipeline.summary(workspace_id, current)
+
+    def _auto_consolidate_workspace_memory(self, workspace_id: str) -> None:
+        stage1 = [
+            payload
+            for key, payload in self.store.items("reports")
+            if key.startswith(f"memory_stage1:{workspace_id}:") and isinstance(payload, dict)
+        ]
+        current = self.store.get("reports", f"workspace_memory:{workspace_id}") or {"workspace_id": workspace_id, "items": []}
+        consolidated = WorkspaceMemoryPipeline.consolidate(
+            workspace_id,
+            stage1,
+            current,
+            workspace_root=self.workspace_service.source_dir(workspace_id),
+        )
+        stale_check = WorkspaceMemoryPipeline.stale_check(self.workspace_service.source_dir(workspace_id), consolidated)
+        consolidated["stale_check"] = stale_check
+        WorkspaceMemoryPipeline.apply_stale_status(consolidated, stale_check)
+        consolidated["memory_summary"] = WorkspaceMemoryPipeline.summary(workspace_id, consolidated)
+        self.store.upsert("reports", f"workspace_memory:{workspace_id}", consolidated)
 
     def project_instructions(self) -> dict[str, Any]:
         payload = ProjectInstructionBundle.build(repo_root=self.settings.repo_root, template_dir=self.settings.template_dir)
@@ -2495,13 +2635,18 @@ class WorkbenchService:
         item["expiry"] = {"expires_at": None, "ttl_days": None, "reason": None, "expired": False}
         current.setdefault("items", []).append(item)
         bucket_map = {
+            "preference": "user_preferences",
             "user_preference": "user_preferences",
             "project_rule": "project_rules",
             "product_decision": "product_decisions",
             "ux_rule": "accepted_ux_rules",
             "architecture": "architecture_summary",
             "known_failure": "known_failures",
+            "failure_signature": "known_failures",
+            "failure_shield": "failure_shields",
             "rejected_approach": "rejected_approaches",
+            "avoidance": "rejected_approaches",
+            "reusable_workflow": "reusable_workflows",
             "do_not_change": "do_not_change",
             "repeated_fix": "repeated_fixes",
         }
@@ -2509,6 +2654,7 @@ class WorkbenchService:
         if bucket:
             current.setdefault(bucket, []).append(item)
         current["stale_check"] = self._memory_stale_check(workspace_id, current)
+        current["memory_summary"] = WorkspaceMemoryPipeline.summary(workspace_id, current)
         self.store.upsert("reports", f"workspace_memory:{workspace_id}", current)
         return current
 
@@ -3652,6 +3798,11 @@ class WorkbenchService:
                     )
         return {"items": sorted(items, key=lambda item: str(item.get("created_at") or ""), reverse=True)[:50]}
 
+    def command_audit(self, workspace_id: str | None = None, *, limit: int = 100) -> dict[str, Any]:
+        if workspace_id:
+            self.workspace_service.get_workspace(workspace_id)
+        return self.exec_policy_service.command_audit(self.store, workspace_id=workspace_id, limit=limit)
+
     def _apply_workspace_approval_grant(self, workspace_id: str, evaluation: dict[str, Any]) -> dict[str, Any]:
         approval = evaluation.get("approval") if isinstance(evaluation.get("approval"), dict) else {}
         fingerprint = str(approval.get("command_fingerprint") or evaluation.get("command_fingerprint") or "")
@@ -4189,6 +4340,21 @@ class WorkbenchService:
             "dom_selector": proof.get("dom_selector") or diagnostics.get("dom_selector") or diagnostics.get("failed_selector"),
             "screenshot_before": proof.get("screenshot_before") or diagnostics.get("screenshot_before"),
             "screenshot_after": proof.get("screenshot_after") or diagnostics.get("screenshot_after"),
+            "dom_snapshots": self._first_list(
+                proof.get("dom_snapshots") if isinstance(proof, dict) else None,
+                diagnostics.get("dom_snapshots") if isinstance(diagnostics, dict) else None,
+                (verification_report or {}).get("dom_snapshots") if isinstance(verification_report, dict) else None,
+            ),
+            "layout_reports": self._first_list(
+                proof.get("layout_reports") if isinstance(proof, dict) else None,
+                diagnostics.get("layout_reports") if isinstance(diagnostics, dict) else None,
+                (verification_report or {}).get("layout_reports") if isinstance(verification_report, dict) else None,
+            ),
+            "visual_diffs": self._first_list(
+                proof.get("visual_diffs") if isinstance(proof, dict) else None,
+                diagnostics.get("visual_diffs") if isinstance(diagnostics, dict) else None,
+                (verification_report or {}).get("visual_diffs") if isinstance(verification_report, dict) else None,
+            ),
             "route_coverage": (run.flow_coverage or {}).get("routes", []),
             "mobile_layout": mobile_layout,
             "viewports": self._browser_proof_viewports(mobile_layout),

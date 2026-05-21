@@ -1,0 +1,49 @@
+{
+  "$id": "https://grounded.local/schemas/app_protocol/rpc_cursor_page.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "cursor_kind": {
+      "default": "none",
+      "enum": [
+        "none",
+        "opaque_cursor",
+        "sequence_cursor",
+        "offset_cursor"
+      ],
+      "title": "Cursor Kind",
+      "type": "string"
+    },
+    "cursor_param": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Cursor Param"
+    },
+    "limit_param": {
+      "default": "limit",
+      "title": "Limit Param",
+      "type": "string"
+    },
+    "next_cursor_field": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Next Cursor Field"
+    }
+  },
+  "title": "RpcCursorPage",
+  "type": "object"
+}

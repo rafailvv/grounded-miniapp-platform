@@ -745,3 +745,237 @@ class RequirementTraceabilityMatrix:
             return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         except TypeError:
             return str(value)
+
+
+class PromptArtifactCompletionAudit:
+    """Final prompt-to-artifact audit used by readiness gates."""
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        run: Any,
+        artifacts: dict[str, Any] | None = None,
+        traceability: dict[str, Any] | None = None,
+        browser_proof: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        artifact_payload = dict(artifacts or {})
+        matrix = traceability if isinstance(traceability, dict) else RequirementTraceabilityMatrix.build(
+            run=run,
+            artifacts=artifact_payload,
+            browser_proof=browser_proof if isinstance(browser_proof, dict) else {},
+        )
+        rows = matrix.get("rows") if isinstance(matrix.get("rows"), list) else []
+        check_results = [RequirementTraceabilityMatrix._normalize_result(item) for item in artifact_payload.get("check_results") or []]
+        checks_by_name = {str(item.get("name") or ""): item for item in check_results if item.get("name")}
+        changed_files = cls._changed_files(run=run, artifacts=artifact_payload, matrix=matrix)
+        audit_rows = [
+            cls._audit_row(row=row, changed_files=changed_files, checks_by_name=checks_by_name)
+            for row in rows
+            if isinstance(row, dict)
+        ]
+        required = bool(matrix.get("required"))
+        uncovered = [
+            {
+                "requirement_id": row.get("requirement_id"),
+                "requirement": row.get("requirement"),
+                "uncovered": list(row.get("uncovered") or []),
+                "details": row.get("uncovered_details") or [],
+            }
+            for row in audit_rows
+            if row.get("uncovered")
+        ]
+        covered_count = sum(1 for row in audit_rows if row.get("status") == "passed")
+        status = "blocked" if required and uncovered else "passed" if required else "not_required"
+        run_id = str(RequirementTraceabilityMatrix._get_attr(run, "run_id") or artifact_payload.get("run_id") or "")
+        workspace_id = str(RequirementTraceabilityMatrix._get_attr(run, "workspace_id") or artifact_payload.get("workspace_id") or "")
+        return {
+            "schema": "grounded.prompt_completion_audit.v1",
+            "run_id": run_id,
+            "workspace_id": workspace_id,
+            "status": status,
+            "required": required,
+            "prompt": str(RequirementTraceabilityMatrix._get_attr(run, "prompt") or "")[:1200],
+            "requirement_count": len(audit_rows),
+            "covered_count": covered_count,
+            "uncovered_count": len(uncovered),
+            "rows": audit_rows,
+            "uncovered": uncovered,
+            "changed_files": changed_files,
+            "proof_summary": cls._proof_summary(checks_by_name=checks_by_name, rows=audit_rows),
+            "artifact_refs": {
+                "run_artifacts": f"run_artifacts:{run_id}" if run_id else None,
+                "requirement_traceability": f"requirement_traceability:{run_id}" if run_id else None,
+                "prompt_completion_audit": f"prompt_completion_audit:{run_id}" if run_id else None,
+                "browser_proof": RequirementTraceabilityMatrix._get_attr(run, "browser_proof_ref"),
+            },
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    @classmethod
+    def blocking_issues(cls, report: dict[str, Any]) -> list[dict[str, Any]]:
+        issues: list[dict[str, Any]] = []
+        for item in report.get("uncovered") or []:
+            if not isinstance(item, dict):
+                continue
+            missing = RequirementTraceabilityMatrix._string_list(item.get("uncovered"))
+            issues.append(
+                {
+                    "kind": "prompt_completion_audit",
+                    "check": f"prompt_completion:{item.get('requirement_id') or 'requirement'}",
+                    "details": f"Prompt requirement is not fully tied to artifacts: {', '.join(missing)}.",
+                    "blocking": True,
+                    "evidence": {
+                        "requirement_id": item.get("requirement_id"),
+                        "requirement": item.get("requirement"),
+                        "uncovered": missing,
+                        "details": item.get("details") or [],
+                    },
+                }
+            )
+        return issues
+
+    @classmethod
+    def _audit_row(
+        cls,
+        *,
+        row: dict[str, Any],
+        changed_files: list[str],
+        checks_by_name: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        requirement_id = str(row.get("requirement_id") or "")
+        expected = row.get("expected") if isinstance(row.get("expected"), dict) else {}
+        implementation_files = cls._implementation_files(row=row, changed_files=changed_files)
+        route_page = row.get("route_page") if isinstance(row.get("route_page"), dict) else {}
+        api = row.get("api") if isinstance(row.get("api"), dict) else {}
+        state = row.get("state") if isinstance(row.get("state"), dict) else {}
+        test = row.get("test") if isinstance(row.get("test"), dict) else {}
+        browser = row.get("browser_proof") if isinstance(row.get("browser_proof"), dict) else {}
+        uncovered = RequirementTraceabilityMatrix._string_list(row.get("missing"))
+        uncovered_details: list[dict[str, Any]] = [
+            {
+                "stage": stage,
+                "reason": "required proof stage missing",
+                "expected": expected,
+            }
+            for stage in uncovered
+        ]
+        if not implementation_files:
+            uncovered.append("implementation_files")
+            uncovered_details.append(
+                {
+                    "stage": "implementation_files",
+                    "reason": "no changed source file could be linked to this prompt requirement",
+                    "changed_files": changed_files,
+                }
+            )
+        status = "blocked" if uncovered else "passed"
+        return {
+            "requirement_id": requirement_id,
+            "requirement": row.get("requirement"),
+            "source": row.get("source"),
+            "status": status,
+            "blocking": bool(uncovered),
+            "implemented": {
+                "status": "passed" if implementation_files else "missing",
+                "files": implementation_files,
+                "routes": route_page.get("routes") or [],
+                "api_paths": api.get("paths") or [],
+                "state_fields": state.get("fields") or [],
+            },
+            "changed_files": implementation_files,
+            "proof": {
+                "api": cls._proof_from_stage(stage=api, check=checks_by_name.get("api_workflow_smoke"), proof_type="api"),
+                "browser": cls._proof_from_stage(stage=browser, check=checks_by_name.get("browser_flow_smoke"), proof_type="browser"),
+                "tests": cls._test_proof(stage=test, checks_by_name=checks_by_name),
+            },
+            "browser_proof": browser,
+            "api_proof": api,
+            "test_proof": test,
+            "uncovered": RequirementTraceabilityMatrix._dedupe(uncovered),
+            "uncovered_details": uncovered_details,
+        }
+
+    @classmethod
+    def _implementation_files(cls, *, row: dict[str, Any], changed_files: list[str]) -> list[str]:
+        expected = row.get("expected") if isinstance(row.get("expected"), dict) else {}
+        routes = set(RequirementTraceabilityMatrix._string_list((row.get("route_page") or {}).get("routes")) + RequirementTraceabilityMatrix._string_list(expected.get("routes")))
+        api_paths = set(RequirementTraceabilityMatrix._string_list((row.get("api") or {}).get("paths")) + RequirementTraceabilityMatrix._string_list(expected.get("api_paths")))
+        files: list[str] = []
+        for path in changed_files:
+            normalized = str(path or "").replace("\\", "/")
+            role_route = RequirementTraceabilityMatrix._route_from_file(normalized)
+            route_match = bool(role_route and role_route in routes)
+            api_match = bool(api_paths and normalized.startswith("miniapp/app/routes/"))
+            state_match = bool(normalized.startswith(("miniapp/app/models", "miniapp/app/db", "miniapp/app/state")))
+            static_match = bool(not routes and normalized.startswith("miniapp/app/static/"))
+            if route_match or api_match or state_match or static_match:
+                files.append(normalized)
+        if not files and len(changed_files) == 1:
+            files = list(changed_files)
+        return RequirementTraceabilityMatrix._dedupe(files)[:40]
+
+    @staticmethod
+    def _proof_from_stage(*, stage: dict[str, Any], check: dict[str, Any] | None, proof_type: str) -> dict[str, Any]:
+        check_payload = check if isinstance(check, dict) else {}
+        proof = {
+            "type": proof_type,
+            "status": stage.get("status") or "missing",
+            "check": check_payload.get("name"),
+            "check_status": check_payload.get("status"),
+            "details": str(check_payload.get("details") or "")[:500],
+            "evidence": stage.get("evidence") if isinstance(stage.get("evidence"), dict) else {},
+        }
+        if proof_type == "browser":
+            proof["steps"] = stage.get("steps") or []
+            proof["screenshots"] = stage.get("screenshots") or []
+        if proof_type == "api":
+            proof["paths"] = stage.get("paths") or []
+        return proof
+
+    @classmethod
+    def _test_proof(cls, *, stage: dict[str, Any], checks_by_name: dict[str, dict[str, Any]]) -> dict[str, Any]:
+        checks = []
+        for name in stage.get("checks") or []:
+            check = checks_by_name.get(str(name))
+            checks.append(
+                {
+                    "name": str(name),
+                    "status": (check or {}).get("status"),
+                    "details": str((check or {}).get("details") or "")[:300],
+                }
+            )
+        return {
+            "type": "tests",
+            "status": stage.get("status") or "missing",
+            "checks": checks,
+            "evidence": stage.get("evidence") if isinstance(stage.get("evidence"), dict) else {},
+        }
+
+    @classmethod
+    def _changed_files(cls, *, run: Any, artifacts: dict[str, Any], matrix: dict[str, Any]) -> list[str]:
+        files = [
+            *RequirementTraceabilityMatrix._paths_from_diff(str(artifacts.get("diff") or "")),
+            *RequirementTraceabilityMatrix._string_list(RequirementTraceabilityMatrix._get_attr(run, "touched_files")),
+        ]
+        for row in matrix.get("rows") or []:
+            if isinstance(row, dict):
+                route_page = row.get("route_page") if isinstance(row.get("route_page"), dict) else {}
+                evidence = route_page.get("evidence") if isinstance(route_page.get("evidence"), dict) else {}
+                files.extend(RequirementTraceabilityMatrix._string_list(evidence.get("touched_files")))
+        return RequirementTraceabilityMatrix._dedupe(files)[:80]
+
+    @classmethod
+    def _proof_summary(cls, *, checks_by_name: dict[str, dict[str, Any]], rows: list[dict[str, Any]]) -> dict[str, Any]:
+        passed_checks = [
+            name
+            for name, check in checks_by_name.items()
+            if str(check.get("status") or "") == "passed"
+        ]
+        return {
+            "passed_checks": passed_checks,
+            "api_proof_count": sum(1 for row in rows if ((row.get("proof") or {}).get("api") or {}).get("status") == "passed"),
+            "browser_proof_count": sum(1 for row in rows if ((row.get("proof") or {}).get("browser") or {}).get("status") == "passed"),
+            "test_proof_count": sum(1 for row in rows if ((row.get("proof") or {}).get("tests") or {}).get("status") == "passed"),
+            "uncovered_count": sum(1 for row in rows if row.get("uncovered")),
+        }

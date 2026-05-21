@@ -168,7 +168,7 @@ class JobRecord(StrictModel):
     target_platform: TargetPlatform
     preview_profile: PreviewProfile
     current_revision_id: str | None = None
-    fidelity: Literal["fast_app", "quality_app", "balanced_app", "basic_app", "blocked"] = "blocked"
+    fidelity: Literal["fast_app", "quality_app", "production_app", "balanced_app", "basic_app", "blocked"] = "blocked"
     llm_enabled: bool = False
     llm_provider: str | None = None
     llm_model: str | None = None

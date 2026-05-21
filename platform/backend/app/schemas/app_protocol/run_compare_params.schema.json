@@ -1,0 +1,21 @@
+{
+  "$id": "https://grounded.local/schemas/app_protocol/run_compare_params.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "base_run_id": {
+      "title": "Base Run Id",
+      "type": "string"
+    },
+    "target_run_id": {
+      "title": "Target Run Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "base_run_id",
+    "target_run_id"
+  ],
+  "title": "RunCompareParams",
+  "type": "object"
+}

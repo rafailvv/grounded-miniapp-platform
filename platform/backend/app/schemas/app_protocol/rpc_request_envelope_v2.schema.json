@@ -1,0 +1,64 @@
+{
+  "$id": "https://grounded.local/schemas/app_protocol/rpc_request_envelope_v2.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Id"
+    },
+    "idempotency_key": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Idempotency Key"
+    },
+    "jsonrpc": {
+      "const": "2.0",
+      "default": "2.0",
+      "title": "Jsonrpc",
+      "type": "string"
+    },
+    "metadata": {
+      "additionalProperties": true,
+      "title": "Metadata",
+      "type": "object"
+    },
+    "method": {
+      "title": "Method",
+      "type": "string"
+    },
+    "params": {
+      "additionalProperties": true,
+      "title": "Params",
+      "type": "object"
+    },
+    "schema": {
+      "default": "grounded.rpc.request.v2",
+      "title": "Schema",
+      "type": "string"
+    }
+  },
+  "required": [
+    "method"
+  ],
+  "title": "RpcRequestEnvelopeV2",
+  "type": "object"
+}

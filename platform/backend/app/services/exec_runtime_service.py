@@ -74,6 +74,10 @@ class ExecRuntimeService:
             "timeout_seconds": timeout_seconds,
             "policy_decision": policy_evaluation.get("decision") or {},
             "sandbox_summary": policy_evaluation.get("sandbox_summary") or {},
+            "sandbox_boundary": None,
+            "environment_snapshot": None,
+            "log_capture": None,
+            "killed_diagnostics": None,
         }
         with self._lock:
             self._sessions[process_id] = session
@@ -145,7 +149,16 @@ class ExecRuntimeService:
         def progress(payload: dict[str, Any]) -> None:
             event = {**payload, "process_id": process_id}
             if payload.get("status") == "started":
-                self._update_session(process_id, {"status": "running", "sandbox_summary": payload.get("sandbox") or {}})
+                self._update_session(
+                    process_id,
+                    {
+                        "status": "running",
+                        "sandbox_summary": payload.get("sandbox") or {},
+                        "sandbox_boundary": payload.get("sandbox_boundary"),
+                        "environment_snapshot": payload.get("environment_snapshot"),
+                        "log_capture": payload.get("log_capture"),
+                    },
+                )
             elif payload.get("status") == "output_delta":
                 self._publish("command/exec/output_delta", event)
             elif payload.get("status") == "heartbeat":
@@ -178,6 +191,10 @@ class ExecRuntimeService:
                 "stdout_ref": result_payload.get("stdout_ref"),
                 "stderr_ref": result_payload.get("stderr_ref"),
                 "output_artifacts": result_payload.get("output_artifacts") or [],
+                "sandbox_boundary": result_payload.get("sandbox_boundary"),
+                "environment_snapshot": result_payload.get("environment_snapshot"),
+                "log_capture": result_payload.get("log_capture"),
+                "killed_diagnostics": result_payload.get("killed_diagnostics"),
                 "completed_at": completed_at,
                 "updated_at": completed_at,
                 "result": result_payload,
@@ -236,6 +253,9 @@ class ExecRuntimeService:
                         "status": session["status"],
                         "exit_code": session.get("exit_code"),
                         "duration_ms": session.get("duration_ms"),
+                        "sandbox_boundary": session.get("sandbox_boundary"),
+                        "log_capture": session.get("log_capture"),
+                        "killed_diagnostics": session.get("killed_diagnostics"),
                     },
                     risk=(session.get("policy_decision") or {}).get("risk") or "read_only",
                     timing={"duration_ms": session.get("duration_ms")},

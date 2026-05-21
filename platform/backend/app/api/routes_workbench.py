@@ -10,10 +10,11 @@ from app.models.context_pressure import ContextPressureReport
 from app.models.domain import RunRecord
 from app.models.event_journal import EventJournalPage, EventJournalPayload, RunJournalState, ThreadJournalState
 from app.models.hooks import HookContext
-from app.models.memory import MemoryRetrievalRequest, MemoryRetrievalResult
+from app.models.memory import MemoryRetrievalRequest, MemoryRetrievalResult, MemorySummaryReport
 from app.models.observability import ObservabilityReport
 from app.models.output_artifacts import CommandOutputArtifact, OutputArtifactIndex
 from app.models.prompt_suggestions import PromptSuggestionsReport
+from app.models.sandbox import SandboxRuntimeManifest
 from app.models.threads import ThreadSnapshot
 from app.models.webhooks import (
     WebhookCreateRequest,
@@ -26,6 +27,8 @@ from app.models.webhooks import (
 from app.models.workbench import (
     AppProtocolManifest,
     GateReport,
+    GenerationModeSlaManifest,
+    PromptCompletionAuditReport,
     ProtocolSchemaCatalog,
     RepairAttemptsReport,
     RepairCase,
@@ -42,10 +45,12 @@ from app.models.workbench import (
     ToolEventsReport,
     TraceBundleReport,
     TraceState,
+    VisualRegressionReport,
     system_schema_manifest,
 )
 from app.services.container import ServiceContainer
 from app.services.app_protocol import app_protocol_manifest, app_protocol_schema_catalog
+from app.services.generation_sla import GenerationSla
 from app.services.run_protocol import RunProtocolConflict
 from app.services.tool_protocol import tool_registry_contract
 from app.modules.miniapp_agent_loop.tool_router import ToolRouter
@@ -169,6 +174,11 @@ def get_exec_policy(container: ServiceContainer = Depends(get_container)) -> dic
     }
 
 
+@router.get("/system/sandbox-runtime", response_model=SandboxRuntimeManifest)
+def get_sandbox_runtime(container: ServiceContainer = Depends(get_container)) -> SandboxRuntimeManifest:
+    return SandboxRuntimeManifest.model_validate(container.sandbox_service.manifest())
+
+
 @router.get("/system/tools/dynamic")
 def get_dynamic_tool_catalog() -> dict[str, Any]:
     return ToolRouter.dynamic_tool_manifest()
@@ -190,6 +200,11 @@ def evaluate_policy(
 @router.get("/system/project-instructions")
 def get_project_instructions(container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     return container.workbench_service.project_instructions()
+
+
+@router.get("/system/generation-modes", response_model=GenerationModeSlaManifest)
+def get_generation_modes() -> GenerationModeSlaManifest:
+    return GenerationModeSlaManifest.model_validate(GenerationSla.manifest())
 
 
 @router.get("/system/rpc-protocol", response_model=RpcProtocolReport)
@@ -900,6 +915,14 @@ def get_run_requirement_traceability(run_id: str, container: ServiceContainer = 
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@router.get("/runs/{run_id}/completion-audit", response_model=PromptCompletionAuditReport)
+def get_run_completion_audit(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.prompt_completion_audit(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.get("/runs/{run_id}/repair-signatures")
 def get_run_repair_signatures(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     try:
@@ -1024,6 +1047,19 @@ def get_recent_denials(container: ServiceContainer = Depends(get_container)) -> 
     return container.workbench_service.recent_denials()
 
 
+@router.get("/system/permissions/command-audit")
+def get_command_audit(limit: int = 100, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    return container.workbench_service.command_audit(limit=limit)
+
+
+@router.get("/workspaces/{workspace_id}/permissions/command-audit")
+def get_workspace_command_audit(workspace_id: str, limit: int = 100, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.command_audit(workspace_id, limit=limit)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.get("/workspaces/{workspace_id}/permissions/approval-grants")
 def get_workspace_permission_grants(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     try:
@@ -1044,6 +1080,14 @@ def get_workspace_memory(workspace_id: str, container: ServiceContainer = Depend
 def get_workspace_memory_pipeline(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     try:
         return container.workbench_service.memory_pipeline(workspace_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/workspaces/{workspace_id}/memory/summary", response_model=MemorySummaryReport)
+def get_workspace_memory_summary(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.memory_summary(workspace_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -1538,5 +1582,13 @@ def get_browser_replay(run_id: str, container: ServiceContainer = Depends(get_co
 def get_run_visual_qa(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     try:
         return container.workbench_service.visual_qa(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/runs/{run_id}/visual-regression", response_model=VisualRegressionReport)
+def get_run_visual_regression(run_id: str, container: ServiceContainer = Depends(get_container)) -> VisualRegressionReport:
+    try:
+        return container.workbench_service.visual_regression(run_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

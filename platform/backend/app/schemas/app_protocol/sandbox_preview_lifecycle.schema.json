@@ -1,0 +1,135 @@
+{
+  "$id": "https://grounded.local/schemas/app_protocol/sandbox_preview_lifecycle.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "cleanup_attempted": {
+      "default": false,
+      "title": "Cleanup Attempted",
+      "type": "boolean"
+    },
+    "cooldown_until": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Cooldown Until"
+    },
+    "diagnostics": {
+      "additionalProperties": true,
+      "title": "Diagnostics",
+      "type": "object"
+    },
+    "draft_run_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Draft Run Id"
+    },
+    "failure_kind": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Failure Kind"
+    },
+    "lifecycle_events": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Lifecycle Events",
+      "type": "array"
+    },
+    "project_name": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Project Name"
+    },
+    "proxy_port": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Proxy Port"
+    },
+    "reused_existing_runtime": {
+      "default": false,
+      "title": "Reused Existing Runtime",
+      "type": "boolean"
+    },
+    "runtime_mode": {
+      "enum": [
+        "inline",
+        "docker",
+        "local"
+      ],
+      "title": "Runtime Mode",
+      "type": "string"
+    },
+    "schema": {
+      "default": "grounded.sandbox.preview_lifecycle.v1",
+      "title": "Schema",
+      "type": "string"
+    },
+    "stage": {
+      "title": "Stage",
+      "type": "string"
+    },
+    "status": {
+      "title": "Status",
+      "type": "string"
+    },
+    "url": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Url"
+    },
+    "workspace_id": {
+      "title": "Workspace Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspace_id",
+    "runtime_mode",
+    "status",
+    "stage"
+  ],
+  "title": "SandboxPreviewLifecycle",
+  "type": "object"
+}

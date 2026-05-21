@@ -6,15 +6,11 @@ from typing import Any
 
 from app.models.domain import RunCheckResult
 from app.models.workbench import ProductReadinessCheck, ProductReadinessResult
+from app.services.generation_sla import GenerationSla
 
 
 ROLE_ORDER = ("client", "specialist", "manager")
-REQUIRED_PRODUCT_CHECKS = (
-    "api_workflow_smoke",
-    "browser_flow_smoke",
-    "generated_app_python_tests",
-    "generated_app_js_tests",
-)
+REQUIRED_PRODUCT_CHECKS = GenerationSla.required_checks("balanced")
 
 
 class ProductReadinessContract:
@@ -48,7 +44,11 @@ class ProductReadinessContract:
         by_name = {str(item.get("name") or ""): item for item in check_results}
         mode = str(run_mode or "").lower()
         generation = str(generation_mode or "").lower()
-        acceptance_required = bool(contract.get("required")) or mode in {"generate", "fix"} or generation in {"quality", "balanced"}
+        sla_profile = GenerationSla.profile(generation)
+        required_product_checks = tuple(sla_profile.required_checks)
+        browser_required = "browser_flow_smoke" in required_product_checks
+        full_audit_required = GenerationSla.requires_full_audit(generation)
+        acceptance_required = bool(contract.get("required")) or mode in {"generate", "fix"} or generation in {"quality", "balanced", "production"}
         diff_paths = cls._paths_from_diff(diff_text)
         changed_paths = list(dict.fromkeys([*diff_paths, *[str(path) for path in (touched_files or []) if str(path).strip()]]))
         product_paths = [path for path in changed_paths if cls._is_product_runtime_source_path(path)]
@@ -58,6 +58,13 @@ class ProductReadinessContract:
             "changed_files": changed_paths[:80],
             "product_runtime_paths": product_paths[:80],
             "acceptance_contract_required": bool(contract.get("required")),
+            "generation_sla": {
+                "mode": sla_profile.mode,
+                "label": sla_profile.label,
+                "required_checks": list(required_product_checks),
+                "audit_level": sla_profile.audit_level,
+                "proof_requirements": list(sla_profile.proof_requirements),
+            },
         }
 
         def add_issue(kind: str, check: str, details: str, *, evidence_payload: dict[str, Any] | None = None) -> None:
@@ -85,10 +92,10 @@ class ProductReadinessContract:
                 add_issue("check_failure", str(item.get("name") or "check"), str(item.get("details") or "Check failed."), evidence_payload=item)
 
         if acceptance_required:
-            for check_name in REQUIRED_PRODUCT_CHECKS:
+            for check_name in required_product_checks:
                 check = by_name.get(check_name)
                 status = str((check or {}).get("status") or "missing")
-                details = f"{check_name} must pass before a generate/fix run can complete."
+                details = f"{check_name} must pass for {sla_profile.mode} generation SLA."
                 required_checks.append(
                     ProductReadinessCheck(
                         key=check_name,
@@ -161,7 +168,7 @@ class ProductReadinessContract:
                 "visible_errors": cls._list_values(browser_diagnostics.get("visible_errors")),
             }
             evidence["mobile"] = mobile if isinstance(mobile, dict) else {}
-            if browser.get("status") == "passed":
+            if browser_required and browser.get("status") == "passed":
                 if not isinstance(browser_steps, list) or not browser_steps:
                     add_issue("browser_proof_missing_ui_steps", "browser_flow_smoke", "Browser proof lacks concrete UI workflow steps.", evidence_payload=browser)
                 if not browser_marker:
@@ -184,12 +191,13 @@ class ProductReadinessContract:
                 ]
                 if runtime_errors:
                     add_issue("browser_proof_runtime_errors", "browser_flow_smoke", "Browser proof contains console, network, or visible runtime errors.", evidence_payload={"errors": runtime_errors[:12], "browser_flow_smoke": browser})
-            if not isinstance(mobile, dict) or not mobile:
+            if browser_required and (not isinstance(mobile, dict) or not mobile):
                 add_issue("mobile_layout_missing", "browser_flow_smoke", "Mobile layout proof is missing from browser workflow evidence.", evidence_payload=browser)
-            elif mobile.get("status") == "failed" or mobile.get("horizontal_overflow") or mobile.get("critical_overlap"):
+            elif browser_required and (mobile.get("status") == "failed" or mobile.get("horizontal_overflow") or mobile.get("critical_overlap")):
                 add_issue("mobile_layout", "browser_flow_smoke", "Mobile layout report contains blocking issues.", evidence_payload=mobile)
 
-            issues.extend(cls._product_task_ledger_issues(by_name, implementation_plan=plan))
+            if full_audit_required:
+                issues.extend(cls._product_task_ledger_issues(by_name, implementation_plan=plan))
 
         for signature in repair_issue_signatures or []:
             if isinstance(signature, dict) and not signature.get("resolved"):

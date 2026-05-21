@@ -314,7 +314,7 @@ def _derived_role_screen_plan(
     multi_page_recommended = (
         complexity_signals >= 2
         or prompt_sentence_count >= 3
-        or mode_value in {GenerationMode.BALANCED.value, GenerationMode.QUALITY.value}
+        or mode_value in {GenerationMode.BALANCED.value, GenerationMode.QUALITY.value, GenerationMode.PRODUCTION.value}
     )
     return {
         "multi_page_recommended": bool(multi_page_recommended),
@@ -406,7 +406,7 @@ def _min_role_routes_for_screen_plan(
         if not multi_page or not _role_has_prompt_responsibility(prompt_hints, role):
             result[role] = 1
             continue
-        cap = 4 if mode_value in {GenerationMode.BALANCED.value, GenerationMode.QUALITY.value} else 3
+        cap = 4 if mode_value in {GenerationMode.BALANCED.value, GenerationMode.QUALITY.value, GenerationMode.PRODUCTION.value} else 3
         result[role] = max(2, min(cap, len(screens) or 1))
     return result
 
@@ -425,7 +425,7 @@ def _product_scale_contract(
     sentence_count = len(prompt_hints.get("prompt_sentences") or [])
     mode_value = normalized_generation_mode(generation_mode)
     score = action_count + min(field_count, 6) + resource_count + capability_count + sentence_count
-    scale = "full_product" if score >= 12 or mode_value == GenerationMode.QUALITY.value else "standard_product" if score >= 7 else "compact_product"
+    scale = "full_product" if score >= 12 or mode_value in {GenerationMode.QUALITY.value, GenerationMode.PRODUCTION.value} else "standard_product" if score >= 7 else "compact_product"
     return {
         "scale": scale,
         "signals": {
@@ -655,7 +655,7 @@ def build_acceptance_contract(
     requires_contract = (
         intent_value == "create"
         or workflow_kind == "behavior_workflow_edit"
-        or mode_value in {GenerationMode.BALANCED.value, GenerationMode.QUALITY.value}
+        or mode_value in {GenerationMode.BALANCED.value, GenerationMode.QUALITY.value, GenerationMode.PRODUCTION.value}
     )
     if not requires_contract:
         return {
@@ -737,7 +737,7 @@ def build_acceptance_contract(
             ],
         }
     ]
-    if mode_value in {GenerationMode.BALANCED.value, GenerationMode.QUALITY.value}:
+    if mode_value in {GenerationMode.BALANCED.value, GenerationMode.QUALITY.value, GenerationMode.PRODUCTION.value}:
         flows.append(
             {
                 "id": "related_resource_workflow",
@@ -1040,7 +1040,7 @@ def build_implementation_plan(
             "no_fixed_width_tables_or_panels": True,
             "touch_targets_min_height": "44px where practical",
             "states_required": ["empty", "loading", "success", "error"],
-            "quality_runs_require_post_green_design_pass": mode_value == GenerationMode.QUALITY.value,
+            "quality_runs_require_post_green_design_pass": mode_value in {GenerationMode.QUALITY.value, GenerationMode.PRODUCTION.value},
         },
         "mode_quality_contract": {
             "fast": "smallest complete mobile product: one shared persisted flow, compact CSS, all roles functional, with prompt-derived role pages only where they clarify the workflow",
@@ -1068,7 +1068,7 @@ def orchestration_metadata_for_contract(
     execution_style = (
         "agent_tool_call_loop"
         if enabled and mode_value == GenerationMode.FAST.value
-        else "agent_tool_call_loop_with_design_pass" if enabled and mode_value == GenerationMode.QUALITY.value
+        else "agent_tool_call_loop_with_design_pass" if enabled and mode_value in {GenerationMode.QUALITY.value, GenerationMode.PRODUCTION.value}
         else "agent_tool_call_loop" if enabled else "none"
     )
     isolated_worker_drafts = False

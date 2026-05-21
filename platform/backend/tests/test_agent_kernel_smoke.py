@@ -169,7 +169,7 @@ def _contract_with_analysis(
 
 
 def test_code_agent_defaults_to_mini_for_all_generation_modes() -> None:
-    for mode in (GenerationMode.FAST, GenerationMode.BALANCED, GenerationMode.QUALITY):
+    for mode in (GenerationMode.FAST, GenerationMode.BALANCED, GenerationMode.QUALITY, GenerationMode.PRODUCTION):
         assert models_for_role("agent_turn", model_profile="", generation_mode=mode) == CODEX_MINI_MODEL
         assert models_for_role("repair", model_profile="", generation_mode=mode) == CODEX_MINI_MODEL
         assert models_for_role("summarize", model_profile="", generation_mode=mode) == CODEX_MINI_MODEL
@@ -1273,6 +1273,7 @@ def test_tool_round_limits_allow_real_agent_inspection_cycles(monkeypatch) -> No
     assert WorkspaceCodeAgentRuntime._tool_round_limit(GenerationMode.FAST) >= 2
     assert WorkspaceCodeAgentRuntime._tool_round_limit(GenerationMode.BALANCED) >= 4
     assert WorkspaceCodeAgentRuntime._tool_round_limit(GenerationMode.QUALITY) >= 6
+    assert WorkspaceCodeAgentRuntime._tool_round_limit(GenerationMode.PRODUCTION) >= 6
 
     monkeypatch.setenv("WORKSPACE_AGENT_FAST_TOOL_ROUND_LIMIT", "3")
     assert WorkspaceCodeAgentRuntime._tool_round_limit(GenerationMode.FAST) == 3
@@ -1382,18 +1383,30 @@ def test_tool_registry_contract_exposes_governed_canonical_specs() -> None:
 
     assert contract["schema"] == "grounded.tool_registry_contract.v2"
     assert contract["alias_index"]["run_command"] == "shell.exec"
+    assert contract["json_schema_tools"]["input_schema_field"] == "input_schema"
+    assert contract["parallel_execution_policy"]["parallel_safe_field"] == "parallel_safe"
     for spec in tools.values():
         assert spec["input_schema"]["type"] == "object"
         assert spec["output_schema"]["type"] == "object"
+        assert spec["capabilities"]
+        assert "read" in spec["allowed_paths"]
+        assert spec["side_effect_class"] in {"none", "read_workspace", "write_draft", "execute_process", "verification", "external_browser", "approval_request", "unknown"}
+        assert isinstance(spec["parallel_safe"], bool)
         assert spec["risk"] in {"safe", "read_only", "mutating", "network", "destructive", "forbidden", "unknown"}
         assert spec["approval_class"] in {"none", "policy", "human", "forbidden"}
         assert isinstance(spec["concurrency_safe"], bool)
         assert spec["timeout_seconds"] > 0
         assert spec["output_cap_chars"] > 0
         assert spec["artifact_spill_policy"] in {"never", "on_truncation", "always"}
+        assert spec["result_summarization"]["mode"]
+        assert spec["retry_policy"]["max_attempts"] >= 1
+        assert spec["failure_signatures"]["format"]
     assert "read_files" in tools["file.read"]["aliases"]
     assert tools["shell.exec"]["approval_class"] == "policy"
+    assert tools["shell.exec"]["side_effect_class"] == "execute_process"
     assert tools["file.write"]["approval_class"] == "human"
+    assert tools["file.write"]["side_effect_class"] == "write_draft"
+    assert tools["file.read"]["parallel_safe"] is True
 
 
 def test_tool_router_normalizes_alias_and_returns_typed_envelope(tmp_path: Path) -> None:
@@ -1418,6 +1431,10 @@ def test_tool_router_normalizes_alias_and_returns_typed_envelope(tmp_path: Path)
     assert envelope["tool"] == "file.read"  # type: ignore[index]
     assert envelope["status"] == "completed"  # type: ignore[index]
     assert envelope["approval"]["class"] == "none"  # type: ignore[index]
+    assert envelope["capabilities"]  # type: ignore[index]
+    assert envelope["parallel_safe"] is True  # type: ignore[index]
+    assert envelope["side_effect_class"] == "read_workspace"  # type: ignore[index]
+    assert envelope["result_summary"]["counts"]["files_count"] == 1  # type: ignore[index]
 
 
 def test_tool_router_spills_large_result_to_output_artifact_writer(tmp_path: Path, monkeypatch) -> None:
@@ -1469,6 +1486,8 @@ def test_tool_router_schema_validation_reports_extra_and_missing_args(tmp_path: 
     assert extra.model_results[1]["envelope"]["tool"] == "file.read"  # type: ignore[index]
     assert missing.model_results[1]["status"] == "failed"
     assert missing.model_results[1]["envelope"]["error"]["details"]["missing"] == ["command"]  # type: ignore[index]
+    assert missing.model_results[1]["envelope"]["failure_signature"].startswith("shell.exec:tool_schema_invalid:")  # type: ignore[index]
+    assert missing.model_results[1]["envelope"]["result_summary"]["error_code"] == "tool_schema_invalid"  # type: ignore[index]
 
 
 def test_tool_router_mode_filtering_and_forced_tools() -> None:
@@ -1482,6 +1501,20 @@ def test_tool_router_mode_filtering_and_forced_tools() -> None:
     assert "browser_verify" not in default_names
     assert mutation_names == {"write_file"}
     assert forced_browser_names == {"browser_verify"}
+
+
+def test_tool_router_manifest_v2_surfaces_capabilities_paths_and_retry_policy() -> None:
+    manifest = ToolRouter.manifest()
+    tools = {item["canonical"]: item for item in manifest["tools"]}
+
+    assert manifest["schema"] == "grounded.tool_router.manifest.v2"
+    assert manifest["parallel_execution_policy"]["parallel_safe_field"] == "parallel_safe"
+    assert manifest["result_policy"]["failure_signature_field"] == "failure_signature"
+    assert tools["file.read"]["capabilities"]
+    assert tools["file.read"]["parallel_safe"] is True
+    assert tools["file.write"]["allowed_paths"]["write"]
+    assert tools["file.write"]["retry_policy"]["first_retry_tool"] == "read_files"
+    assert tools["shell.exec"]["side_effect_class"] == "execute_process"
 
 
 def test_tool_router_dynamic_tool_search_discovers_deferred_capabilities(tmp_path: Path) -> None:
@@ -2973,6 +3006,12 @@ def test_quality_mode_uses_real_worker_branch_plan_by_default(monkeypatch) -> No
     assert quality_mailbox["worker_groups"]["verifier"] == ["mobile_polish_worker"]  # type: ignore[index]
     assert quality_mailbox["execution_stages"][0]["stage"] == "backend_contract"  # type: ignore[index]
     assert no_contract_mailbox["enabled"] is False
+    production_mailbox = AgentWorkerManager.mailbox_for_plan(
+        generation_mode=GenerationMode.PRODUCTION,
+        implementation_plan=plan,
+    )
+    assert production_mailbox["enabled"] is True
+    assert production_mailbox["worker_groups"]["verifier"] == ["mobile_polish_worker"]  # type: ignore[index]
     assert any(worker["worker_id"] == "backend_api_worker" for worker in quality_mailbox["workers"])  # type: ignore[index]
     assert any(worker["worker_id"] == "mobile_polish_worker" and worker["branch_role"] == "verifier" for worker in quality_mailbox["workers"])  # type: ignore[index]
     assert all(worker["alias_ids"] == [] for worker in quality_mailbox["workers"])  # type: ignore[index]

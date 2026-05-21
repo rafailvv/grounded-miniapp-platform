@@ -5,6 +5,7 @@ from typing import Any
 
 from app.models.domain import CheckExecutionRecord, RunCheckResult, ValidationSnapshot
 from app.services.check_runner import CheckRunner
+from app.services.generation_sla import GenerationSla
 from app.services.product_readiness import ProductReadinessContract
 from app.services.requirement_traceability import RequirementTraceabilityMatrix
 from app.services.workspace.service import WorkspaceService
@@ -68,7 +69,8 @@ class WorkspaceAgentCompletionGate:
                 "check_results": [result.model_dump(mode="json") for result in results],
             },
         )
-        remaining_issues.extend(RequirementTraceabilityMatrix.blocking_issues(traceability))
+        if GenerationSla.requires_full_audit(generation_mode):
+            remaining_issues.extend(RequirementTraceabilityMatrix.blocking_issues(traceability))
         if validation_snapshot is not None:
             remaining_issues.extend(
                 issue

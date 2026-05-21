@@ -57,7 +57,7 @@ class ModelManagerService:
         enabled_providers = [name for name, status in providers.items() if status.enabled]
         catalog = self.catalog()
         routes: dict[str, Any] = {}
-        for mode in ("fast", "balanced", "quality"):
+        for mode in ("fast", "balanced", "quality", "production"):
             profile = default_profile_for_generation_mode(mode)
             routes[mode] = {
                 role: self.select(role=role, model_profile=profile, generation_mode=mode).model_dump(mode="json")
@@ -80,6 +80,7 @@ class ModelManagerService:
                 "fast": default_profile_for_generation_mode(GenerationMode.FAST),
                 "balanced": default_profile_for_generation_mode(GenerationMode.BALANCED),
                 "quality": default_profile_for_generation_mode(GenerationMode.QUALITY),
+                "production": default_profile_for_generation_mode(GenerationMode.PRODUCTION),
                 "basic": default_profile_for_generation_mode(GenerationMode.BASIC),
             },
             task_profiles=TASK_PROFILES,
@@ -113,6 +114,7 @@ class ModelManagerService:
                 "fast": default_profile_for_generation_mode(GenerationMode.FAST),
                 "balanced": default_profile_for_generation_mode(GenerationMode.BALANCED),
                 "quality": default_profile_for_generation_mode(GenerationMode.QUALITY),
+                "production": default_profile_for_generation_mode(GenerationMode.PRODUCTION),
                 "basic": default_profile_for_generation_mode(GenerationMode.BASIC),
             },
             updated_at=self._now(),

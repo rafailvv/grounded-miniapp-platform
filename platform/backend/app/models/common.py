@@ -25,6 +25,7 @@ class GenerationMode(str, Enum):
     FAST = "fast"
     BALANCED = "balanced"
     QUALITY = "quality"
+    PRODUCTION = "production"
     BASIC = "basic"
 
 

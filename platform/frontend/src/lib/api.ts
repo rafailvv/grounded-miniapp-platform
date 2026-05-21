@@ -1,4 +1,5 @@
 import type { components } from "./generated/openapi-types";
+import { AppProtocolClient, isRpcConnectionError, type RpcNotificationHandler } from "./appProtocolClient";
 
 type ApiSchemas = components["schemas"];
 type RequiredKeys<T, K extends keyof T> = T & { [P in K]-?: NonNullable<T[P]> };
@@ -35,7 +36,7 @@ export type Run = {
   workspace_id: string;
   prompt: string;
   mode?: "generate" | "fix";
-  generation_mode?: "fast" | "balanced" | "quality" | "basic";
+  generation_mode?: "fast" | "balanced" | "quality" | "production" | "basic";
   intent: "create" | "edit" | "refine" | "role_only_change";
   apply_strategy: "staged_auto_apply" | "manual_approve";
   target_role_scope: Array<"client" | "specialist" | "manager">;
@@ -365,7 +366,7 @@ export type SystemConfiguration = {
     model_catalog?: Record<string, unknown>;
   };
   defaults: {
-    generation_mode: "fast" | "balanced" | "quality" | "basic";
+    generation_mode: "fast" | "balanced" | "quality" | "production" | "basic";
     model_profile: string;
   };
   default_coding_profile: string;
@@ -758,16 +759,40 @@ export type WorkspaceMemory = {
     memory_id?: string;
     kind: string;
     text: string;
+    status?: string;
+    confidence?: Record<string, unknown>;
+    payload?: Record<string, unknown>;
     citation?: Record<string, unknown> | null;
     created_at?: string;
   }>;
   project_rules?: Array<string | Record<string, unknown>>;
   user_preferences?: Array<string | Record<string, unknown>>;
   product_decisions?: Array<string | Record<string, unknown>>;
+  failure_shields?: Array<string | Record<string, unknown>>;
+  reusable_workflows?: Array<string | Record<string, unknown>>;
   platform_constraints?: Array<string | Record<string, unknown>>;
   repeated_fixes?: Array<string | Record<string, unknown>>;
+  memory_summary?: MemorySummaryReport | null;
   pipeline?: MemoryPipelineReport;
   stale_check?: Record<string, unknown>;
+};
+
+export type MemorySummaryReport = {
+  schema?: string;
+  workspace_id: string;
+  status: string;
+  always_loaded?: boolean;
+  generated_at?: string;
+  text?: string;
+  sections?: Array<{
+    kind: string;
+    title: string;
+    items: Array<Record<string, unknown>>;
+  }>;
+  counts?: Record<string, number>;
+  stale?: Record<string, unknown>;
+  detail_retrieval?: Record<string, unknown>;
+  source_refs?: Record<string, unknown>;
 };
 
 export type MemoryPipelineReport = {
@@ -776,6 +801,13 @@ export type MemoryPipelineReport = {
   status: string;
   stage1_count?: number;
   stage1_items?: number;
+  active_count?: number;
+  stale_count?: number;
+  expired_count?: number;
+  superseded_count?: number;
+  retrieval_schema?: string;
+  summary_schema?: string;
+  summary?: MemorySummaryReport;
   consolidated_at?: string | null;
   items?: Array<Record<string, unknown>>;
 };
@@ -868,6 +900,9 @@ export type BrowserReplayReport = {
   replay_first?: boolean;
   replay_plan?: Record<string, unknown>;
 };
+
+export type VisualRegressionReport = ApiSchemas["VisualRegressionReport"];
+export type GenerationModeSlaManifest = ApiSchemas["GenerationModeSlaManifest"];
 
 export type RunGateReport = RequiredKeys<
   ApiSchemas["GateReport"],
@@ -1032,166 +1067,7 @@ export type GeneratedReport = {
   [key: string]: unknown;
 };
 
-type RpcEnvelope = {
-  id?: number;
-  method?: string;
-  params?: Record<string, unknown>;
-  result?: unknown;
-  error?: { code: number; message: string; data?: unknown };
-};
-
-type RpcNotificationHandler = (message: RpcEnvelope) => void;
-
-class RpcConnectionError extends Error {
-  constructor(message = "RPC socket connection failed.") {
-    super(message);
-    this.name = "RpcConnectionError";
-  }
-}
-
-function isRpcConnectionError(error: unknown): boolean {
-  return (
-    error instanceof RpcConnectionError ||
-    (error instanceof Error &&
-      (error.message === "RPC socket connection failed." || error.message === "RPC socket is not open."))
-  );
-}
-
-class JsonRpcClient {
-  private socket: WebSocket | null = null;
-  private nextId = 1;
-  private pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
-  private connected: Promise<void> | null = null;
-  private handlers = new Set<RpcNotificationHandler>();
-
-  async call<T>(method: string, params: Record<string, unknown> = {}): Promise<T> {
-    await this.ensureConnected();
-    const socket = this.socket;
-    if (!socket || socket.readyState !== WebSocket.OPEN) {
-      throw new Error("RPC socket is not open.");
-    }
-    const id = this.nextId++;
-    const result = new Promise<T>((resolve, reject) => {
-      this.pending.set(id, { resolve: resolve as (value: unknown) => void, reject });
-    });
-    socket.send(JSON.stringify({ id, method, params }));
-    return result;
-  }
-
-  subscribe(handler: RpcNotificationHandler): () => void {
-    this.handlers.add(handler);
-    void this.ensureConnected().catch(() => undefined);
-    return () => {
-      this.handlers.delete(handler);
-    };
-  }
-
-  private async ensureConnected(): Promise<void> {
-    if (this.socket?.readyState === WebSocket.OPEN) {
-      return;
-    }
-    if (this.connected) {
-      return this.connected;
-    }
-    this.connected = new Promise<void>((resolve, reject) => {
-      const socket = new WebSocket(this.rpcUrl());
-      this.socket = socket;
-      let settled = false;
-      const fail = (error: Error) => {
-        if (settled) {
-          return;
-        }
-        settled = true;
-        this.connected = null;
-        if (this.socket === socket) {
-          this.socket = null;
-        }
-        if (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN) {
-          socket.close();
-        }
-        this.rejectPending(error);
-        reject(error);
-      };
-      const succeed = () => {
-        if (settled) {
-          return;
-        }
-        settled = true;
-        resolve();
-      };
-      const timeout = window.setTimeout(() => {
-        fail(new RpcConnectionError("RPC socket connection failed."));
-      }, 5000);
-      socket.addEventListener("open", async () => {
-        try {
-          await this.callRaw("initialize", { clientInfo: { name: "grounded-miniapp-frontend" } });
-          window.clearTimeout(timeout);
-          succeed();
-        } catch (error) {
-          window.clearTimeout(timeout);
-          fail(error instanceof Error ? error : new RpcConnectionError("RPC socket connection failed."));
-        }
-      });
-      socket.addEventListener("message", (event) => {
-        const message = JSON.parse(String(event.data)) as RpcEnvelope;
-        if (typeof message.id === "number") {
-          const pending = this.pending.get(message.id);
-          if (!pending) {
-            return;
-          }
-          this.pending.delete(message.id);
-          if (message.error) {
-            pending.reject(new Error(message.error.message));
-          } else {
-            pending.resolve(message.result);
-          }
-          return;
-        }
-        this.handlers.forEach((handler) => handler(message));
-      });
-      socket.addEventListener("close", () => {
-        this.socket = null;
-        this.connected = null;
-        window.clearTimeout(timeout);
-        if (!settled) {
-          fail(new RpcConnectionError("RPC socket connection failed."));
-        }
-      });
-      socket.addEventListener("error", () => {
-        window.clearTimeout(timeout);
-        fail(new RpcConnectionError("RPC socket connection failed."));
-      });
-    });
-    return this.connected;
-  }
-
-  private async callRaw<T>(method: string, params: Record<string, unknown>): Promise<T> {
-    const socket = this.socket;
-    if (!socket || socket.readyState !== WebSocket.OPEN) {
-      throw new Error("RPC socket is not open.");
-    }
-    const id = this.nextId++;
-    const result = new Promise<T>((resolve, reject) => {
-      this.pending.set(id, { resolve: resolve as (value: unknown) => void, reject });
-    });
-    socket.send(JSON.stringify({ id, method, params }));
-    return result;
-  }
-
-  private rpcUrl(): string {
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    return `${protocol}//${window.location.host}/rpc`;
-  }
-
-  private rejectPending(error: Error): void {
-    for (const pending of this.pending.values()) {
-      pending.reject(error);
-    }
-    this.pending.clear();
-  }
-}
-
-const rpcClient = new JsonRpcClient();
+const rpcClient = new AppProtocolClient();
 const workspaceThreadIds = new Map<string, string>();
 const runTurnRefs = new Map<string, { threadId: string; turnId: string }>();
 
@@ -1247,6 +1123,10 @@ export async function getWorkspaceObservability(workspaceId: string): Promise<Ob
   return request<ObservabilityReport>(`/workspaces/${workspaceId}/observability`);
 }
 
+export async function getGenerationModes(): Promise<GenerationModeSlaManifest> {
+  return request<GenerationModeSlaManifest>("/system/generation-modes");
+}
+
 export async function createRun(
   workspaceId: string,
   payload: {
@@ -1256,7 +1136,7 @@ export async function createRun(
     apply_strategy?: "staged_auto_apply" | "manual_approve";
     target_role_scope?: Array<"client" | "specialist" | "manager">;
     model_profile?: string;
-    generation_mode?: "fast" | "balanced" | "quality" | "basic";
+    generation_mode?: "fast" | "balanced" | "quality" | "production" | "basic";
     target_platform?: "telegram_mini_app" | "max_mini_app";
     preview_profile?: "telegram_mock" | "max_mock" | "web_preview";
     resume_from_run_id?: string;
@@ -1578,6 +1458,10 @@ export async function getRunVisualQa(runId: string): Promise<GeneratedReport> {
   return request<GeneratedReport>(`/runs/${runId}/visual-qa`);
 }
 
+export async function getRunVisualRegression(runId: string): Promise<VisualRegressionReport> {
+  return request<VisualRegressionReport>(`/runs/${runId}/visual-regression`);
+}
+
 export async function getRunTraceReducer(runId: string): Promise<GeneratedReport> {
   return request<GeneratedReport>(`/runs/${runId}/trace-reducer`);
 }
@@ -1588,6 +1472,10 @@ export async function extractRunMemory(runId: string): Promise<GeneratedReport> 
 
 export async function getWorkspaceMemoryPipeline(workspaceId: string): Promise<MemoryPipelineReport> {
   return request<MemoryPipelineReport>(`/workspaces/${workspaceId}/memory/pipeline`);
+}
+
+export async function getWorkspaceMemorySummary(workspaceId: string): Promise<MemorySummaryReport> {
+  return request<MemorySummaryReport>(`/workspaces/${workspaceId}/memory/summary`);
 }
 
 export async function consolidateWorkspaceMemory(workspaceId: string): Promise<WorkspaceMemory> {

@@ -132,17 +132,26 @@ class RepairPromptBuilder:
         forbidden_files = list(case.get("forbidden_files") or [])
         sections = {
             "failure": failure,
+            "normalized_signature": case.get("normalized_signature") or "",
             "failed_check": case.get("failed_check") or "",
             "broken_surface": case.get("broken_surface") or {},
             "evidence": case.get("evidence") or {},
             "target_files": target_files,
             "likely_files": case.get("likely_files") or target_files,
+            "probable_files": case.get("probable_files") or [],
             "forbidden_files": forbidden_files,
             "first_tool": first_tool,
             "allowed_edit_slice": case.get("allowed_edit_slice") or target_files,
+            "product_guardrails": case.get("product_guardrails") or {},
+            "known_fix_recipe": case.get("known_fix_recipe") or {},
+            "known_fix_recipes": case.get("known_fix_recipes") or [],
+            "repair_confidence": case.get("repair_confidence") or {},
             "next_action": case.get("next_action") or {},
             "expected_proof": case.get("expected_proof") or [],
             "post_fix_proof": case.get("post_fix_proof") or {},
+            "post_repair_proof": case.get("post_repair_proof") or case.get("post_fix_proof") or {},
+            "browser_replay": case.get("browser_replay") or {},
+            "api_replay": case.get("api_replay") or {},
             "repair_packet": case.get("repair_packet") or {},
             "retry_policy": case.get("retry_policy") or {},
         }
@@ -156,14 +165,20 @@ class RepairPromptBuilder:
             "evidence": sections["evidence"],
             "target_files": target_files,
             "likely_files": sections["likely_files"],
+            "probable_files": sections["probable_files"],
             "failed_check": sections["failed_check"],
             "broken_surface": sections["broken_surface"],
             "forbidden_files": forbidden_files,
             "first_tool": first_tool,
             "allowed_edit_slice": sections["allowed_edit_slice"],
+            "product_guardrails": sections["product_guardrails"],
+            "known_fix_recipe": sections["known_fix_recipe"],
+            "known_fix_recipes": sections["known_fix_recipes"],
+            "repair_confidence": sections["repair_confidence"],
             "next_action": sections["next_action"],
             "expected_proof": sections["expected_proof"],
             "post_fix_proof": sections["post_fix_proof"],
+            "post_repair_proof": sections["post_repair_proof"],
             "repair_packet": sections["repair_packet"],
             "retry_policy": sections["retry_policy"],
             "attempt_count": len(case.get("attempts") or []),
@@ -461,6 +476,13 @@ class RepairCaseService:
                 {
                     **packet,
                     "repair_case_id": active.get("case_id"),
+                    "normalized_signature": active.get("normalized_signature"),
+                    "probable_files": active.get("probable_files") or [],
+                    "known_fix_recipe": active.get("known_fix_recipe") or {},
+                    "known_fix_recipes": active.get("known_fix_recipes") or [],
+                    "product_guardrails": active.get("product_guardrails") or {},
+                    "repair_confidence": active.get("repair_confidence") or {},
+                    "post_repair_proof": active.get("post_repair_proof") or active.get("post_fix_proof") or {},
                     "repair_prompt": prompt,
                     "attempt_count": len(active.get("attempts") or []),
                     "forbidden_repeat_action": active.get("forbidden_repeat_action"),
@@ -493,24 +515,34 @@ class RepairCaseService:
         repair_packet = dict(packet.get("repair_packet") or {})
         failed_check = str(packet.get("failed_check") or packet.get("verification_check") or failure_class)
         likely_files = list(packet.get("likely_files") or target_files)
+        probable_files = list(packet.get("probable_files") or [])
         broken_surface = dict(packet.get("broken_surface") or {})
         post_fix_proof = dict(packet.get("post_fix_proof") or {})
+        post_repair_proof = dict(packet.get("post_repair_proof") or post_fix_proof)
+        known_fix_recipes = list(packet.get("known_fix_recipes") or [])
+        known_fix_recipe = dict(packet.get("known_fix_recipe") or (known_fix_recipes[0] if known_fix_recipes and isinstance(known_fix_recipes[0], dict) else {}))
+        product_guardrails = dict(packet.get("product_guardrails") or {})
+        repair_confidence = dict(packet.get("repair_confidence") or {})
+        signature_normalization = dict(packet.get("signature_normalization") or {})
+        browser_replay = cls._browser_replay(packet)
+        api_replay = cls._api_replay(packet)
         evidence = {
             "packet": packet,
             "repair_packet": repair_packet,
-            "browser_replay": cls._browser_replay(packet),
-            "api_replay": cls._api_replay(packet),
+            "browser_replay": browser_replay,
+            "api_replay": api_replay,
             "trace": {
                 key: (trace_state or {}).get(key)
                 for key in ("last_failed_attempt", "repeated_action", "next_best_repair_case", "stale_diff")
                 if isinstance(trace_state, dict) and key in trace_state
             },
         }
-        retry_policy = cls._retry_policy(packet)
+        retry_policy = dict(packet.get("retry_strategy") or {}) or cls._retry_policy(packet)
         if target_files and retry_policy.get("first_tool") == "semantic_scan":
             retry_policy = {**retry_policy, "first_tool": "read_files"}
         case = {
             "schema": REPAIR_CASE_SCHEMA,
+            "repair_catalog_version": str(packet.get("repair_catalog_version") or "v2"),
             "case_id": case_id,
             "workspace_id": workspace_id,
             "run_id": run_id,
@@ -518,13 +550,23 @@ class RepairCaseService:
             "source": source,
             "failure_class": failure_class,
             "failure_signature": signature,
+            "normalized_signature": str(packet.get("normalized_signature") or signature_normalization.get("normalized") or signature),
+            "signature_normalization": signature_normalization,
             "issue_code": str(packet.get("issue_code") or packet.get("code") or "uncatalogued_repair_case"),
             "severity": str(packet.get("severity") or "medium"),
             "likely_cause": str(packet.get("likely_root_cause") or packet.get("instruction") or "Repair requires evidence-driven triage."),
             "failed_check": failed_check,
             "likely_files": likely_files,
+            "probable_files": probable_files,
             "broken_surface": broken_surface,
             "post_fix_proof": post_fix_proof,
+            "post_repair_proof": post_repair_proof,
+            "known_fix_recipe": known_fix_recipe,
+            "known_fix_recipes": known_fix_recipes,
+            "product_guardrails": product_guardrails,
+            "repair_confidence": repair_confidence,
+            "browser_replay": browser_replay,
+            "api_replay": api_replay,
             "repair_packet": repair_packet,
             "target_files": target_files,
             "forbidden_files": list(packet.get("forbidden_target_files") or []),
@@ -554,7 +596,9 @@ class RepairCaseService:
         if expected_proof and isinstance(expected_proof[0], dict):
             verification_check = str(expected_proof[0].get("value") or "")
         evidence = case.get("evidence") if isinstance(case.get("evidence"), dict) else {}
-        browser_replay = evidence.get("browser_replay") if isinstance(evidence.get("browser_replay"), dict) else {}
+        browser_replay = case.get("browser_replay") if isinstance(case.get("browser_replay"), dict) else {}
+        if not browser_replay:
+            browser_replay = evidence.get("browser_replay") if isinstance(evidence.get("browser_replay"), dict) else {}
         attempt_count = len(case.get("attempts") or [])
         if browser_replay.get("replay_plan"):
             action = "reproduce_browser_step_first"
@@ -584,6 +628,10 @@ class RepairCaseService:
             "failed_check": case.get("failed_check") or verification_check,
             "broken_surface": case.get("broken_surface") or {},
             "post_fix_proof": case.get("post_fix_proof") or {},
+            "post_repair_proof": case.get("post_repair_proof") or case.get("post_fix_proof") or {},
+            "product_guardrails": case.get("product_guardrails") or {},
+            "repair_confidence": case.get("repair_confidence") or {},
+            "known_fix_recipe": case.get("known_fix_recipe") or {},
             "browser_replay": browser_replay,
             "replay_first": bool(browser_replay.get("replay_plan")),
             "instruction": instruction,

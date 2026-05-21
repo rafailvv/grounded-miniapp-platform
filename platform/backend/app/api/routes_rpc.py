@@ -4,10 +4,12 @@ import asyncio
 from typing import Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from pydantic import ValidationError
 
+from app.models.protocol import RpcErrorObject, RpcResponseEnvelopeV2
 from app.models.threads import ThreadSnapshot
 from app.services.container import ServiceContainer
-from app.services.rpc_protocol import JSON_RPC_VERSION, rpc_protocol_manifest
+from app.services.rpc_protocol import JSON_RPC_VERSION, RPC_PARAM_MODELS, rpc_protocol_manifest
 
 router = APIRouter(tags=["rpc"])
 
@@ -26,6 +28,7 @@ async def rpc_endpoint(websocket: WebSocket) -> None:
     container: ServiceContainer = websocket.app.state.container
     subscription = container.rpc_event_hub.subscribe()
     initialized = False
+    idempotency_cache: dict[tuple[str, str], Any] = {}
 
     async def send_notifications() -> None:
         while True:
@@ -39,9 +42,15 @@ async def rpc_endpoint(websocket: WebSocket) -> None:
             request_id = raw.get("id")
             method = str(raw.get("method") or "")
             params = raw.get("params") or {}
+            idempotency_key = str(raw.get("idempotency_key") or raw.get("idempotencyKey") or params.get("idempotency_key") or params.get("idempotencyKey") or "").strip() or None
             try:
                 if method != "initialize" and not initialized:
                     raise RpcError(-32000, "Not initialized.")
+                params = _validate_params(method, params)
+                cache_key = (method, idempotency_key) if idempotency_key else None
+                if cache_key is not None and cache_key in idempotency_cache:
+                    await websocket.send_json(_response(request_id, result=idempotency_cache[cache_key], idempotency_key=idempotency_key))
+                    continue
                 if method == "initialize":
                     initialized = True
                     result = {
@@ -62,13 +71,15 @@ async def rpc_endpoint(websocket: WebSocket) -> None:
                     }
                 else:
                     result = await _dispatch(container, method, params)
-                await websocket.send_json({"jsonrpc": JSON_RPC_VERSION, "id": request_id, "result": result})
+                if cache_key is not None:
+                    idempotency_cache[cache_key] = result
+                await websocket.send_json(_response(request_id, result=result, idempotency_key=idempotency_key))
             except RpcError as exc:
-                await websocket.send_json({"jsonrpc": JSON_RPC_VERSION, "id": request_id, "error": {"code": exc.code, "message": exc.message, "data": exc.data}})
-            except (KeyError, ValueError) as exc:
-                await websocket.send_json({"jsonrpc": JSON_RPC_VERSION, "id": request_id, "error": {"code": -32602, "message": str(exc)}})
+                await websocket.send_json(_response(request_id, error=RpcErrorObject(code=exc.code, message=exc.message, data=exc.data), idempotency_key=idempotency_key))
+            except (KeyError, ValueError, ValidationError) as exc:
+                await websocket.send_json(_response(request_id, error=RpcErrorObject(code=-32602, message=str(exc)), idempotency_key=idempotency_key))
             except Exception as exc:
-                await websocket.send_json({"jsonrpc": JSON_RPC_VERSION, "id": request_id, "error": {"code": -32603, "message": str(exc)}})
+                await websocket.send_json(_response(request_id, error=RpcErrorObject(code=-32603, message=str(exc)), idempotency_key=idempotency_key))
     except WebSocketDisconnect:
         pass
     finally:
@@ -208,6 +219,33 @@ async def _dispatch(container: ServiceContainer, method: str, params: dict[str, 
     if method == "plugin/list":
         return container.workbench_service.plugins()
     raise RpcError(-32601, f"Unknown method: {method}")
+
+
+def _validate_params(method: str, params: Any) -> dict[str, Any]:
+    if not isinstance(params, dict):
+        raise ValueError("JSON-RPC params must be an object.")
+    model = RPC_PARAM_MODELS.get(method)
+    if model is None:
+        if method in {"thread/snapshot", "thread/snapshot/list", "thread/archive", "thread/rollback", "turn/steer", "turn/compact/start", "review/start", "fs/readDirectory", "fs/watch", "fs/unwatch", "command/exec/write", "command/exec/resize", "command/exec/terminate", "command/exec/read", "model/list"}:
+            return params
+        raise RpcError(-32601, f"Unknown method: {method}")
+    return model.model_validate(params).model_dump(mode="json", by_alias=False)
+
+
+def _response(
+    request_id: Any,
+    *,
+    result: Any | None = None,
+    error: RpcErrorObject | None = None,
+    idempotency_key: str | None = None,
+) -> dict[str, Any]:
+    return RpcResponseEnvelopeV2(
+        jsonrpc=JSON_RPC_VERSION,
+        id=request_id,
+        result=result,
+        error=error,
+        idempotency_key=idempotency_key,
+    ).model_dump(mode="json", by_alias=True, exclude_none=True)
 
 
 def _snapshot_payload(snapshot: ThreadSnapshot) -> dict[str, Any]:

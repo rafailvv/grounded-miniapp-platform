@@ -1,0 +1,566 @@
+{
+  "$defs": {
+    "SandboxEnvironmentSnapshot": {
+      "additionalProperties": false,
+      "properties": {
+        "argv": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Argv",
+          "type": "array"
+        },
+        "created_at": {
+          "title": "Created At",
+          "type": "string"
+        },
+        "cwd": {
+          "title": "Cwd",
+          "type": "string"
+        },
+        "enforcement": {
+          "enum": [
+            "hard",
+            "policy_only",
+            "unavailable"
+          ],
+          "title": "Enforcement",
+          "type": "string"
+        },
+        "env_keys": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Env Keys",
+          "type": "array"
+        },
+        "env_sha256": {
+          "title": "Env Sha256",
+          "type": "string"
+        },
+        "home_dir": {
+          "title": "Home Dir",
+          "type": "string"
+        },
+        "host_pid": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Host Pid"
+        },
+        "isolated_workspace": {
+          "title": "Isolated Workspace",
+          "type": "string"
+        },
+        "network_mode": {
+          "enum": [
+            "blocked",
+            "allowed"
+          ],
+          "title": "Network Mode",
+          "type": "string"
+        },
+        "os_name": {
+          "title": "Os Name",
+          "type": "string"
+        },
+        "process_id": {
+          "title": "Process Id",
+          "type": "string"
+        },
+        "profile": {
+          "enum": [
+            "analysis_readonly",
+            "agent_draft_write",
+            "source_apply_gate",
+            "developer_bypass"
+          ],
+          "title": "Profile",
+          "type": "string"
+        },
+        "provider": {
+          "title": "Provider",
+          "type": "string"
+        },
+        "resolved_argv": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Resolved Argv",
+          "type": "array"
+        },
+        "resource_limits": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "title": "Resource Limits",
+          "type": "object"
+        },
+        "schema": {
+          "default": "grounded.sandbox.environment_snapshot.v1",
+          "title": "Schema",
+          "type": "string"
+        },
+        "snapshot_sha256": {
+          "title": "Snapshot Sha256",
+          "type": "string"
+        },
+        "tmp_dir": {
+          "title": "Tmp Dir",
+          "type": "string"
+        },
+        "workspace_root": {
+          "title": "Workspace Root",
+          "type": "string"
+        },
+        "wrapped_argv": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Wrapped Argv",
+          "type": "array"
+        }
+      },
+      "required": [
+        "process_id",
+        "created_at",
+        "workspace_root",
+        "isolated_workspace",
+        "cwd",
+        "env_sha256",
+        "tmp_dir",
+        "home_dir",
+        "os_name",
+        "profile",
+        "provider",
+        "enforcement",
+        "network_mode",
+        "snapshot_sha256"
+      ],
+      "title": "SandboxEnvironmentSnapshot",
+      "type": "object"
+    },
+    "SandboxFilesystemAllowlist": {
+      "additionalProperties": false,
+      "properties": {
+        "allowed_operations": {
+          "items": {
+            "enum": [
+              "read",
+              "write",
+              "delete",
+              "copy",
+              "apply",
+              "exec"
+            ],
+            "type": "string"
+          },
+          "title": "Allowed Operations",
+          "type": "array"
+        },
+        "cwd": {
+          "title": "Cwd",
+          "type": "string"
+        },
+        "denied_names": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Denied Names",
+          "type": "array"
+        },
+        "denied_parts": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Denied Parts",
+          "type": "array"
+        },
+        "denied_suffixes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Denied Suffixes",
+          "type": "array"
+        },
+        "generated_prefix": {
+          "default": "",
+          "title": "Generated Prefix",
+          "type": "string"
+        },
+        "path_safety": {
+          "additionalProperties": true,
+          "title": "Path Safety",
+          "type": "object"
+        },
+        "read_roots": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Read Roots",
+          "type": "array"
+        },
+        "root": {
+          "title": "Root",
+          "type": "string"
+        },
+        "schema": {
+          "default": "grounded.sandbox.filesystem_allowlist.v1",
+          "title": "Schema",
+          "type": "string"
+        },
+        "write_roots": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Write Roots",
+          "type": "array"
+        }
+      },
+      "required": [
+        "root",
+        "cwd"
+      ],
+      "title": "SandboxFilesystemAllowlist",
+      "type": "object"
+    },
+    "SandboxNetworkDecision": {
+      "additionalProperties": false,
+      "properties": {
+        "allowed": {
+          "default": false,
+          "title": "Allowed",
+          "type": "boolean"
+        },
+        "enforcement": {
+          "default": "unavailable",
+          "enum": [
+            "hard",
+            "policy_only",
+            "unavailable"
+          ],
+          "title": "Enforcement",
+          "type": "string"
+        },
+        "mode": {
+          "default": "blocked",
+          "enum": [
+            "blocked",
+            "allowed"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "provider": {
+          "default": "none",
+          "title": "Provider",
+          "type": "string"
+        },
+        "reason": {
+          "default": "",
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "title": "SandboxNetworkDecision",
+      "type": "object"
+    },
+    "SandboxPreviewLifecycle": {
+      "additionalProperties": false,
+      "properties": {
+        "cleanup_attempted": {
+          "default": false,
+          "title": "Cleanup Attempted",
+          "type": "boolean"
+        },
+        "cooldown_until": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cooldown Until"
+        },
+        "diagnostics": {
+          "additionalProperties": true,
+          "title": "Diagnostics",
+          "type": "object"
+        },
+        "draft_run_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Draft Run Id"
+        },
+        "failure_kind": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Failure Kind"
+        },
+        "lifecycle_events": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Lifecycle Events",
+          "type": "array"
+        },
+        "project_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Project Name"
+        },
+        "proxy_port": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Proxy Port"
+        },
+        "reused_existing_runtime": {
+          "default": false,
+          "title": "Reused Existing Runtime",
+          "type": "boolean"
+        },
+        "runtime_mode": {
+          "enum": [
+            "inline",
+            "docker",
+            "local"
+          ],
+          "title": "Runtime Mode",
+          "type": "string"
+        },
+        "schema": {
+          "default": "grounded.sandbox.preview_lifecycle.v1",
+          "title": "Schema",
+          "type": "string"
+        },
+        "stage": {
+          "title": "Stage",
+          "type": "string"
+        },
+        "status": {
+          "title": "Status",
+          "type": "string"
+        },
+        "url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Url"
+        },
+        "workspace_id": {
+          "title": "Workspace Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "runtime_mode",
+        "status",
+        "stage"
+      ],
+      "title": "SandboxPreviewLifecycle",
+      "type": "object"
+    },
+    "SandboxViolation": {
+      "additionalProperties": false,
+      "properties": {
+        "blocking": {
+          "default": true,
+          "title": "Blocking",
+          "type": "boolean"
+        },
+        "code": {
+          "title": "Code",
+          "type": "string"
+        },
+        "details": {
+          "additionalProperties": true,
+          "title": "Details",
+          "type": "object"
+        },
+        "message": {
+          "title": "Message",
+          "type": "string"
+        },
+        "path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Path"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "title": "SandboxViolation",
+      "type": "object"
+    }
+  },
+  "$id": "https://grounded.local/schemas/app_protocol/sandbox_runtime_boundary.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "cwd": {
+      "title": "Cwd",
+      "type": "string"
+    },
+    "enforcement": {
+      "enum": [
+        "hard",
+        "policy_only",
+        "unavailable"
+      ],
+      "title": "Enforcement",
+      "type": "string"
+    },
+    "environment": {
+      "$ref": "#/$defs/SandboxEnvironmentSnapshot"
+    },
+    "filesystem": {
+      "$ref": "#/$defs/SandboxFilesystemAllowlist"
+    },
+    "isolated_workspace": {
+      "title": "Isolated Workspace",
+      "type": "string"
+    },
+    "log_capture_policy": {
+      "additionalProperties": true,
+      "title": "Log Capture Policy",
+      "type": "object"
+    },
+    "mode": {
+      "default": "workspace_process_group",
+      "title": "Mode",
+      "type": "string"
+    },
+    "network": {
+      "$ref": "#/$defs/SandboxNetworkDecision"
+    },
+    "preview_lifecycle": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SandboxPreviewLifecycle"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "process_group_kill": {
+      "default": false,
+      "title": "Process Group Kill",
+      "type": "boolean"
+    },
+    "process_id": {
+      "title": "Process Id",
+      "type": "string"
+    },
+    "profile": {
+      "enum": [
+        "analysis_readonly",
+        "agent_draft_write",
+        "source_apply_gate",
+        "developer_bypass"
+      ],
+      "title": "Profile",
+      "type": "string"
+    },
+    "provider": {
+      "title": "Provider",
+      "type": "string"
+    },
+    "resource_limits": {
+      "additionalProperties": {
+        "type": "integer"
+      },
+      "title": "Resource Limits",
+      "type": "object"
+    },
+    "schema": {
+      "default": "grounded.sandbox.runtime_boundary.v1",
+      "title": "Schema",
+      "type": "string"
+    },
+    "timeout_seconds": {
+      "title": "Timeout Seconds",
+      "type": "integer"
+    },
+    "violations": {
+      "items": {
+        "$ref": "#/$defs/SandboxViolation"
+      },
+      "title": "Violations",
+      "type": "array"
+    },
+    "workspace_root": {
+      "title": "Workspace Root",
+      "type": "string"
+    }
+  },
+  "required": [
+    "process_id",
+    "profile",
+    "provider",
+    "enforcement",
+    "workspace_root",
+    "isolated_workspace",
+    "cwd",
+    "filesystem",
+    "network",
+    "timeout_seconds",
+    "environment"
+  ],
+  "title": "SandboxRuntimeBoundary",
+  "type": "object"
+}

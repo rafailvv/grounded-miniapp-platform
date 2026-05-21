@@ -1,5 +1,39 @@
 {
   "$defs": {
+    "CompatibilityRule": {
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "title": "Description",
+          "type": "string"
+        },
+        "enforcement": {
+          "default": "tested",
+          "enum": [
+            "documented",
+            "tested",
+            "enforced"
+          ],
+          "title": "Enforcement",
+          "type": "string"
+        },
+        "rule_id": {
+          "title": "Rule Id",
+          "type": "string"
+        },
+        "since": {
+          "default": "v2",
+          "title": "Since",
+          "type": "string"
+        }
+      },
+      "required": [
+        "rule_id",
+        "description"
+      ],
+      "title": "CompatibilityRule",
+      "type": "object"
+    },
     "ProtocolSubjectSpec": {
       "additionalProperties": false,
       "properties": {
@@ -106,6 +140,13 @@
       "title": "Compatibility Policy",
       "type": "string"
     },
+    "compatibility_rules": {
+      "items": {
+        "$ref": "#/$defs/CompatibilityRule"
+      },
+      "title": "Compatibility Rules",
+      "type": "array"
+    },
     "current_version": {
       "const": "v2",
       "default": "v2",
@@ -142,6 +183,18 @@
       },
       "title": "Payload Models",
       "type": "array"
+    },
+    "rpc_method_models": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Rpc Method Models",
+      "type": "array"
+    },
+    "rpc_protocol_model": {
+      "default": "RpcProtocolReport",
+      "title": "Rpc Protocol Model",
+      "type": "string"
     },
     "schema": {
       "default": "grounded.app_protocol.manifest.v1",

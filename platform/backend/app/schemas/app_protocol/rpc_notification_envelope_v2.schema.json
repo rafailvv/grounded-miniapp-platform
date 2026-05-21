@@ -1,0 +1,44 @@
+{
+  "$id": "https://grounded.local/schemas/app_protocol/rpc_notification_envelope_v2.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "jsonrpc": {
+      "const": "2.0",
+      "default": "2.0",
+      "title": "Jsonrpc",
+      "type": "string"
+    },
+    "method": {
+      "title": "Method",
+      "type": "string"
+    },
+    "params": {
+      "additionalProperties": true,
+      "title": "Params",
+      "type": "object"
+    },
+    "schema": {
+      "default": "grounded.rpc.notification.v2",
+      "title": "Schema",
+      "type": "string"
+    },
+    "sequence": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Sequence"
+    }
+  },
+  "required": [
+    "method"
+  ],
+  "title": "RpcNotificationEnvelopeV2",
+  "type": "object"
+}
