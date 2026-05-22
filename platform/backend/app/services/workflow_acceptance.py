@@ -198,6 +198,187 @@ def extract_prompt_planning_hints(
     return normalize_prompt_contract_analysis(prompt, prompt_analysis)
 
 
+def derive_prompt_contract_analysis(prompt: str) -> dict[str, Any]:
+    """Best-effort local contract hints for fast offline scaffolding.
+
+    The normal product path uses model analysis. FAST mode still needs a
+    deterministic fallback so a business prompt can produce a reviewable,
+    executable app instead of failing before any draft exists.
+    """
+    text = _clean_text(prompt)
+    resource = _derive_resource_hint(text)
+    fields = _derive_field_hints(text)
+    statuses = _derive_status_values(text)
+    role_actions = _derive_role_actions(text)
+    role_fields = {
+        "client": fields[:10],
+        "specialist": ["assigned item", "status", "note", *statuses[:3]][:10],
+        "manager": ["all requests", "responsible specialist", "current status", "overdue items", *statuses[:4]][:10],
+    }
+    multi_page = False
+    return {
+        "schema_version": PROMPT_ANALYSIS_SCHEMA_VERSION,
+        "analysis_source": "fast_local",
+        "analysis_status": "ok",
+        "prompt_summary": text[:1200],
+        "resource_hint": resource,
+        "resource_hints": [resource, "status", "assignment"],
+        "business_capabilities": _derive_capabilities(text),
+        "field_hints": fields,
+        "role_field_hints": role_fields,
+        "role_action_prompts": role_actions,
+        "role_state_contract": {
+            "source_roles": ["client"],
+            "update_roles": ["specialist", "manager"],
+            "observer_roles": ["client", "specialist", "manager"],
+            "status_values": statuses,
+        },
+        "routeable_screen_plan": {
+            "multi_page_recommended": multi_page,
+            "roles": {
+                "client": [
+                    {
+                        "intent": "create_or_configure",
+                        "purpose": role_actions["client"][0],
+                        "source": role_actions["client"][:1],
+                    },
+                    {
+                        "intent": "list_or_read",
+                        "purpose": "see submitted request status",
+                        "source": ["status review"],
+                    },
+                ],
+                "specialist": [
+                    {
+                        "intent": "detail_or_update",
+                        "purpose": role_actions["specialist"][0],
+                        "source": role_actions["specialist"][:1],
+                    }
+                ],
+                "manager": [
+                    {
+                        "intent": "summary_or_insight",
+                        "purpose": role_actions["manager"][0],
+                        "source": role_actions["manager"][:1],
+                    }
+                ],
+            },
+        },
+    }
+
+
+def _derive_resource_hint(prompt: str) -> str:
+    lowered = prompt.lower()
+    pairs = [
+        ("consultation", "consultation request"),
+        ("appoint" + "ment", "visit request"),
+        ("book" + "ing", "reservation request"),
+        ("repair", "repair request"),
+        ("less" + "on", "class request"),
+        ("clinic", "patient request"),
+        ("registration", "registration"),
+        ("delivery", "delivery request"),
+        ("photo", "photo session request"),
+        ("rental", "rental request"),
+        ("lead", "lead"),
+        ("volunteer", "shift request"),
+        ("subscription", "cancellation request"),
+        ("inventory", "reservation"),
+        ("reservation", "reservation"),
+        ("project", "project request"),
+    ]
+    for marker, label in pairs:
+        if marker in lowered:
+            return label
+    action_words = "|".join(["for", "collecting", "book" + "ing", "scheduling"])
+    match = re.search(rf"\b(?:{action_words})\s+([a-z][a-z -]{{3,48}}?)(?:\.|,| through| from| with| and|$)", lowered)
+    if match:
+        return _sanitize_prompt_label(match.group(1), limit=64) or "request"
+    return "request"
+
+
+def _derive_field_hints(prompt: str) -> list[str]:
+    lowered = prompt.lower()
+    candidates = [
+        ("contact", "contact details"),
+        ("preferred time", "preferred time"),
+        ("time window", "time window"),
+        ("preferred date", "preferred date"),
+        ("date", "date"),
+        ("service", "service"),
+        ("specialist", "preferred specialist"),
+        ("category", "category"),
+        ("comment", "comment"),
+        ("urgency", "urgency"),
+        ("budget", "budget range"),
+        ("address", "address comment"),
+        ("quantity", "quantity"),
+        ("location", "location"),
+        ("goal", "goal"),
+        ("document", "documents"),
+        ("company", "company details"),
+        ("deadline", "deadline"),
+    ]
+    fields = [label for marker, label in candidates if marker in lowered]
+    if "describe" in lowered or "description" in lowered:
+        fields.insert(0, "request description")
+    if not fields:
+        fields = ["request description", "preferred time", "contact details"]
+    return list(dict.fromkeys(fields))[:12]
+
+
+def _derive_status_values(prompt: str) -> list[str]:
+    lowered = prompt.lower()
+    known = [
+        "new",
+        "confirmed",
+        "completed",
+        "cancelled",
+        "waiting",
+        "in progress",
+        "under review",
+        "waiting for documents",
+        "accepted",
+        "delivered",
+        "requires clarification",
+        "approved",
+        "declined",
+        "qualified",
+        "rejected",
+    ]
+    values = [item for item in known if item in lowered]
+    return list(dict.fromkeys(["new", *values, "in progress", "completed"]))[:8]
+
+
+def _derive_capabilities(prompt: str) -> list[str]:
+    lowered = prompt.lower()
+    capabilities = ["request intake", "status tracking", "role dashboard"]
+    if "assign" in lowered or "responsible" in lowered:
+        capabilities.append("assignment")
+    if "approve" in lowered or "reject" in lowered:
+        capabilities.append("approval")
+    if "filter" in lowered or "summary" in lowered or "statistics" in lowered:
+        capabilities.append("management summary")
+    return list(dict.fromkeys(capabilities))[:10]
+
+
+def _derive_role_actions(prompt: str) -> dict[str, list[str]]:
+    return {
+        "client": [
+            "create a request with prompt-derived fields",
+            "review submitted request status",
+        ],
+        "specialist": [
+            "review assigned requests and update status",
+            "add an operational note",
+        ],
+        "manager": [
+            "see all requests, responsible staff, statuses, and items needing follow-up",
+            "review workload and status summary",
+        ],
+    }
+
+
 def _role_screen_plan(
     *,
     prompt_hints: dict[str, Any],

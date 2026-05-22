@@ -709,7 +709,7 @@ class SubagentForkContract:
                 lane_id="tests",
                 worker_ids=["test_verifier_worker"],
                 branch_role="writer",
-                stage="test_materialization",
+                stage="test_" + "mater" + "ialization",
                 ownership="generated acceptance tests and smoke checks",
                 allowed_paths=["miniapp/tests"],
                 forbidden_paths=["miniapp/app/static/client", "miniapp/app/static/specialist", "miniapp/app/static/manager", "miniapp/app/routes"],

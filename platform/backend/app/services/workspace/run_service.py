@@ -41,7 +41,12 @@ from app.services.event_journal import EventJournalService
 from app.services.run_protocol import RunProtocolService
 from app.services.run_state_machine import RunStateMachine
 from app.services.run_task_ledger import RunTaskLedger
-from app.services.workflow_acceptance import build_acceptance_contract, build_implementation_plan, orchestration_metadata_for_contract
+from app.services.workflow_acceptance import (
+    build_acceptance_contract,
+    build_implementation_plan,
+    derive_prompt_contract_analysis,
+    orchestration_metadata_for_contract,
+)
 from app.services.workspace.log_service import WorkspaceLogService
 from app.services.workspace.preview_service import PreviewService
 from app.services.workspace.service import WorkspaceService
@@ -215,19 +220,26 @@ class RunService:
             or effective_generation_mode in {GenerationMode.BALANCED, GenerationMode.QUALITY}
         ) and not inherited_acceptance_contract
         if requires_prompt_analysis:
-            if not self.openai_client.enabled:
-                raise RuntimeError("LLM prompt analysis is required before creating a workflow run.")
-            with self.openai_client.routing_context(
-                model_profile=effective_model_profile,
-                generation_mode=effective_generation_mode,
-            ):
-                prompt_analysis = self.openai_client.analyze_miniapp_prompt(
-                    prompt=request.prompt,
-                    generation_mode=effective_generation_mode,
+            if effective_generation_mode in {GenerationMode.FAST, GenerationMode.BASIC}:
+                prompt_analysis = derive_prompt_contract_analysis(request.prompt)
+                prompt_analysis_model = "fast-local-contract"
+            elif not self.openai_client.enabled:
+                if effective_generation_mode not in {GenerationMode.FAST, GenerationMode.BASIC}:
+                    raise RuntimeError("LLM prompt analysis is required before creating a workflow run.")
+                prompt_analysis = derive_prompt_contract_analysis(request.prompt)
+                prompt_analysis_model = "fast-local-contract"
+            else:
+                with self.openai_client.routing_context(
                     model_profile=effective_model_profile,
-                )
-            prompt_analysis_usage = dict((prompt_analysis or {}).pop("_llm_usage", {}) or {})
-            prompt_analysis_model = str((prompt_analysis or {}).pop("_llm_model", "") or "") or None
+                    generation_mode=effective_generation_mode,
+                ):
+                    prompt_analysis = self.openai_client.analyze_miniapp_prompt(
+                        prompt=request.prompt,
+                        generation_mode=effective_generation_mode,
+                        model_profile=effective_model_profile,
+                    )
+                prompt_analysis_usage = dict((prompt_analysis or {}).pop("_llm_usage", {}) or {})
+                prompt_analysis_model = str((prompt_analysis or {}).pop("_llm_model", "") or "") or None
         contract_prompt = contract_source_run.prompt if inherited_acceptance_contract and contract_source_run is not None else request.prompt
         if inherited_acceptance_contract:
             acceptance_contract = {
@@ -3110,6 +3122,9 @@ class RunService:
 
     @staticmethod
     def _should_wait_for_preview_refresh(request: CreateRunRequest, run: RunRecord) -> bool:
+        mode = str(getattr(run.generation_mode, "value", run.generation_mode) or request.generation_mode or "").strip().lower()
+        if mode in {"fast", "basic"}:
+            return False
         if str(run.intent or "").strip().lower() not in {"edit", "refine", "role_only_change"}:
             return True
         probe = GenerateRequest(

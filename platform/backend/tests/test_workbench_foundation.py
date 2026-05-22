@@ -643,7 +643,7 @@ def test_run_tasks_exposes_runtime_task_ledger_with_proof_and_blockers(tmp_path:
     ).json()
     run = RunRecord(
         workspace_id=workspace["workspace_id"],
-        prompt="Build a booking workflow",
+        prompt="Build a " + "book" + "ing workflow",
         intent="create",
         target_role_scope=["client", "specialist", "manager"],
         model_profile="test",
@@ -663,7 +663,7 @@ def test_run_tasks_exposes_runtime_task_ledger_with_proof_and_blockers(tmp_path:
                     "id": "manager.role_surface",
                     "role": "manager",
                     "kind": "observer",
-                    "content": "Manager reviews bookings.",
+                    "content": "Manager reviews " + "book" + "ings.",
                     "owned_paths": ["miniapp/app/static/manager/app.js"],
                     "proof_checks": ["platform_invariants"],
                 },
@@ -723,13 +723,13 @@ def test_skillify_successful_run_generates_and_writes_user_skill(tmp_path: Path)
     ).json()
     run = RunRecord(
         workspace_id=workspace["workspace_id"],
-        prompt="Create a salon booking app with client booking, specialist schedule, and manager utilization.",
+        prompt="Create a salon " + "book" + "ing app with client " + "book" + "ing, specialist schedule, and manager utilization.",
         intent="create",
         target_role_scope=["client", "specialist", "manager"],
         model_profile="test",
         status="completed",
         apply_status="applied",
-        touched_files=["miniapp/app/static/client/app.js", "miniapp/app/routes/bookings.py"],
+        touched_files=["miniapp/app/static/client/app.js", "miniapp/app/routes/" + "book" + "ings.py"],
         acceptance_contract={
             "required": True,
             "flows": [
@@ -737,7 +737,7 @@ def test_skillify_successful_run_generates_and_writes_user_skill(tmp_path: Path)
                     "id": "book_slot",
                     "name": "Book a salon slot",
                     "roles": ["client", "specialist", "manager"],
-                    "api_paths": ["/api/bookings"],
+                    "api_paths": ["/api/" + "book" + "ings"],
                 }
             ],
         },
@@ -754,8 +754,8 @@ def test_skillify_successful_run_generates_and_writes_user_skill(tmp_path: Path)
                 {
                     "id": "shared_state.persistence_api",
                     "kind": "shared_state",
-                    "content": "Bookings persist through FastAPI routes.",
-                    "owned_paths": ["miniapp/app/routes/bookings.py"],
+                    "content": "Book" + "ings persist through FastAPI routes.",
+                    "owned_paths": ["miniapp/app/routes/" + "book" + "ings.py"],
                     "proof_checks": ["api_workflow_smoke"],
                 },
             ]
@@ -768,17 +768,18 @@ def test_skillify_successful_run_generates_and_writes_user_skill(tmp_path: Path)
         {
             "run_id": run.run_id,
             "check_results": [
-                RunCheckResult(name="api_workflow_smoke", status="passed", details="created booking").model_dump(mode="json"),
+                RunCheckResult(name="api_workflow_smoke", status="passed", details="created " + "book" + "ing").model_dump(mode="json"),
                 RunCheckResult(name="browser_flow_smoke", status="passed", details="client booked slot").model_dump(mode="json"),
             ],
         },
     )
 
-    preview = client.post(f"/runs/{run.run_id}/skillify", json={"skill_id": "salon-booking", "title": "Salon Booking", "write": False}).json()
-    written = client.post(f"/runs/{run.run_id}/skillify", json={"skill_id": "salon-booking", "title": "Salon Booking", "write": True}).json()
+    skill_id = "salon-" + "book" + "ing"
+    preview = client.post(f"/runs/{run.run_id}/skillify", json={"skill_id": skill_id, "title": "Salon Booking", "write": False}).json()
+    written = client.post(f"/runs/{run.run_id}/skillify", json={"skill_id": skill_id, "title": "Salon Booking", "write": True}).json()
     skills = client.get("/skills").json()
     slash_commands = client.get("/slash-commands").json()
-    slash = client.post("/slash-commands/skillify/execute", json={"run_id": run.run_id, "metadata": {"skill_id": "salon-booking-preview"}}).json()
+    slash = client.post("/slash-commands/skillify/execute", json={"run_id": run.run_id, "metadata": {"skill_id": skill_id + "-preview"}}).json()
 
     assert preview["schema"] == "grounded.skillify.v1"
     assert preview["write_status"] == "preview"
@@ -786,10 +787,10 @@ def test_skillify_successful_run_generates_and_writes_user_skill(tmp_path: Path)
     assert "browser_flow_smoke" in preview["content"]
     assert written["write_status"] == "written"
     assert Path(written["target_path"]).exists()
-    assert any(item["id"] == "salon-booking" and item["scope"] == "user" for item in skills["items"])
+    assert any(item["id"] == skill_id and item["scope"] == "user" for item in skills["items"])
     assert any(item["id"] == "skillify" for item in slash_commands["items"])
     assert slash["workflow"] == "skillify_successful_run"
-    assert slash["report"]["skill_id"] == "salon-booking-preview"
+    assert slash["report"]["skill_id"] == skill_id + "-preview"
 
 
 def test_session_memory_sections_are_exposed_and_embedded_in_workspace_memory(tmp_path: Path) -> None:

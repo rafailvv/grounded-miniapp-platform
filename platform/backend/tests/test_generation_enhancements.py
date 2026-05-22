@@ -5,7 +5,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from app.main import create_app
-from app.models.domain import CheckExecutionRecord, RunCheckResult, RunRecord
+from app.models.domain import CheckExecutionRecord, CreateRunRequest, RunCheckResult, RunRecord
 from app.services.generation_enhancements import ProjectInstructionBundle, SkillPackCatalog
 from app.services.skill_registry import SkillRegistryService
 from app.services.memory_pipeline import WorkspaceMemoryPipeline
@@ -180,6 +180,30 @@ def test_slash_generate_execute_starts_real_run_workflow(tmp_path: Path, monkeyp
     assert execution["run"]["mode"] == "generate"
     assert execution["run"]["intent"] == "create"
     assert execution["run"]["prompt"] == "Создай приложение для записи клиентов."
+
+
+def test_fast_generation_uses_local_scaffold_and_applies_without_preview_infra(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = _workspace(client)
+    prompt = (
+        "I need a delivery request mini-application for a small local service. "
+        "The client should create a delivery request with pickup details, destination details, "
+        "preferred time, package comment, and contact information. Staff should update the request "
+        "as accepted, in delivery, delivered, or requiring clarification. The manager should see "
+        "all active delivery requests, responsible staff members, and status changes."
+    )
+
+    run = app.state.container.run_service.create_run_sync(
+        workspace["workspace_id"],
+        CreateRunRequest(prompt=prompt, mode="generate", generation_mode="fast"),
+    )
+
+    assert run.status == "completed"
+    assert run.apply_status == "applied"
+    assert run.llm_model == "fast-local-scaffold"
+    assert "miniapp/app/routes/fast_requests.py" in run.touched_files
+    assert {"client": "covered", "specialist": "covered", "manager": "covered"} == run.role_coverage
 
 
 def test_slash_acceptance_execute_runs_proof_workflow(tmp_path: Path, monkeypatch) -> None:
