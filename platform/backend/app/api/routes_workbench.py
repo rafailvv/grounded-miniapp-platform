@@ -35,9 +35,11 @@ from app.models.workbench import (
     RepairCasesReport,
     RunBookmarksReport,
     RunCompareReport,
+    RunDiffReviewReport,
     RunEventReplayReport,
     RunEventsReport,
     RunProtocolReport,
+    RunSessionCheckpointsReport,
     RpcProtocolReport,
     RunTimelineReport,
     RunTraceViewReport,
@@ -506,6 +508,30 @@ def compare_runs(run_id: str, target_run_id: str, container: ServiceContainer = 
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@router.get("/runs/{run_id}/checkpoints", response_model=RunSessionCheckpointsReport)
+def get_run_session_checkpoints(run_id: str, container: ServiceContainer = Depends(get_container)) -> RunSessionCheckpointsReport:
+    try:
+        return container.workbench_service.session_checkpoints(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/runs/{run_id}/compare-last-working", response_model=RunCompareReport)
+def compare_run_with_last_working_product(run_id: str, container: ServiceContainer = Depends(get_container)) -> RunCompareReport:
+    try:
+        return container.workbench_service.compare_current_vs_last_working_product(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/runs/{run_id}/rollback-last-good")
+def rollback_run_to_last_good_app(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.rollback_to_last_good_app(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.post("/runs/{run_id}/approvals/{approval_id}/approve")
 def approve_tool_action(run_id: str, approval_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     try:
@@ -725,6 +751,19 @@ def get_run_diff(
 ) -> dict[str, Any]:
     try:
         return container.workbench_service.diff(run_id, base=base, target=target, file=file, worker_id=worker_id, category=category, status=status)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/runs/{run_id}/diff-review", response_model=RunDiffReviewReport)
+def get_run_diff_review(
+    run_id: str,
+    base: str = "source",
+    target: str = "draft",
+    container: ServiceContainer = Depends(get_container),
+) -> RunDiffReviewReport:
+    try:
+        return container.workbench_service.diff_review(run_id, base=base, target=target)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 

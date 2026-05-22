@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shutil
 import sys
+import threading
 import time
 from typing import Any
 import zipfile
@@ -45,6 +46,7 @@ from app.modules.workspace_code_agent_runtime.budget import completion_budget_fo
 from app.openapi_export import export_openapi
 from app.repositories.platform_db import PlatformDb
 from app.services.repair_catalog import RepairCatalog
+from app.services.repair_classifier import RepairClassifier
 from app.services.event_journal import EventJournalSecretError, EventJournalService
 from app.services.exec_policy_service import ExecPolicyService
 from app.services.sandbox_service import SandboxService, SandboxViolationError
@@ -542,6 +544,7 @@ def test_policy_simulation_endpoint_returns_matched_rules(tmp_path: Path) -> Non
     response = client.post("/policy/evaluate", json={"command": "python3 -m pip install requests"}).json()
     doctor = client.get("/doctor").json()
 
+    assert doctor["schema"] == "grounded.doctor_health_panel.v1"
     assert response["decision"]["action"] == "forbidden"
     assert response["decision"]["network_policy"]["code"] == "package_network_operation"
     assert response["shell_parse"]["kind"] == "simple_command"
@@ -551,6 +554,11 @@ def test_policy_simulation_endpoint_returns_matched_rules(tmp_path: Path) -> Non
     check_names = {item["name"] for item in doctor["checks"]}
     assert "exec_policy" in check_names
     assert {
+        "python_deps",
+        "backend_imports",
+        "preview_runtime",
+        "db_writable",
+        "browser_availability",
         "docker_daemon",
         "playwright_browsers",
         "model_access",
@@ -560,6 +568,9 @@ def test_policy_simulation_endpoint_returns_matched_rules(tmp_path: Path) -> Non
         "preview_port_range",
         "runtime_policy_files",
     }.issubset(check_names)
+    section_keys = {item["key"] for item in doctor["sections"]}
+    assert {"python", "node", "browser", "backend", "preview", "storage", "templates", "policy"}.issubset(section_keys)
+    assert doctor["summary"]["total"] == len(doctor["checks"])
     template_hash = next(item for item in doctor["checks"] if item["name"] == "template_hash")
     disk_space = next(item for item in doctor["checks"] if item["name"] == "disk_space")
     assert "sha256=" in template_hash["details"]
@@ -684,11 +695,18 @@ def test_run_tasks_exposes_runtime_task_ledger_with_proof_and_blockers(tmp_path:
     lane = client.get(f"/runs/{run.run_id}/tasks").json()
 
     assert lane["task_ledger"]["schema"] == "grounded.run_task_ledger.v1"
+    assert lane["task_graph"]["schema"] == "grounded.run_task_graph.v1"
     by_id = {item["task_id"]: item for item in lane["items"] if item["source"] == "runtime_task_ledger"}
     assert by_id["client.role_surface"]["status"] == "completed"
     assert by_id["client.role_surface"]["proof_status"] == "passed"
     assert by_id["manager.role_surface"]["status"] == "blocked"
     assert by_id["manager.role_surface"]["blocker"]["details"] == "manager route missing"
+    graph_by_id = {item["task_id"]: item for item in lane["task_graph"]["nodes"]}
+    assert graph_by_id["planner.plan_ready"]["status"] == "completed"
+    assert graph_by_id["client.role_surface"]["dependencies"] == ["planner.plan_ready"]
+    assert graph_by_id["repair.resolve_blockers"]["ready"] is True
+    assert lane["task_graph"]["blockers"][0]["task_id"] == "manager.role_surface"
+    assert any(edge["from"] == "planner.plan_ready" and edge["to"] == "client.role_surface" for edge in lane["task_graph"]["edges"])
 
 
 def test_skillify_successful_run_generates_and_writes_user_skill(tmp_path: Path) -> None:
@@ -1098,6 +1116,7 @@ def test_debug_stuck_and_doctor_workflows_emit_repair_packets(tmp_path: Path) ->
     assert stuck["mode"] == "stuck_run"
     assert stuck["diagnosis"]["stuck"]["kind"] == "active_not_terminal"
     assert doctor["mode"] == "doctor_workspace"
+    assert doctor["environment_health"]["schema"] == "grounded.doctor_health_panel.v1"
     assert doctor["repair_packet"]["target_files"][0] == "miniapp/app/routes/checkout.py"
     assert debug_slash["workflow"] == "debug_run"
     assert stuck_slash["workflow"] == "stuck_run"
@@ -1861,6 +1880,7 @@ def test_typed_event_replay_reconstructs_run_resume_and_compare(tmp_path: Path) 
         failure_reason="Browser proof failed.",
         failure_class="browser_flow_smoke",
         failure_signature="missing_confirmed_reservation",
+        resume_checkpoint_ref="resume_checkpoint:replay",
         touched_files=["miniapp/app/static/client/app.js"],
         target_role_scope=["client", "specialist", "manager"],
         model_profile="test",
@@ -1872,6 +1892,7 @@ def test_typed_event_replay_reconstructs_run_resume_and_compare(tmp_path: Path) 
         status="completed",
         apply_status="applied",
         current_stage="completed",
+        result_revision_id="rev_last_good",
         resume_from_run_id=base.run_id,
         forked_from_run_id=base.run_id,
         touched_files=["miniapp/app/static/client/app.js", "miniapp/app/static/manager/app.js"],
@@ -1923,6 +1944,8 @@ def test_typed_event_replay_reconstructs_run_resume_and_compare(tmp_path: Path) 
     protocol = client.get("/system/rpc-protocol").json()
     replay = client.get(f"/runs/{base.run_id}/event-replay").json()
     compare = client.get(f"/runs/{base.run_id}/compare/{target.run_id}").json()
+    checkpoints = client.get(f"/runs/{base.run_id}/checkpoints").json()
+    last_working_compare = client.get(f"/runs/{base.run_id}/compare-last-working").json()
 
     assert protocol["schema"] == "grounded.rpc_protocol.v2"
     assert {"run/replay", "run/compare", "run/fork_from_bookmark"}.issubset({item["method"] for item in protocol["methods"]})
@@ -1936,6 +1959,12 @@ def test_typed_event_replay_reconstructs_run_resume_and_compare(tmp_path: Path) 
     assert "browser_flow_smoke" in compare["check_delta"]["improved"]
     assert compare["readiness_delta"]["base_status"] == "blocked"
     assert compare["readiness_delta"]["target_status"] == "passed"
+    assert checkpoints["schema"] == "grounded.run_session_checkpoints.v1"
+    assert {"resume_checkpoint", "protocol_bookmark", "failed_check", "browser_failure"}.issubset({item["kind"] for item in checkpoints["items"]})
+    assert checkpoints["latest_good_run_id"] == target.run_id
+    assert {"resume_from_failed_check", "rollback_to_last_good_app", "compare_current_vs_last_working_product"}.issubset({item["action"] for item in checkpoints["actions"]})
+    assert last_working_compare["base_run_id"] == target.run_id
+    assert last_working_compare["target_run_id"] == base.run_id
 
 
 def test_resume_from_stale_bookmark_returns_structured_conflict(tmp_path: Path) -> None:
@@ -2295,7 +2324,21 @@ def test_reliability_gate_passes_applied_run_with_product_proof(tmp_path: Path) 
         touched_files=["miniapp/app/main.py"],
     )
     check_results = [
+        {"name": "changed_files_static", "status": "passed", "details": "ok"},
+        {"name": "frontend_interaction_static_smoke", "status": "passed", "details": "ok"},
         {"name": "backend_static_validators", "status": "passed", "details": "ok"},
+        {
+            "name": "platform_invariants",
+            "status": "passed",
+            "details": "ok",
+            "diagnostics": {
+                "role_coverage": {
+                    "client": {"status": "present", "route_count": 1},
+                    "specialist": {"status": "present", "route_count": 1},
+                    "manager": {"status": "present", "route_count": 1},
+                }
+            },
+        },
         {
             "name": "api_workflow_smoke",
             "status": "passed",
@@ -2380,6 +2423,19 @@ def test_requirement_traceability_matrix_links_prompt_to_route_api_state_tests_a
             "diff": "diff --git a/miniapp/app/static/client/app.js b/miniapp/app/static/client/app.js\n",
             "preview": {"url": "http://127.0.0.1:18000", "role_urls": {"client": "/client"}, "status": "running"},
             "check_results": [
+                {"name": "changed_files_static", "status": "passed", "details": "ok"},
+                {"name": "frontend_interaction_static_smoke", "status": "passed", "details": "ok"},
+                {
+                    "name": "platform_invariants",
+                    "status": "passed",
+                    "details": "ok",
+                    "diagnostics": {
+                        "role_coverage": {
+                            "client": {"status": "present", "route_count": 1},
+                            "manager": {"status": "present", "route_count": 1},
+                        }
+                    },
+                },
                 {
                     "name": "api_workflow_smoke",
                     "status": "passed",
@@ -2496,6 +2552,20 @@ def _readiness_check_results(
     include_generated_tests: bool = True,
 ) -> list[dict[str, Any]]:
     results = [
+        {"name": "changed_files_static", "status": "passed", "details": "ok"},
+        {"name": "frontend_interaction_static_smoke", "status": "passed", "details": "ok"},
+        {
+            "name": "platform_invariants",
+            "status": "passed",
+            "details": "ok",
+            "diagnostics": {
+                "role_coverage": {
+                    "client": {"status": "present", "route_count": 1},
+                    "specialist": {"status": "present", "route_count": 1},
+                    "manager": {"status": "present", "route_count": 1},
+                }
+            },
+        },
         {
             "name": "api_workflow_smoke",
             "status": "passed",
@@ -2600,6 +2670,57 @@ def test_product_readiness_gate_blocks_incomplete_proof(tmp_path: Path, check_re
     assert expected_kinds.issubset(issue_kinds)
     assert gate["product_readiness"]["status"] == "blocked"
     assert final_report["product_readiness"]["blocking_reasons"]
+
+
+def test_strict_product_acceptance_gate_blocks_placeholder_data_and_out_of_scope_diff(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Strict Product Gate",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    run = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Build a persisted role workflow",
+        intent="create",
+        target_role_scope=["client", "specialist", "manager"],
+        model_profile="test",
+        status="completed",
+        apply_status="applied",
+        touched_files=["miniapp/app/static/client/app.js", "README.md"],
+        acceptance_contract={"required": True},
+    )
+    app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+    app.state.container.store.upsert(
+        "reports",
+        f"run_artifacts:{run.run_id}",
+        {
+            "diff": "\n".join(
+                [
+                    "diff --git a/miniapp/app/static/client/app.js b/miniapp/app/static/client/app.js",
+                    "+const mockData = [{ name: 'John Doe' }];",
+                    "diff --git a/README.md b/README.md",
+                    "+notes",
+                ]
+            ),
+            "check_results": _readiness_check_results(),
+        },
+    )
+
+    gate = client.get(f"/runs/{run.run_id}/gate").json()
+    reconciled = client.get(f"/runs/{run.run_id}").json()
+    issue_kinds = {issue["kind"] for issue in gate["issues"]}
+    checklist = {item["key"]: item["status"] for item in gate["product_readiness"]["checklist"]}
+
+    assert gate["status"] == "blocked"
+    assert {"placeholder_runtime_data", "diff_scope"}.issubset(issue_kinds)
+    assert checklist["runtime_data"] == "blocked"
+    assert checklist["diff_scope"] == "blocked"
+    assert reconciled["status"] == "blocked"
 
 
 def test_api_errors_use_typed_envelope(tmp_path: Path) -> None:
@@ -2999,6 +3120,21 @@ def test_reliability_gate_final_report_and_empty_repair_queue(tmp_path: Path) ->
         {
             "diff": "diff --git a/miniapp/app/static/client/app.js b/miniapp/app/static/client/app.js\n",
             "check_results": [
+                {"name": "changed_files_static", "status": "passed", "details": "ok", "logs": []},
+                {"name": "frontend_interaction_static_smoke", "status": "passed", "details": "ok", "logs": []},
+                {
+                    "name": "platform_invariants",
+                    "status": "passed",
+                    "details": "ok",
+                    "logs": [],
+                    "diagnostics": {
+                        "role_coverage": {
+                            "client": {"status": "present", "route_count": 1},
+                            "specialist": {"status": "present", "route_count": 1},
+                            "manager": {"status": "present", "route_count": 1},
+                        }
+                    },
+                },
                 {
                     "name": "api_workflow_smoke",
                     "status": "passed",
@@ -3142,6 +3278,9 @@ def test_browser_proof_final_artifact_includes_scenarios_errors_and_screenshots(
     assert proof["status"] == "failed"
     assert proof["network_errors"] == ["500 http://localhost/api/items"]
     assert proof["screenshots"] == [str(screenshot)]
+    assert proof["role_page_screenshots"][0]["role"] == "client"
+    assert proof["replayable_scripts"][0]["schema"] == "grounded.browser_replay_script.v1"
+    assert proof["replayable_scripts"][0]["steps"][0]["selector"] == "form#client-main"
     assert proof["playwright_scenario"]["steps"][0]["selector"] == "form#client-main"
     assert proof["dom_selector"] == "form#client-main"
     assert proof["screenshot_before"] == str(screenshot)
@@ -3154,6 +3293,7 @@ def test_browser_proof_final_artifact_includes_scenarios_errors_and_screenshots(
     assert visual["dom_state_snapshots"][0]["snapshot"]["controlCount"] == 2
     assert visual["visual_diffs"][0]["action"] == "client_create"
     assert visual["overflow_overlap"]["status"] == "passed"
+    assert any(item["kind"] == "js_error" for item in visual["issues"])
     assert final_report["visual_regression"]["schema"] == "grounded.visual_regression.v1"
     assert final_report["browser_proof"]["artifact_refs"]["export_browser_proof_bundle"].endswith("/export/browser-proof-bundle")
     with zipfile.ZipFile(export["file_path"]) as archive:
@@ -3251,10 +3391,89 @@ def test_visual_regression_blocks_gate_on_mobile_overflow_and_overlap(tmp_path: 
     assert visual["blocking"] is True
     assert visual["overflow_overlap"]["horizontal_overflow"] is True
     assert visual["overflow_overlap"]["critical_overlap"] is True
+    assert any(item["kind"] == "horizontal_overflow" for item in visual["issues"])
     assert gate["status"] == "blocked"
     assert gate["visual_regression"]["status"] == "failed"
     assert gate["artifact_refs"]["visual_regression"] == f"visual_regression:{run.run_id}"
     assert any(issue["kind"] == "visual_regression" for issue in gate["issues"])
+
+
+def test_visual_regression_compares_previous_successful_role_screenshots(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Visual Baseline Workspace",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    baseline = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Build role workflow",
+        intent="create",
+        target_role_scope=["client", "manager"],
+        model_profile="test",
+        status="completed",
+        apply_status="applied",
+    )
+    app.state.container.store.upsert("runs", baseline.run_id, baseline.model_dump(mode="json"))
+    app.state.container.store.upsert(
+        "reports",
+        f"visual_regression:{baseline.run_id}",
+        {
+            "schema": "grounded.visual_regression.v1",
+            "run_id": baseline.run_id,
+            "workspace_id": workspace["workspace_id"],
+            "status": "passed",
+            "blocking": False,
+            "role_page_snapshots": [
+                {"role": "client", "route": "/client", "screenshot": "/tmp/base-client.png"},
+                {"role": "manager", "route": "/manager", "screenshot": "/tmp/base-manager.png"},
+            ],
+            "artifact_refs": {"visual_regression": f"visual_regression:{baseline.run_id}"},
+            "created_at": "2026-05-20T00:00:00+00:00",
+        },
+    )
+    time.sleep(0.001)
+    target = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Edit role workflow",
+        intent="edit",
+        target_role_scope=["client", "manager"],
+        model_profile="test",
+        status="completed",
+        apply_status="applied",
+        touched_files=["miniapp/app/static/client/app.js"],
+    )
+    app.state.container.store.upsert("runs", target.run_id, target.model_dump(mode="json"))
+    app.state.container.store.upsert(
+        "reports",
+        f"run_artifacts:{target.run_id}",
+        {
+            "diff": "diff --git a/miniapp/app/static/client/app.js b/miniapp/app/static/client/app.js\n",
+            "check_results": [
+                {
+                    "name": "browser_flow_smoke",
+                    "status": "passed",
+                    "diagnostics": {
+                        "roles_checked": ["client"],
+                        "ui_steps": [{"role": "client", "route": "/client", "action": "open", "status": "passed", "screenshot_after": "/tmp/current-client.png"}],
+                        "screenshots": ["/tmp/current-client.png"],
+                        "mobile_layout": {"status": "passed"},
+                    },
+                }
+            ],
+        },
+    )
+
+    visual = client.get(f"/runs/{target.run_id}/visual-regression").json()
+
+    assert visual["status"] == "failed"
+    assert visual["baseline"]["baseline_run_id"] == baseline.run_id
+    assert "manager:/manager" in visual["baseline"]["missing_role_snapshots"]
+    assert any(item["kind"] == "layout_regression" for item in visual["issues"])
 
 
 def test_reliability_gate_blocks_missing_browser_proof(tmp_path: Path) -> None:
@@ -4456,6 +4675,72 @@ def test_repair_catalog_emits_precise_repair_packet_contract() -> None:
     assert "console and network errors are empty" in packet["post_fix_proof"]["evidence_required"]
 
 
+def test_repair_classifier_selects_focused_recipe_and_relevant_checks() -> None:
+    api = RepairClassifier.classify(
+        {
+            "verification_check": "api_workflow_smoke",
+            "failure_signature": "sqlite OperationalError: no such table: requests",
+            "target_files": ["miniapp/app/routes/api.py"],
+            "evidence": {"logs": ["sqlite3.OperationalError: no such table: requests"], "path": "miniapp/app/db.py"},
+        }
+    )
+    selector = RepairClassifier.classify(
+        {
+            "verification_check": "frontend_interaction_static_smoke",
+            "details": "Visible workflow form has no submit handler for selector #manager-submit",
+            "evidence": {"failed_role": "manager", "failed_selector": "#manager-submit"},
+        }
+    )
+    overflow = RepairClassifier.classify(
+        {
+            "verification_check": "browser_flow_smoke",
+            "details": "mobile viewport reports horizontal overflow and overlap",
+            "evidence": {"failed_role": "client", "path": "miniapp/app/static/client/styles.css"},
+        }
+    )
+
+    assert api["repair_class"] == "db_schema"
+    assert api["recipe"]["recipe_id"] == "repair.db_schema_contract"
+    assert api["focused_patch_plan"]["allowed_files"][0] == "miniapp/app/routes/api.py"
+    assert [item["check"] for item in api["relevant_checks"]] == ["api_workflow_smoke", "generated_app_python_tests"]
+    assert api["escalation"]["escalate_to"] == "full_repair"
+    assert selector["repair_class"] == "selector"
+    assert selector["focused_patch_plan"]["selector"] == "#manager-submit"
+    assert selector["check_profile"] == "focused_frontend_interaction"
+    assert overflow["repair_class"] == "css_overflow"
+    assert overflow["recipe"]["focused"] is True
+
+
+def test_repair_catalog_and_case_include_repair_class_recipe_and_focused_checks(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    service = app.state.container.repair_case_service
+    packet = RepairCatalog.classify_issue(
+        {
+            "kind": "check_failure",
+            "check": "generated_app_js_tests",
+            "details": "generated_app_js_tests failed because of stale selector assertion for #client-save",
+            "paths": ["miniapp/tests/generated_app.test.mjs", "miniapp/app/static/client/app.js"],
+        }
+    )
+
+    cases = service.sync_from_packets(
+        workspace_id="ws_classifier",
+        run_id="run_classifier",
+        packets=[packet],
+        source="agent_loop_checks",
+    )
+    active = cases["active_case"]
+
+    assert packet["repair_class"] == "selector"
+    assert packet["repair_packet"]["focused_patch_plan"]["mode"] == "focused_patch"
+    assert active["repair_class"] == "selector"
+    assert active["known_fix_recipe"]["classifier_recipe_id"] == "repair.selector_wiring"
+    assert active["next_action"]["focused_patch_plan"]["mode"] == "focused_patch"
+    assert active["next_action"]["relevant_checks"][0]["check"] == "frontend_interaction_static_smoke"
+    assert active["repair_prompt"]["sections"]["escalation"]["escalate_to"] == "full_repair"
+    RepairCase.model_validate(active)
+
+
 def test_repair_catalog_v2_normalizes_dynamic_error_signatures_and_dedupes() -> None:
     packets = RepairCatalog.classify_many(
         [
@@ -4599,6 +4884,63 @@ def test_exec_runtime_streams_and_blocks_workspace_escape(tmp_path: Path) -> Non
     assert "Absolute and home-relative paths are blocked" in escaped_error
     if symlink_session is not None:
         assert symlink_session["result"]["semantic_status"] == "blocked_by_sandbox"
+
+
+def test_exec_runtime_manages_long_running_process_until_terminate(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Managed Exec Workspace",
+            "description": "managed exec runtime test",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    service = app.state.container.thread_service
+    source_dir = app.state.container.workspace_service.source_dir(workspace["workspace_id"])
+    fifo_path = source_dir / "miniapp" / "app" / "live.pipe"
+    os.mkfifo(fifo_path)
+
+    started = service.exec_command(workspace_id=workspace["workspace_id"], command="cat miniapp/app/live.pipe", timeout=0, managed=True)
+    process_id = started["process_id"]
+    for _ in range(50):
+        snapshot = app.state.container.exec_runtime_service.snapshot()
+        if any(item.get("process_id") == process_id for item in snapshot.get("managed_processes", [])):
+            break
+        time.sleep(0.02)
+
+    release_writer = threading.Event()
+
+    def write_fifo() -> None:
+        with fifo_path.open("w", encoding="utf-8") as fifo:
+            fifo.write("managed line\n")
+            fifo.flush()
+            release_writer.wait(timeout=3)
+
+    writer = threading.Thread(target=write_fifo, daemon=True)
+    writer.start()
+    for _ in range(50):
+        output = service.read_exec_output(process_id, stream="stdout", start=0)
+        if "managed line" in output["content"]:
+            break
+        time.sleep(0.02)
+    else:
+        output = service.read_exec_output(process_id, stream="stdout", start=0)
+    next_output = service.read_exec_output(process_id, stream="stdout", start=output["next_start"])
+    terminated = service.terminate_exec(process_id)
+    release_writer.set()
+    writer.join(timeout=3)
+    completed_session = _wait_for_exec_session(app, process_id)
+
+    assert started["managed"] is True
+    assert started["timeout_seconds"] == 0
+    assert "managed line" in output["content"]
+    assert output["managed"] is True
+    assert next_output["content"] == ""
+    assert terminated["ok"] is True
+    assert completed_session["result"]["killed_diagnostics"]["reason"] == "manual_terminate"
 
 
 def test_workspace_source_apply_blocks_draft_symlink_before_mutating_source(tmp_path: Path) -> None:
@@ -4768,6 +5110,60 @@ def test_staged_apply_commits_only_selected_files_and_discard_restores_draft(tmp
     journal = client.get(f"/runs/{run.run_id}/events-v2").json()
     event_types = {item["event_type"] for item in journal["items"]}
     assert {"apply.staged", "apply.applied", "apply.discarded"}.issubset(event_types)
+
+
+def test_diff_review_panel_groups_risk_coverage_and_revert_actions(tmp_path: Path) -> None:
+    app, client, workspace, run = _workspace_with_run(tmp_path)
+    run.prompt = "Build a client request workflow with manager review"
+    run.draft_ready = True
+    run.draft_status = "ready"
+    run.touched_files = [
+        "miniapp/app/static/client/app.js",
+        "miniapp/tests/generated_app.test.mjs",
+        "platform/backend/app/services/internal.py",
+    ]
+    app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+    app.state.container.store.upsert(
+        "reports",
+        f"run_artifacts:{run.run_id}",
+        {
+            "diff": "\n".join(
+                [
+                    "diff --git a/miniapp/app/static/client/app.js b/miniapp/app/static/client/app.js",
+                    "+submitClientRequest();",
+                    "diff --git a/miniapp/tests/generated_app.test.mjs b/miniapp/tests/generated_app.test.mjs",
+                    "+await page.click('#client-submit');",
+                    "diff --git a/platform/backend/app/services/internal.py b/platform/backend/app/services/internal.py",
+                    "+INTERNAL_FLAG = True",
+                ]
+            ),
+            "check_results": [
+                {"name": "changed_files_static", "status": "passed", "details": "syntax ok"},
+                {"name": "frontend_interaction_static_smoke", "status": "passed", "details": "handlers ok"},
+                {"name": "browser_flow_smoke", "status": "passed", "diagnostics": {"roles_checked": ["client"]}},
+                {"name": "generated_app_js_tests", "status": "passed", "details": "workflow test passed"},
+            ],
+        },
+    )
+
+    review = client.get(f"/runs/{run.run_id}/diff-review").json()
+
+    by_path = {item["path"]: item for item in review["files"]}
+    group_keys = {item["key"] for item in review["groups"]}
+    assert review["schema"] == "grounded.run_diff_review.v1"
+    assert review["summary"]["file_count"] == 3
+    assert review["summary"]["platform_file_count"] == 1
+    assert review["summary"]["highest_risk"] == "high"
+    assert "generated_app:client_surface_worker" in group_keys
+    assert "generated_tests:tests" in group_keys
+    assert "platform:other" in group_keys
+    assert by_path["miniapp/app/static/client/app.js"]["risk"] == "medium"
+    assert by_path["platform/backend/app/services/internal.py"]["risk"] == "high"
+    assert "run prompt" in by_path["miniapp/app/static/client/app.js"]["why_changed"]
+    assert {item["check"] for item in by_path["miniapp/app/static/client/app.js"]["coverage"]}.issuperset({"changed_files_static", "browser_flow_smoke"})
+    assert by_path["miniapp/app/static/client/app.js"]["actions"][1]["action"] == "revert_draft_file"
+    assert by_path["miniapp/app/static/client/app.js"]["actions"][1]["enabled"] is True
+    assert any(item["action"] == "revert_all_draft_files" for item in review["actions"])
 
 
 def test_staged_apply_uses_actual_diff_for_generated_manifest(tmp_path: Path) -> None:
@@ -4940,7 +5336,10 @@ def test_observability_report_tracks_cost_latency_green_rate_and_repairs(tmp_pat
         checks_summary={"validators": "passed", "build": "passed", "preview": "passed", "gate_status": "passed", "issues": []},
         token_usage={"input_tokens": 1000, "output_tokens": 500, "reasoning_tokens": 100, "total_tokens": 1500, "turn_count": 2},
         latency_breakdown={"agent_total_ms": 1200, "checks_ms": 300},
+        orchestration_phases=[{"phase": "planner", "tokens": 500}, {"phase": "ui", "tokens": 1000}],
     )
+    green_run.created_at = green_run.created_at.replace(hour=10, minute=0, second=0, microsecond=0)
+    green_run.updated_at = green_run.created_at.replace(hour=10, minute=2, second=0)
     failed_run = RunRecord(
         workspace_id=workspace["workspace_id"],
         prompt="Build a failing app",
@@ -4972,6 +5371,8 @@ def test_observability_report_tracks_cost_latency_green_rate_and_repairs(tmp_pat
         latency_breakdown={"agent_total_ms": 800},
         repair_iterations=[{"status": "passed"}],
     )
+    fix_run.created_at = fix_run.created_at.replace(hour=11, minute=0, second=0, microsecond=0)
+    fix_run.updated_at = fix_run.created_at.replace(hour=11, minute=1, second=0)
     for run in (green_run, failed_run, fix_run):
         app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
     case_ref = f"repair_case:{workspace['workspace_id']}:{failed_run.run_id}:case_1"
@@ -5010,5 +5411,14 @@ def test_observability_report_tracks_cost_latency_green_rate_and_repairs(tmp_pat
     assert report["failure_classes"][0]["failure_class"] == "browser_flow_smoke"
     assert report["repair_success"]["fix_success_rate"] == 1.0
     assert report["repair_success"]["attempt_success_rate"] == 1.0
+    assert report["quality_dashboard"]["schema"] == "grounded.quality_observability_dashboard.v1"
+    assert report["quality_dashboard"]["completed_product_count"] == 2
+    assert report["quality_dashboard"]["retry_run_count"] >= 1
+    assert report["time_to_completed_product"]["completed_product_count"] == 2
+    assert report["time_to_completed_product"]["average_ms"] == 90000
+    assert any(item["phase"] == "planner" and item["total_tokens"] == 500 for item in report["tokens_per_phase"])
+    assert report["retries_per_run"][0]["retry_count"] >= 1
+    assert report["cost_by_workspace"][0]["workspace_id"] == workspace["workspace_id"]
+    assert any(item["model"] == "gpt-5.4-mini" and item["task_type"] == "generate:balanced" for item in report["model_performance_by_task_type"])
     assert scoped["workspace_id"] == workspace["workspace_id"]
     assert "ObservabilityReport" in openapi["components"]["schemas"]

@@ -320,6 +320,29 @@ class WorkspaceService:
         self.workspace_log_service.append(workspace_id, source="workspace", message="Workspace rolled back to previous revision.")
         return workspace
 
+    def restore_revision(self, workspace_id: str, revision_id: str, message: str) -> RevisionRecord:
+        workspace = self.get_workspace(workspace_id)
+        target_revision = next((revision for revision in workspace.revisions if revision.revision_id == revision_id), None)
+        if target_revision is None:
+            raise KeyError(f"Revision not found: {revision_id}")
+
+        source_dir = self.source_dir(workspace_id)
+        self._restore_tree_from_commit(source_dir, target_revision.commit_sha)
+        commit_sha = self._git_commit(source_dir, message)
+        revision = RevisionRecord(commit_sha=commit_sha, message=message, source="rollback")
+        workspace.current_revision_id = revision.revision_id
+        workspace.revisions.append(revision)
+        workspace.updated_at = revision.created_at
+        self.store.upsert("workspaces", workspace_id, workspace.model_dump(mode="json"))
+        self._refresh_indexes_async(workspace)
+        self.workspace_log_service.append(
+            workspace_id,
+            source="workspace",
+            message="Workspace restored to a known-good revision.",
+            payload={"target_revision_id": revision_id, "revision_id": revision.revision_id},
+        )
+        return revision
+
     def revert_revision(self, workspace_id: str, revision_id: str, message: str) -> RevisionRecord:
         workspace = self.get_workspace(workspace_id)
         target_revision = next((revision for revision in workspace.revisions if revision.revision_id == revision_id), None)

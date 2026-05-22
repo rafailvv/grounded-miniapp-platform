@@ -197,6 +197,7 @@ class CommandExecParams(StrictModel):
     thread_id: str | None = Field(default=None, validation_alias=AliasChoices("thread_id", "threadId"))
     turn_id: str | None = Field(default=None, validation_alias=AliasChoices("turn_id", "turnId"))
     timeout: int = 30
+    managed: bool = False
     approval_id: str | None = Field(default=None, validation_alias=AliasChoices("approval_id", "approvalId"))
     preset: str = "safe_auto"
     idempotency_key: str | None = Field(default=None, validation_alias=AliasChoices("idempotency_key", "idempotencyKey"))

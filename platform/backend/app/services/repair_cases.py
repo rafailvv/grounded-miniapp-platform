@@ -145,6 +145,12 @@ class RepairPromptBuilder:
             "product_guardrails": case.get("product_guardrails") or {},
             "known_fix_recipe": case.get("known_fix_recipe") or {},
             "known_fix_recipes": case.get("known_fix_recipes") or [],
+            "repair_class": case.get("repair_class") or "",
+            "repair_classification": case.get("repair_classification") or {},
+            "focused_patch_plan": case.get("focused_patch_plan") or {},
+            "relevant_checks": case.get("relevant_checks") or [],
+            "check_profile": case.get("check_profile") or "",
+            "escalation": case.get("escalation") or {},
             "repair_confidence": case.get("repair_confidence") or {},
             "next_action": case.get("next_action") or {},
             "expected_proof": case.get("expected_proof") or [],
@@ -480,6 +486,12 @@ class RepairCaseService:
                     "probable_files": active.get("probable_files") or [],
                     "known_fix_recipe": active.get("known_fix_recipe") or {},
                     "known_fix_recipes": active.get("known_fix_recipes") or [],
+                    "repair_class": active.get("repair_class") or "",
+                    "repair_classification": active.get("repair_classification") or {},
+                    "focused_patch_plan": active.get("focused_patch_plan") or {},
+                    "relevant_checks": active.get("relevant_checks") or [],
+                    "check_profile": active.get("check_profile") or "",
+                    "escalation": active.get("escalation") or {},
                     "product_guardrails": active.get("product_guardrails") or {},
                     "repair_confidence": active.get("repair_confidence") or {},
                     "post_repair_proof": active.get("post_repair_proof") or active.get("post_fix_proof") or {},
@@ -521,6 +533,12 @@ class RepairCaseService:
         post_repair_proof = dict(packet.get("post_repair_proof") or post_fix_proof)
         known_fix_recipes = list(packet.get("known_fix_recipes") or [])
         known_fix_recipe = dict(packet.get("known_fix_recipe") or (known_fix_recipes[0] if known_fix_recipes and isinstance(known_fix_recipes[0], dict) else {}))
+        repair_class = str(packet.get("repair_class") or "")
+        repair_classification = dict(packet.get("repair_classification") or {})
+        focused_patch_plan = dict(packet.get("focused_patch_plan") or {})
+        relevant_checks = list(packet.get("relevant_checks") or [])
+        check_profile = str(packet.get("check_profile") or "")
+        escalation = dict(packet.get("escalation") or {})
         product_guardrails = dict(packet.get("product_guardrails") or {})
         repair_confidence = dict(packet.get("repair_confidence") or {})
         signature_normalization = dict(packet.get("signature_normalization") or {})
@@ -563,6 +581,12 @@ class RepairCaseService:
             "post_repair_proof": post_repair_proof,
             "known_fix_recipe": known_fix_recipe,
             "known_fix_recipes": known_fix_recipes,
+            "repair_class": repair_class,
+            "repair_classification": repair_classification,
+            "focused_patch_plan": focused_patch_plan,
+            "relevant_checks": relevant_checks,
+            "check_profile": check_profile,
+            "escalation": escalation,
             "product_guardrails": product_guardrails,
             "repair_confidence": repair_confidence,
             "browser_replay": browser_replay,
@@ -625,6 +649,11 @@ class RepairCaseService:
             "target_files": target_files[:12],
             "forbidden_files": list(case.get("forbidden_files") or [])[:12],
             "verification_check": verification_check,
+            "check_profile": case.get("check_profile") or "",
+            "relevant_checks": list(case.get("relevant_checks") or [])[:8],
+            "focused_patch_plan": case.get("focused_patch_plan") or {},
+            "escalation": case.get("escalation") or {},
+            "repair_class": case.get("repair_class") or "",
             "failed_check": case.get("failed_check") or verification_check,
             "broken_surface": case.get("broken_surface") or {},
             "post_fix_proof": case.get("post_fix_proof") or {},

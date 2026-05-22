@@ -3,12 +3,15 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import hashlib
 import http.client
+import importlib
+import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 from typing import Any
@@ -30,9 +33,11 @@ from app.models.workbench import (
     RepairCasesReport,
     RunBookmarksReport,
     RunCompareReport,
+    RunDiffReviewReport,
     RunEventReplayReport,
     RunEventsReport,
     RunProtocolReport,
+    RunSessionCheckpointsReport,
     RpcProtocolReport,
     RunTimelineReport,
     RunTraceViewReport,
@@ -423,6 +428,186 @@ class WorkbenchService:
         self.store.upsert("reports", f"run_compare:{base_run_id}:{target_run_id}", payload)
         return self._typed_payload(RunCompareReport, payload)
 
+    def session_checkpoints(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        artifacts = self._run_artifacts_or_empty(run_id)
+        checkpoints: dict[str, dict[str, Any]] = {}
+        for key, payload in self.store.items("reports"):
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("schema") != "grounded.session_checkpoint.v1" or payload.get("run_id") != run_id:
+                continue
+            item = dict(payload)
+            item.setdefault("checkpoint_id", key)
+            checkpoints[str(item["checkpoint_id"])] = item
+
+        if run.resume_checkpoint_ref:
+            checkpoint = self.store.get("reports", run.resume_checkpoint_ref)
+            checkpoints.setdefault(
+                f"session_checkpoint:{run.workspace_id}:{run.run_id}:resume",
+                {
+                    "schema": "grounded.session_checkpoint.v1",
+                    "checkpoint_id": f"session_checkpoint:{run.workspace_id}:{run.run_id}:resume",
+                    "run_id": run.run_id,
+                    "workspace_id": run.workspace_id,
+                    "kind": "resume_checkpoint",
+                    "status": str((checkpoint or {}).get("status") or "available") if isinstance(checkpoint, dict) else "available",
+                    "source": "resume_checkpoint_ref",
+                    "summary": str((checkpoint or {}).get("reason") or "Run has a retained resume checkpoint.") if isinstance(checkpoint, dict) else "Run has a retained resume checkpoint.",
+                    "created_at": str((checkpoint or {}).get("created_at") or run.updated_at.isoformat()) if isinstance(checkpoint, dict) else run.updated_at.isoformat(),
+                    "run_status": run.status,
+                    "apply_status": run.apply_status,
+                    "current_stage": run.current_stage,
+                    "failure_class": run.failure_class,
+                    "failure_signature": run.failure_signature,
+                    "refs": {"resume_checkpoint": run.resume_checkpoint_ref},
+                    "metadata": checkpoint if isinstance(checkpoint, dict) else {},
+                },
+            )
+
+        for bookmark in self.bookmarks(run_id).get("items") or []:
+            bookmark_id = str(bookmark.get("bookmark_id") or "")
+            if not bookmark_id:
+                continue
+            checkpoints.setdefault(
+                f"session_checkpoint:{run.workspace_id}:{run.run_id}:bookmark:{bookmark_id}",
+                {
+                    "schema": "grounded.session_checkpoint.v1",
+                    "checkpoint_id": f"session_checkpoint:{run.workspace_id}:{run.run_id}:bookmark:{bookmark_id}",
+                    "run_id": run.run_id,
+                    "workspace_id": run.workspace_id,
+                    "kind": "protocol_bookmark",
+                    "status": "available",
+                    "source": "run_protocol",
+                    "summary": "Replayable protocol bookmark for resume or fork.",
+                    "created_at": bookmark.get("created_at"),
+                    "run_status": run.status,
+                    "apply_status": run.apply_status,
+                    "current_stage": run.current_stage,
+                    "refs": {
+                        "checkpoint_ref": bookmark.get("checkpoint_ref"),
+                        "trace_bundle_ref": bookmark.get("trace_bundle_ref"),
+                    },
+                    "metadata": dict(bookmark),
+                },
+            )
+
+        failed_checks = [
+            item for item in artifacts.get("check_results") or []
+            if isinstance(item, dict) and str(item.get("status") or "").lower() in {"failed", "blocked"}
+        ]
+        if failed_checks:
+            latest = failed_checks[-1]
+            checkpoints.setdefault(
+                f"session_checkpoint:{run.workspace_id}:{run.run_id}:failed_check",
+                {
+                    "schema": "grounded.session_checkpoint.v1",
+                    "checkpoint_id": f"session_checkpoint:{run.workspace_id}:{run.run_id}:failed_check",
+                    "run_id": run.run_id,
+                    "workspace_id": run.workspace_id,
+                    "kind": "failed_check",
+                    "status": "blocked",
+                    "source": "check_results",
+                    "summary": f"Resume point from failed check {latest.get('name') or 'unknown'}.",
+                    "created_at": run.updated_at.isoformat(),
+                    "run_status": run.status,
+                    "apply_status": run.apply_status,
+                    "current_stage": run.current_stage,
+                    "failure_class": run.failure_class,
+                    "failure_signature": run.failure_signature,
+                    "refs": {"latest_check": f"latest_check_execution:{run.run_id}", "run_artifacts": f"run_artifacts:{run.run_id}"},
+                    "metadata": {"failed_checks": failed_checks[-5:]},
+                },
+            )
+
+        browser_check = self._check_result_by_name(artifacts, "browser_flow_smoke")
+        browser_failed = str(browser_check.get("status") or "").lower() in {"failed", "blocked"} or "browser" in str(run.failure_class or "").lower()
+        if browser_failed:
+            checkpoints.setdefault(
+                f"session_checkpoint:{run.workspace_id}:{run.run_id}:browser_failure",
+                {
+                    "schema": "grounded.session_checkpoint.v1",
+                    "checkpoint_id": f"session_checkpoint:{run.workspace_id}:{run.run_id}:browser_failure",
+                    "run_id": run.run_id,
+                    "workspace_id": run.workspace_id,
+                    "kind": "browser_failure",
+                    "status": "blocked",
+                    "source": "browser_proof",
+                    "summary": "Resume point from browser verification failure.",
+                    "created_at": run.updated_at.isoformat(),
+                    "run_status": run.status,
+                    "apply_status": run.apply_status,
+                    "current_stage": run.current_stage,
+                    "failure_class": run.failure_class,
+                    "failure_signature": run.failure_signature,
+                    "refs": {"browser_proof": run.browser_proof_ref, "run_artifacts": f"run_artifacts:{run.run_id}"},
+                    "metadata": {"browser_check": browser_check, "browser_proof": self._normalize_browser_proof_payload(run, artifacts)},
+                },
+            )
+
+        last_good = self._latest_working_run(run.workspace_id, exclude_run_id=run.run_id)
+        actions = self._session_checkpoint_actions(run, last_good=last_good)
+        items = [self._with_checkpoint_actions(item, run=run, last_good=last_good) for item in checkpoints.values()]
+        items.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+        payload = {
+            "schema": "grounded.run_session_checkpoints.v1",
+            "run_id": run.run_id,
+            "workspace_id": run.workspace_id,
+            "status": "ok",
+            "items": items,
+            "latest_good_run_id": last_good.run_id if last_good else None,
+            "latest_good_revision_id": last_good.result_revision_id if last_good else None,
+            "actions": actions,
+        }
+        self.store.upsert("reports", f"session_checkpoints:{run.run_id}", payload)
+        return self._typed_payload(RunSessionCheckpointsReport, payload)
+
+    def compare_current_vs_last_working_product(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        last_good = self._latest_working_run(run.workspace_id, exclude_run_id=run.run_id)
+        if last_good is None:
+            return self._typed_payload(
+                RunCompareReport,
+                {
+                    "schema": "grounded.run_compare.v1",
+                    "status": "no_last_working_product",
+                    "base_run_id": "",
+                    "target_run_id": run.run_id,
+                    "workspace_id": run.workspace_id,
+                    "lineage": {"relation": "none"},
+                    "refs": {"session_checkpoints": f"/runs/{run.run_id}/checkpoints"},
+                },
+            )
+        return self.compare_runs(last_good.run_id, run.run_id)
+
+    def rollback_to_last_good_app(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        last_good = self._latest_working_run(run.workspace_id, exclude_run_id=run.run_id)
+        if last_good is None or not last_good.result_revision_id:
+            return {
+                "schema": "grounded.run_checkpoint_action.v1",
+                "status": "no_last_working_product",
+                "run_id": run.run_id,
+                "workspace_id": run.workspace_id,
+            }
+        revision = self.workspace_service.restore_revision(
+            run.workspace_id,
+            last_good.result_revision_id,
+            f"Restore last working product from run {last_good.run_id}",
+        )
+        payload = {
+            "schema": "grounded.run_checkpoint_action.v1",
+            "status": "restored",
+            "action": "rollback_to_last_good_app",
+            "run_id": run.run_id,
+            "workspace_id": run.workspace_id,
+            "last_good_run_id": last_good.run_id,
+            "last_good_revision_id": last_good.result_revision_id,
+            "restored_revision_id": revision.revision_id,
+        }
+        self.store.upsert("reports", f"rollback_last_good:{run.run_id}", payload)
+        return payload
+
     def resume_from_bookmark(self, run_id: str, bookmark_id: str, *, prompt: str | None = None, fork: bool = False) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
         if self.run_protocol_service is None:
@@ -653,6 +838,218 @@ class WorkbenchService:
             "failure_class": run.failure_class,
             "failure_signature": run.failure_signature,
         }
+
+    def _latest_working_run(self, workspace_id: str, *, exclude_run_id: str | None = None) -> RunRecord | None:
+        candidates: list[RunRecord] = []
+        for payload in self.store.list("runs"):
+            try:
+                run = RunRecord.model_validate(payload)
+            except Exception:
+                continue
+            if run.workspace_id != workspace_id or run.run_id == exclude_run_id:
+                continue
+            if run.status != "completed" or run.apply_status != "applied" or run.rolled_back or not run.result_revision_id:
+                continue
+            readiness = self._stored_product_readiness(run.run_id)
+            if readiness and str(readiness.get("status") or "").lower() not in {"passed", "ok", "green"}:
+                continue
+            candidates.append(run)
+        candidates.sort(key=lambda item: item.updated_at, reverse=True)
+        return candidates[0] if candidates else None
+
+    def _session_checkpoint_actions(self, run: RunRecord, *, last_good: RunRecord | None) -> list[dict[str, Any]]:
+        actions: list[dict[str, Any]] = []
+        if run.status in {"blocked", "failed"} or run.resume_checkpoint_ref:
+            actions.extend(
+                [
+                    {"action": "resume_from_failed_check", "method": "POST", "href": f"/runs/{run.run_id}/resume"},
+                    {"action": "resume_from_browser_failure", "method": "POST", "href": f"/runs/{run.run_id}/resume"},
+                ]
+            )
+        if last_good is not None:
+            actions.extend(
+                [
+                    {
+                        "action": "rollback_to_last_good_app",
+                        "method": "POST",
+                        "href": f"/runs/{run.run_id}/rollback-last-good",
+                        "last_good_run_id": last_good.run_id,
+                        "last_good_revision_id": last_good.result_revision_id,
+                    },
+                    {
+                        "action": "compare_current_vs_last_working_product",
+                        "method": "GET",
+                        "href": f"/runs/{run.run_id}/compare-last-working",
+                        "last_good_run_id": last_good.run_id,
+                    },
+                ]
+            )
+        return actions
+
+    def _with_checkpoint_actions(self, item: dict[str, Any], *, run: RunRecord, last_good: RunRecord | None) -> dict[str, Any]:
+        enriched = dict(item)
+        actions = list(enriched.get("actions") or [])
+        kind = str(enriched.get("kind") or "")
+        if kind == "protocol_bookmark":
+            bookmark_id = str((enriched.get("metadata") or {}).get("bookmark_id") or "")
+            if bookmark_id:
+                actions.extend(
+                    [
+                        {"action": "resume_from_bookmark", "method": "POST", "href": f"/runs/{run.run_id}/resume-from-bookmark", "bookmark_id": bookmark_id},
+                        {"action": "fork_from_bookmark", "method": "POST", "href": f"/runs/{run.run_id}/fork-from-bookmark", "bookmark_id": bookmark_id},
+                    ]
+                )
+        if kind in {"failed_check", "browser_failure", "resume_checkpoint"}:
+            actions.append({"action": "resume_run", "method": "POST", "href": f"/runs/{run.run_id}/resume"})
+        if kind == "after_successful_tests" and last_good is not None:
+            actions.append({"action": "compare_current_vs_last_working_product", "method": "GET", "href": f"/runs/{run.run_id}/compare-last-working"})
+        enriched["actions"] = actions
+        return enriched
+
+    def _diff_review_file(self, *, run: RunRecord, artifacts: dict[str, Any], path: str, stats: dict[str, Any]) -> dict[str, Any]:
+        product_area = self._file_category(path)
+        file_class = self._diff_file_class(path)
+        risk = self._diff_file_risk(path, product_area=product_area, file_class=file_class, stats=stats)
+        return {
+            "path": path,
+            "product_area": product_area,
+            "file_class": file_class,
+            "status": str(stats.get("status") or "modified"),
+            "risk": risk,
+            "additions": int(stats.get("additions") or 0),
+            "deletions": int(stats.get("deletions") or 0),
+            "why_changed": self._diff_why_changed(run=run, path=path, product_area=product_area, file_class=file_class),
+            "coverage": self._diff_file_coverage(artifacts, path=path, product_area=product_area),
+            "actions": [
+                {"action": "stage_file", "method": "POST", "href": f"/runs/{run.run_id}/stage/files", "files": [path]},
+                {
+                    "action": "revert_draft_file",
+                    "method": "POST",
+                    "href": f"/runs/{run.run_id}/discard/files",
+                    "files": [path],
+                    "enabled": bool(run.draft_ready or run.draft_status == "ready"),
+                },
+                {"action": "open_raw_diff", "method": "GET", "href": f"/runs/{run.run_id}/diff?file={path}"},
+            ],
+        }
+
+    def _diff_review_groups(self, files: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        risk_rank = {"low": 0, "medium": 1, "high": 2}
+        grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for item in files:
+            grouped.setdefault((str(item.get("file_class") or "platform"), str(item.get("product_area") or "other")), []).append(item)
+        groups: list[dict[str, Any]] = []
+        for (file_class, product_area), items in grouped.items():
+            risk = max((str(item.get("risk") or "medium") for item in items), key=lambda value: risk_rank.get(value, 1), default="medium")
+            groups.append(
+                {
+                    "key": f"{file_class}:{product_area}",
+                    "title": f"{file_class.replace('_', ' ').title()} / {product_area.replace('_', ' ').title()}",
+                    "product_area": product_area,
+                    "file_class": file_class,
+                    "risk": risk,
+                    "files": items,
+                    "summary": {
+                        "file_count": len(items),
+                        "additions": sum(int(item.get("additions") or 0) for item in items),
+                        "deletions": sum(int(item.get("deletions") or 0) for item in items),
+                    },
+                }
+            )
+        return sorted(groups, key=lambda item: (str(item.get("file_class")), str(item.get("product_area"))))
+
+    @staticmethod
+    def _diff_file_class(path: str) -> str:
+        normalized = str(path or "").replace("\\", "/")
+        if normalized.startswith("miniapp/app/generated/"):
+            return "generated_metadata"
+        if normalized.startswith("miniapp/tests/") or "/tests/" in normalized or normalized.endswith((".test.js", ".test.mjs", "_test.py")):
+            return "generated_tests"
+        if normalized.startswith("miniapp/"):
+            return "generated_app"
+        return "platform"
+
+    @staticmethod
+    def _diff_file_risk(path: str, *, product_area: str, file_class: str, stats: dict[str, Any]) -> str:
+        normalized = str(path or "").replace("\\", "/")
+        churn = int(stats.get("additions") or 0) + int(stats.get("deletions") or 0)
+        if file_class == "platform" or normalized.endswith((".sql", "pyproject.toml", "package.json")):
+            return "high"
+        if product_area in {"backend", "generated_manifest"} or churn >= 120:
+            return "high"
+        if product_area in {"tests", "styles"} and churn <= 40:
+            return "low"
+        return "medium"
+
+    def _diff_why_changed(self, *, run: RunRecord, path: str, product_area: str, file_class: str) -> str:
+        worker = next((worker_id for worker_id in PRODUCT_WORKERS if self._path_owned_by_worker(worker_id, path)), None)
+        owner = worker or product_area.replace("_", " ")
+        prompt = str(run.prompt or "").strip()
+        prefix = f"{path} changed for {owner}"
+        if file_class == "generated_tests":
+            return f"{prefix} so generated checks can cover the requested workflow."
+        if file_class == "platform":
+            return f"{prefix}; platform-level changes should be reviewed before apply."
+        if prompt:
+            return f"{prefix} to implement the run prompt: {prompt[:180]}"
+        return f"{prefix} as part of this run's generated draft."
+
+    def _diff_file_coverage(self, artifacts: dict[str, Any], *, path: str, product_area: str) -> list[dict[str, Any]]:
+        checks = [item for item in artifacts.get("check_results") or [] if isinstance(item, dict)]
+        relevant: list[dict[str, Any]] = []
+        for item in checks:
+            name = str(item.get("name") or "")
+            diagnostics = item.get("diagnostics") if isinstance(item.get("diagnostics"), dict) else {}
+            if self._check_covers_file(name, diagnostics, path=path, product_area=product_area):
+                relevant.append(
+                    {
+                        "check": name,
+                        "status": item.get("status"),
+                        "details": item.get("details"),
+                        "diagnostics": diagnostics,
+                    }
+                )
+        return relevant
+
+    @staticmethod
+    def _check_covers_file(name: str, diagnostics: dict[str, Any], *, path: str, product_area: str) -> bool:
+        lower = name.lower()
+        if lower in {"changed_files_static", "platform_invariants"}:
+            return True
+        if product_area == "backend":
+            return lower in {"api_workflow_smoke", "generated_app_python_tests", "backend_import_smoke"} or "python" in lower or "api" in lower
+        if product_area in {"client_surface_worker", "specialist_surface_worker", "manager_surface_worker", "styles"}:
+            role = product_area.split("_", 1)[0] if product_area.endswith("_surface_worker") else ""
+            roles_checked = {str(role_item).lower() for role_item in diagnostics.get("roles_checked") or []}
+            return lower in {"browser_flow_smoke", "frontend_interaction_static_smoke", "generated_app_js_tests"} or bool(role and role in roles_checked)
+        if product_area == "tests":
+            return "generated" in lower or "test" in lower
+        return lower in {"changed_files_static", "browser_flow_smoke"}
+
+    @staticmethod
+    def _diff_file_stats(diff_text: str) -> dict[str, dict[str, Any]]:
+        stats: dict[str, dict[str, Any]] = {}
+        current: str | None = None
+        for line in str(diff_text or "").splitlines():
+            if line.startswith("diff --git "):
+                current = line.rsplit(" b/", 1)[-1].strip()
+                if current.startswith("draft/"):
+                    current = current.split("draft/", 1)[-1]
+                if current.startswith("source/"):
+                    current = current.split("source/", 1)[-1]
+                stats.setdefault(current, {"additions": 0, "deletions": 0, "status": "modified"})
+                continue
+            if current is None:
+                continue
+            if line.startswith("new file mode"):
+                stats[current]["status"] = "added"
+            elif line.startswith("deleted file mode"):
+                stats[current]["status"] = "deleted"
+            elif line.startswith("+") and not line.startswith("+++"):
+                stats[current]["additions"] = int(stats[current].get("additions") or 0) + 1
+            elif line.startswith("-") and not line.startswith("---"):
+                stats[current]["deletions"] = int(stats[current].get("deletions") or 0) + 1
+        return stats
 
     def trace_view(self, run_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
@@ -1158,6 +1555,7 @@ class WorkbenchService:
             "status": run.status,
             "items": items,
             "task_ledger": task_ledger,
+            "task_graph": task_ledger.get("task_graph") or {},
             "repair_cases": repair_cases,
         }
 
@@ -1835,9 +2233,29 @@ class WorkbenchService:
             run=resolved_run,
             artifacts=resolved_artifacts,
             browser_proof=resolved_browser,
+            baseline=self._previous_successful_visual_regression(resolved_run),
         )
         self.store.upsert("reports", f"visual_regression:{run_id}", payload)
         return self._typed_payload(VisualRegressionReport, payload)
+
+    def _previous_successful_visual_regression(self, run: RunRecord) -> dict[str, Any]:
+        for candidate in self.run_service.list_runs(run.workspace_id):
+            if candidate.run_id == run.run_id:
+                continue
+            if candidate.created_at >= run.created_at:
+                continue
+            if candidate.status != "completed" or candidate.apply_status != "applied":
+                continue
+            gate = self.store.get("reports", f"gate:{candidate.run_id}")
+            if isinstance(gate, dict) and gate.get("status") not in {None, "passed"}:
+                continue
+            stored = self.store.get("reports", f"visual_regression:{candidate.run_id}")
+            if isinstance(stored, dict) and stored.get("status") in {"passed", "incomplete"}:
+                return stored
+            artifacts = self._run_artifacts_or_empty(candidate.run_id)
+            browser = self._normalize_browser_proof_payload(candidate, artifacts)
+            return VisualRegressionGenerator.build(run=candidate, artifacts=artifacts, browser_proof=browser, baseline=None)
+        return {}
 
     def trace_reducer(self, run_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
@@ -1918,8 +2336,40 @@ class WorkbenchService:
             api_logs=self._workspace_log_lines(workspace_id, kind="api"),
             reports=reports,
         )
+        payload["environment_health"] = self._doctor_workspace_environment_health()
         self.store.upsert("reports", f"doctor_workspace:{workspace_id}", payload)
         return payload
+
+    def _doctor_workspace_environment_health(self) -> dict[str, Any]:
+        doctor = self.doctor()
+        checks = [
+            item
+            for item in doctor.get("checks", [])
+            if isinstance(item, dict)
+            and str(item.get("name") or "")
+            in {
+                "python",
+                "python_deps",
+                "node",
+                "npm",
+                "playwright",
+                "browser_availability",
+                "backend_imports",
+                "preview_runtime",
+                "preview_port_range",
+                "db_writable",
+                "template_integrity",
+                "exec_policy",
+            }
+        ]
+        return {
+            "schema": doctor.get("schema") or "grounded.doctor_health_panel.v1",
+            "status": doctor.get("status"),
+            "summary": doctor.get("summary") or {},
+            "sections": doctor.get("sections") or [],
+            "checks": checks,
+            "created_at": doctor.get("created_at"),
+        }
 
     def _diagnostic_inputs(self, run: RunRecord) -> dict[str, Any]:
         process_outputs = self.store.get("reports", run.process_outputs_ref) if run.process_outputs_ref else {}
@@ -2620,6 +3070,7 @@ class WorkbenchService:
         expired_count = sum(1 for item in items if item.get("status") == "expired" or (item.get("expiry") or {}).get("expired"))
         superseded_count = sum(1 for item in items if item.get("status") == "superseded")
         memory_summary = WorkspaceMemoryPipeline.summary(workspace_id, workspace_memory)
+        category_counts = WorkspaceMemoryPipeline._category_counts(items)
         return {
             "schema": "grounded.memory_pipeline.v1",
             "workspace_id": workspace_id,
@@ -2640,6 +3091,7 @@ class WorkbenchService:
             },
             "stage1_count": len(stage1),
             "stage1_items": sum(len(payload.get("items") or []) for payload in stage1),
+            "category_counts": category_counts,
             "active_count": active_count,
             "stale_count": stale_count,
             "expired_count": expired_count,
@@ -3270,6 +3722,7 @@ class WorkbenchService:
     def doctor(self) -> dict[str, Any]:
         checks = [
             self._python_version_check(),
+            self._python_deps_check(),
             self._node_version_check(),
             self._npm_version_check(),
             self._binary_check("docker"),
@@ -3277,16 +3730,20 @@ class WorkbenchService:
             self._docker_daemon_check(),
             self._playwright_check(),
             self._playwright_browsers_check(),
+            self._browser_availability_check(),
             self._openai_check(),
             self._model_access_check(),
             self._writable_check("data_dir", self.settings.data_dir),
             self._writable_dirs_check(),
+            self._db_writable_check(),
             self._disk_space_check(),
             self._template_check(),
             self._template_hash_check(),
             self._port_check(),
             self._preview_port_range_check(),
+            self._preview_runtime_check(),
             self._backend_routes_check(),
+            self._backend_imports_check(),
             self._stale_backend_check(),
             self._preview_container_check(),
             self._test_command_check(),
@@ -3294,7 +3751,14 @@ class WorkbenchService:
             self.exec_policy_service.doctor_check(),
         ]
         status = "passed" if all(item["status"] == "passed" for item in checks if item["required"]) else "failed"
-        payload = {"status": status, "checks": checks, "created_at": datetime.now(timezone.utc).isoformat()}
+        payload = {
+            "schema": "grounded.doctor_health_panel.v1",
+            "status": status,
+            "checks": checks,
+            "sections": self._doctor_sections(checks),
+            "summary": self._doctor_summary(checks),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
         self.store.upsert("reports", "doctor:exec_policy", self.exec_policy_service.doctor_check())
         self.store.upsert("reports", "doctor:last", payload)
         return payload
@@ -3317,6 +3781,23 @@ class WorkbenchService:
         failure_classes = self._observability_failure_classes(runs)
         repair_success = self._observability_repair_success(runs)
         green_rates = self._observability_green_rates(runs, cost.get("_cost_by_mode", {}))
+        tokens_per_phase = self._observability_tokens_per_phase(runs)
+        retries_per_run = self._observability_retries_per_run(runs)
+        time_to_completed_product = self._observability_time_to_completed_product(runs)
+        cost_by_workspace = self._observability_cost_by_workspace(runs)
+        model_performance = self._observability_model_performance_by_task_type(runs)
+        quality_dashboard = self._observability_quality_dashboard(
+            runs=runs,
+            token_usage=token_usage,
+            latency=latency,
+            failure_classes=failure_classes,
+            repair_success=repair_success,
+            green_rates=green_rates,
+            retries_per_run=retries_per_run,
+            time_to_completed_product=time_to_completed_product,
+            cost_by_workspace=cost_by_workspace,
+            model_performance=model_performance,
+        )
         cost.pop("_cost_by_mode", None)
         payload = {
             "schema": "grounded.observability.v1",
@@ -3338,6 +3819,12 @@ class WorkbenchService:
             "green_rate_by_generation_mode": green_rates,
             "failure_classes": failure_classes,
             "repair_success": repair_success,
+            "quality_dashboard": quality_dashboard,
+            "tokens_per_phase": tokens_per_phase,
+            "retries_per_run": retries_per_run,
+            "time_to_completed_product": time_to_completed_product,
+            "cost_by_workspace": cost_by_workspace,
+            "model_performance_by_task_type": model_performance,
             "by_status": by_status,
         }
         typed = ObservabilityReport.model_validate(payload).model_dump(mode="json", by_alias=True)
@@ -3604,6 +4091,236 @@ class WorkbenchService:
             if isinstance(payload, dict):
                 cases.append(payload)
         return cases
+
+    @classmethod
+    def _observability_tokens_per_phase(cls, runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        buckets: dict[str, dict[str, Any]] = {}
+        for run in runs:
+            usage = run.get("token_usage") if isinstance(run.get("token_usage"), dict) else {}
+            phases = run.get("orchestration_phases") if isinstance(run.get("orchestration_phases"), list) else []
+            phase_tokens = usage.get("phases") if isinstance(usage.get("phases"), dict) else {}
+            if isinstance(phase_tokens, dict) and phase_tokens:
+                for phase, value in phase_tokens.items():
+                    cls._add_phase_tokens(buckets, str(phase), cls._safe_int(value), run)
+                continue
+            total_tokens = cls._safe_int(usage.get("total_tokens")) or cls._safe_int(usage.get("input_tokens")) + cls._safe_int(usage.get("output_tokens"))
+            if not total_tokens:
+                continue
+            if phases:
+                weights: list[tuple[str, int]] = []
+                for item in phases:
+                    if not isinstance(item, dict):
+                        continue
+                    phase = str(item.get("phase") or item.get("name") or item.get("stage") or "").strip()
+                    if not phase:
+                        continue
+                    weight = cls._safe_int(item.get("tokens") or item.get("token_count") or item.get("duration_ms") or 1) or 1
+                    weights.append((phase, weight))
+                weight_sum = sum(weight for _phase, weight in weights) or len(weights)
+                for phase, weight in weights:
+                    cls._add_phase_tokens(buckets, phase, int(total_tokens * (weight / weight_sum)), run)
+            else:
+                task_type = cls._task_type(run)
+                cls._add_phase_tokens(buckets, task_type, total_tokens, run)
+        rows = []
+        for item in buckets.values():
+            run_count = int(item.get("run_count") or 0)
+            total = int(item.get("total_tokens") or 0)
+            rows.append({**item, "average_tokens": round(total / run_count, 2) if run_count else 0.0})
+        return sorted(rows, key=lambda item: int(item.get("total_tokens") or 0), reverse=True)
+
+    @classmethod
+    def _add_phase_tokens(cls, buckets: dict[str, dict[str, Any]], phase: str, tokens: int, run: dict[str, Any]) -> None:
+        if not phase or tokens <= 0:
+            return
+        bucket = buckets.setdefault(phase, {"phase": phase, "total_tokens": 0, "run_count": 0, "generation_modes": {}})
+        bucket["total_tokens"] += int(tokens)
+        bucket["run_count"] += 1
+        mode = str(run.get("generation_mode") or "unknown")
+        bucket["generation_modes"][mode] = bucket["generation_modes"].get(mode, 0) + 1
+
+    def _observability_retries_per_run(self, runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        child_counts: dict[str, int] = {}
+        for run in runs:
+            source = str(run.get("resume_from_run_id") or "")
+            if source:
+                child_counts[source] = child_counts.get(source, 0) + 1
+        rows: list[dict[str, Any]] = []
+        for run in runs:
+            run_id = str(run.get("run_id") or "")
+            cases = self._repair_cases_for_observability(run_id)
+            case_attempts = sum(len(case.get("attempts") or []) for case in cases if isinstance(case, dict))
+            repair_iterations = run.get("repair_iterations") if isinstance(run.get("repair_iterations"), list) else []
+            retry_count = child_counts.get(run_id, 0) + len(repair_iterations) + case_attempts
+            if retry_count or str(run.get("status") or "") in {"failed", "blocked"}:
+                rows.append(
+                    {
+                        "run_id": run_id,
+                        "workspace_id": str(run.get("workspace_id") or ""),
+                        "status": str(run.get("status") or "unknown"),
+                        "generation_mode": str(run.get("generation_mode") or "unknown"),
+                        "retry_count": retry_count,
+                        "continuation_retries": child_counts.get(run_id, 0),
+                        "repair_iterations": len(repair_iterations),
+                        "repair_case_attempts": case_attempts,
+                    }
+                )
+        return sorted(rows, key=lambda item: (int(item.get("retry_count") or 0), str(item.get("run_id") or "")), reverse=True)[:50]
+
+    @classmethod
+    def _observability_time_to_completed_product(cls, runs: list[dict[str, Any]]) -> dict[str, Any]:
+        durations: list[int] = []
+        by_mode: dict[str, list[int]] = {}
+        for run in runs:
+            if not cls._is_green_run(run):
+                continue
+            created = cls._parse_datetime(run.get("created_at"))
+            updated = cls._parse_datetime(run.get("updated_at"))
+            if not created or not updated:
+                continue
+            duration_ms = max(0, int((updated - created).total_seconds() * 1000))
+            durations.append(duration_ms)
+            by_mode.setdefault(str(run.get("generation_mode") or "unknown"), []).append(duration_ms)
+        durations.sort()
+        return {
+            "completed_product_count": len(durations),
+            "average_ms": round(sum(durations) / len(durations), 2) if durations else 0.0,
+            "p50_ms": cls._percentile(durations, 0.50),
+            "p95_ms": cls._percentile(durations, 0.95),
+            "by_generation_mode": [
+                {
+                    "generation_mode": mode,
+                    "count": len(values),
+                    "average_ms": round(sum(values) / len(values), 2) if values else 0.0,
+                    "p50_ms": cls._percentile(sorted(values), 0.50),
+                }
+                for mode, values in sorted(by_mode.items())
+            ],
+        }
+
+    @classmethod
+    def _observability_cost_by_workspace(cls, runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        buckets: dict[str, dict[str, Any]] = {}
+        for run in runs:
+            workspace_id = str(run.get("workspace_id") or "unknown")
+            usage = run.get("token_usage") if isinstance(run.get("token_usage"), dict) else {}
+            input_tokens = cls._safe_int(usage.get("input_tokens"))
+            output_tokens = cls._safe_int(usage.get("output_tokens"))
+            total_tokens = cls._safe_int(usage.get("total_tokens")) or input_tokens + output_tokens
+            explicit = cls._safe_float(usage.get("estimated_cost_usd") or usage.get("cost_usd") or usage.get("cost"))
+            estimate = explicit if explicit > 0 else cls._estimate_cost_usd(str(run.get("llm_model") or run.get("model") or "unknown"), input_tokens=input_tokens, output_tokens=output_tokens)
+            item = buckets.setdefault(workspace_id, {"workspace_id": workspace_id, "run_count": 0, "completed_runs": 0, "total_tokens": 0, "estimated_cost_usd": 0.0})
+            item["run_count"] += 1
+            item["completed_runs"] += 1 if str(run.get("status") or "") == "completed" else 0
+            item["total_tokens"] += total_tokens
+            item["estimated_cost_usd"] = round(float(item["estimated_cost_usd"]) + estimate, 6)
+        return sorted(buckets.values(), key=lambda item: float(item.get("estimated_cost_usd") or 0.0), reverse=True)
+
+    @classmethod
+    def _observability_model_performance_by_task_type(cls, runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        buckets: dict[tuple[str, str], dict[str, Any]] = {}
+        for run in runs:
+            model = str(run.get("llm_model") or run.get("model") or "unknown")
+            task_type = cls._task_type(run)
+            key = (model, task_type)
+            usage = run.get("token_usage") if isinstance(run.get("token_usage"), dict) else {}
+            latency = run.get("latency_breakdown") if isinstance(run.get("latency_breakdown"), dict) else {}
+            input_tokens = cls._safe_int(usage.get("input_tokens"))
+            output_tokens = cls._safe_int(usage.get("output_tokens"))
+            total_tokens = cls._safe_int(usage.get("total_tokens")) or input_tokens + output_tokens
+            total_ms = cls._safe_int(latency.get("total_ms") or latency.get("agent_total_ms")) or sum(cls._safe_int(value) for value in latency.values() if isinstance(value, (int, float, str)))
+            item = buckets.setdefault(
+                key,
+                {
+                    "model": model,
+                    "task_type": task_type,
+                    "run_count": 0,
+                    "green_count": 0,
+                    "failed_count": 0,
+                    "total_tokens": 0,
+                    "total_latency_ms": 0,
+                    "estimated_cost_usd": 0.0,
+                },
+            )
+            item["run_count"] += 1
+            item["green_count"] += 1 if cls._is_green_run(run) else 0
+            item["failed_count"] += 1 if str(run.get("status") or "") in {"failed", "blocked"} else 0
+            item["total_tokens"] += total_tokens
+            item["total_latency_ms"] += total_ms
+            explicit = cls._safe_float(usage.get("estimated_cost_usd") or usage.get("cost_usd") or usage.get("cost"))
+            estimate = explicit if explicit > 0 else cls._estimate_cost_usd(model, input_tokens=input_tokens, output_tokens=output_tokens)
+            item["estimated_cost_usd"] = round(float(item["estimated_cost_usd"]) + estimate, 6)
+        rows = []
+        for item in buckets.values():
+            run_count = int(item.get("run_count") or 0)
+            rows.append(
+                {
+                    **item,
+                    "green_rate": round(int(item.get("green_count") or 0) / run_count, 4) if run_count else 0.0,
+                    "average_tokens": round(int(item.get("total_tokens") or 0) / run_count, 2) if run_count else 0.0,
+                    "average_latency_ms": round(int(item.get("total_latency_ms") or 0) / run_count, 2) if run_count else 0.0,
+                }
+            )
+        return sorted(rows, key=lambda item: (str(item.get("task_type") or ""), -int(item.get("run_count") or 0), str(item.get("model") or "")))
+
+    @classmethod
+    def _observability_quality_dashboard(
+        cls,
+        *,
+        runs: list[dict[str, Any]],
+        token_usage: dict[str, Any],
+        latency: dict[str, Any],
+        failure_classes: list[dict[str, Any]],
+        repair_success: dict[str, Any],
+        green_rates: list[dict[str, Any]],
+        retries_per_run: list[dict[str, Any]],
+        time_to_completed_product: dict[str, Any],
+        cost_by_workspace: list[dict[str, Any]],
+        model_performance: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        terminal = [run for run in runs if str(run.get("status") or "") in {"completed", "failed", "blocked", "awaiting_approval"}]
+        green = [run for run in terminal if cls._is_green_run(run)]
+        return {
+            "schema": "grounded.quality_observability_dashboard.v1",
+            "terminal_run_count": len(terminal),
+            "completed_product_count": len(green),
+            "completed_product_rate": round(len(green) / len(terminal), 4) if terminal else 0.0,
+            "total_tokens": int(token_usage.get("total_tokens") or 0),
+            "average_tokens_per_run": round(int(token_usage.get("total_tokens") or 0) / len(runs), 2) if runs else 0.0,
+            "average_time_to_completed_product_ms": time_to_completed_product.get("average_ms") or 0.0,
+            "p95_latency_ms": latency.get("p95_ms") or 0,
+            "retry_run_count": len([item for item in retries_per_run if int(item.get("retry_count") or 0) > 0]),
+            "average_retries_per_run": round(sum(int(item.get("retry_count") or 0) for item in retries_per_run) / len(runs), 4) if runs else 0.0,
+            "most_common_failures": failure_classes[:5],
+            "repair_success_rate": repair_success.get("attempt_success_rate") or 0.0,
+            "green_rate_by_generation_mode": green_rates,
+            "top_cost_workspaces": cost_by_workspace[:5],
+            "model_performance_by_task_type": model_performance[:12],
+        }
+
+    @staticmethod
+    def _task_type(run: dict[str, Any]) -> str:
+        mode = str(run.get("mode") or "generate")
+        intent = str(run.get("intent") or "unknown")
+        generation_mode = str(run.get("generation_mode") or "unknown")
+        if mode == "fix" or intent in {"edit", "refine", "role_only_change"}:
+            return f"{mode}:{intent}"
+        return f"{mode}:{generation_mode}"
+
+    @staticmethod
+    def _parse_datetime(value: Any) -> datetime | None:
+        if isinstance(value, datetime):
+            return value
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            if text.endswith("Z"):
+                text = f"{text[:-1]}+00:00"
+            parsed = datetime.fromisoformat(text)
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
 
     @staticmethod
     def _is_green_run(run: dict[str, Any]) -> bool:
@@ -4258,6 +4975,53 @@ class WorkbenchService:
         filtered_diff = self._filter_diff(diff, files) if (file or worker_id or category or status) else diff
         return {"run_id": run_id, "base": base, "target": target, "diff": filtered_diff, "files": files, "filters": {"file": file, "worker_id": worker_id, "category": category, "status": status}}
 
+    def diff_review(self, run_id: str, *, base: str = "source", target: str = "draft") -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        artifacts = self._run_artifacts_or_empty(run_id)
+        diff_text = str(artifacts.get("diff") or self.workspace_service.diff(run.workspace_id, run_id=run_id) or "")
+        stats = self._diff_file_stats(diff_text)
+        files = list(dict.fromkeys([*(run.touched_files or []), *self._paths_from_diff(diff_text), *stats.keys()]))
+        review_files = [self._diff_review_file(run=run, artifacts=artifacts, path=path, stats=stats.get(path, {})) for path in files]
+        groups = self._diff_review_groups(review_files)
+        risk_rank = {"low": 0, "medium": 1, "high": 2}
+        highest_risk = max((item.get("risk", "medium") for item in review_files), key=lambda item: risk_rank.get(str(item), 1), default="low")
+        summary = {
+            "file_count": len(review_files),
+            "generated_file_count": sum(1 for item in review_files if str(item.get("file_class")) != "platform"),
+            "platform_file_count": sum(1 for item in review_files if item.get("file_class") == "platform"),
+            "additions": sum(int(item.get("additions") or 0) for item in review_files),
+            "deletions": sum(int(item.get("deletions") or 0) for item in review_files),
+            "highest_risk": highest_risk,
+            "risk_counts": {
+                level: sum(1 for item in review_files if item.get("risk") == level)
+                for level in ("low", "medium", "high")
+            },
+        }
+        actions = [
+            {"action": "stage_all", "method": "POST", "href": f"/runs/{run_id}/stage/files", "files": files},
+            {"action": "revert_all_draft_files", "method": "POST", "href": f"/runs/{run_id}/discard/files", "files": files, "enabled": bool(run.draft_ready or run.draft_status == "ready")},
+            {"action": "apply_staged", "method": "POST", "href": f"/runs/{run_id}/apply/staged"},
+        ]
+        payload = {
+            "schema": "grounded.run_diff_review.v1",
+            "run_id": run_id,
+            "workspace_id": run.workspace_id,
+            "status": "ok",
+            "base": base,
+            "target": target,
+            "files": review_files,
+            "groups": groups,
+            "summary": summary,
+            "actions": actions,
+            "refs": {
+                "raw_diff": f"/runs/{run_id}/diff",
+                "run_artifacts": f"run_artifacts:{run_id}",
+                "staged_files": f"staged_files:{run_id}",
+            },
+        }
+        self.store.upsert("reports", f"diff_review:{run_id}", payload)
+        return self._typed_payload(RunDiffReviewReport, payload)
+
     def approvals(self, run_id: str) -> dict[str, Any]:
         self.run_service.get_run(run_id)
         return self.store.get("reports", f"approvals:{run_id}") or {"run_id": run_id, "items": []}
@@ -4517,6 +5281,14 @@ class WorkbenchService:
         status = self._browser_proof_status(browser_check, proof, steps, console_errors, network_errors, mobile_layout)
         issues = self._browser_proof_issues(browser_check, steps, console_errors, network_errors, mobile_layout)
         scenarios = self._browser_proof_scenarios(steps, proof, diagnostics, mobile_layout, status)
+        role_page_screenshots = self._browser_role_page_screenshots(steps=steps, proof=proof, diagnostics=diagnostics, screenshots=screenshots)
+        replayable_scripts = self._browser_replayable_scripts(
+            steps=steps,
+            proof=proof,
+            diagnostics=diagnostics,
+            playwright_scenario=playwright_scenario,
+            mobile_layout=mobile_layout,
+        )
         return {
             "schema": "grounded.browser_proof.v1",
             "run_id": run.run_id,
@@ -4534,10 +5306,12 @@ class WorkbenchService:
             "issues": issues,
             "roles_checked": roles_checked,
             "screenshots": screenshots,
+            "role_page_screenshots": role_page_screenshots,
             "video_refs": self._dedupe_strings(self._collect_values(proof, keys=("video", "video_path", "video_ref", "videos"))),
             "console_errors": console_errors,
             "network_errors": network_errors,
             "playwright_scenario": playwright_scenario,
+            "replayable_scripts": replayable_scripts,
             "failed_step_context": self._first_dict(
                 proof.get("failed_step_context") if isinstance(proof, dict) else None,
                 diagnostics.get("failed_step_context") if isinstance(diagnostics, dict) else None,
@@ -4689,6 +5463,67 @@ class WorkbenchService:
                 }
             )
         return scenarios
+
+    @classmethod
+    def _browser_role_page_screenshots(cls, *, steps: list[Any], proof: dict[str, Any], diagnostics: dict[str, Any], screenshots: list[str]) -> list[dict[str, Any]]:
+        raw = cls._browser_raw_role_screenshots(proof=proof, diagnostics=diagnostics)
+        items: list[dict[str, Any]] = []
+        if isinstance(raw, dict):
+            raw = [{"role": role, "path": path, "route": f"/{role}"} for role, path in raw.items()]
+        for entry in raw:
+            if isinstance(entry, dict):
+                path = entry.get("path") or entry.get("screenshot") or entry.get("image_path")
+                route = str(entry.get("route") or "")
+                role = str(entry.get("role") or cls._role_from_text(route) or "").strip()
+                if path:
+                    items.append({"role": role, "route": route or (f"/{role}" if role else ""), "path": str(path), "phase": entry.get("phase") or "snapshot", "mobile_viewport": entry.get("mobile_viewport") or {}})
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            route = str(step.get("route") or step.get("url") or step.get("path") or "")
+            role = str(step.get("role") or cls._role_from_text(route) or "")
+            path = step.get("screenshot_after") or step.get("screenshot")
+            if role and path:
+                items.append({"role": role, "route": route or f"/{role}", "path": str(path), "phase": "after", "mobile_viewport": step.get("mobile_viewport") or {}})
+        for path in screenshots:
+            role = cls._role_from_text(path)
+            if role:
+                items.append({"role": role, "route": f"/{role}", "path": path, "phase": "snapshot", "mobile_viewport": {}})
+        deduped: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in items:
+            key = f"{item.get('role')}:{item.get('route')}:{item.get('path')}"
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+        return deduped[:80]
+
+    @staticmethod
+    def _browser_raw_role_screenshots(*, proof: dict[str, Any], diagnostics: dict[str, Any]) -> list[Any]:
+        for value in (proof.get("role_page_screenshots"), proof.get("role_screenshots"), diagnostics.get("role_page_screenshots"), diagnostics.get("role_screenshots")):
+            if isinstance(value, dict) and value:
+                return [{"role": role, "path": path, "route": f"/{role}"} for role, path in value.items()]
+            if isinstance(value, list) and value:
+                return list(value)
+        return []
+
+    @classmethod
+    def _browser_replayable_scripts(
+        cls,
+        *,
+        steps: list[Any],
+        proof: dict[str, Any],
+        diagnostics: dict[str, Any],
+        playwright_scenario: dict[str, Any],
+        mobile_layout: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        explicit = cls._first_list(proof.get("replayable_scripts"), diagnostics.get("replayable_scripts"))
+        scripts = [dict(item) for item in explicit if isinstance(item, dict)]
+        scenario = playwright_scenario or {"schema": "grounded.browser_playwright_scenario.v1", "steps": steps, "mobile_viewport": mobile_layout.get("viewport") or {}}
+        if steps and not scripts:
+            scripts.append(BrowserProofReplay.replayable_script(scenario=scenario, fallback_viewport=mobile_layout.get("viewport") or {}))
+        return scripts[:20]
 
     @staticmethod
     def _role_from_text(value: str) -> str:
@@ -5444,6 +6279,14 @@ class WorkbenchService:
         )
         return self._check("python", ok, details, str(Path(sys.executable)), required=True)
 
+    def _python_deps_check(self) -> dict[str, Any]:
+        required = ["fastapi", "pydantic", "uvicorn", "sqlalchemy"]
+        optional = ["playwright", "pytest"]
+        missing_required = [name for name in required if importlib.util.find_spec(name) is None]
+        missing_optional = [name for name in optional if importlib.util.find_spec(name) is None]
+        details = f"required_present={len(required) - len(missing_required)}/{len(required)}; missing_required={missing_required}; missing_optional={missing_optional}"
+        return self._check("python_deps", not missing_required, details, required=True)
+
     def _required_python_version(self) -> tuple[int, int]:
         pyproject = self.settings.repo_root / "platform" / "backend" / "pyproject.toml"
         try:
@@ -5722,6 +6565,14 @@ class WorkbenchService:
                 seen.add(key)
         return unique
 
+    def _browser_availability_check(self) -> dict[str, Any]:
+        package = importlib.util.find_spec("playwright") is not None
+        roots = self._playwright_browser_roots()
+        installed = [root for root in roots if root.exists() and any(root.iterdir())]
+        ok = package and bool(installed)
+        details = f"playwright_package={package}; browser_cache_roots={[str(path) for path in roots]}; installed_roots={[str(path) for path in installed]}"
+        return self._check("browser_availability", ok, details, "python -m playwright install --dry-run", required=False)
+
     def _preview_container_check(self) -> dict[str, Any]:
         docker = shutil.which("docker")
         if not docker:
@@ -5738,6 +6589,48 @@ class WorkbenchService:
             )
         except Exception as exc:
             return self._check("preview_containers", False, str(exc), "docker ps --format '{{.Names}}'", required=False)
+
+    def _preview_runtime_check(self) -> dict[str, Any]:
+        workspace_root = self.settings.workspaces_dir
+        runtime_dir = self.settings.runtime_dir
+        checks = {
+            "workspace_root_exists": workspace_root.exists(),
+            "runtime_dir_exists": runtime_dir.exists(),
+            "workspace_root_writable": os.access(workspace_root, os.W_OK) if workspace_root.exists() else False,
+            "runtime_dir_writable": os.access(runtime_dir, os.W_OK) if runtime_dir.exists() else False,
+        }
+        ok = all(checks.values())
+        return self._check("preview_runtime", ok, json.dumps(checks, ensure_ascii=False, sort_keys=True), required=True)
+
+    def _db_writable_check(self) -> dict[str, Any]:
+        path = self.settings.data_dir / ".doctor-db-write.sqlite3"
+        try:
+            self.settings.data_dir.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(path)
+            try:
+                conn.execute("CREATE TABLE IF NOT EXISTS doctor_probe (id INTEGER PRIMARY KEY, value TEXT)")
+                conn.execute("INSERT INTO doctor_probe(value) VALUES (?)", ("ok",))
+                row = conn.execute("SELECT value FROM doctor_probe ORDER BY id DESC LIMIT 1").fetchone()
+                conn.commit()
+            finally:
+                conn.close()
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return self._check("db_writable", bool(row and row[0] == "ok"), f"path={path}; write_probe=ok", required=True)
+        except Exception as exc:
+            return self._check("db_writable", False, f"path={path}; error={exc}", required=True)
+
+    def _backend_imports_check(self) -> dict[str, Any]:
+        modules = ["app.main", "app.api.routes_workbench", "app.modules.workspace_code_agent_runtime.runtime"]
+        failed: list[str] = []
+        for module in modules:
+            try:
+                importlib.import_module(module)
+            except Exception as exc:
+                failed.append(f"{module}: {exc.__class__.__name__}: {exc}")
+        return self._check("backend_imports", not failed, "ok" if not failed else "; ".join(failed), required=True)
 
     def _test_command_check(self) -> dict[str, Any]:
         return self._check("platform_tests", (self.settings.repo_root / "platform" / "backend" / "tests").exists(), "pytest platform/backend/tests", required=True)
@@ -5764,6 +6657,60 @@ class WorkbenchService:
         ok = not invalid and not any(path.endswith("agent_exec_policy.json") for path in missing)
         details = f"loaded={loaded}; missing_optional={missing}; invalid={invalid}"
         return self._check("runtime_policy_files", ok, details, required=True)
+
+    @staticmethod
+    def _doctor_summary(checks: list[dict[str, Any]]) -> dict[str, Any]:
+        counts: dict[str, int] = {}
+        required_failed: list[str] = []
+        warnings: list[str] = []
+        for check in checks:
+            status = str(check.get("status") or "unknown")
+            counts[status] = counts.get(status, 0) + 1
+            if check.get("required") and status != "passed":
+                required_failed.append(str(check.get("name") or "unknown"))
+            elif status != "passed":
+                warnings.append(str(check.get("name") or "unknown"))
+        return {
+            "total": len(checks),
+            "by_status": dict(sorted(counts.items())),
+            "required_failed": required_failed,
+            "warnings": warnings,
+        }
+
+    @staticmethod
+    def _doctor_sections(checks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        groups = [
+            ("python", "Python/deps", {"python", "python_deps"}),
+            ("node", "Node/npm", {"node", "npm"}),
+            ("browser", "Browser/Playwright", {"playwright", "playwright_browsers", "browser_availability"}),
+            ("backend", "Backend imports/API", {"backend_imports", "backend_routes", "stale_backend_port_8000"}),
+            ("preview", "Preview runtime/ports", {"preview_runtime", "preview_port_base", "preview_port_range", "preview_containers", "docker", "docker_compose", "docker_daemon"}),
+            ("storage", "Storage/DB", {"data_dir", "writable_dirs", "db_writable", "disk_space"}),
+            ("templates", "Template integrity", {"template_integrity", "template_hash"}),
+            ("policy", "Policy config", {"exec_policy", "runtime_policy_files"}),
+            ("models", "Model access", {"openai", "model_access"}),
+            ("tests", "Test commands", {"platform_tests"}),
+        ]
+        by_name = {str(check.get("name") or ""): check for check in checks}
+        sections: list[dict[str, Any]] = []
+        for key, title, names in groups:
+            items = [by_name[name] for name in sorted(names) if name in by_name]
+            if not items:
+                continue
+            required_failed = [item for item in items if item.get("required") and item.get("status") != "passed"]
+            failed_optional = [item for item in items if not item.get("required") and item.get("status") != "passed"]
+            status = "failed" if required_failed else "warning" if failed_optional else "passed"
+            sections.append(
+                {
+                    "key": key,
+                    "title": title,
+                    "status": status,
+                    "checks": [str(item.get("name") or "") for item in items],
+                    "required_failed": [str(item.get("name") or "") for item in required_failed],
+                    "warnings": [str(item.get("name") or "") for item in failed_optional],
+                }
+            )
+        return sections
 
     @staticmethod
     def _builtin_skills() -> dict[str, dict[str, Any]]:

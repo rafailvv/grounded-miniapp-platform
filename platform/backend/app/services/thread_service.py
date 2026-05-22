@@ -351,7 +351,18 @@ class ThreadService:
             entries = [entry for entry in entries if str(entry.get("path") or "").startswith(prefix)]
         return {"entries": entries}
 
-    def exec_command(self, *, workspace_id: str, command: str, thread_id: str | None = None, turn_id: str | None = None, timeout: int = 30, approval_id: str | None = None, preset: str = "safe_auto") -> dict[str, Any]:
+    def exec_command(
+        self,
+        *,
+        workspace_id: str,
+        command: str,
+        thread_id: str | None = None,
+        turn_id: str | None = None,
+        timeout: int = 30,
+        managed: bool = False,
+        approval_id: str | None = None,
+        preset: str = "safe_auto",
+    ) -> dict[str, Any]:
         linked_run_id = self._get_turn(turn_id).linked_run_id if turn_id else None
         source_dir = self.workspace_service.source_dir(workspace_id)
         evaluation = self.exec_policy_service.evaluate_command(command, preset=preset, root=source_dir, workspace_id=workspace_id)
@@ -413,6 +424,7 @@ class ThreadService:
             turn_id=turn_id,
             run_id=linked_run_id,
             timeout_seconds=timeout,
+            managed=managed,
         )
         self.exec_policy_service.append_audit_record(
             self.store,
@@ -432,7 +444,7 @@ class ThreadService:
                 tool_envelope(
                     tool="shell.exec",
                     input_payload={"command": self.exec_policy_service.redact(command)},
-                    result={key: payload.get(key) for key in ("status", "process_id", "timeout_seconds")},
+                    result={key: payload.get(key) for key in ("status", "process_id", "timeout_seconds", "managed", "lifecycle")},
                     risk=decision.get("risk") or "read_only",
                     approval={"required": False, "status": "approved" if approval_id else "not_required", "approval_id": approval_id},
                 ),

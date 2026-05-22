@@ -155,6 +155,7 @@ async def _dispatch(container: ServiceContainer, method: str, params: dict[str, 
             thread_id=params.get("thread_id") or params.get("threadId"),
             turn_id=params.get("turn_id") or params.get("turnId"),
             timeout=int(params.get("timeout") or 30),
+            managed=bool(params.get("managed") or False),
             approval_id=params.get("approval_id") or params.get("approvalId"),
             preset=str(params.get("preset") or "safe_auto"),
         )

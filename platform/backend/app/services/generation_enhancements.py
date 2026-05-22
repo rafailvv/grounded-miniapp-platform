@@ -1000,8 +1000,9 @@ class VisualQAGenerator:
 
 class VisualRegressionGenerator:
     @classmethod
-    def build(cls, *, run: Any, artifacts: dict[str, Any], browser_proof: dict[str, Any]) -> dict[str, Any]:
+    def build(cls, *, run: Any, artifacts: dict[str, Any], browser_proof: dict[str, Any], baseline: dict[str, Any] | None = None) -> dict[str, Any]:
         proof = browser_proof if isinstance(browser_proof, dict) else {}
+        baseline_payload = baseline if isinstance(baseline, dict) else {}
         browser_check = cls._browser_check(artifacts)
         diagnostics = browser_check.get("diagnostics") if isinstance(browser_check.get("diagnostics"), dict) else {}
         steps = cls._first_list(
@@ -1017,6 +1018,8 @@ class VisualRegressionGenerator:
         mobile_screenshots = cls._mobile_viewport_screenshots(proof=proof, diagnostics=diagnostics, steps=steps)
         role_snapshots = cls._role_page_snapshots(steps=steps, screenshots=mobile_screenshots)
         overflow_overlap = cls._overflow_overlap(mobile_layout=mobile_layout, layout_reports=layout_reports)
+        runtime_errors = cls._runtime_errors(proof=proof, diagnostics=diagnostics)
+        baseline_comparison = cls._baseline_comparison(current_role_snapshots=role_snapshots, baseline=baseline_payload)
         changed_files = cls._changed_files(run=run, artifacts=artifacts)
         issues = cls._issues(
             mobile_screenshots=mobile_screenshots,
@@ -1024,6 +1027,8 @@ class VisualRegressionGenerator:
             dom_snapshots=dom_snapshots,
             visual_diffs=visual_diffs,
             overflow_overlap=overflow_overlap,
+            runtime_errors=runtime_errors,
+            baseline_comparison=baseline_comparison,
             run=run,
         )
         blocking = any(str(item.get("severity") or "") == "high" for item in issues)
@@ -1039,6 +1044,8 @@ class VisualRegressionGenerator:
             "role_page_snapshots": role_snapshots,
             "dom_state_snapshots": dom_snapshots,
             "overflow_overlap": overflow_overlap,
+            "runtime_errors": runtime_errors,
+            "baseline": baseline_comparison,
             "visual_diffs": visual_diffs,
             "changed_files": changed_files,
             "issues": issues,
@@ -1046,6 +1053,7 @@ class VisualRegressionGenerator:
                 "run_artifacts": f"run_artifacts:{run.run_id}",
                 "browser_proof": run.browser_proof_ref,
                 "visual_regression": f"visual_regression:{run.run_id}",
+                "baseline_visual_regression": baseline_comparison.get("baseline_ref"),
             },
             "created_at": _now(),
         }
@@ -1136,6 +1144,18 @@ class VisualRegressionGenerator:
             add(step.get("screenshot"), route=step.get("route"), role=step.get("role"), phase="snapshot", viewport=step.get("mobile_viewport"), action=step.get("action"))
         for path in cls._as_list(proof.get("screenshots") or diagnostics.get("screenshots")):
             add(path, phase="snapshot")
+        raw_role_screenshots = cls._first_role_screenshots(proof=proof, diagnostics=diagnostics)
+        if isinstance(raw_role_screenshots, dict):
+            raw_role_screenshots = [{"role": role, "path": path, "route": f"/{role}"} for role, path in raw_role_screenshots.items()]
+        for item in raw_role_screenshots:
+            if isinstance(item, dict):
+                add(
+                    item.get("path") or item.get("screenshot") or item.get("image_path"),
+                    route=item.get("route"),
+                    role=item.get("role"),
+                    phase=str(item.get("phase") or "snapshot"),
+                    viewport=item.get("mobile_viewport"),
+                )
         deduped: list[dict[str, Any]] = []
         seen: set[str] = set()
         for item in screenshots:
@@ -1202,6 +1222,53 @@ class VisualRegressionGenerator:
                 )
         return diffs[:80]
 
+    @staticmethod
+    def _runtime_errors(*, proof: dict[str, Any], diagnostics: dict[str, Any]) -> dict[str, Any]:
+        console = [str(item) for item in VisualRegressionGenerator._as_list(proof.get("console_errors") or diagnostics.get("console_errors")) if str(item).strip()]
+        page = [str(item) for item in VisualRegressionGenerator._as_list(proof.get("page_errors") or diagnostics.get("page_errors")) if str(item).strip()]
+        network = [str(item) for item in VisualRegressionGenerator._as_list(proof.get("network_errors") or diagnostics.get("network_errors")) if str(item).strip()]
+        visible = [str(item) for item in VisualRegressionGenerator._as_list(proof.get("visible_errors") or diagnostics.get("visible_errors")) if str(item).strip()]
+        return {
+            "status": "failed" if console or page or network or visible else "passed",
+            "console_errors": console[:20],
+            "page_errors": page[:20],
+            "network_errors": network[:20],
+            "visible_errors": visible[:20],
+        }
+
+    @classmethod
+    def _first_role_screenshots(cls, *, proof: dict[str, Any], diagnostics: dict[str, Any]) -> list[Any]:
+        for value in (proof.get("role_page_screenshots"), proof.get("role_screenshots"), diagnostics.get("role_page_screenshots"), diagnostics.get("role_screenshots")):
+            if isinstance(value, dict) and value:
+                return [{"role": role, "path": path, "route": f"/{role}"} for role, path in value.items()]
+            if isinstance(value, list) and value:
+                return list(value)
+        return []
+
+    @classmethod
+    def _baseline_comparison(cls, *, current_role_snapshots: list[dict[str, Any]], baseline: dict[str, Any]) -> dict[str, Any]:
+        baseline_snapshots = [dict(item) for item in baseline.get("role_page_snapshots") or [] if isinstance(item, dict)]
+        baseline_ref = (baseline.get("artifact_refs") or {}).get("visual_regression") if isinstance(baseline.get("artifact_refs"), dict) else None
+        current_keys = {cls._snapshot_key(item) for item in current_role_snapshots if cls._snapshot_key(item)}
+        baseline_keys = {cls._snapshot_key(item) for item in baseline_snapshots if cls._snapshot_key(item)}
+        missing = sorted(key for key in baseline_keys if key not in current_keys)
+        new = sorted(key for key in current_keys if key not in baseline_keys)
+        return {
+            "status": "not_recorded" if not baseline else "regressed" if missing else "matched",
+            "baseline_ref": baseline_ref,
+            "baseline_run_id": baseline.get("run_id"),
+            "current_snapshot_count": len(current_role_snapshots),
+            "baseline_snapshot_count": len(baseline_snapshots),
+            "missing_role_snapshots": missing,
+            "new_role_snapshots": new,
+        }
+
+    @staticmethod
+    def _snapshot_key(item: dict[str, Any]) -> str:
+        role = str(item.get("role") or "").strip()
+        route = str(item.get("route") or "").strip()
+        return f"{role}:{route}" if role or route else ""
+
     @classmethod
     def _overflow_overlap(cls, *, mobile_layout: dict[str, Any], layout_reports: list[Any]) -> dict[str, Any]:
         normalized_reports = [dict(item) for item in layout_reports if isinstance(item, dict)]
@@ -1229,11 +1296,32 @@ class VisualRegressionGenerator:
         dom_snapshots: list[Any],
         visual_diffs: list[dict[str, Any]],
         overflow_overlap: dict[str, Any],
+        runtime_errors: dict[str, Any],
+        baseline_comparison: dict[str, Any],
         run: Any,
     ) -> list[dict[str, Any]]:
         issues: list[dict[str, Any]] = []
         if overflow_overlap.get("status") == "failed":
             issues.append({"kind": "overflow_overlap", "severity": "high", "message": "Mobile viewport proof found horizontal overflow or overlapping critical UI.", "evidence": overflow_overlap})
+        if overflow_overlap.get("horizontal_overflow"):
+            issues.append({"kind": "horizontal_overflow", "severity": "high", "message": "Mobile viewport has horizontal overflow.", "evidence": overflow_overlap})
+        if runtime_errors.get("status") == "failed":
+            issues.append({"kind": "js_error", "severity": "high", "message": "Browser proof recorded JavaScript, network, or visible runtime errors.", "evidence": runtime_errors})
+        empty_dom = [
+            item
+            for item in dom_snapshots
+            if isinstance(item, dict)
+            and (
+                item.get("empty") is True
+                or item.get("is_empty") is True
+                or str(item.get("status") or "").lower() in {"empty", "blank"}
+                or (item.get("text_length") is not None and int(item.get("text_length") or 0) <= 0)
+            )
+        ]
+        if empty_dom:
+            issues.append({"kind": "empty_screen", "severity": "high", "message": "Browser proof found an empty or blank screen.", "evidence": {"dom_snapshots": empty_dom[:8]}})
+        if baseline_comparison.get("status") == "regressed":
+            issues.append({"kind": "layout_regression", "severity": "high", "message": "Current browser proof is missing role screenshots that existed in the previous successful run.", "evidence": baseline_comparison})
         if not mobile_screenshots:
             issues.append({"kind": "missing_mobile_viewport_screenshots", "severity": "medium", "message": "No mobile viewport screenshots were recorded for generated app visual proof."})
         if not role_snapshots:

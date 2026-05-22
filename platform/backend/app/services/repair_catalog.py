@@ -6,6 +6,8 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.services.repair_classifier import RepairClassifier
+
 
 @dataclass(frozen=True)
 class RepairCatalogEntry:
@@ -972,8 +974,15 @@ def _known_fix_recipes(
     broken_surface: dict[str, Any],
     likely_files: list[str],
     post_fix_proof: dict[str, Any],
+    classification: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     issue_code = str(packet.get("issue_code") or packet.get("code") or "repair_case")
+    recipe = classification.get("recipe") if isinstance(classification, dict) and isinstance(classification.get("recipe"), dict) else {}
+    if recipe:
+        compatible_recipe = dict(recipe)
+        compatible_recipe["classifier_recipe_id"] = compatible_recipe.get("recipe_id")
+        compatible_recipe["recipe_id"] = str(packet.get("repair_recipe_id") or f"catalog.{issue_code}")
+        return [compatible_recipe]
     signature = str(packet.get("signature") or packet.get("failure_signature") or issue_code)
     kind = str(broken_surface.get("kind") or "")
     base_steps = [
@@ -1090,21 +1099,53 @@ class RepairCatalog:
         probable_files = _probable_files(enriched, broken_surface, likely_files)
         post_fix_proof = _post_fix_proof(enriched, failed_check, broken_surface)
         signature_normalization = _normalize_error_signature(enriched, failed_check)
+        classification = RepairClassifier.classify(
+            {
+                **enriched,
+                "failed_check": failed_check,
+                "broken_surface": broken_surface,
+                "likely_files": likely_files,
+                "post_fix_proof": post_fix_proof,
+            }
+        )
         known_fix_recipes = _known_fix_recipes(
             enriched,
             failed_check=failed_check,
             broken_surface=broken_surface,
             likely_files=likely_files,
             post_fix_proof=post_fix_proof,
+            classification=classification,
         )
         retry_strategy = _retry_strategy(enriched, broken_surface, post_fix_proof)
+        if isinstance(classification, dict):
+            escalation = classification.get("escalation") if isinstance(classification.get("escalation"), dict) else {}
+            relevant_checks = classification.get("relevant_checks") if isinstance(classification.get("relevant_checks"), list) else []
+            if relevant_checks:
+                retry_strategy = {
+                    **retry_strategy,
+                    "check_profile": classification.get("check_profile") or retry_strategy.get("check_profile"),
+                    "relevant_checks": relevant_checks,
+                    "escalation": escalation or retry_strategy.get("escalation"),
+                }
         product_guardrails = _product_guardrails(enriched, likely_files)
         repair_confidence = _repair_confidence(enriched, probable_files, known_fix_recipes)
+        if isinstance(classification.get("confidence"), dict):
+            repair_confidence = {
+                **repair_confidence,
+                "classifier_score": classification["confidence"].get("score"),
+                "repair_class": classification.get("repair_class"),
+            }
         repair_packet = {
             "schema": "grounded.repair_packet.v2",
             "failed_check": failed_check,
             "normalized_signature": signature_normalization["normalized"],
             "signature_normalization": signature_normalization,
+            "repair_class": classification.get("repair_class"),
+            "repair_classification": classification,
+            "focused_patch_plan": classification.get("focused_patch_plan"),
+            "relevant_checks": classification.get("relevant_checks") or [],
+            "check_profile": classification.get("check_profile"),
+            "escalation": classification.get("escalation") or {},
             "likely_files": likely_files,
             "probable_files": probable_files,
             "broken_surface": broken_surface,
@@ -1120,6 +1161,12 @@ class RepairCatalog:
         enriched["repair_catalog_version"] = "v2"
         enriched["normalized_signature"] = signature_normalization["normalized"]
         enriched["signature_normalization"] = signature_normalization
+        enriched["repair_class"] = classification.get("repair_class")
+        enriched["repair_classification"] = classification
+        enriched["focused_patch_plan"] = classification.get("focused_patch_plan")
+        enriched["relevant_checks"] = classification.get("relevant_checks") or []
+        enriched["check_profile"] = classification.get("check_profile")
+        enriched["escalation"] = classification.get("escalation") or {}
         enriched["likely_files"] = likely_files
         enriched["probable_files"] = probable_files
         enriched["broken_surface"] = broken_surface

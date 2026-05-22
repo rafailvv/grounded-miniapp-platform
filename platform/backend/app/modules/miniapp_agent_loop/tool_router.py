@@ -22,6 +22,7 @@ from app.modules.miniapp_agent_loop.lsp_tools import LspToolService
 from app.modules.miniapp_agent_loop.product_workers import canonical_worker_id
 from app.modules.miniapp_agent_loop.semantic_tools import semantic_scan
 from app.modules.miniapp_agent_loop.tool_batch_summary import summarize_tool_batch
+from app.modules.miniapp_agent_loop.tool_orchestrator import ToolOrchestrationRequest, ToolOrchestrator
 from app.modules.miniapp_agent_loop.agent_tool_runtime import (
     list_workspace_files,
     run_workspace_command,
@@ -584,50 +585,30 @@ class ToolRouter:
 
     def route_one(self, request: ToolCallRequest) -> ToolRouterResult:
         decision = self._decide(request)
-        validation_error = self._schema_error(request) if decision.allowed else None
-        if validation_error is not None:
-            return self._failed_result(request, decision, validation_error)
-        if not decision.allowed:
-            return self._failed_result(
-                request,
-                decision,
-                structured_tool_error(
-                    code="tool_not_allowed",
-                    message=decision.reason,
-                    details={"tool": request.tool, "mode": self.context.mode},
-                ),
-            )
-        pre_hook_error = self._pre_hook_error(request, decision)
-        if pre_hook_error is not None:
-            result = self._failed_result(request, decision, pre_hook_error)
-            post_outcome = self._post_hook(request, result.envelope, failed=True)
-            if post_outcome is not None and post_outcome.additional_contexts:
-                result.model_result["hook_contexts"] = list(post_outcome.additional_contexts)
-                result.model_result["hook_evaluation"] = post_outcome.as_dict()
-            return result
-        try:
+        orchestrator = ToolOrchestrator(emit_activity=self._emit_activity)
+
+        def execute() -> ToolRouterResult:
             if decision.deferred:
-                result = self._defer_mutation(request, decision)
+                return self._defer_mutation(request, decision)
             elif decision.kind == "verification":
-                result = self._execute_verification(request, decision)
-            else:
-                result = self._execute_read_only(request, decision)
-        except Exception as exc:
-            result = self._failed_result(
-                request,
-                decision,
-                structured_tool_error(
-                    code="tool_execution_error",
-                    message=str(exc),
-                    retryable=True,
-                    details={"error_class": exc.__class__.__name__},
-                ),
-            )
-        post_outcome = self._post_hook(request, result.envelope, failed=str(result.envelope.get("status") or "") == "failed")
-        if post_outcome is not None and post_outcome.additional_contexts:
-            result.model_result["hook_contexts"] = list(post_outcome.additional_contexts)
-            result.model_result["hook_evaluation"] = post_outcome.as_dict()
-        return result
+                return self._execute_verification(request, decision)
+            return self._execute_read_only(request, decision)
+
+        result = orchestrator.run(
+            ToolOrchestrationRequest(
+                request=request,
+                decision=decision,
+                protocol_input={**self._protocol_input(request), "mode": self.context.mode},
+                workspace_id=self.context.workspace_id,
+                run_id=self.context.run_id,
+            ),
+            schema_error=lambda: self._schema_error(request),
+            pre_hook_error=lambda: self._pre_hook_error(request, decision),
+            post_hook=lambda router_result, failed: self._post_hook(request, router_result.envelope, failed=failed),
+            execute=execute,
+            failed_result=lambda error: self._failed_result(request, decision, error),
+        )
+        return result.router_result
 
     def _requests_from_tool_calls(self, tool_calls: list[dict[str, Any]]) -> list[ToolCallRequest]:
         requests: list[ToolCallRequest] = []
@@ -1355,18 +1336,7 @@ class ToolRouter:
 
     @staticmethod
     def _approval_payload(decision: ToolRouteDecision, override: dict[str, Any] | None) -> dict[str, Any]:
-        if override is not None:
-            payload = dict(override)
-            payload.setdefault("class", decision.approval_class)
-            payload.setdefault("policy", decision.reason)
-            return payload
-        if decision.approval_class == "policy":
-            return {"required": False, "status": "policy_checked", "class": "policy", "policy": decision.reason}
-        if decision.approval_class == "human":
-            return {"required": True, "status": "pending", "class": "human", "policy": decision.reason}
-        if decision.approval_class == "forbidden":
-            return {"required": True, "status": "rejected", "class": "forbidden", "policy": decision.reason}
-        return {"required": False, "status": "not_required", "class": "none"}
+        return ToolOrchestrator.approval_payload(decision, override)
 
     @staticmethod
     def _model_result(request: ToolCallRequest, envelope: dict[str, Any], result: dict[str, Any]) -> dict[str, object]:

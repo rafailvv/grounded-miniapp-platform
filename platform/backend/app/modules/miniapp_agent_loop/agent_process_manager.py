@@ -35,6 +35,8 @@ DEFAULT_RESOURCE_LIMITS = {
     "open_files": int(os.getenv("AGENT_EXEC_OPEN_FILES", "256")),
 }
 
+COMPLETED_PROCESS_RETENTION = int(os.getenv("AGENT_EXEC_PROCESS_RETENTION", "128"))
+
 
 @dataclass
 class HeadTailOutputBuffer:
@@ -445,6 +447,8 @@ class AgentProcessManager:
                 "status": "running",
                 "stdout": stdout_buffer.snapshot(),
                 "stderr": stderr_buffer.snapshot(),
+                "stdout_content": "",
+                "stderr_content": "",
                 "output_delta_count": 0,
                 "sandbox": sandbox_summary,
                 "sandbox_boundary": sandbox_boundary,
@@ -469,6 +473,7 @@ class AgentProcessManager:
                         meta = self._active_meta.get(resolved_process_id)
                         if meta is not None:
                             meta[stream_name] = buffer.snapshot()
+                            meta[f"{stream_name}_content"] = spool.content
                             meta["output_delta_count"] = output_delta_count
                     emit(
                         {
@@ -503,7 +508,7 @@ class AgentProcessManager:
         last_heartbeat = started
         while process.poll() is None:
             elapsed = time.perf_counter() - started
-            if elapsed >= timeout_seconds:
+            if timeout_seconds > 0 and elapsed >= timeout_seconds:
                 timed_out = True
                 self._terminate_process_tree(process, kill=False)
                 try:
@@ -623,6 +628,8 @@ class AgentProcessManager:
                     "duration_ms": duration_ms,
                     "stdout": stdout_buffer.snapshot(),
                     "stderr": stderr_buffer.snapshot(),
+                    "stdout_content": stdout_spool.content,
+                    "stderr_content": stderr_spool.content,
                     "stdout_ref": (stdout_artifact or {}).get("ref"),
                     "stderr_ref": (stderr_artifact or {}).get("ref"),
                     "output_artifacts": output_artifacts,
@@ -636,6 +643,7 @@ class AgentProcessManager:
             )
             self._active.pop(resolved_process_id, None)
             self._active_meta[resolved_process_id] = meta
+            self._prune_completed_locked()
         return AgentCommandResult(
             command=command,
             process_id=resolved_process_id,
@@ -709,19 +717,39 @@ class AgentProcessManager:
         with self._lock:
             meta = dict(self._active_meta.get(process_id) or {})
         payload = meta.get(stream_name) if isinstance(meta.get(stream_name), dict) else {}
-        text = str(payload.get("excerpt") or "")
-        sliced = text[slice(start, end)]
+        text = str(meta.get(f"{stream_name}_content") or payload.get("excerpt") or "")
+        normalized_start = max(0, int(start or 0))
+        normalized_end = int(end) if end is not None else None
+        sliced = text[slice(normalized_start, normalized_end)]
+        next_start = normalized_start + len(sliced)
         return {
             "process_id": process_id,
             "stream": stream_name,
-            "start": start,
-            "end": end,
+            "start": normalized_start,
+            "end": normalized_end,
+            "next_start": next_start,
             "content": sliced,
             "total_chars": payload.get("total_chars", len(text)),
+            "buffered_chars": len(text),
             "omitted_chars": payload.get("omitted_chars", 0),
             "status": meta.get("status", "unknown"),
             "artifact_ref": meta.get(f"{stream_name}_ref"),
         }
+
+    def _prune_completed_locked(self) -> None:
+        completed = [
+            item
+            for item in self._active_meta.values()
+            if str(item.get("status") or "") != "running"
+        ]
+        overflow = len(completed) - max(1, COMPLETED_PROCESS_RETENTION)
+        if overflow <= 0:
+            return
+        completed.sort(key=lambda item: str(item.get("started_at") or ""))
+        for item in completed[:overflow]:
+            process_id = str(item.get("process_id") or "")
+            if process_id and process_id not in self._active:
+                self._active_meta.pop(process_id, None)
 
     @staticmethod
     def _write_output_artifact(

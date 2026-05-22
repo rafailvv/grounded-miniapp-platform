@@ -132,6 +132,8 @@ class WorkspaceMemoryReport(MemoryApiModel):
     architecture_summary: list[dict[str, Any]] = Field(default_factory=list)
     known_failures: list[dict[str, Any]] = Field(default_factory=list)
     failure_shields: list[dict[str, Any]] = Field(default_factory=list)
+    known_failure_recipes: list[dict[str, Any]] = Field(default_factory=list)
+    successful_app_patterns: list[dict[str, Any]] = Field(default_factory=list)
     rejected_approaches: list[dict[str, Any]] = Field(default_factory=list)
     reusable_workflows: list[dict[str, Any]] = Field(default_factory=list)
     do_not_change: list[dict[str, Any]] = Field(default_factory=list)

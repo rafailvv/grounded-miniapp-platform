@@ -196,6 +196,75 @@ class RunCompareReport(WorkbenchApiModel):
     refs: dict[str, Any] = Field(default_factory=dict)
 
 
+class DiffReviewFile(WorkbenchApiModel):
+    path: str
+    product_area: str
+    file_class: str
+    status: str = "modified"
+    risk: str = "medium"
+    additions: int = 0
+    deletions: int = 0
+    why_changed: str | None = None
+    coverage: list[dict[str, Any]] = Field(default_factory=list)
+    actions: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class DiffReviewGroup(WorkbenchApiModel):
+    key: str
+    title: str
+    product_area: str
+    file_class: str
+    risk: str
+    files: list[DiffReviewFile] = Field(default_factory=list)
+    summary: dict[str, Any] = Field(default_factory=dict)
+
+
+class RunDiffReviewReport(WorkbenchApiModel):
+    schema_: str = Field(default="grounded.run_diff_review.v1", alias="schema")
+    run_id: str
+    workspace_id: str
+    status: str = "ok"
+    base: str = "source"
+    target: str = "draft"
+    files: list[DiffReviewFile] = Field(default_factory=list)
+    groups: list[DiffReviewGroup] = Field(default_factory=list)
+    summary: dict[str, Any] = Field(default_factory=dict)
+    actions: list[dict[str, Any]] = Field(default_factory=list)
+    refs: dict[str, Any] = Field(default_factory=dict)
+
+
+class RunSessionCheckpoint(WorkbenchApiModel):
+    schema_: str | None = Field(default=None, alias="schema")
+    checkpoint_id: str
+    run_id: str
+    workspace_id: str
+    kind: str
+    status: str
+    source: str | None = None
+    summary: str | None = None
+    created_at: str | None = None
+    run_status: str | None = None
+    apply_status: str | None = None
+    current_stage: str | None = None
+    revision_id: str | None = None
+    failure_class: str | None = None
+    failure_signature: str | None = None
+    refs: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    actions: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class RunSessionCheckpointsReport(WorkbenchApiModel):
+    schema_: str = Field(default="grounded.run_session_checkpoints.v1", alias="schema")
+    run_id: str
+    workspace_id: str
+    status: str = "ok"
+    items: list[RunSessionCheckpoint] = Field(default_factory=list)
+    latest_good_run_id: str | None = None
+    latest_good_revision_id: str | None = None
+    actions: list[dict[str, Any]] = Field(default_factory=list)
+
+
 class RunEventsReport(WorkbenchApiModel):
     schema_: str = Field(default="grounded.run_events.v1", alias="schema")
     run_id: str
@@ -315,6 +384,12 @@ class RepairCase(WorkbenchApiModel):
     post_repair_proof: dict[str, Any] = Field(default_factory=dict)
     known_fix_recipe: dict[str, Any] = Field(default_factory=dict)
     known_fix_recipes: list[dict[str, Any]] = Field(default_factory=list)
+    repair_class: str | None = None
+    repair_classification: dict[str, Any] = Field(default_factory=dict)
+    focused_patch_plan: dict[str, Any] = Field(default_factory=dict)
+    relevant_checks: list[dict[str, Any]] = Field(default_factory=list)
+    check_profile: str | None = None
+    escalation: dict[str, Any] = Field(default_factory=dict)
     product_guardrails: dict[str, Any] = Field(default_factory=dict)
     repair_confidence: dict[str, Any] = Field(default_factory=dict)
     browser_replay: dict[str, Any] = Field(default_factory=dict)

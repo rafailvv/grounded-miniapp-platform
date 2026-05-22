@@ -61,6 +61,7 @@ class AgentContextPressureAnalyzer:
                 "tool_registry": parsed.get("tool_registry"),
                 "context_pack_retrieval": ((parsed.get("context_pack") or {}).get("retrieval_stats") if isinstance(parsed.get("context_pack"), dict) else {}),
             },
+            "context_packs": parsed.get("context_packs"),
             "checks": {
                 "latest_checks": parsed.get("latest_checks"),
                 "diagnostics_delta": parsed.get("diagnostics_delta"),
@@ -81,6 +82,7 @@ class AgentContextPressureAnalyzer:
                 "file_contexts": section_tokens["files"],
                 "tool_results": section_tokens["tool_outputs"],
                 "agent_memory": section_tokens["memory"],
+                "context_packs": section_tokens["context_packs"],
                 "latest_checks": self._tokens(parsed.get("latest_checks")),
                 "preview": self._tokens(parsed.get("preview")),
                 "implementation_plan": self._tokens(parsed.get("implementation_plan")),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 from pathlib import PurePosixPath
 import os
@@ -646,6 +647,62 @@ class RunService:
         payload = self.store.get("reports", self._resume_checkpoint_ref_for_run(run))
         return dict(payload) if isinstance(payload, dict) else None
 
+    def _record_session_checkpoint(
+        self,
+        run: RunRecord,
+        *,
+        kind: str,
+        status: str,
+        source: str,
+        summary: str,
+        refs: dict[str, Any] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        checkpoint_id = f"session_checkpoint:{run.workspace_id}:{run.run_id}:{kind}"
+        payload = {
+            "schema": "grounded.session_checkpoint.v1",
+            "checkpoint_id": checkpoint_id,
+            "run_id": run.run_id,
+            "workspace_id": run.workspace_id,
+            "kind": kind,
+            "status": status,
+            "source": source,
+            "summary": summary,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "run_status": run.status,
+            "apply_status": run.apply_status,
+            "current_stage": run.current_stage,
+            "revision_id": run.result_revision_id or run.candidate_revision_id or run.source_revision_id,
+            "failure_class": run.failure_class,
+            "failure_signature": run.failure_signature,
+            "refs": dict(refs or {}),
+            "metadata": dict(metadata or {}),
+        }
+        self.store.upsert("reports", checkpoint_id, payload)
+        return payload
+
+    def _record_before_apply_checkpoint(self, run: RunRecord, *, source: str) -> None:
+        try:
+            draft_diff = self.workspace_service.diff(run.workspace_id, run_id=run.run_id)
+        except Exception:
+            draft_diff = ""
+        self._record_session_checkpoint(
+            run,
+            kind="before_apply",
+            status="ready",
+            source=source,
+            summary="Checkpoint captured before applying the generated draft.",
+            refs={
+                "draft_run_id": run.run_id,
+                "source_revision_id": run.source_revision_id,
+                "run_artifacts": f"run_artifacts:{run.run_id}",
+            },
+            metadata={
+                "diff_sha256": hashlib.sha256(draft_diff.encode("utf-8")).hexdigest() if draft_diff else None,
+                "changed_files": list(run.touched_files or []),
+            },
+        )
+
     def _recover_orphaned_terminal_jobs(self) -> None:
         for item in self.store.list("jobs"):
             job = JobRecord.model_validate(item)
@@ -1011,6 +1068,7 @@ class RunService:
             idempotency_key=f"apply.started:{run.run_id}:{run.updated_at.isoformat()}",
         )
         self._append_job_event(run.linked_job_id, "apply_started", "Applying the reviewed draft to the source workspace.")
+        self._record_before_apply_checkpoint(run, source="manual_apply")
         revision = self.workspace_service.approve_draft(run.workspace_id, run.run_id, f"Approve AI draft for run {run.run_id}")
         self.workspace_service.discard_draft(run.workspace_id, run.run_id)
         run.result_revision_id = revision.revision_id
@@ -2274,6 +2332,19 @@ class RunService:
                 "Applied source preview passed post-apply product proof.",
                 {"reason": "post_apply_source_proof", "run_id": run.run_id, "report_ref": report_ref},
             )
+            self._record_session_checkpoint(
+                run,
+                kind="after_successful_tests",
+                status="ready",
+                source="post_apply_source_proof",
+                summary="Checkpoint captured after applied source passed post-apply product proof.",
+                refs={
+                    "post_apply_checks": report_ref,
+                    "browser_proof": run.browser_proof_ref,
+                    "result_revision_id": run.result_revision_id,
+                },
+                metadata={"check_count": len(execution.results)},
+            )
 
     @staticmethod
     def _specific_failure_reason_from_results(results: list[RunCheckResult]) -> str | None:
@@ -3088,6 +3159,7 @@ class RunService:
         run.updated_at = datetime.now(timezone.utc)
         self._save_run(run)
         self._append_job_event(run.linked_job_id, "apply_started", message)
+        self._record_before_apply_checkpoint(run, source="auto_apply")
         revision = self.workspace_service.approve_draft(run.workspace_id, run.run_id, f"Auto-apply AI draft for run {run.run_id}")
         self.workspace_service.discard_draft(run.workspace_id, run.run_id)
         run.result_revision_id = revision.revision_id

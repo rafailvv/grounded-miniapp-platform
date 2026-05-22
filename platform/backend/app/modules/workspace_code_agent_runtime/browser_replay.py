@@ -33,6 +33,7 @@ class BrowserProofReplay:
             scenario=scenario,
             mobile_viewport=mobile_viewport,
         )
+        replayable_script = BrowserProofReplay.replayable_script(scenario=scenario, fallback_viewport=mobile_viewport)
         return {
             "schema": "grounded.browser_replay_packet.v2",
             "check": "browser_flow_smoke",
@@ -59,6 +60,8 @@ class BrowserProofReplay:
             "mobile_layout": diagnostics.get("mobile_layout"),
             "mobile_viewport": mobile_viewport,
             "playwright_scenario": scenario,
+            "replayable_script": replayable_script,
+            "replayable_scripts": [replayable_script] if replayable_script else [],
             "failed_step_context": failed_context,
             "replay_plan": replay_plan,
             "repair_order": [
@@ -69,6 +72,41 @@ class BrowserProofReplay:
             ],
             "logs": list(browser.logs or [])[-8:],
             "next_action": "reproduce this exact Playwright failed step first, repair it, rerun the same step, then rerun the full browser proof",
+        }
+
+    @staticmethod
+    def replayable_script(*, scenario: dict[str, Any], fallback_viewport: Any = None) -> dict[str, Any]:
+        steps = [item for item in scenario.get("steps") or [] if isinstance(item, dict)] if isinstance(scenario, dict) else []
+        script_steps: list[dict[str, Any]] = []
+        for index, step in enumerate(steps, start=1):
+            route = str(step.get("route") or step.get("url") or step.get("path") or "")
+            selector = str(step.get("selector") or step.get("dom_selector") or "")
+            action = str(step.get("action") or step.get("step") or f"step_{index}")
+            script_steps.append(
+                {
+                    "index": index,
+                    "role": step.get("role"),
+                    "route": route,
+                    "action": action,
+                    "selector": selector,
+                    "input": step.get("input") or step.get("value") or step.get("text"),
+                    "expect": step.get("expect") or step.get("assertion") or step.get("expected"),
+                    "mobile_viewport": step.get("mobile_viewport") or fallback_viewport or scenario.get("mobile_viewport") or {},
+                    "screenshot_before": step.get("screenshot_before"),
+                    "screenshot_after": step.get("screenshot_after") or step.get("screenshot"),
+                }
+            )
+        return {
+            "schema": "grounded.browser_replay_script.v1",
+            "mode": "playwright_step_replay",
+            "steps": script_steps,
+            "step_count": len(script_steps),
+            "mobile_viewport": fallback_viewport or scenario.get("mobile_viewport") or {},
+            "instructions": [
+                "Open each step route in order.",
+                "Apply selector/action/input exactly when present.",
+                "Capture console, network, DOM, layout, and screenshot evidence after every step.",
+            ],
         }
 
     @staticmethod

@@ -325,7 +325,14 @@ def test_memory_pipeline_extracts_consolidates_dedupes_and_rejects_secrets(tmp_p
 
     assert stage1["status"] == "extracted"
     assert stage1["phase"] == "raw"
-    assert {item["kind"] for item in stage1["items"]} >= {"preference", "product_decision", "failure_signature", "failure_shield", "avoidance"}
+    assert {item["kind"] for item in stage1["items"]} >= {
+        "preference",
+        "product_decision",
+        "failure_signature",
+        "failure_shield",
+        "known_failure_recipe",
+        "avoidance",
+    }
     shield = next(item for item in stage1["items"] if item["kind"] == "failure_shield")
     assert shield["payload"]["failure_signature"]
     assert shield["payload"]["symptom"]
@@ -339,6 +346,8 @@ def test_memory_pipeline_extracts_consolidates_dedupes_and_rejects_secrets(tmp_p
     assert all(item["status"] == "active" for item in consolidated["items"])
     assert consolidated["pipeline"]["phase1"]["raw_count"] == len(stage1["items"]) * 2
     assert consolidated["pipeline"]["phase2"]["deduped_count"] == len(stage1["items"])
+    assert consolidated["pipeline"]["category_counts"]["known_failure_recipes"] >= 1
+    assert consolidated["known_failure_recipes"]
     assert stale["status"] == "stale"
     assert retrieval["schema"] == "grounded.memory_retrieval.v1"
     assert retrieval["hits"]
@@ -348,6 +357,41 @@ def test_memory_pipeline_extracts_consolidates_dedupes_and_rejects_secrets(tmp_p
     assert summary["schema"] == "grounded.memory_summary.v1"
     assert summary["always_loaded"] is True
     assert any(section["kind"] == "failure_shield" for section in summary["sections"])
+    assert any(section["kind"] == "known_failure_recipe" for section in summary["sections"])
+
+
+def test_memory_pipeline_extracts_successful_app_patterns() -> None:
+    run = RunRecord(
+        workspace_id="ws_1",
+        prompt="Create a dense project dashboard with reusable repair workflow.",
+        intent="create",
+        target_role_scope=["client", "manager"],
+        model_profile="test",
+        status="completed",
+        apply_status="applied",
+        touched_files=["miniapp/app/main.py", "miniapp/app/static/styles.css"],
+        implementation_plan={"primary_entities": ["project", "run"]},
+        acceptance_contract={"workflow_kind": "operational_dashboard", "roles": ["client", "manager"]},
+    )
+    stage1 = WorkspaceMemoryPipeline.extract_run(
+        run,
+        {"check_results": [{"name": "browser_flow_smoke", "status": "passed"}]},
+    )
+    consolidated = WorkspaceMemoryPipeline.consolidate("ws_1", [stage1], {"workspace_id": "ws_1", "items": []})
+    retrieval = WorkspaceMemoryPipeline.retrieve(
+        "ws_1",
+        consolidated,
+        prompt="Build another project dashboard with similar workflow",
+        top_k=5,
+    )
+
+    kinds = {item["kind"] for item in stage1["items"]}
+    assert "reusable_workflow" in kinds
+    assert "successful_app_pattern" in kinds
+    assert consolidated["successful_app_patterns"]
+    assert consolidated["pipeline"]["category_counts"]["successful_app_patterns"] == 1
+    assert consolidated["successful_app_patterns"][0]["payload"]["primary_entities"] == ["project", "run"]
+    assert any(item["kind"] == "successful_app_pattern" for item in retrieval["items"])
 
 
 def test_memory_summary_hides_stale_items_and_details_can_opt_in(tmp_path: Path) -> None:

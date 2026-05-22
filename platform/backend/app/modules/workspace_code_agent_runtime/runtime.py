@@ -61,6 +61,7 @@ from app.modules.miniapp_agent_loop.agent_scratchpad import AgentScratchpad
 from app.modules.miniapp_agent_loop.agent_tool_registry import AgentToolRegistry
 from app.modules.miniapp_agent_loop.edit_validator import AgentEditValidator
 from app.modules.miniapp_agent_loop.context_pressure import AgentContextPressureAnalyzer
+from app.modules.miniapp_agent_loop.context_packer import AgentContextPacker
 from app.modules.miniapp_agent_loop.environment_snapshot import AgentEnvironmentSnapshot
 from app.modules.miniapp_agent_loop.rollout_trace import RolloutTraceRecorder
 from app.modules.miniapp_agent_loop.semantic_tools import semantic_scan
@@ -4135,6 +4136,19 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             if isinstance(active_repair_case_payload.get("next_action"), dict)
             else {}
         )
+        context_packs = AgentContextPacker.pack(
+            user_prompt=request.prompt,
+            acceptance_contract=acceptance_contract,
+            implementation_plan=implementation_plan,
+            latest_execution=latest_execution,
+            file_contexts=file_context_payload,
+            latest_diff_summary=latest_diff_summary,
+            repair_packets=repair_packets or [],
+            active_repair_case=active_repair_case_payload,
+            diagnostics_delta=diagnostics_delta or {},
+            repeated_no_progress=repeated_no_progress,
+            context_mode=context_mode,
+        )
         payload = {
             "task": "Edit the draft workspace to satisfy the user prompt and pass platform invariant checks.",
             "workspace_id": workspace_id,
@@ -4177,6 +4191,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             "attempt": attempt,
             "tool_round": tool_round,
             "context_mode": context_mode,
+            "context_packs": context_packs,
             "repeated_no_progress": repeated_no_progress,
             "agent_memory": (
                 self._compact_jsonish(agent_memory or {}, max_chars=700, max_items=5)
@@ -7493,6 +7508,10 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             "context_suggestion",
             "hook_started",
             "hook_completed",
+            "tool_orchestration_started",
+            "tool_attempt_started",
+            "tool_attempt_completed",
+            "tool_orchestration_completed",
             "verifier_nudge",
             "worker_started",
             "worker_completed",
@@ -7527,6 +7546,10 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             "context_suggestion",
             "hook_started",
             "hook_completed",
+            "tool_orchestration_started",
+            "tool_attempt_started",
+            "tool_attempt_completed",
+            "tool_orchestration_completed",
             "verifier_nudge",
         }:
             return event_type, message
@@ -7920,6 +7943,9 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             "prompt_excerpt": prompt_payload[:4000],
             "context_pack": {
                 "present": bool(context_pack),
+                "budgeted_packs_present": isinstance(parsed.get("context_packs"), dict),
+                "budget_status": ((parsed.get("context_packs") or {}).get("budget") or {}).get("status") if isinstance(parsed.get("context_packs"), dict) else None,
+                "retry_mode": ((parsed.get("context_packs") or {}).get("retry_policy") or {}).get("mode") if isinstance(parsed.get("context_packs"), dict) else None,
                 "workspace_summary_chars": len(str(context_pack.get("workspace_summary") or "")) if context_pack else 0,
                 "selected_code_paths": [
                     str(item.get("path") or "")

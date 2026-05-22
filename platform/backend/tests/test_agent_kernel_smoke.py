@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import time
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,6 +26,7 @@ from app.modules.miniapp_agent_loop.agent_transcript import AgentTranscriptStore
 from app.modules.miniapp_agent_loop.agent_tool_registry import AgentToolRegistry
 from app.modules.miniapp_agent_loop.agent_tool_changes import file_changes_from_mutating_tool_calls
 from app.modules.miniapp_agent_loop.tool_router import ToolRouter, ToolRouterContext
+from app.modules.miniapp_agent_loop.tool_orchestrator import ToolOrchestrationRequest, ToolOrchestrator
 from app.modules.miniapp_agent_loop.diagnostics_delta import AgentDiagnosticsDelta
 from app.modules.miniapp_agent_loop.agent_worker_manager import AgentWorkerManager
 from app.modules.miniapp_agent_loop.agent_worker_branch_loop import AgentWorkerBranchLoop
@@ -31,6 +34,7 @@ from app.modules.miniapp_agent_loop.agent_worker_runtime import AgentWorkerRunti
 from app.modules.miniapp_agent_loop.agent_worker_tasks import AgentWorkerTaskPlanner
 from app.models.artifacts import ApplyPatchResult
 from app.modules.miniapp_agent_loop.context_pressure import AgentContextPressureAnalyzer
+from app.modules.miniapp_agent_loop.context_packer import AgentContextPacker
 from app.modules.miniapp_agent_loop.edit_validator import AgentEditValidator
 from app.modules.miniapp_agent_loop.lsp_tools import LspToolService
 from app.modules.miniapp_agent_loop.repair_packets import RepairTransitionPolicy
@@ -53,6 +57,7 @@ from app.services.miniapp_contract import MiniAppContractCompiler
 from app.services.repair_catalog import RepairCatalog
 from app.services.workspace.run_service import RunService
 from app.services.workflow_acceptance import build_acceptance_contract, build_implementation_plan, extract_prompt_planning_hints
+from app.services.generated_tests_synthesizer import GeneratedTestsSynthesizer
 from app.repositories.state_store import StateStore
 
 
@@ -830,14 +835,82 @@ def test_ordinary_business_prompt_promotes_prompt_scale_to_role_pages() -> None:
     assert any(item["id"] == "manager.role_surface" and item["expected_min_routes"] >= 3 for item in ledger)
     manager_item = next(item for item in ledger if item["id"] == "manager.role_surface")
     assert "miniapp/app/static/manager/app.js" in manager_item["owned_paths"]
+    assert manager_item["depends_on"] == ["planner.plan_ready"]
     assert "browser_flow_smoke" in manager_item["proof_checks"]
     assert any(item["id"] == "shared_state.persistence_api" for item in ledger)
+    proof_item = next(item for item in ledger if item["id"] == "proof.generated_and_browser")
+    assert "manager.role_surface" in proof_item["depends_on"]
+    assert "shared_state.persistence_api" in proof_item["depends_on"]
     assert audit["status"] == "required"
     assert "verify each ledger item has product runtime source changes, not only tests or generated metadata" in audit["audit_steps"]
 
     execution_contract = WorkspaceCodeAgentRuntime._product_execution_contract_payload(plan)
     assert "product_task_ledger" in execution_contract
     assert "completion_audit_contract" in execution_contract
+
+
+def test_generated_tests_synthesizer_builds_workflow_oriented_python_and_js_tests() -> None:
+    contract = {
+        "required": True,
+        "roles": ["client", "manager"],
+        "flows": [
+            {
+                "id": "create_task",
+                "name": "Client creates task for manager review",
+                "roles": ["client", "manager"],
+                "api_paths": ["/api/tasks"],
+                "state_fields": ["id", "title", "status"],
+            }
+        ],
+        "required_controls": [{"role": "client", "selector": "#client-main-form"}],
+    }
+    synthesis = GeneratedTestsSynthesizer.synthesize(
+        acceptance_contract=contract,
+        implementation_plan={"roles": ["client", "manager"]},
+        prompt="Client creates task and manager reviews persisted status.",
+    )
+
+    kinds = {item["kind"] for item in synthesis["test_specs"]}
+    python_source = synthesis["files"]["miniapp/tests/test_generated_app.py"]
+    js_source = synthesis["files"]["miniapp/tests/generated_app.test.mjs"]
+
+    assert synthesis["schema"] == "grounded.generated_tests_synthesis.v1"
+    assert {"api_persistence", "route_static_shell", "js_source_selector", "browser_workflow", "role_specific"}.issubset(kinds)
+    assert "/api/tasks" in synthesis["api_paths"]
+    assert {"title", "status"}.issubset(set(synthesis["state_fields"]))
+    assert "TestClient(app)" in python_source
+    assert "client.post(api_path" in python_source
+    assert "client.get(api_path)" in python_source
+    assert "querySelector" in js_source
+    assert "fetch\\(" in js_source
+    assert "#client-main-form" in js_source
+
+
+def test_implementation_plan_embeds_generated_tests_synthesis() -> None:
+    contract = build_acceptance_contract(
+        prompt="Client creates task, manager reviews status.",
+        intent="create",
+        generation_mode=GenerationMode.BALANCED,
+        prompt_analysis={
+            "resource_hint": "task",
+            "resource_hints": ["task"],
+            "role_action_prompts": {"client": ["creates task"], "manager": ["reviews status"]},
+            "role_field_hints": {"client": ["title"], "manager": ["status"]},
+            "role_state_contract": {"source_roles": ["client"], "observer_roles": ["manager"]},
+        },
+    )
+    plan = build_implementation_plan(
+        prompt="Client creates task, manager reviews status.",
+        intent="create",
+        generation_mode=GenerationMode.BALANCED,
+        acceptance_contract=contract,
+    )
+
+    synthesis = plan["generated_tests_synthesis"]
+    assert synthesis["status"] == "ready"
+    assert synthesis["files"]["miniapp/tests/test_generated_app.py"]
+    assert synthesis["files"]["miniapp/tests/generated_app.test.mjs"]
+    assert any(item["kind"] == "browser_workflow" for item in synthesis["test_specs"])
 
 
 def test_acceptance_contract_carries_prompt_field_hints() -> None:
@@ -1612,6 +1685,126 @@ def test_tool_router_mutating_tools_defer_without_writing_files(tmp_path: Path) 
     assert envelope["approval"]["required"] is True  # type: ignore[index]
     assert result.deferred_changes[0].file_path == "miniapp/app/static/client/app.js"
     assert target.read_text(encoding="utf-8") == "console.log('ok');\n"
+
+
+def _orchestrator_request(*, allowed: bool = True, deferred: bool = False, max_attempts: int = 1) -> ToolOrchestrationRequest:
+    request = SimpleNamespace(tool="read_files", canonical_tool="file.read", tool_call_id="tool_1")
+    decision = SimpleNamespace(
+        allowed=allowed,
+        reason="allowed" if allowed else "blocked by mode",
+        approval_class="none",
+        sandbox_profile="analysis_readonly",
+        retry_policy={"max_attempts": max_attempts},
+        deferred=deferred,
+    )
+    return ToolOrchestrationRequest(
+        request=request,
+        decision=decision,
+        protocol_input={"mode": "default"},
+        workspace_id="ws_router",
+        run_id="run_router",
+    )
+
+
+def _orchestrator_result(*, status: str = "completed", error_code: str | None = None):
+    error = None
+    if error_code:
+        error = {"code": error_code, "message": error_code, "retryable": True, "details": {}}
+    envelope = {
+        "tool": "file.read",
+        "status": status,
+        "error": error,
+        "retry": {"max_attempts": 1},
+        "result_summary": {},
+        "failure_class": error_code,
+        "failure_signature": f"file.read:{error_code}:test" if error_code else None,
+    }
+    return SimpleNamespace(envelope=envelope, model_result={"status": status, "envelope": envelope})
+
+
+def test_tool_orchestrator_records_attempts_for_allowed_tool() -> None:
+    events: list[dict[str, object]] = []
+    orchestrator = ToolOrchestrator(emit_activity=lambda kind, label, details: events.append({"kind": kind, "label": label, "details": details}))
+
+    result = orchestrator.run(
+        _orchestrator_request(),
+        schema_error=lambda: None,
+        pre_hook_error=lambda: None,
+        post_hook=lambda router_result, failed: None,
+        execute=lambda: _orchestrator_result(),
+        failed_result=lambda error: _orchestrator_result(status="failed", error_code=error["code"]),
+    )
+
+    assert result.router_result.envelope["status"] == "completed"
+    assert result.router_result.envelope["retry"]["attempt"] == 1
+    assert result.router_result.envelope["retry"]["attempts"][0]["status"] == "completed"
+    assert result.router_result.envelope["orchestration"]["attempt_count"] == 1
+    assert [event["kind"] for event in events] == [
+        "tool_orchestration_started",
+        "tool_attempt_started",
+        "tool_attempt_completed",
+        "tool_orchestration_completed",
+    ]
+
+
+def test_tool_orchestrator_disallowed_tool_uses_compatible_failure_shape() -> None:
+    orchestrator = ToolOrchestrator()
+
+    result = orchestrator.run(
+        _orchestrator_request(allowed=False),
+        schema_error=lambda: None,
+        pre_hook_error=lambda: None,
+        post_hook=lambda router_result, failed: None,
+        execute=lambda: _orchestrator_result(),
+        failed_result=lambda error: _orchestrator_result(status="failed", error_code=error["code"]),
+    )
+
+    assert result.router_result.envelope["status"] == "failed"
+    assert result.router_result.envelope["error"]["code"] == "tool_not_allowed"
+    assert result.router_result.model_result["orchestration_attempts"][0]["failure_class"] == "tool_not_allowed"
+
+
+def test_tool_orchestrator_hook_block_runs_failure_post_hook() -> None:
+    post_calls: list[bool] = []
+    orchestrator = ToolOrchestrator()
+
+    result = orchestrator.run(
+        _orchestrator_request(),
+        schema_error=lambda: None,
+        pre_hook_error=lambda: {"code": "tool_hook_blocked", "message": "blocked", "retryable": False, "details": {}},
+        post_hook=lambda router_result, failed: post_calls.append(failed),
+        execute=lambda: _orchestrator_result(),
+        failed_result=lambda error: _orchestrator_result(status="failed", error_code=error["code"]),
+    )
+
+    assert result.router_result.envelope["error"]["code"] == "tool_hook_blocked"
+    assert post_calls == [True]
+
+
+def test_tool_orchestrator_governance_retry_is_limited_to_max_attempts() -> None:
+    calls = {"count": 0}
+    orchestrator = ToolOrchestrator()
+
+    def execute():
+        calls["count"] += 1
+        return _orchestrator_result(status="failed", error_code="sandbox_preflight_blocked")
+
+    result = orchestrator.run(
+        _orchestrator_request(deferred=True, max_attempts=2),
+        schema_error=lambda: None,
+        pre_hook_error=lambda: None,
+        post_hook=lambda router_result, failed: None,
+        execute=execute,
+        failed_result=lambda error: _orchestrator_result(status="failed", error_code=error["code"]),
+    )
+
+    assert calls["count"] == 2
+    assert len(result.attempts) == 2
+    assert result.router_result.envelope["retry"]["governance_retry_only"] is True
+    assert [attempt["error_code"] for attempt in result.router_result.envelope["retry"]["attempts"]] == [
+        "sandbox_preflight_blocked",
+        "sandbox_preflight_blocked",
+    ]
 
 
 def test_role_surface_issues_accepts_generation_mode(tmp_path: Path) -> None:
@@ -2551,6 +2744,59 @@ def test_process_manager_keeps_completed_output_readable(tmp_path: Path) -> None
     assert manager.snapshot()["processes"][0]["status"] == "completed"  # type: ignore[index]
 
 
+def test_process_manager_keeps_managed_process_readable_until_terminated(tmp_path: Path) -> None:
+    root = tmp_path
+    (root / "miniapp/app").mkdir(parents=True)
+    manager = AgentProcessManager()
+    events: list[dict[str, object]] = []
+    base_decision = decide_workspace_command("cat miniapp/app")
+    decision = replace(
+        base_decision,
+        action="allow",
+        reason="Test-managed stdin process.",
+        argv=("cat",),
+        resolved_argv=(shutil.which("cat") or "cat",),
+    )
+
+    def run_process() -> None:
+        manager.run(
+            draft_source=root,
+            command="cat",
+            decision=decision,
+            timeout_seconds=0,
+            max_output_chars=800,
+            progress_callback=lambda payload: events.append(payload),
+            process_id="proc_managed_test",
+            yield_time_ms=100,
+        )
+
+    import threading
+
+    thread = threading.Thread(target=run_process, daemon=True)
+    thread.start()
+    for _ in range(50):
+        if any(event.get("status") == "started" for event in events):
+            break
+        time.sleep(0.02)
+
+    assert manager.write_stdin("proc_managed_test", "hello managed\n") is True
+    for _ in range(50):
+        output = manager.read_output("proc_managed_test", stream="stdout", start=0)
+        if "hello managed" in output["content"]:
+            break
+        time.sleep(0.02)
+    else:
+        output = manager.read_output("proc_managed_test", stream="stdout", start=0)
+
+    assert output["status"] == "running"
+    assert output["next_start"] >= len("hello managed\n")
+    assert "hello managed" in output["content"]
+    assert manager.terminate("proc_managed_test") is True
+    thread.join(timeout=3)
+    assert not thread.is_alive()
+    assert manager.snapshot()["processes"][0]["status"] == "completed"  # type: ignore[index]
+
+
 def test_process_manager_writes_head_tail_output_artifact(tmp_path: Path) -> None:
     root = tmp_path
     app_dir = root / "miniapp/app"
@@ -2618,6 +2864,84 @@ def test_context_pressure_recommends_compaction_for_large_payload() -> None:
     assert {"files", "tool_outputs", "memory", "diff", "skills", "checks", "prompt_contract", "full_payload"} <= set(pressure["sections"])
     assert {item["code"] for item in pressure["recommendations"]} & {"avoid_broad_file_reads", "use_artifact_ref", "compact_memory_context"}
     assert pressure["sections"]["files"]["top_contributors"][0]["label"] == "miniapp/app/main.py"
+
+
+def test_context_packer_builds_retry_product_error_template_packs_without_noise() -> None:
+    execution = CheckExecutionRecord(
+        workspace_id="ws_1",
+        run_id="run_1",
+        changed_files=["miniapp/app/static/manager/app.js"],
+        results=[
+            RunCheckResult(
+                name="frontend_interaction_static_smoke",
+                status="failed",
+                details="selector #manager-submit is not wired",
+                logs=["missing selector #manager-submit"],
+                diagnostics={"failed_selector": "#manager-submit"},
+            ),
+            RunCheckResult(name="api_workflow_smoke", status="passed", details="ok"),
+        ],
+        started_at=utc_now(),
+        completed_at=utc_now(),
+        duration_ms=1,
+    )
+    packs = AgentContextPacker.pack(
+        user_prompt="Build role workflow",
+        acceptance_contract={"roles": ["client", "specialist", "manager"], "flows": [{"id": "manager_update"}]},
+        implementation_plan={"product_task_ledger": [{"task_id": "manager.workflow"}], "routeable_screen_plan": {"manager": ["/manager"]}},
+        latest_execution=execution,
+        file_contexts={
+            "miniapp/app/static/manager/app.js": "const submit = document.querySelector('#manager-submit');",
+            "miniapp/app/generated/route_manifest.json": "{}",
+            "miniapp/app/static/client/app.js": "console.log('unrelated')",
+        },
+        latest_diff_summary="diff --git a/miniapp/app/static/manager/app.js b/miniapp/app/static/manager/app.js\n",
+        repair_packets=[
+            {
+                "repair_class": "selector",
+                "focused_patch_plan": {"allowed_files": ["miniapp/app/static/manager/app.js"]},
+                "relevant_checks": [{"check": "frontend_interaction_static_smoke"}],
+            }
+        ],
+        active_repair_case={
+            "repair_class": "selector",
+            "focused_patch_plan": {"allowed_files": ["miniapp/app/static/manager/app.js"]},
+            "relevant_checks": [{"check": "frontend_interaction_static_smoke"}],
+            "escalation": {"escalate_to": "full_repair"},
+        },
+        diagnostics_delta={"added_failures": ["frontend_interaction_static_smoke"]},
+        repeated_no_progress=1,
+        context_mode="minimal",
+    )
+
+    assert packs["schema"] == "grounded.agent_context_packs.v1"
+    assert packs["mode"] == "retry"
+    assert packs["product"]["schema"] == "grounded.product_context_pack.v1"
+    assert packs["current_error"]["schema"] == "grounded.error_context_pack.v1"
+    assert packs["template_invariants"]["schema"] == "grounded.template_invariants_pack.v1"
+    assert packs["retry_policy"]["active"] is True
+    assert packs["retry_policy"]["include_only"] == ["product_contract", "latest_diff", "failure_diagnostics", "relevant_source", "repair_recipe"]
+    assert list(packs["retry_policy"]["relevant_source"]) == ["miniapp/app/static/manager/app.js"]
+    assert "miniapp/app/generated/route_manifest.json" not in packs["retry_policy"]["relevant_source"]
+    assert packs["current_error"]["failed_checks"][0]["name"] == "frontend_interaction_static_smoke"
+    assert packs["current_error"]["repair_class"] == "selector"
+    assert packs["retry_policy"]["escalation"]["escalate_to"] == "full_repair"
+
+
+def test_context_pressure_accounts_for_budgeted_context_packs() -> None:
+    pressure = AgentContextPressureAnalyzer().analyze_payload(
+        {
+            "context_packs": {
+                "schema": "grounded.agent_context_packs.v1",
+                "product": {"prompt_excerpt": "x" * 2000},
+                "current_error": {"failed_checks": [{"details": "y" * 2000}]},
+                "template_invariants": {"invariants": ["keep route metadata derived"]},
+            }
+        }
+    )
+
+    assert "context_packs" in pressure["sections"]
+    assert pressure["section_tokens"]["context_packs"] > 0
 
 
 def test_context_pressure_detects_duplicate_reads_from_transcript() -> None:

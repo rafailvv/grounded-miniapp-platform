@@ -1841,6 +1841,7 @@ export async function execWorkspaceCommand(payload: {
   thread_id?: string;
   turn_id?: string;
   timeout?: number;
+  managed?: boolean;
   approval_id?: string;
   preset?: string;
 }): Promise<Record<string, unknown>> {

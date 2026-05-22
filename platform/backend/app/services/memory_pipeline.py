@@ -29,6 +29,8 @@ MEMORY_KINDS = {
     "reusable_workflow",
     "failure_signature",
     "failure_shield",
+    "known_failure_recipe",
+    "successful_app_pattern",
     "avoidance",
 }
 SECRET_PATTERNS = (
@@ -62,6 +64,8 @@ SUMMARY_KIND_ORDER = (
     "preference",
     "product_decision",
     "failure_shield",
+    "known_failure_recipe",
+    "successful_app_pattern",
     "reusable_workflow",
     "working_pattern",
     "failure_signature",
@@ -188,6 +192,12 @@ class WorkspaceMemoryPipeline:
                 workflow_payload,
                 {"source": "run_success_workflow", "status": run.status, "apply_status": run.apply_status},
             )
+            add(
+                "successful_app_pattern",
+                WorkspaceMemoryPipeline._successful_app_pattern_text(workflow_payload),
+                WorkspaceMemoryPipeline._successful_app_pattern_payload(run, workflow_payload),
+                {"source": "run_success_pattern", "status": run.status, "apply_status": run.apply_status},
+            )
         failure_signature = run.failure_signature or run.failure_class
         if failure_signature:
             add(
@@ -215,6 +225,7 @@ class WorkspaceMemoryPipeline:
                 source="run_failure",
             )
             add("failure_shield", WorkspaceMemoryPipeline._failure_shield_text(shield), shield, {"source": "run_failure", "failure_signature": failure_signature})
+            add("known_failure_recipe", WorkspaceMemoryPipeline._known_failure_recipe_text(shield), shield, {"source": "run_failure_recipe", "failure_signature": failure_signature})
         for item in run.repair_issue_signatures or []:
             if isinstance(item, dict) and item.get("signature"):
                 add(
@@ -225,10 +236,12 @@ class WorkspaceMemoryPipeline:
                 )
                 shield = WorkspaceMemoryPipeline._failure_shield(item, run=run, source="repair_issue_signature")
                 add("failure_shield", WorkspaceMemoryPipeline._failure_shield_text(shield), shield, {"source": "repair_issue_signature", **item})
+                add("known_failure_recipe", WorkspaceMemoryPipeline._known_failure_recipe_text(shield), shield, {"source": "repair_issue_signature_recipe", **item})
         for iteration in run.repair_iterations or []:
             if isinstance(iteration, dict) and (iteration.get("failure_signature") or iteration.get("signature") or iteration.get("failed_check")):
                 shield = WorkspaceMemoryPipeline._failure_shield(iteration, run=run, source="repair_iteration")
                 add("failure_shield", WorkspaceMemoryPipeline._failure_shield_text(shield), shield, {"source": "repair_iteration"})
+                add("known_failure_recipe", WorkspaceMemoryPipeline._known_failure_recipe_text(shield), shield, {"source": "repair_iteration_recipe"})
         for check in artifacts.get("check_results") or []:
             if isinstance(check, dict) and str(check.get("status") or "") in {"failed", "blocked"}:
                 add(
@@ -251,6 +264,7 @@ class WorkspaceMemoryPipeline:
                     source="check_result",
                 )
                 add("failure_shield", WorkspaceMemoryPipeline._failure_shield_text(shield), shield, {"source": "check_result", "check_name": check.get("name")})
+                add("known_failure_recipe", WorkspaceMemoryPipeline._known_failure_recipe_text(shield), shield, {"source": "check_result_recipe", "check_name": check.get("name")})
         status = "empty" if not items else "extracted"
         deduped = WorkspaceMemoryPipeline._dedupe(items)
         batch = RunMemoryBatch(
@@ -320,6 +334,7 @@ class WorkspaceMemoryPipeline:
             "schema": "grounded.memory_pipeline.v1",
             "phase1": {"schema": "grounded.memory_stage1.v1", "batch_count": len(stage1_payloads), "raw_count": sum(len(p.get("items") or []) for p in stage1_payloads)},
             "phase2": {"schema": "grounded.workspace_memory.v2", **counts, "deduped_count": deduped_count},
+            "category_counts": WorkspaceMemoryPipeline._category_counts(items),
             "stage1_count": len(stage1_payloads),
             "stage1_items": sum(len(payload.get("items") or []) for payload in stage1_payloads),
             "active_count": counts["active_count"],
@@ -621,6 +636,36 @@ class WorkspaceMemoryPipeline:
         return " ".join(parts)
 
     @staticmethod
+    def _successful_app_pattern_payload(run: Any, workflow_payload: dict[str, Any]) -> dict[str, Any]:
+        contract = getattr(run, "acceptance_contract", None) if isinstance(getattr(run, "acceptance_contract", None), dict) else {}
+        implementation_plan = getattr(run, "implementation_plan", None) if isinstance(getattr(run, "implementation_plan", None), dict) else {}
+        return {
+            "run_id": getattr(run, "run_id", None),
+            "intent": getattr(run, "intent", None),
+            "target_role_scope": list(getattr(run, "target_role_scope", []) or [])[:8],
+            "workflow_kind": contract.get("workflow_kind"),
+            "primary_entities": list(implementation_plan.get("primary_entities") or [])[:8],
+            "touched_files": list(workflow_payload.get("touched_files") or [])[:30],
+            "passed_checks": list(workflow_payload.get("passed_checks") or [])[:20],
+            "reuse_instruction": "Reuse this app shape when a future prompt asks for a similar product flow, but keep prompt-specific labels and data fields fresh.",
+        }
+
+    @staticmethod
+    def _successful_app_pattern_text(payload: dict[str, Any]) -> str:
+        entities = ", ".join(str(item) for item in (payload.get("primary_entities") or [])[:4])
+        roles = ", ".join(str(item) for item in (payload.get("target_role_scope") or [])[:4])
+        files = ", ".join(str(path) for path in (payload.get("touched_files") or [])[:4])
+        parts = ["Successful app pattern: applied run produced a working product shape."]
+        if entities:
+            parts.append(f"Primary entities: {entities}.")
+        if roles:
+            parts.append(f"Role surfaces: {roles}.")
+        if files:
+            parts.append(f"Useful files: {files}.")
+        parts.append("Reuse the structure only when the future prompt matches the product flow.")
+        return " ".join(parts)
+
+    @staticmethod
     def _failure_shield(issue: dict[str, Any], *, run: Any, source: str) -> dict[str, Any]:
         packet = RepairCatalog.classify_issue(issue)
         signature = str(
@@ -682,6 +727,14 @@ class WorkspaceMemoryPipeline:
         return f"Failure shield `{signature}`: symptom {symptom}; cause {cause}; fix {fix}; verification {verification}."
 
     @staticmethod
+    def _known_failure_recipe_text(shield: dict[str, Any]) -> str:
+        signature = shield.get("failure_signature") or "uncatalogued_failure"
+        fix = shield.get("fix") or "repair from evidence"
+        verification = shield.get("verification") or "rerun failing check"
+        check_name = shield.get("check_name") or "related check"
+        return f"Known failure recipe `{signature}`: apply fix `{fix}` and verify with `{verification}` for {check_name}."
+
+    @staticmethod
     def _artifact_refs(run: Any) -> dict[str, Any]:
         return {
             "trace_bundle": getattr(run, "trace_bundle_ref", None),
@@ -720,6 +773,8 @@ class WorkspaceMemoryPipeline:
             "reusable_workflow": 0.78,
             "failure_signature": 0.76,
             "failure_shield": 0.8,
+            "known_failure_recipe": 0.82,
+            "successful_app_pattern": 0.84,
             "avoidance": 0.72,
         }.get(kind, 0.5)
         signals = [str(evidence.get("source") or "extracted")]
@@ -743,7 +798,15 @@ class WorkspaceMemoryPipeline:
 
     @staticmethod
     def _expiry_for_kind(kind: str, created_at: str) -> MemoryExpiry:
-        ttl_by_kind = {"failure_signature": 30, "failure_shield": 60, "avoidance": 45, "working_pattern": 120, "reusable_workflow": 120}
+        ttl_by_kind = {
+            "failure_signature": 30,
+            "failure_shield": 60,
+            "known_failure_recipe": 90,
+            "avoidance": 45,
+            "working_pattern": 120,
+            "reusable_workflow": 120,
+            "successful_app_pattern": 180,
+        }
         ttl = ttl_by_kind.get(kind)
         expires_at = None
         if ttl:
@@ -896,6 +959,18 @@ class WorkspaceMemoryPipeline:
         }
 
     @staticmethod
+    def _category_counts(items: list[dict[str, Any]]) -> dict[str, int]:
+        active_items = [item for item in items if item.get("status") == "active"]
+        return {
+            "user_preferences": sum(1 for item in active_items if item.get("kind") == "preference"),
+            "known_failure_recipes": sum(1 for item in active_items if item.get("kind") == "known_failure_recipe"),
+            "successful_app_patterns": sum(1 for item in active_items if item.get("kind") == "successful_app_pattern"),
+            "known_failures": sum(1 for item in active_items if item.get("kind") == "failure_signature"),
+            "failure_shields": sum(1 for item in active_items if item.get("kind") == "failure_shield"),
+            "reusable_workflows": sum(1 for item in active_items if item.get("kind") == "reusable_workflow"),
+        }
+
+    @staticmethod
     def _retrieval_score(
         item: dict[str, Any],
         *,
@@ -922,6 +997,8 @@ class WorkspaceMemoryPipeline:
         kind_weight = {
             "product_decision": 2.2,
             "preference": 2.0,
+            "successful_app_pattern": 2.05,
+            "known_failure_recipe": 2.0,
             "failure_shield": 1.95,
             "reusable_workflow": 1.9,
             "working_pattern": 1.8,
@@ -975,13 +1052,30 @@ class WorkspaceMemoryPipeline:
             summary = " -> ".join(parts)
         elif kind == "reusable_workflow" and payload.get("workflow_steps"):
             summary = " / ".join(str(step) for step in list(payload.get("workflow_steps") or [])[:3])[:280]
+        elif kind == "known_failure_recipe":
+            signature = payload.get("failure_signature") or item.get("memory_id")
+            fix = payload.get("fix") or WorkspaceMemoryPipeline._nested_payload_value(payload, ("fix", "instruction"))
+            verification = payload.get("verification") or WorkspaceMemoryPipeline._nested_payload_value(payload, ("verification_check", "verification_command"))
+            summary = f"{signature}: fix {str(fix or 'from evidence')[:150]}; verify {str(verification or 'failing check')[:100]}"
+        elif kind == "successful_app_pattern":
+            entities = ", ".join(str(value) for value in list(payload.get("primary_entities") or [])[:3])
+            checks = ", ".join(str(value) for value in list(payload.get("passed_checks") or [])[:3])
+            summary = "reuse app shape"
+            if entities:
+                summary += f" for {entities}"
+            if checks:
+                summary += f"; proof {checks}"
         return {
             "memory_id": item.get("memory_id"),
             "kind": kind,
             "summary": summary,
             "text": text[:320],
             "confidence": item.get("confidence") or {},
-            "payload": {key: payload.get(key) for key in ("polarity", "failure_signature", "workflow_steps", "touched_files", "passed_checks") if key in payload},
+            "payload": {
+                key: payload.get(key)
+                for key in ("polarity", "failure_signature", "workflow_steps", "touched_files", "passed_checks", "primary_entities", "reuse_instruction")
+                if key in payload
+            },
         }
 
     @staticmethod
@@ -1008,6 +1102,8 @@ class WorkspaceMemoryPipeline:
             "preference": "User likes and dislikes",
             "product_decision": "Product decisions",
             "failure_shield": "Failure shields",
+            "known_failure_recipe": "Known failure recipes",
+            "successful_app_pattern": "Successful app patterns",
             "reusable_workflow": "Reusable workflows",
             "working_pattern": "Working patterns",
             "failure_signature": "Known failures",
@@ -1031,8 +1127,10 @@ class WorkspaceMemoryPipeline:
             "product_decision": "product_decisions",
             "working_pattern": "architecture_summary",
             "reusable_workflow": "reusable_workflows",
+            "successful_app_pattern": "successful_app_patterns",
             "failure_signature": "known_failures",
             "failure_shield": "failure_shields",
+            "known_failure_recipe": "known_failure_recipes",
             "avoidance": "rejected_approaches",
         }
         for bucket in bucket_map.values():

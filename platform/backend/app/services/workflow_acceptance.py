@@ -4,6 +4,7 @@ from typing import Any
 import re
 
 from app.models.common import GenerationMode
+from app.services.generated_tests_synthesizer import GeneratedTestsSynthesizer
 
 
 ROLE_ORDER = ("client", "specialist", "manager")
@@ -497,6 +498,7 @@ def _product_task_ledger(
                     f"miniapp/app/static/{role}/styles.css",
                     f"miniapp/app/static/{role}/**/index.html",
                 ],
+                "depends_on": ["planner.plan_ready"],
                 "proof_checks": ["platform_invariants", "frontend_interaction_static_smoke", "browser_flow_smoke"],
                 "done_when": [
                     "role has routeable mobile pages for the prompt-derived screen intents",
@@ -516,6 +518,7 @@ def _product_task_ledger(
                 "kind": "backend",
                 "resources": resources or [resource_hint],
                 "owned_paths": ["miniapp/app/routes/**", "miniapp/app/db.py", "miniapp/app/schemas.py"],
+                "depends_on": ["planner.plan_ready"],
                 "proof_checks": ["api_workflow_smoke", "generated_app_python_tests"],
                 "done_when": [
                     "backend routes persist prompt-derived records without seed/demo data",
@@ -531,6 +534,7 @@ def _product_task_ledger(
             "role": "shared",
             "kind": "proof",
             "owned_paths": ["miniapp/tests/test_generated_app.py", "miniapp/tests/generated_app.test.mjs"],
+            "depends_on": [str(item.get("id")) for item in tasks if item.get("id")],
             "proof_checks": ["generated_app_python_tests", "generated_app_js_tests", "browser_flow_smoke"],
             "done_when": [
                 "generated Python and JS tests cover prompt-derived selectors/routes/API calls",
@@ -926,6 +930,11 @@ def build_implementation_plan(
         update_roles=update_roles,
         observer_roles=observer_roles,
     )
+    generated_tests = GeneratedTestsSynthesizer.synthesize(
+        acceptance_contract=contract,
+        implementation_plan={"product_task_ledger": product_task_ledger, "roles": list(contract.get("roles") or ROLE_ORDER)},
+        prompt=prompt,
+    )
     return {
         "version": 1,
         "required": bool(contract.get("required")),
@@ -937,6 +946,7 @@ def build_implementation_plan(
         "primary_entities": list(prompt_hints.get("resource_hints") or ([prompt_hints.get("resource_hint")] if prompt_hints.get("resource_hint") else []))[:8],
         "product_scale_contract": product_scale_contract,
         "product_task_ledger": product_task_ledger,
+        "generated_tests_synthesis": generated_tests,
         "completion_audit_contract": {
             "status": "required" if contract.get("required") else "optional",
             "principle": "Do not treat proxy signals as completion unless they cover every prompt-derived requirement.",

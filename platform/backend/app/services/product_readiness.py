@@ -11,6 +11,13 @@ from app.services.generation_sla import GenerationSla
 
 ROLE_ORDER = ("client", "specialist", "manager")
 REQUIRED_PRODUCT_CHECKS = GenerationSla.required_checks("balanced")
+STRICT_STATIC_CHECKS = ("changed_files_static", "frontend_interaction_static_smoke", "platform_invariants")
+PREVIEW_CHECKS = ("preview_boot_smoke", "preview_connectivity_smoke", "browser_flow_smoke")
+PLACEHOLDER_DATA_RE = re.compile(
+    r"\b(mockData|demoData|sampleData|placeholderData|fakeData|seedData)\b|"
+    r"\b(John Doe|Jane Doe|Lorem ipsum|TODO product|demo item|mock item)\b",
+    re.I,
+)
 
 
 class ProductReadinessContract:
@@ -196,6 +203,18 @@ class ProductReadinessContract:
             elif browser_required and (mobile.get("status") == "failed" or mobile.get("horizontal_overflow") or mobile.get("critical_overlap")):
                 add_issue("mobile_layout", "browser_flow_smoke", "Mobile layout report contains blocking issues.", evidence_payload=mobile)
 
+            strict_gate = cls._strict_product_gate(
+                by_name=by_name,
+                contract=contract,
+                plan=plan,
+                diff_text=diff_text,
+                changed_paths=changed_paths,
+                product_paths=product_paths,
+                target_role_scope=target_role_scope,
+                browser_diagnostics=browser_diagnostics,
+            )
+            evidence["strict_product_gate"] = strict_gate.get("evidence") or {}
+            issues.extend(strict_gate.get("issues") or [])
             if full_audit_required:
                 issues.extend(cls._product_task_ledger_issues(by_name, implementation_plan=plan))
 
@@ -288,6 +307,11 @@ class ProductReadinessContract:
             "browser_flow_smoke": "Browser UI proof",
             "generated_app_python_tests": "Generated Python tests",
             "generated_app_js_tests": "Generated JS tests",
+            "changed_files_static": "Changed files static check",
+            "frontend_interaction_static_smoke": "Frontend/static interaction check",
+            "platform_invariants": "Role route and platform invariants",
+            "preview_boot_smoke": "Preview boot proof",
+            "preview_connectivity_smoke": "Preview connectivity proof",
         }.get(check_name, check_name)
 
     @classmethod
@@ -313,7 +337,24 @@ class ProductReadinessContract:
         tests_passed = bool(py_ok and js_ok and py_ok.status == "passed" and js_ok.status == "passed")
         browser_evidence = evidence.get("browser") if isinstance(evidence.get("browser"), dict) else {}
         mobile_evidence = evidence.get("mobile") if isinstance(evidence.get("mobile"), dict) else {}
+        strict_evidence = evidence.get("strict_product_gate") if isinstance(evidence.get("strict_product_gate"), dict) else {}
         items = [
+            ProductReadinessCheck(
+                key="backend_tests",
+                label="Backend tests",
+                status="blocked" if blocked_by("backend_tests_missing", "required_product_proof", "check_failure") else "passed" if acceptance_required else "not_required",
+                check="api_workflow_smoke/generated_app_python_tests",
+                details="Backend API workflow and generated Python tests must pass.",
+                evidence=strict_evidence.get("backend_tests") or {},
+            ),
+            ProductReadinessCheck(
+                key="frontend_static",
+                label="Frontend/static checks",
+                status="blocked" if blocked_by("frontend_static_missing", "static_check_missing", "check_failure") else "passed" if acceptance_required else "not_required",
+                check="changed_files_static/frontend_interaction_static_smoke",
+                details="Frontend and changed-file static checks must pass.",
+                evidence=strict_evidence.get("frontend_static") or {},
+            ),
             ProductReadinessCheck(
                 key="api",
                 label="API",
@@ -333,10 +374,18 @@ class ProductReadinessContract:
             ProductReadinessCheck(
                 key="ui",
                 label="UI",
-                status="passed" if browser_ok and browser_ok.status == "passed" and not blocked_by("browser_proof_missing_ui_steps", "browser_proof_runtime_errors") else "blocked" if acceptance_required else "not_required",
+                status="passed" if browser_ok and browser_ok.status == "passed" and not blocked_by("browser_proof_missing_ui_steps", "browser_proof_runtime_errors", "browser_console_not_clean") else "blocked" if acceptance_required else "not_required",
                 check="browser_flow_smoke",
                 details="Browser proof needs concrete UI steps and no runtime errors.",
                 evidence={"steps": browser_evidence.get("ui_steps") or []},
+            ),
+            ProductReadinessCheck(
+                key="role_routes",
+                label="Role routes",
+                status="blocked" if blocked_by("role_routes_not_loaded", "platform_invariants_missing") else "passed" if acceptance_required else "not_required",
+                check="platform_invariants",
+                details="Every required role route must load.",
+                evidence=strict_evidence.get("role_routes") or {},
             ),
             ProductReadinessCheck(
                 key="roles",
@@ -363,6 +412,38 @@ class ProductReadinessContract:
                 evidence={"generated_app_python_tests": (py_ok.evidence if py_ok else {}), "generated_app_js_tests": (js_ok.evidence if js_ok else {})},
             ),
             ProductReadinessCheck(
+                key="prompt_requirements",
+                label="Prompt requirements",
+                status="blocked" if blocked_by("product_task_ledger", "prompt_requirements_missing") else "passed" if acceptance_required else "not_required",
+                check="product_task_ledger",
+                details="Prompt-derived product tasks and requirements must be covered.",
+                evidence=strict_evidence.get("prompt_requirements") or {},
+            ),
+            ProductReadinessCheck(
+                key="runtime_data",
+                label="Runtime data",
+                status="blocked" if blocked_by("placeholder_runtime_data") else "passed" if acceptance_required else "not_required",
+                check="source_scan",
+                details="Runtime source must not rely on placeholder/mock/demo data unless requested.",
+                evidence=strict_evidence.get("runtime_data") or {},
+            ),
+            ProductReadinessCheck(
+                key="diff_scope",
+                label="Diff scope",
+                status="blocked" if blocked_by("diff_scope") else "passed" if acceptance_required else "not_required",
+                check="meaningful_product_diff",
+                details="Diff must be scoped to product/runtime/tests/config files.",
+                evidence=strict_evidence.get("diff_scope") or {},
+            ),
+            ProductReadinessCheck(
+                key="preview_url",
+                label="Preview URL",
+                status="blocked" if blocked_by("preview_url_not_working") else "passed" if acceptance_required else "not_required",
+                check="preview_boot_smoke/browser_flow_smoke",
+                details="Preview must boot or browser proof must show a reachable preview.",
+                evidence=strict_evidence.get("preview_url") or {},
+            ),
+            ProductReadinessCheck(
                 key="apply_guardian",
                 label="Apply/Guardian",
                 status="passed" if not require_apply or run_status not in {"completed", "blocked", "failed"} or apply_status == "applied" else "blocked",
@@ -372,6 +453,95 @@ class ProductReadinessContract:
             ),
         ]
         return items
+
+    @classmethod
+    def _strict_product_gate(
+        cls,
+        *,
+        by_name: dict[str, dict[str, Any]],
+        contract: dict[str, Any],
+        plan: dict[str, Any],
+        diff_text: str,
+        changed_paths: list[str],
+        product_paths: list[str],
+        target_role_scope: list[str] | None,
+        browser_diagnostics: dict[str, Any],
+    ) -> dict[str, Any]:
+        issues: list[dict[str, Any]] = []
+
+        def add(kind: str, check: str, details: str, evidence: dict[str, Any] | None = None) -> None:
+            issues.append({"kind": kind, "check": check, "details": details, "blocking": True, "evidence": evidence or {}})
+
+        def passed(check_name: str) -> bool:
+            return str((by_name.get(check_name) or {}).get("status") or "") == "passed"
+
+        backend_checks = ("api_workflow_smoke", "generated_app_python_tests")
+        missing_backend = [check for check in backend_checks if not passed(check)]
+        if missing_backend:
+            add("backend_tests_missing", "backend_tests", "Backend/API proof is incomplete.", {"missing": missing_backend})
+
+        missing_static = [check for check in STRICT_STATIC_CHECKS if not passed(check)]
+        if missing_static:
+            add("static_check_missing", "static_checks", "Static/frontend/platform checks must pass before completion.", {"missing": missing_static})
+
+        missing_frontend = [check for check in ("frontend_interaction_static_smoke", "generated_app_js_tests") if not passed(check)]
+        if missing_frontend:
+            add("frontend_static_missing", "frontend_static", "Frontend/static proof is incomplete.", {"missing": missing_frontend})
+
+        preview_ok = any(passed(check) for check in PREVIEW_CHECKS)
+        preview_url = cls._preview_url_from_results(by_name, browser_diagnostics)
+        if not preview_ok:
+            add("preview_url_not_working", "preview_boot_smoke", "Preview URL has no passing boot/connectivity/browser proof.", {"preview_url": preview_url})
+
+        runtime_errors = [
+            *cls._list_values(browser_diagnostics.get("console_errors")),
+            *cls._list_values(browser_diagnostics.get("page_errors")),
+            *cls._list_values(browser_diagnostics.get("network_errors")),
+            *cls._list_values(browser_diagnostics.get("visible_errors")),
+        ]
+        if runtime_errors:
+            add("browser_console_not_clean", "browser_flow_smoke", "Browser console/network/visible errors must be empty.", {"errors": runtime_errors[:12]})
+
+        role_coverage = cls._role_coverage_from_platform_invariants(by_name)
+        required_roles = cls._required_roles(contract=contract, target_role_scope=target_role_scope)
+        missing_roles: list[str] = []
+        for role in required_roles:
+            coverage = role_coverage.get(role) if isinstance(role_coverage.get(role), dict) else {}
+            status = str(coverage.get("status") or "")
+            try:
+                route_count = int(coverage.get("route_count") or 0)
+            except (TypeError, ValueError):
+                route_count = 0
+            if status != "present" or route_count < 1:
+                missing_roles.append(role)
+        if missing_roles:
+            add("role_routes_not_loaded", "platform_invariants", "One or more required role routes did not load.", {"missing_roles": missing_roles, "role_coverage": role_coverage})
+
+        issues.extend(cls._product_task_ledger_issues(by_name, implementation_plan=plan))
+        if plan.get("product_task_ledger") and not any(str((by_name.get(check) or {}).get("status") or "") == "passed" for check in ("platform_invariants", "browser_flow_smoke")):
+            add("prompt_requirements_missing", "product_task_ledger", "Prompt-derived product task ledger has no passing route/browser proof.", {"task_count": len(plan.get("product_task_ledger") or [])})
+
+        if not cls._placeholder_data_allowed(contract=contract, plan=plan):
+            placeholder_hits = cls._placeholder_hits(diff_text)
+            if placeholder_hits:
+                add("placeholder_runtime_data", "source_scan", "Runtime diff contains placeholder/mock/demo data.", {"hits": placeholder_hits[:8]})
+
+        out_of_scope = [path for path in changed_paths if not cls._is_allowed_final_gate_path(path)]
+        if out_of_scope:
+            add("diff_scope", "meaningful_product_diff", "Diff touches files outside the final product acceptance scope.", {"paths": out_of_scope[:20], "product_paths": product_paths[:20]})
+
+        return {
+            "issues": issues,
+            "evidence": {
+                "backend_tests": {check: by_name.get(check) or {"status": "missing"} for check in backend_checks},
+                "frontend_static": {check: by_name.get(check) or {"status": "missing"} for check in ("changed_files_static", "frontend_interaction_static_smoke", "generated_app_js_tests")},
+                "role_routes": {"required_roles": required_roles, "role_coverage": role_coverage},
+                "prompt_requirements": {"task_count": len(plan.get("product_task_ledger") or []), "has_plan": bool(plan)},
+                "runtime_data": {"placeholder_allowed": cls._placeholder_data_allowed(contract=contract, plan=plan)},
+                "diff_scope": {"changed_paths": changed_paths[:80], "product_paths": product_paths[:80], "out_of_scope": out_of_scope[:20]},
+                "preview_url": {"preview_url": preview_url, "preview_ok": preview_ok},
+            },
+        }
 
     @classmethod
     def _product_task_ledger_issues(
@@ -433,6 +603,55 @@ class ProductReadinessContract:
             return {}
         role_coverage = diagnostics.get("role_coverage")
         return dict(role_coverage) if isinstance(role_coverage, dict) else {}
+
+    @classmethod
+    def _preview_url_from_results(cls, by_name: dict[str, dict[str, Any]], browser_diagnostics: dict[str, Any]) -> str | None:
+        for payload in [browser_diagnostics, *(cls._diagnostics(by_name.get(check) or {}) for check in PREVIEW_CHECKS)]:
+            for key in ("preview_url", "url", "base_url"):
+                value = payload.get(key)
+                if value:
+                    return str(value)
+        return None
+
+    @staticmethod
+    def _placeholder_data_allowed(*, contract: dict[str, Any], plan: dict[str, Any]) -> bool:
+        text = " ".join(
+            str(value or "")
+            for value in (
+                contract.get("allow_placeholder_data"),
+                contract.get("allow_mock_data"),
+                contract.get("requested_mock_data"),
+                plan.get("allow_placeholder_data"),
+                plan.get("allow_mock_data"),
+            )
+        ).lower()
+        return any(token in text for token in ("true", "requested", "allowed", "explicit"))
+
+    @staticmethod
+    def _placeholder_hits(diff_text: str) -> list[dict[str, Any]]:
+        hits: list[dict[str, Any]] = []
+        for line_no, line in enumerate(str(diff_text or "").splitlines(), start=1):
+            if not line.startswith("+") or line.startswith("+++"):
+                continue
+            match = PLACEHOLDER_DATA_RE.search(line)
+            if match:
+                hits.append({"line": line_no, "pattern": match.group(0), "excerpt": line[:220]})
+        return hits
+
+    @classmethod
+    def _is_allowed_final_gate_path(cls, file_path: str) -> bool:
+        normalized = str(file_path or "").strip().replace("\\", "/")
+        while normalized.startswith("./"):
+            normalized = normalized[2:]
+        if not normalized:
+            return True
+        if cls._is_product_runtime_source_path(normalized):
+            return True
+        if normalized.startswith(("miniapp/tests/", "tests/", "runtime/templates/", "docker/")):
+            return True
+        if normalized in {"miniapp/requirements.txt", "miniapp/package.json", "miniapp/package-lock.json", "miniapp/pyproject.toml"}:
+            return True
+        return False
 
     @classmethod
     def _paths_from_diff(cls, diff_text: str) -> list[str]:
