@@ -1,0 +1,81 @@
+{
+  "$id": "https://grounded.local/schemas/app_protocol/protocol_envelope_v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "created_at": {
+      "title": "Created At",
+      "type": "string"
+    },
+    "message_id": {
+      "title": "Message Id",
+      "type": "string"
+    },
+    "payload": {
+      "additionalProperties": true,
+      "title": "Payload",
+      "type": "object"
+    },
+    "protocol_version": {
+      "const": "v1",
+      "default": "v1",
+      "title": "Protocol Version",
+      "type": "string"
+    },
+    "refs": {
+      "additionalProperties": true,
+      "title": "Refs",
+      "type": "object"
+    },
+    "schema": {
+      "default": "grounded.app_protocol.envelope.v1",
+      "title": "Schema",
+      "type": "string"
+    },
+    "sequence": {
+      "title": "Sequence",
+      "type": "integer"
+    },
+    "status": {
+      "enum": [
+        "queued",
+        "started",
+        "running",
+        "waiting",
+        "completed",
+        "failed",
+        "blocked",
+        "cancelled",
+        "skipped"
+      ],
+      "title": "Status",
+      "type": "string"
+    },
+    "subject": {
+      "enum": [
+        "run",
+        "turn",
+        "tool_call",
+        "approval",
+        "event",
+        "worker_update"
+      ],
+      "title": "Subject",
+      "type": "string"
+    },
+    "type": {
+      "title": "Type",
+      "type": "string"
+    }
+  },
+  "required": [
+    "message_id",
+    "sequence",
+    "subject",
+    "type",
+    "status",
+    "created_at"
+  ],
+  "title": "ProtocolEnvelopeV1",
+  "type": "object"
+}

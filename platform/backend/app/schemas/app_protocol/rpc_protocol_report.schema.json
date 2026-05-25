@@ -1,0 +1,341 @@
+{
+  "$defs": {
+    "CompatibilityRule": {
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "title": "Description",
+          "type": "string"
+        },
+        "enforcement": {
+          "default": "tested",
+          "enum": [
+            "documented",
+            "tested",
+            "enforced"
+          ],
+          "title": "Enforcement",
+          "type": "string"
+        },
+        "rule_id": {
+          "title": "Rule Id",
+          "type": "string"
+        },
+        "since": {
+          "default": "v2",
+          "title": "Since",
+          "type": "string"
+        }
+      },
+      "required": [
+        "rule_id",
+        "description"
+      ],
+      "title": "CompatibilityRule",
+      "type": "object"
+    },
+    "ExperimentalFieldSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "reason": {
+          "default": "",
+          "title": "Reason",
+          "type": "string"
+        },
+        "replacement": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Replacement"
+        },
+        "since": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Since"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "ExperimentalFieldSpec",
+      "type": "object"
+    },
+    "RpcCursorPage": {
+      "additionalProperties": false,
+      "properties": {
+        "cursor_kind": {
+          "default": "none",
+          "enum": [
+            "none",
+            "opaque_cursor",
+            "sequence_cursor",
+            "offset_cursor"
+          ],
+          "title": "Cursor Kind",
+          "type": "string"
+        },
+        "cursor_param": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cursor Param"
+        },
+        "limit_param": {
+          "default": "limit",
+          "title": "Limit Param",
+          "type": "string"
+        },
+        "next_cursor_field": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Next Cursor Field"
+        }
+      },
+      "title": "RpcCursorPage",
+      "type": "object"
+    },
+    "RpcIdempotency": {
+      "additionalProperties": false,
+      "properties": {
+        "header": {
+          "default": "Idempotency-Key",
+          "title": "Header",
+          "type": "string"
+        },
+        "key_field": {
+          "default": "idempotency_key",
+          "title": "Key Field",
+          "type": "string"
+        },
+        "mode": {
+          "default": "none",
+          "enum": [
+            "none",
+            "optional",
+            "recommended",
+            "required"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "scope": {
+          "default": "request",
+          "enum": [
+            "request",
+            "workspace",
+            "thread",
+            "run",
+            "global"
+          ],
+          "title": "Scope",
+          "type": "string"
+        }
+      },
+      "title": "RpcIdempotency",
+      "type": "object"
+    },
+    "RpcMethodSpecV2": {
+      "additionalProperties": false,
+      "properties": {
+        "cursor": {
+          "$ref": "#/$defs/RpcCursorPage"
+        },
+        "description": {
+          "default": "",
+          "title": "Description",
+          "type": "string"
+        },
+        "experimental": {
+          "items": {
+            "$ref": "#/$defs/ExperimentalFieldSpec"
+          },
+          "title": "Experimental",
+          "type": "array",
+          "x-grounded-experimental": true
+        },
+        "idempotency": {
+          "$ref": "#/$defs/RpcIdempotency"
+        },
+        "idempotent": {
+          "default": false,
+          "title": "Idempotent",
+          "type": "boolean"
+        },
+        "method": {
+          "title": "Method",
+          "type": "string"
+        },
+        "notification_models": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Notification Models",
+          "type": "array"
+        },
+        "params_model": {
+          "title": "Params Model",
+          "type": "string"
+        },
+        "params_schema": {
+          "additionalProperties": true,
+          "title": "Params Schema",
+          "type": "object"
+        },
+        "result_model": {
+          "title": "Result Model",
+          "type": "string"
+        },
+        "result_schema": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Result Schema"
+        },
+        "stability": {
+          "default": "stable",
+          "enum": [
+            "stable",
+            "experimental",
+            "deprecated"
+          ],
+          "title": "Stability",
+          "type": "string"
+        },
+        "transport": {
+          "const": "websocket",
+          "default": "websocket",
+          "title": "Transport",
+          "type": "string"
+        },
+        "version": {
+          "const": "v2",
+          "default": "v2",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "method",
+        "params_model",
+        "result_model"
+      ],
+      "title": "RpcMethodSpecV2",
+      "type": "object"
+    }
+  },
+  "$id": "https://grounded.local/schemas/app_protocol/rpc_protocol_report.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "capabilities": {
+      "additionalProperties": true,
+      "title": "Capabilities",
+      "type": "object"
+    },
+    "compatibility_rules": {
+      "items": {
+        "$ref": "#/$defs/CompatibilityRule"
+      },
+      "title": "Compatibility Rules",
+      "type": "array"
+    },
+    "current_version": {
+      "const": "v2",
+      "default": "v2",
+      "title": "Current Version",
+      "type": "string"
+    },
+    "endpoint": {
+      "default": "/rpc",
+      "title": "Endpoint",
+      "type": "string"
+    },
+    "jsonrpc": {
+      "const": "2.0",
+      "default": "2.0",
+      "title": "Jsonrpc",
+      "type": "string"
+    },
+    "methods": {
+      "items": {
+        "$ref": "#/$defs/RpcMethodSpecV2"
+      },
+      "title": "Methods",
+      "type": "array"
+    },
+    "notification_envelope_model": {
+      "default": "RpcNotificationEnvelopeV2",
+      "title": "Notification Envelope Model",
+      "type": "string"
+    },
+    "request_envelope_model": {
+      "default": "RpcRequestEnvelopeV2",
+      "title": "Request Envelope Model",
+      "type": "string"
+    },
+    "response_envelope_model": {
+      "default": "RpcResponseEnvelopeV2",
+      "title": "Response Envelope Model",
+      "type": "string"
+    },
+    "schema": {
+      "default": "grounded.rpc_protocol.v2",
+      "title": "Schema",
+      "type": "string"
+    },
+    "status": {
+      "default": "ok",
+      "title": "Status",
+      "type": "string"
+    },
+    "supported_versions": {
+      "items": {
+        "enum": [
+          "v1",
+          "v2"
+        ],
+        "type": "string"
+      },
+      "title": "Supported Versions",
+      "type": "array"
+    }
+  },
+  "title": "RpcProtocolReport",
+  "type": "object"
+}

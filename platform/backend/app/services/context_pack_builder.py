@@ -9,6 +9,9 @@ from app.models.domain import CodeChunkRecord, ContextPack, WorkspaceRecord
 from app.services.code_index_service import CodeIndexService
 from app.services.engine.mode_profiles import ModeProfiles
 from app.services.generation_enhancements import ProjectInstructionBundle, SkillPackCatalog
+from app.services.memory_pipeline import WorkspaceMemoryPipeline
+from app.services.session_memory import SessionMemorySections
+from app.services.skill_registry import SkillRegistryService
 from app.services.workspace.service import WorkspaceService
 
 
@@ -99,18 +102,28 @@ class ContextPackBuilder:
         retrieval_stats["budget"] = budget
         retrieval_stats["mode_profile"] = mode_profile
         retrieval_stats["prompt_fingerprint"] = prompt_fingerprint
+        workspace_summary = self._workspace_summary(
+            workspace,
+            prompt=prompt,
+            intent=intent,
+            generation_mode=generation_mode,
+            paths=retrieval_active_paths,
+        )
+        memory_trace = self._last_memory_retrieval(workspace.workspace_id)
+        if memory_trace:
+            retrieval_stats["memory_retrieval"] = {
+                "schema": memory_trace.get("schema"),
+                "status": memory_trace.get("status"),
+                "selected_count": (memory_trace.get("stats") or {}).get("selected_count"),
+                "selected_ids": [item.get("memory_id") for item in memory_trace.get("items") or [] if isinstance(item, dict)],
+                "reasons": [hit.get("selection_reason") for hit in memory_trace.get("hits") or [] if isinstance(hit, dict)],
+            }
         return ContextPack(
             workspace_id=workspace.workspace_id,
             revision_id=workspace.current_revision_id,
             prompt=prompt,
             system_prefix=stable_prefix,
-            workspace_summary=self._workspace_summary(
-                workspace,
-                prompt=prompt,
-                intent=intent,
-                generation_mode=generation_mode,
-                paths=retrieval_active_paths,
-            ),
+            workspace_summary=workspace_summary,
             current_task=prompt.strip(),
             recent_diff=self._build_recent_diff(
                 workspace=workspace,
@@ -143,10 +156,10 @@ class ContextPackBuilder:
             f"Workspace {workspace.name}. Target platform: {platform}. "
             f"Template cloned: {workspace.template_cloned}. Current revision: {workspace.current_revision_id or 'none'}."
         ]
-        memory = self._workspace_memory_summary(workspace.workspace_id)
+        memory = self._workspace_memory_summary(workspace.workspace_id, prompt=prompt, paths=paths or [])
         if memory:
             parts.append(memory)
-        instruction_summary = self._project_instruction_summary()
+        instruction_summary = self._project_instruction_summary(workspace=workspace, paths=paths or [])
         if instruction_summary:
             parts.append(instruction_summary)
         skill_summary = self._runtime_skill_summary(
@@ -159,20 +172,58 @@ class ContextPackBuilder:
             parts.append(skill_summary)
         return "\n".join(parts)
 
-    def _workspace_memory_summary(self, workspace_id: str) -> str:
+    def _workspace_memory_summary(self, workspace_id: str, *, prompt: str = "", paths: list[str] | None = None) -> str:
         store = getattr(self.code_index_service, "store", None)
         if store is None:
             return ""
         payload = store.get("reports", f"workspace_memory:{workspace_id}") or {}
-        items = [item for item in payload.get("items") or [] if isinstance(item, dict)]
-        if not items:
+        session_memory = store.get("reports", f"session_memory:{workspace_id}")
+        if not isinstance(session_memory, dict):
+            session_memory = SessionMemorySections.build(workspace_id=workspace_id, memory=payload, runs=[])
+            store.upsert("reports", f"session_memory:{workspace_id}", session_memory)
+        summary = WorkspaceMemoryPipeline.summary(workspace_id, payload, prompt=prompt, paths=paths or [], top_k=10)
+        retrieval = WorkspaceMemoryPipeline.retrieve(
+            workspace_id,
+            payload,
+            prompt=prompt,
+            paths=paths or [],
+            top_k=10,
+        )
+        store.upsert("reports", f"memory_retrieval:last:{workspace_id}", retrieval)
+        items = [item for item in retrieval.get("items") or [] if isinstance(item, dict)]
+        summary_text = str(summary.get("text") or "").strip()
+        session_text = SessionMemorySections.compact_text(session_memory, limit=2400)
+        if not items and not summary_text and not session_text:
             return ""
         lines = ["Workspace memory:"]
-        for item in items[-10:]:
+        if session_text:
+            lines.append(session_text)
+        if summary_text:
+            lines.append(summary_text)
+        else:
+            lines.append("Workspace memory summary (always loaded; retrieve details on demand):")
+        hits_by_id = {
+            str((hit.get("item") or {}).get("memory_id") or ""): hit
+            for hit in retrieval.get("hits") or []
+            if isinstance(hit, dict) and isinstance(hit.get("item"), dict)
+        }
+        if items:
+            lines.append("Relevant memory details:")
+        for item in items:
             text = str(item.get("text") or "").strip()
             if text:
-                lines.append(f"- {item.get('kind')}: {text[:220]}")
+                hit = hits_by_id.get(str(item.get("memory_id") or ""))
+                reasons = ", ".join(str(reason) for reason in ((hit or {}).get("selection_reason") or [])[:3])
+                suffix = f" [selected: {reasons}]" if reasons else ""
+                lines.append(f"- {item.get('kind')}: {text[:220]}{suffix}")
         return "\n".join(lines)
+
+    def _last_memory_retrieval(self, workspace_id: str) -> dict[str, Any]:
+        store = getattr(self.code_index_service, "store", None)
+        if store is None:
+            return {}
+        payload = store.get("reports", f"memory_retrieval:last:{workspace_id}") or {}
+        return payload if isinstance(payload, dict) else {}
 
     def _runtime_skill_summary(
         self,
@@ -185,9 +236,9 @@ class ContextPackBuilder:
         settings = getattr(self.code_index_service, "settings", None)
         if settings is None:
             return ""
-        prefetch = SkillPackCatalog.prefetch(settings.runtime_dir, settings.repo_root)
-        search = SkillPackCatalog.search_for_context(
-            list(prefetch.get("items") or []),
+        registry = SkillRegistryService(runtime_dir=settings.runtime_dir, repo_root=settings.repo_root, data_dir=settings.data_dir)
+        prefetch = registry.prefetch()
+        search = registry.search_for_context(
             prompt=prompt,
             intent=intent,
             generation_mode=str(getattr(generation_mode, "value", generation_mode) or ""),
@@ -219,9 +270,9 @@ class ContextPackBuilder:
         settings = getattr(self.code_index_service, "settings", None)
         if settings is None:
             return {"schema": "grounded.skill_search.v1", "status": "settings_unavailable", "selected": [], "skipped": []}
-        prefetch = SkillPackCatalog.prefetch(settings.runtime_dir, settings.repo_root)
-        search = SkillPackCatalog.search_for_context(
-            list(prefetch.get("items") or []),
+        registry = SkillRegistryService(runtime_dir=settings.runtime_dir, repo_root=settings.repo_root, data_dir=settings.data_dir)
+        prefetch = registry.prefetch()
+        search = registry.search_for_context(
             prompt=prompt,
             intent=intent,
             generation_mode=str(getattr(generation_mode, "value", generation_mode) or ""),
@@ -233,11 +284,12 @@ class ContextPackBuilder:
             "prefetch": {k: v for k, v in prefetch.items() if k != "items"},
         }
 
-    def _project_instruction_summary(self) -> str:
+    def _project_instruction_summary(self, *, workspace: WorkspaceRecord | None = None, paths: list[str] | None = None) -> str:
         settings = getattr(self.code_index_service, "settings", None)
         if settings is None:
             return ""
-        bundle = ProjectInstructionBundle.build(repo_root=settings.repo_root, template_dir=settings.template_dir)
+        workspace_root = self.workspace_service.source_dir(workspace.workspace_id) if workspace is not None else None
+        bundle = ProjectInstructionBundle.build(repo_root=settings.repo_root, template_dir=settings.template_dir, workspace_root=workspace_root, paths=paths or [])
         return ProjectInstructionBundle.compact_summary(bundle, limit=1400)
 
     @staticmethod

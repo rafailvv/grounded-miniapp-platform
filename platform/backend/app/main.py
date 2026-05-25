@@ -23,6 +23,7 @@ from app.api import (
     routes_workspaces,
 )
 from app.api.errors import http_exception_handler, unhandled_exception_handler, validation_exception_handler
+from app.models.model_manager import ModelManagerStatus
 from app.services.container import build_container
 
 
@@ -66,9 +67,13 @@ def create_app(*, repo_root: Path | None = None, data_dir: Path | None = None) -
         return {
             "llm": {
                 "enabled": llm["enabled"],
-                "provider": "openai" if llm["enabled"] else None,
+                "provider": (llm.get("routing") or {}).get("provider") if isinstance(llm.get("routing"), dict) else None,
                 "models": llm["models"],
                 "task_profiles": llm["task_profiles"],
+                "routing": llm.get("routing"),
+                "provider_routing": llm.get("provider_routing"),
+                "model_manager": llm.get("model_manager"),
+                "model_catalog": llm.get("model_catalog"),
             },
             "defaults": {
                 "generation_mode": "balanced",
@@ -78,6 +83,10 @@ def create_app(*, repo_root: Path | None = None, data_dir: Path | None = None) -
             "supports_staged_apply": True,
             "research_artifacts_enabled": True,
         }
+
+    @app.get("/system/models", response_model=ModelManagerStatus)
+    def system_models() -> dict[str, object]:
+        return app.state.container.model_manager_service.status().model_dump(mode="json", by_alias=True)
 
     app.include_router(routes_auth.router)
     app.include_router(routes_workspaces.router)

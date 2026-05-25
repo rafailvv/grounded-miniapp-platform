@@ -1,0 +1,86 @@
+{
+  "$id": "https://grounded.local/schemas/app_protocol/sandbox_filesystem_allowlist.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "allowed_operations": {
+      "items": {
+        "enum": [
+          "read",
+          "write",
+          "delete",
+          "copy",
+          "apply",
+          "exec"
+        ],
+        "type": "string"
+      },
+      "title": "Allowed Operations",
+      "type": "array"
+    },
+    "cwd": {
+      "title": "Cwd",
+      "type": "string"
+    },
+    "denied_names": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Denied Names",
+      "type": "array"
+    },
+    "denied_parts": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Denied Parts",
+      "type": "array"
+    },
+    "denied_suffixes": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Denied Suffixes",
+      "type": "array"
+    },
+    "generated_prefix": {
+      "default": "",
+      "title": "Generated Prefix",
+      "type": "string"
+    },
+    "path_safety": {
+      "additionalProperties": true,
+      "title": "Path Safety",
+      "type": "object"
+    },
+    "read_roots": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Read Roots",
+      "type": "array"
+    },
+    "root": {
+      "title": "Root",
+      "type": "string"
+    },
+    "schema": {
+      "default": "grounded.sandbox.filesystem_allowlist.v1",
+      "title": "Schema",
+      "type": "string"
+    },
+    "write_roots": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Write Roots",
+      "type": "array"
+    }
+  },
+  "required": [
+    "root",
+    "cwd"
+  ],
+  "title": "SandboxFilesystemAllowlist",
+  "type": "object"
+}

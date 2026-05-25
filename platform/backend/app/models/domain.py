@@ -168,7 +168,7 @@ class JobRecord(StrictModel):
     target_platform: TargetPlatform
     preview_profile: PreviewProfile
     current_revision_id: str | None = None
-    fidelity: Literal["fast_app", "quality_app", "balanced_app", "basic_app", "blocked"] = "blocked"
+    fidelity: Literal["fast_app", "quality_app", "production_app", "balanced_app", "basic_app", "blocked"] = "blocked"
     llm_enabled: bool = False
     llm_provider: str | None = None
     llm_model: str | None = None
@@ -215,6 +215,7 @@ class JobRecord(StrictModel):
     turn_diff_ref: str | None = None
     environment_snapshot_ref: str | None = None
     tool_batch_summaries_ref: str | None = None
+    task_ledger_ref: str | None = None
     worker_mailbox_ref: str | None = None
     scratchpad_ref: str | None = None
     memory_ref: str | None = None
@@ -267,9 +268,11 @@ BackgroundTaskType = Literal[
     "generate_product",
     "repair_failed_run",
     "browser_verify",
+    "lsp_diagnostics",
     "memory_consolidate",
     "worker_branch",
     "preview_rebuild",
+    "pr_ci_babysit",
 ]
 BackgroundTaskStatus = Literal["queued", "running", "stopping", "completed", "failed", "blocked", "cancelled"]
 
@@ -606,6 +609,7 @@ class RunRecord(StrictModel):
     turn_diff_ref: str | None = None
     environment_snapshot_ref: str | None = None
     tool_batch_summaries_ref: str | None = None
+    task_ledger_ref: str | None = None
     worker_mailbox_ref: str | None = None
     scratchpad_ref: str | None = None
     memory_ref: str | None = None

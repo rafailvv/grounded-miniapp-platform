@@ -1,0 +1,21 @@
+{
+  "$id": "https://grounded.local/schemas/app_protocol/turn_interrupt_params.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "thread_id": {
+      "title": "Thread Id",
+      "type": "string"
+    },
+    "turn_id": {
+      "title": "Turn Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "thread_id",
+    "turn_id"
+  ],
+  "title": "TurnInterruptParams",
+  "type": "object"
+}

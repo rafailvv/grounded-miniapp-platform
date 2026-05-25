@@ -1,0 +1,106 @@
+{
+  "$id": "https://grounded.local/schemas/app_protocol/protocol_turn_state.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "completed_at": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Completed At"
+    },
+    "kind": {
+      "default": "agent",
+      "title": "Kind",
+      "type": "string"
+    },
+    "linked_run_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Linked Run Id"
+    },
+    "parent_turn_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Parent Turn Id"
+    },
+    "refs": {
+      "additionalProperties": true,
+      "title": "Refs",
+      "type": "object"
+    },
+    "schema": {
+      "default": "grounded.app_protocol.turn_state.v2",
+      "title": "Schema",
+      "type": "string"
+    },
+    "started_at": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Started At"
+    },
+    "status": {
+      "title": "Status",
+      "type": "string"
+    },
+    "thread_id": {
+      "title": "Thread Id",
+      "type": "string"
+    },
+    "turn_id": {
+      "title": "Turn Id",
+      "type": "string"
+    },
+    "updated_at": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Updated At"
+    },
+    "workspace_id": {
+      "title": "Workspace Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "turn_id",
+    "thread_id",
+    "workspace_id",
+    "status"
+  ],
+  "title": "ProtocolTurnState",
+  "type": "object"
+}

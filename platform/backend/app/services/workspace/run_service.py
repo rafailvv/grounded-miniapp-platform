@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 from pathlib import PurePosixPath
 import os
@@ -29,6 +30,7 @@ from app.models.domain import (
     ValidationSnapshot,
     WorkspaceRecord,
 )
+from app.modules.miniapp_agent_loop.guardian_review import GuardianReview
 from app.modules.workspace_code_agent_runtime import WorkspaceCodeAgentRuntime
 from app.repositories.state_store import StateStore
 from app.services.check_runner import CheckRunner
@@ -38,7 +40,13 @@ from app.services.repair_cases import RepairCaseService
 from app.services.event_journal import EventJournalService
 from app.services.run_protocol import RunProtocolService
 from app.services.run_state_machine import RunStateMachine
-from app.services.workflow_acceptance import build_acceptance_contract, build_implementation_plan, orchestration_metadata_for_contract
+from app.services.run_task_ledger import RunTaskLedger
+from app.services.workflow_acceptance import (
+    build_acceptance_contract,
+    build_implementation_plan,
+    derive_prompt_contract_analysis,
+    orchestration_metadata_for_contract,
+)
 from app.services.workspace.log_service import WorkspaceLogService
 from app.services.workspace.preview_service import PreviewService
 from app.services.workspace.service import WorkspaceService
@@ -212,19 +220,26 @@ class RunService:
             or effective_generation_mode in {GenerationMode.BALANCED, GenerationMode.QUALITY}
         ) and not inherited_acceptance_contract
         if requires_prompt_analysis:
-            if not self.openai_client.enabled:
-                raise RuntimeError("LLM prompt analysis is required before creating a workflow run.")
-            with self.openai_client.routing_context(
-                model_profile=effective_model_profile,
-                generation_mode=effective_generation_mode,
-            ):
-                prompt_analysis = self.openai_client.analyze_miniapp_prompt(
-                    prompt=request.prompt,
-                    generation_mode=effective_generation_mode,
+            if effective_generation_mode in {GenerationMode.FAST, GenerationMode.BASIC}:
+                prompt_analysis = derive_prompt_contract_analysis(request.prompt)
+                prompt_analysis_model = "fast-local-contract"
+            elif not self.openai_client.enabled:
+                if effective_generation_mode not in {GenerationMode.FAST, GenerationMode.BASIC}:
+                    raise RuntimeError("LLM prompt analysis is required before creating a workflow run.")
+                prompt_analysis = derive_prompt_contract_analysis(request.prompt)
+                prompt_analysis_model = "fast-local-contract"
+            else:
+                with self.openai_client.routing_context(
                     model_profile=effective_model_profile,
-                )
-            prompt_analysis_usage = dict((prompt_analysis or {}).pop("_llm_usage", {}) or {})
-            prompt_analysis_model = str((prompt_analysis or {}).pop("_llm_model", "") or "") or None
+                    generation_mode=effective_generation_mode,
+                ):
+                    prompt_analysis = self.openai_client.analyze_miniapp_prompt(
+                        prompt=request.prompt,
+                        generation_mode=effective_generation_mode,
+                        model_profile=effective_model_profile,
+                    )
+                prompt_analysis_usage = dict((prompt_analysis or {}).pop("_llm_usage", {}) or {})
+                prompt_analysis_model = str((prompt_analysis or {}).pop("_llm_model", "") or "") or None
         contract_prompt = contract_source_run.prompt if inherited_acceptance_contract and contract_source_run is not None else request.prompt
         if inherited_acceptance_contract:
             acceptance_contract = {
@@ -302,7 +317,20 @@ class RunService:
             storage_version=2,
             token_usage=self._token_usage_from_prompt_analysis(prompt_analysis_usage),
         )
+        run.task_ledger_ref = f"task_ledger:{workspace_id}:{run.run_id}"
         run.implementation_plan = implementation_plan
+        self.store.upsert(
+            "reports",
+            run.task_ledger_ref,
+            RunTaskLedger.build(
+                run_id=run.run_id,
+                workspace_id=workspace_id,
+                implementation_plan=implementation_plan,
+                run_status=run.status,
+                current_stage=run.current_stage,
+                updated_at=run.updated_at.isoformat(),
+            ),
+        )
         if acceptance_contract.get("required"):
             miniapp_contract = MiniAppContractCompiler.compile(
                 workspace_id=workspace_id,
@@ -631,6 +659,62 @@ class RunService:
         payload = self.store.get("reports", self._resume_checkpoint_ref_for_run(run))
         return dict(payload) if isinstance(payload, dict) else None
 
+    def _record_session_checkpoint(
+        self,
+        run: RunRecord,
+        *,
+        kind: str,
+        status: str,
+        source: str,
+        summary: str,
+        refs: dict[str, Any] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        checkpoint_id = f"session_checkpoint:{run.workspace_id}:{run.run_id}:{kind}"
+        payload = {
+            "schema": "grounded.session_checkpoint.v1",
+            "checkpoint_id": checkpoint_id,
+            "run_id": run.run_id,
+            "workspace_id": run.workspace_id,
+            "kind": kind,
+            "status": status,
+            "source": source,
+            "summary": summary,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "run_status": run.status,
+            "apply_status": run.apply_status,
+            "current_stage": run.current_stage,
+            "revision_id": run.result_revision_id or run.candidate_revision_id or run.source_revision_id,
+            "failure_class": run.failure_class,
+            "failure_signature": run.failure_signature,
+            "refs": dict(refs or {}),
+            "metadata": dict(metadata or {}),
+        }
+        self.store.upsert("reports", checkpoint_id, payload)
+        return payload
+
+    def _record_before_apply_checkpoint(self, run: RunRecord, *, source: str) -> None:
+        try:
+            draft_diff = self.workspace_service.diff(run.workspace_id, run_id=run.run_id)
+        except Exception:
+            draft_diff = ""
+        self._record_session_checkpoint(
+            run,
+            kind="before_apply",
+            status="ready",
+            source=source,
+            summary="Checkpoint captured before applying the generated draft.",
+            refs={
+                "draft_run_id": run.run_id,
+                "source_revision_id": run.source_revision_id,
+                "run_artifacts": f"run_artifacts:{run.run_id}",
+            },
+            metadata={
+                "diff_sha256": hashlib.sha256(draft_diff.encode("utf-8")).hexdigest() if draft_diff else None,
+                "changed_files": list(run.touched_files or []),
+            },
+        )
+
     def _recover_orphaned_terminal_jobs(self) -> None:
         for item in self.store.list("jobs"):
             job = JobRecord.model_validate(item)
@@ -848,12 +932,141 @@ class RunService:
         artifacts = self.get_run_artifacts(run_id)
         return list(artifacts.get("iterations", []) or [])
 
+    def enforce_guardian_before_apply(
+        self,
+        run: RunRecord,
+        *,
+        source: str,
+        changed_files: list[str] | None = None,
+    ) -> tuple[bool, dict[str, Any]]:
+        report = self._guardian_review_for_apply(run, source=source, changed_files=changed_files)
+        if report.get("status") == "passed":
+            return True, report
+        findings = [item for item in report.get("findings") or [] if isinstance(item, dict)]
+        run.status = "blocked"
+        run.apply_status = "blocked"
+        run.outcome_kind = "blocked_generation"
+        run.draft_status = "ready" if self.workspace_service.draft_exists(run.workspace_id, run.run_id) else run.draft_status
+        run.draft_ready = run.draft_status == "ready"
+        run.current_stage = "guardian review blocked apply"
+        run.progress_percent = self._terminal_failure_progress(run.progress_percent)
+        run.failure_class = "guardian.pre_apply_blocked"
+        run.failure_signature = f"guardian.pre_apply_blocked:{findings[0].get('code') if findings else 'blocker'}"
+        run.failure_reason = findings[0].get("message") if findings else "Guardian review blocked source apply."
+        run.remaining_issues = [
+            {
+                "kind": "guardian_blocker",
+                "code": item.get("code"),
+                "category": item.get("category"),
+                "details": item.get("message"),
+                "file_path": item.get("file_path"),
+                "line": item.get("line"),
+                "blocking": True,
+                "evidence": item.get("evidence") or {},
+            }
+            for item in findings
+        ]
+        run.updated_at = datetime.now(timezone.utc)
+        self._save_run(run)
+        self._append_job_event(
+            run.linked_job_id,
+            "validation_failed",
+            "Guardian review blocked source apply.",
+            {"run_id": run.run_id, "guardian_review_ref": f"guardian_review:{run.workspace_id}:{run.run_id}", "findings": findings},
+        )
+        self._journal_run(
+            run,
+            "guardian.apply_blocked",
+            {"run_id": run.run_id, "workspace_id": run.workspace_id, "findings": findings},
+            summary="Guardian review blocked source apply.",
+            idempotency_key=f"guardian.apply_blocked:{run.run_id}:{report.get('created_at')}",
+        )
+        return False, report
+
+    def _guardian_review_for_apply(
+        self,
+        run: RunRecord,
+        *,
+        source: str,
+        changed_files: list[str] | None = None,
+    ) -> dict[str, Any]:
+        stored = self._stored_guardian_review(run)
+        if stored and source != "pre_apply_guardian" and stored.get("status") == "passed":
+            self.store.upsert("reports", f"guardian_review:{run.workspace_id}:{run.run_id}", stored)
+            return stored
+        artifacts = self.store.get("reports", f"run_artifacts:{run.run_id}")
+        artifacts = artifacts if isinstance(artifacts, dict) else {}
+        raw_checks = artifacts.get("check_results") if isinstance(artifacts.get("check_results"), list) else []
+        if not raw_checks and run.linked_job_id:
+            job_payload = self.store.get("jobs", run.linked_job_id)
+            raw_checks = job_payload.get("executed_checks") if isinstance(job_payload, dict) and isinstance(job_payload.get("executed_checks"), list) else []
+        results: list[RunCheckResult] = []
+        for item in raw_checks or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                results.append(RunCheckResult.model_validate(item))
+            except Exception:
+                continue
+        execution = CheckExecutionRecord(
+            workspace_id=run.workspace_id,
+            run_id=run.run_id,
+            changed_files=list(changed_files or run.touched_files or self._paths_from_diff(str(artifacts.get("diff") or ""))),
+            results=results,
+            completed_at=datetime.now(timezone.utc),
+        ) if results else None
+        draft_source = self.workspace_service.draft_source_dir(run.workspace_id, run.run_id)
+        if not draft_source.exists():
+            draft_source = self.workspace_service.source_dir(run.workspace_id)
+        report = GuardianReview.review(
+            workspace_id=run.workspace_id,
+            run_id=run.run_id,
+            draft_source=draft_source,
+            changed_files=list(changed_files or run.touched_files or self._paths_from_diff(str(artifacts.get("diff") or ""))),
+            latest_execution=execution,
+            preview_details=artifacts.get("preview") if isinstance(artifacts.get("preview"), dict) else {},
+            acceptance_contract=run.acceptance_contract,
+            implementation_plan=run.implementation_plan,
+            target_role_scope=run.target_role_scope,
+            intent=run.intent,
+            source="pre_apply_guardian",
+            review_context={
+                "run": run.model_dump(mode="json"),
+                "diff": str(artifacts.get("diff") or ""),
+                "token_usage": run.token_usage,
+                "context_pressure": self.store.get("reports", run.context_pressure_ref) if run.context_pressure_ref else {},
+            },
+        ).model_dump(mode="json", by_alias=True)
+        self.store.upsert("reports", f"guardian_review:{run.workspace_id}:{run.run_id}", report)
+        return report
+
+    def _stored_guardian_review(self, run: RunRecord) -> dict[str, Any] | None:
+        candidates: list[Any] = []
+        if run.verifier_review_ref:
+            candidates.append(self.store.get("reports", run.verifier_review_ref))
+        candidates.append(self.store.get("reports", f"guardian_review:{run.workspace_id}:{run.run_id}"))
+        for payload in candidates:
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("schema") == "grounded.guardian_review.v1":
+                return dict(payload)
+            for key in ("review", "report"):
+                review = payload.get(key) if isinstance(payload.get(key), dict) else None
+                if isinstance(review, dict) and isinstance(review.get("guardian_review"), dict):
+                    return dict(review["guardian_review"])
+            if isinstance(payload.get("guardian_review"), dict):
+                return dict(payload["guardian_review"])
+        return None
+
     def apply_run(self, run_id: str) -> RunRecord:
         run = self.get_run(run_id)
         if run.apply_strategy != "manual_approve":
             return run
         if run.status != "awaiting_approval":
             return run
+        allowed, _ = self.enforce_guardian_before_apply(run, source="pre_apply_guardian")
+        if not allowed:
+            return self.get_run(run_id)
         apply_started_at = time.perf_counter()
         run.current_stage = "finalizing apply"
         run.progress_percent = 99
@@ -867,6 +1080,7 @@ class RunService:
             idempotency_key=f"apply.started:{run.run_id}:{run.updated_at.isoformat()}",
         )
         self._append_job_event(run.linked_job_id, "apply_started", "Applying the reviewed draft to the source workspace.")
+        self._record_before_apply_checkpoint(run, source="manual_apply")
         revision = self.workspace_service.approve_draft(run.workspace_id, run.run_id, f"Approve AI draft for run {run.run_id}")
         self.workspace_service.discard_draft(run.workspace_id, run.run_id)
         run.result_revision_id = revision.revision_id
@@ -1061,6 +1275,7 @@ class RunService:
                 "turn_diff_ref",
                 "environment_snapshot_ref",
                 "tool_batch_summaries_ref",
+                "task_ledger_ref",
                 "worker_mailbox_ref",
                 "scratchpad_ref",
                 "memory_ref",
@@ -1704,8 +1919,8 @@ class RunService:
             if job.status == "completed":
                 should_apply_fix_draft = request.mode == "fix" and self.workspace_service.draft_exists(run.workspace_id, run.run_id)
                 if should_apply_fix_draft:
-                    self._apply_completed_draft(run, message="Applying verified fix draft to the source workspace.")
-                    self._clear_successful_completion_metadata(run=run, job=job)
+                    if self._apply_completed_draft(run, message="Applying verified fix draft to the source workspace."):
+                        self._clear_successful_completion_metadata(run=run, job=job)
                 else:
                     meaningful_paths = self._meaningful_paths_for_run(
                         workspace_id=run.workspace_id,
@@ -1716,8 +1931,8 @@ class RunService:
                     if not meaningful_paths:
                         self._mark_run_without_meaningful_diff(run, job)
                     else:
-                        self._apply_completed_draft(run, message="Applying generated draft to the source workspace.")
-                        self._clear_successful_completion_metadata(run=run, job=job)
+                        if self._apply_completed_draft(run, message="Applying generated draft to the source workspace."):
+                            self._clear_successful_completion_metadata(run=run, job=job)
             else:
                 meaningful_paths = self._meaningful_paths_for_run(
                     workspace_id=run.workspace_id,
@@ -2129,6 +2344,19 @@ class RunService:
                 "Applied source preview passed post-apply product proof.",
                 {"reason": "post_apply_source_proof", "run_id": run.run_id, "report_ref": report_ref},
             )
+            self._record_session_checkpoint(
+                run,
+                kind="after_successful_tests",
+                status="ready",
+                source="post_apply_source_proof",
+                summary="Checkpoint captured after applied source passed post-apply product proof.",
+                refs={
+                    "post_apply_checks": report_ref,
+                    "browser_proof": run.browser_proof_ref,
+                    "result_revision_id": run.result_revision_id,
+                },
+                metadata={"check_count": len(execution.results)},
+            )
 
     @staticmethod
     def _specific_failure_reason_from_results(results: list[RunCheckResult]) -> str | None:
@@ -2389,6 +2617,62 @@ class RunService:
             artifacts = {}
         payload = WorkspaceMemoryPipeline.extract_run(run, artifacts)
         self.store.upsert("reports", f"memory_stage1:{run.workspace_id}:{run.run_id}", payload)
+        try:
+            self._auto_consolidate_workspace_memory(run.workspace_id)
+        except Exception:
+            logger.exception("memory_auto_consolidate_failed run_id=%s workspace_id=%s", run.run_id, run.workspace_id)
+        if self.event_journal_service is not None:
+            try:
+                self.event_journal_service.append_run(
+                    workspace_id=run.workspace_id,
+                    run_id=run.run_id,
+                    event_type="memory.raw_extracted",
+                    payload={"memory_ref": f"memory_stage1:{run.workspace_id}:{run.run_id}", "raw_count": len(payload.get("items") or [])},
+                    actor="system",
+                    summary="Raw run memory extracted.",
+                    source_ref=f"memory_stage1:{run.workspace_id}:{run.run_id}",
+                    idempotency_key=f"memory.raw_extracted:{run.run_id}",
+                )
+            except Exception:
+                pass
+
+    def _auto_consolidate_workspace_memory(self, workspace_id: str) -> None:
+        stage1 = [
+            payload
+            for key, payload in self.store.items("reports")
+            if key.startswith(f"memory_stage1:{workspace_id}:") and isinstance(payload, dict)
+        ]
+        current = self.store.get("reports", f"workspace_memory:{workspace_id}") or {"workspace_id": workspace_id, "items": []}
+        source_dir = self.workspace_service.source_dir(workspace_id)
+        consolidated = WorkspaceMemoryPipeline.consolidate(
+            workspace_id,
+            stage1,
+            current,
+            workspace_root=source_dir,
+        )
+        stale_check = WorkspaceMemoryPipeline.stale_check(source_dir, consolidated)
+        consolidated["stale_check"] = stale_check
+        WorkspaceMemoryPipeline.apply_stale_status(consolidated, stale_check)
+        consolidated["memory_summary"] = WorkspaceMemoryPipeline.summary(workspace_id, consolidated)
+        self.store.upsert("reports", f"workspace_memory:{workspace_id}", consolidated)
+        pipeline = consolidated.get("pipeline") if isinstance(consolidated.get("pipeline"), dict) else {}
+        self.store.upsert(
+            "reports",
+            f"memory_consolidation:{workspace_id}",
+            {
+                "schema": "grounded.memory_consolidation.v1",
+                "workspace_id": workspace_id,
+                "status": "auto_consolidated",
+                "stage1_count": len(stage1),
+                "raw_count": int(pipeline.get("stage1_items", 0) or 0),
+                "active_count": int(pipeline.get("active_count", 0) or 0),
+                "stale_count": int(pipeline.get("stale_count", 0) or 0),
+                "expired_count": int(pipeline.get("expired_count", 0) or 0),
+                "superseded_count": int(pipeline.get("superseded_count", 0) or 0),
+                "deduped_count": int(pipeline.get("deduped_count", 0) or 0),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
 
     def _schedule_auto_repair_continuation_if_needed(self, run: RunRecord) -> None:
         try:
@@ -2412,7 +2696,12 @@ class RunService:
             or str(run.failure_signature or "").startswith("repair.no_progress:")
             or str(run.current_fix_phase or "") == "blocked_repair_continuation_needed"
         )
-        if not budget_exhausted and not repeated_no_progress:
+        reliability_gate_blocked = (
+            run.failure_class == "reliability_gate.blocked"
+            or str(run.failure_signature or "").startswith("reliability_gate.blocked:")
+            or str(run.current_stage or "") == "blocked by reliability gate"
+        )
+        if not budget_exhausted and not repeated_no_progress and not reliability_gate_blocked:
             return
         if self.store.get("reports", f"auto_repair_continuation:{run.run_id}"):
             return
@@ -2833,6 +3122,9 @@ class RunService:
 
     @staticmethod
     def _should_wait_for_preview_refresh(request: CreateRunRequest, run: RunRecord) -> bool:
+        mode = str(getattr(run.generation_mode, "value", run.generation_mode) or request.generation_mode or "").strip().lower()
+        if mode in {"fast", "basic"}:
+            return False
         if str(run.intent or "").strip().lower() not in {"edit", "refine", "role_only_change"}:
             return True
         probe = GenerateRequest(
@@ -2872,13 +3164,17 @@ class RunService:
             job.fix_targets = []
             job.handoff_from_failed_generate = None
 
-    def _apply_completed_draft(self, run: RunRecord, *, message: str) -> None:
+    def _apply_completed_draft(self, run: RunRecord, *, message: str) -> bool:
+        allowed, _ = self.enforce_guardian_before_apply(run, source="pre_apply_guardian")
+        if not allowed:
+            return False
         apply_started_at = time.perf_counter()
         run.current_stage = "finalizing apply"
         run.progress_percent = max(run.progress_percent, 94)
         run.updated_at = datetime.now(timezone.utc)
         self._save_run(run)
         self._append_job_event(run.linked_job_id, "apply_started", message)
+        self._record_before_apply_checkpoint(run, source="auto_apply")
         revision = self.workspace_service.approve_draft(run.workspace_id, run.run_id, f"Auto-apply AI draft for run {run.run_id}")
         self.workspace_service.discard_draft(run.workspace_id, run.run_id)
         run.result_revision_id = revision.revision_id
@@ -2905,6 +3201,7 @@ class RunService:
             "apply_completed",
             "Generated draft was applied successfully.",
         )
+        return True
 
     def _meaningful_paths_for_run(
         self,

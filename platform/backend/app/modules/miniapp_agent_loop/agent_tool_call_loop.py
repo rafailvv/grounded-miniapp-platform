@@ -972,21 +972,29 @@ class AgentToolCallLoop:
                         "file_count": len({operation.file_path for operation in synced_file_changes}),
                     },
                 )
-            if callbacks.before_apply is not None:
-                callbacks.before_apply(turn + 1, synced_file_changes)
-            try:
-                with self.mutation_guard.lock(run_id):
-                    envelope = self.context_builder.workspace_service.build_patch_envelope_for_file_changes(workspace_id, run_id, synced_file_changes)
-                    apply_result = self.context_builder.workspace_service.apply_patch_envelope_to_draft(workspace_id, run_id, envelope)
-                latest_apply_result = apply_result.model_dump(mode="json")
-            except ValueError as exc:
+            hook_outcome = callbacks.before_apply(turn + 1, synced_file_changes) if callbacks.before_apply is not None else None
+            if hook_outcome is not None and hook_outcome.should_block:
                 apply_result = ApplyPatchResult(
                     workspace_id=workspace_id,
                     run_id=run_id,
-                    status="conflict",
-                    conflict_reason=str(exc),
+                    status="blocked",
+                    conflict_reason=hook_outcome.block_reason or "Draft apply blocked by hook policy.",
                 )
                 latest_apply_result = apply_result.model_dump(mode="json")
+            else:
+                try:
+                    with self.mutation_guard.lock(run_id):
+                        envelope = self.context_builder.workspace_service.build_patch_envelope_for_file_changes(workspace_id, run_id, synced_file_changes)
+                        apply_result = self.context_builder.workspace_service.apply_patch_envelope_to_draft(workspace_id, run_id, envelope)
+                    latest_apply_result = apply_result.model_dump(mode="json")
+                except ValueError as exc:
+                    apply_result = ApplyPatchResult(
+                        workspace_id=workspace_id,
+                        run_id=run_id,
+                        status="conflict",
+                        conflict_reason=str(exc),
+                    )
+                    latest_apply_result = apply_result.model_dump(mode="json")
             if callbacks.after_apply is not None:
                 callbacks.after_apply(
                     turn + 1,

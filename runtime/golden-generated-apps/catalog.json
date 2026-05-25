@@ -1,0 +1,439 @@
+{
+  "schema": "grounded.golden.generated_apps.v1",
+  "description": "Golden generated app contracts for regression testing. These are product-quality expectations, not source-code templates.",
+  "items": [
+    {
+      "id": "beauty-salon-booking",
+      "title": "Beauty salon booking",
+      "domain": "beauty_salon",
+      "generation_mode": "quality",
+      "prompt": "Создай Telegram mini-app для салона красоты: клиент выбирает услугу и мастера, бронирует слот; мастер видит записи дня, меняет статус и блокирует время; менеджер следит за загрузкой, отменами и расписанием.",
+      "expected_skill_ids": [
+        "booking-reservations",
+        "services-masters",
+        "manager-dashboard"
+      ],
+      "expected_contract": {
+        "resource_hint": "appointment",
+        "required_resource_hints": ["appointment", "service", "master", "slot"],
+        "required_fields": ["service", "master", "date", "slot", "client_name", "phone", "status"],
+        "source_roles": ["client"],
+        "update_roles": ["specialist", "manager"],
+        "observer_roles": ["manager"],
+        "status_values": ["new", "confirmed", "completed", "canceled"],
+        "min_role_routes": {"client": 2, "specialist": 2, "manager": 2},
+        "required_step_kinds": ["prompt_state_source", "prompt_state_update", "mobile_layout"]
+      },
+      "readiness_required_checks": [
+        "api",
+        "persistence",
+        "ui",
+        "roles",
+        "mobile",
+        "tests",
+        "apply_guardian"
+      ],
+      "prompt_analysis": {
+        "prompt_summary": "Salon booking app with service and master selection, persisted appointment status, specialist schedule operations, and manager utilization view.",
+        "resource_hint": "appointment",
+        "resource_hints": ["appointment", "service", "master", "slot"],
+        "field_hints": ["service", "master", "date", "slot", "client_name", "phone", "status", "notes"],
+        "business_capabilities": ["service selection", "slot booking", "specialist day schedule", "manager utilization"],
+        "role_action_prompts": {
+          "client": ["choose service and master", "book available slot", "view booking status"],
+          "specialist": ["view daily appointments", "update appointment status", "block unavailable slot"],
+          "manager": ["monitor utilization", "resolve cancellations", "manage schedule"]
+        },
+        "role_field_hints": {
+          "client": ["service", "master", "date", "slot", "client_name", "phone"],
+          "specialist": ["appointment_time", "client_name", "service", "status", "notes"],
+          "manager": ["utilization", "cancellations", "specialist_load", "schedule_conflicts"]
+        },
+        "role_state_contract": {
+          "source_roles": ["client"],
+          "update_roles": ["specialist", "manager"],
+          "observer_roles": ["manager"],
+          "status_values": ["new", "confirmed", "completed", "canceled"]
+        },
+        "routeable_screen_plan": {
+          "multi_page_recommended": true,
+          "roles": {
+            "client": [
+              {"intent": "services", "purpose": "choose service and master"},
+              {"intent": "booking", "purpose": "pick slot and confirm appointment"}
+            ],
+            "specialist": [
+              {"intent": "today", "purpose": "manage daily appointments"},
+              {"intent": "availability", "purpose": "block unavailable slots"}
+            ],
+            "manager": [
+              {"intent": "operations", "purpose": "monitor bookings and cancellations"},
+              {"intent": "schedule", "purpose": "inspect utilization and conflicts"}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "restaurant-reservations",
+      "title": "Restaurant reservations",
+      "domain": "restaurant",
+      "generation_mode": "quality",
+      "prompt": "Создай Telegram mini-app для ресторана с бронированием столиков: гость выбирает дату, время и количество гостей; хост подтверждает бронь и посадку; менеджер видит загрузку зала, отмены и waitlist.",
+      "expected_skill_ids": [
+        "booking-reservations",
+        "manager-dashboard",
+        "empty-error-loading-states"
+      ],
+      "expected_contract": {
+        "resource_hint": "reservation",
+        "required_resource_hints": ["reservation", "table", "guest", "waitlist"],
+        "required_fields": ["date", "time", "party_size", "guest_name", "phone", "status"],
+        "source_roles": ["client"],
+        "update_roles": ["specialist", "manager"],
+        "observer_roles": ["manager"],
+        "status_values": ["new", "confirmed", "seated", "waitlist", "canceled"],
+        "min_role_routes": {"client": 2, "specialist": 2, "manager": 2},
+        "required_step_kinds": ["prompt_state_source", "prompt_state_update", "mobile_layout"]
+      },
+      "readiness_required_checks": [
+        "api",
+        "persistence",
+        "ui",
+        "roles",
+        "mobile",
+        "tests",
+        "apply_guardian"
+      ],
+      "prompt_analysis": {
+        "prompt_summary": "Restaurant table reservation workflow with guest booking, host confirmation and seating, manager room load and waitlist control.",
+        "resource_hint": "reservation",
+        "resource_hints": ["reservation", "table", "guest", "waitlist"],
+        "field_hints": ["date", "time", "party_size", "guest_name", "phone", "status", "table_zone"],
+        "business_capabilities": ["table booking", "host confirmation", "waitlist", "room load analytics"],
+        "role_action_prompts": {
+          "client": ["choose date and time", "reserve table", "view reservation status"],
+          "specialist": ["confirm reservation", "mark guest seated", "move guest to waitlist"],
+          "manager": ["monitor room load", "resolve cancellations", "manage waitlist"]
+        },
+        "role_field_hints": {
+          "client": ["date", "time", "party_size", "guest_name", "phone"],
+          "specialist": ["reservation_time", "party_size", "table_zone", "status"],
+          "manager": ["capacity", "waitlist_count", "cancellations", "room_load"]
+        },
+        "role_state_contract": {
+          "source_roles": ["client"],
+          "update_roles": ["specialist", "manager"],
+          "observer_roles": ["manager"],
+          "status_values": ["new", "confirmed", "seated", "waitlist", "canceled"]
+        },
+        "routeable_screen_plan": {
+          "multi_page_recommended": true,
+          "roles": {
+            "client": [
+              {"intent": "reservation", "purpose": "select date, time, and party size"},
+              {"intent": "status", "purpose": "view reservation confirmation"}
+            ],
+            "specialist": [
+              {"intent": "host-queue", "purpose": "confirm and seat reservations"},
+              {"intent": "waitlist", "purpose": "manage waitlisted guests"}
+            ],
+            "manager": [
+              {"intent": "floor-load", "purpose": "track room capacity"},
+              {"intent": "exceptions", "purpose": "handle cancellations and waitlist pressure"}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "shop-catalog-orders",
+      "title": "Shop catalog and orders",
+      "domain": "shop",
+      "generation_mode": "quality",
+      "prompt": "Создай Telegram mini-app магазина: клиент смотрит каталог товаров, фильтрует категории, добавляет товар в корзину и оформляет заказ; специалист собирает заказ; менеджер управляет каталогом, остатками и заказами.",
+      "expected_skill_ids": [
+        "shop-catalog",
+        "manager-dashboard",
+        "empty-error-loading-states"
+      ],
+      "expected_contract": {
+        "resource_hint": "order",
+        "required_resource_hints": ["product", "cart", "order", "stock"],
+        "required_fields": ["product", "category", "quantity", "price", "customer_name", "status"],
+        "source_roles": ["client"],
+        "update_roles": ["specialist", "manager"],
+        "observer_roles": ["manager"],
+        "status_values": ["new", "confirmed", "packing", "ready", "canceled"],
+        "min_role_routes": {"client": 3, "specialist": 2, "manager": 2},
+        "required_step_kinds": ["prompt_state_source", "prompt_state_update", "mobile_layout"]
+      },
+      "readiness_required_checks": [
+        "api",
+        "persistence",
+        "ui",
+        "roles",
+        "mobile",
+        "tests",
+        "apply_guardian"
+      ],
+      "prompt_analysis": {
+        "prompt_summary": "Shop app with catalog browsing, cart checkout, fulfillment queue, stock and order management.",
+        "resource_hint": "order",
+        "resource_hints": ["product", "cart", "order", "stock"],
+        "field_hints": ["product", "category", "quantity", "price", "customer_name", "phone", "status"],
+        "business_capabilities": ["catalog browsing", "cart checkout", "fulfillment queue", "stock management"],
+        "role_action_prompts": {
+          "client": ["browse product catalog", "filter categories", "add product to cart", "submit order"],
+          "specialist": ["prepare ordered items", "update fulfillment status", "flag missing stock"],
+          "manager": ["manage catalog", "monitor stock", "review order metrics"]
+        },
+        "role_field_hints": {
+          "client": ["product", "category", "quantity", "customer_name", "phone"],
+          "specialist": ["order_items", "quantity", "status", "stock_issue"],
+          "manager": ["stock", "top_products", "revenue", "order_count"]
+        },
+        "role_state_contract": {
+          "source_roles": ["client"],
+          "update_roles": ["specialist", "manager"],
+          "observer_roles": ["manager"],
+          "status_values": ["new", "confirmed", "packing", "ready", "canceled"]
+        },
+        "routeable_screen_plan": {
+          "multi_page_recommended": true,
+          "roles": {
+            "client": [
+              {"intent": "catalog", "purpose": "browse and filter products"},
+              {"intent": "product-detail", "purpose": "inspect item and options"},
+              {"intent": "cart", "purpose": "review cart and submit order"}
+            ],
+            "specialist": [
+              {"intent": "fulfillment", "purpose": "prepare active orders"},
+              {"intent": "stock-issues", "purpose": "flag missing items"}
+            ],
+            "manager": [
+              {"intent": "catalog-admin", "purpose": "manage stock and availability"},
+              {"intent": "orders", "purpose": "review order metrics and exceptions"}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "crm-request-pipeline",
+      "title": "CRM request pipeline",
+      "domain": "crm",
+      "generation_mode": "quality",
+      "prompt": "Создай Telegram mini-app CRM заявок: клиент оставляет заявку и контакты; специалист квалифицирует лид, назначает статус и follow-up; менеджер смотрит pipeline, просрочки, нагрузку и конверсию.",
+      "expected_skill_ids": [
+        "crm-requests",
+        "manager-dashboard",
+        "empty-error-loading-states"
+      ],
+      "expected_contract": {
+        "resource_hint": "request",
+        "required_resource_hints": ["request", "lead", "pipeline", "follow-up"],
+        "required_fields": ["contact_name", "phone", "source", "priority", "assignee", "status"],
+        "source_roles": ["client"],
+        "update_roles": ["specialist", "manager"],
+        "observer_roles": ["manager"],
+        "status_values": ["new", "qualified", "in progress", "waiting for client", "done", "lost"],
+        "min_role_routes": {"client": 2, "specialist": 2, "manager": 2},
+        "required_step_kinds": ["prompt_state_source", "prompt_state_update", "mobile_layout"]
+      },
+      "readiness_required_checks": [
+        "api",
+        "persistence",
+        "ui",
+        "roles",
+        "mobile",
+        "tests",
+        "apply_guardian"
+      ],
+      "prompt_analysis": {
+        "prompt_summary": "CRM app for incoming requests, lead qualification, follow-up ownership, manager pipeline and conversion analytics.",
+        "resource_hint": "request",
+        "resource_hints": ["request", "lead", "pipeline", "follow-up"],
+        "field_hints": ["contact_name", "phone", "source", "priority", "assignee", "status", "next_contact_at"],
+        "business_capabilities": ["lead capture", "qualification", "follow-up scheduling", "pipeline analytics"],
+        "role_action_prompts": {
+          "client": ["submit request", "add contact details", "view request status"],
+          "specialist": ["qualify lead", "assign status", "schedule follow-up"],
+          "manager": ["monitor pipeline", "find overdue requests", "review conversion"]
+        },
+        "role_field_hints": {
+          "client": ["contact_name", "phone", "request_text"],
+          "specialist": ["source", "priority", "assignee", "status", "next_contact_at"],
+          "manager": ["pipeline_stage", "overdue_count", "assignee_load", "conversion"]
+        },
+        "role_state_contract": {
+          "source_roles": ["client"],
+          "update_roles": ["specialist", "manager"],
+          "observer_roles": ["manager"],
+          "status_values": ["new", "qualified", "in progress", "waiting for client", "done", "lost"]
+        },
+        "routeable_screen_plan": {
+          "multi_page_recommended": true,
+          "roles": {
+            "client": [
+              {"intent": "new-request", "purpose": "submit request and contacts"},
+              {"intent": "request-status", "purpose": "view current status"}
+            ],
+            "specialist": [
+              {"intent": "lead-queue", "purpose": "qualify and assign requests"},
+              {"intent": "follow-up", "purpose": "schedule next action"}
+            ],
+            "manager": [
+              {"intent": "pipeline", "purpose": "monitor stage health"},
+              {"intent": "risks", "purpose": "review overdue and load risks"}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "specialist-schedule",
+      "title": "Specialist schedule",
+      "domain": "schedule",
+      "generation_mode": "quality",
+      "prompt": "Создай Telegram mini-app расписания специалистов: клиент видит доступные окна и записывается; специалист редактирует смены, перерывы и занятость; менеджер контролирует расписание, перегрузку и свободные окна.",
+      "expected_skill_ids": [
+        "booking-reservations",
+        "services-masters",
+        "manager-dashboard"
+      ],
+      "expected_contract": {
+        "resource_hint": "schedule_slot",
+        "required_resource_hints": ["schedule_slot", "specialist", "shift", "break"],
+        "required_fields": ["specialist", "date", "start_time", "end_time", "availability", "status"],
+        "source_roles": ["specialist"],
+        "update_roles": ["client", "manager"],
+        "observer_roles": ["manager"],
+        "status_values": ["available", "booked", "break", "blocked"],
+        "min_role_routes": {"client": 2, "specialist": 2, "manager": 2},
+        "required_step_kinds": ["prompt_state_source", "mobile_layout"]
+      },
+      "readiness_required_checks": [
+        "api",
+        "persistence",
+        "ui",
+        "roles",
+        "mobile",
+        "tests",
+        "apply_guardian"
+      ],
+      "prompt_analysis": {
+        "prompt_summary": "Specialist schedule app with availability windows, shift editing, client booking, and manager load control.",
+        "resource_hint": "schedule_slot",
+        "resource_hints": ["schedule_slot", "specialist", "shift", "break"],
+        "field_hints": ["specialist", "date", "start_time", "end_time", "availability", "status", "notes"],
+        "business_capabilities": ["availability view", "shift editing", "client booking", "load control"],
+        "role_action_prompts": {
+          "client": ["view available windows", "book a schedule slot", "view appointment status"],
+          "specialist": ["edit shifts", "add breaks", "mark busy time"],
+          "manager": ["control schedule coverage", "find overload", "inspect free windows"]
+        },
+        "role_field_hints": {
+          "client": ["specialist", "date", "start_time", "service"],
+          "specialist": ["date", "start_time", "end_time", "availability", "break"],
+          "manager": ["specialist_load", "free_windows", "overload", "blocked_slots"]
+        },
+        "role_state_contract": {
+          "source_roles": ["specialist"],
+          "update_roles": ["client", "manager"],
+          "observer_roles": ["manager"],
+          "status_values": ["available", "booked", "break", "blocked"]
+        },
+        "routeable_screen_plan": {
+          "multi_page_recommended": true,
+          "roles": {
+            "client": [
+              {"intent": "availability", "purpose": "view open specialist windows"},
+              {"intent": "booking", "purpose": "reserve a selected slot"}
+            ],
+            "specialist": [
+              {"intent": "shift-editor", "purpose": "edit shifts and breaks"},
+              {"intent": "busy-time", "purpose": "mark unavailable time"}
+            ],
+            "manager": [
+              {"intent": "coverage", "purpose": "review schedule coverage"},
+              {"intent": "overload", "purpose": "identify overload and free windows"}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "event-registration",
+      "title": "Event registration",
+      "domain": "events",
+      "generation_mode": "quality",
+      "prompt": "Создай Telegram mini-app для регистрации на мероприятия: участник выбирает событие и регистрируется; организатор отмечает check-in и посещаемость; менеджер видит вместимость, waitlist, регистрации и конверсию.",
+      "expected_skill_ids": [
+        "events",
+        "manager-dashboard",
+        "empty-error-loading-states"
+      ],
+      "expected_contract": {
+        "resource_hint": "registration",
+        "required_resource_hints": ["event", "registration", "ticket", "attendance"],
+        "required_fields": ["event", "attendee_name", "phone", "ticket_type", "status", "check_in"],
+        "source_roles": ["client"],
+        "update_roles": ["specialist", "manager"],
+        "observer_roles": ["manager"],
+        "status_values": ["registered", "waitlist", "checked in", "attended", "canceled"],
+        "min_role_routes": {"client": 2, "specialist": 2, "manager": 2},
+        "required_step_kinds": ["prompt_state_source", "prompt_state_update", "mobile_layout"]
+      },
+      "readiness_required_checks": [
+        "api",
+        "persistence",
+        "ui",
+        "roles",
+        "mobile",
+        "tests",
+        "apply_guardian"
+      ],
+      "prompt_analysis": {
+        "prompt_summary": "Event registration app with attendee signup, organizer check-in, manager capacity, waitlist and conversion tracking.",
+        "resource_hint": "registration",
+        "resource_hints": ["event", "registration", "ticket", "attendance"],
+        "field_hints": ["event", "attendee_name", "phone", "ticket_type", "status", "check_in", "capacity"],
+        "business_capabilities": ["event browsing", "registration", "check-in", "capacity and waitlist analytics"],
+        "role_action_prompts": {
+          "client": ["choose event", "register for event", "view ticket status"],
+          "specialist": ["check in attendee", "update attendance", "manage event-day tasks"],
+          "manager": ["monitor capacity", "review waitlist", "track registrations and conversion"]
+        },
+        "role_field_hints": {
+          "client": ["event", "attendee_name", "phone", "ticket_type"],
+          "specialist": ["attendee_name", "ticket_type", "check_in", "status"],
+          "manager": ["capacity", "waitlist", "registration_count", "conversion"]
+        },
+        "role_state_contract": {
+          "source_roles": ["client"],
+          "update_roles": ["specialist", "manager"],
+          "observer_roles": ["manager"],
+          "status_values": ["registered", "waitlist", "checked in", "attended", "canceled"]
+        },
+        "routeable_screen_plan": {
+          "multi_page_recommended": true,
+          "roles": {
+            "client": [
+              {"intent": "events", "purpose": "choose event"},
+              {"intent": "registration", "purpose": "register and view ticket status"}
+            ],
+            "specialist": [
+              {"intent": "check-in", "purpose": "mark attendee check-in"},
+              {"intent": "attendance", "purpose": "update attendance and event tasks"}
+            ],
+            "manager": [
+              {"intent": "capacity", "purpose": "monitor capacity and waitlist"},
+              {"intent": "registrations", "purpose": "review registrations and conversion"}
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

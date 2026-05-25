@@ -85,6 +85,7 @@ PRODUCT_WORKERS: tuple[ProductWorkerRole, ...] = (
         forbidden_paths=("miniapp/app/routes", "miniapp/app/schemas.py", "miniapp/app/db.py", "miniapp/tests"),
         role=None,
         expected_proof=("mobile_layout", "browser_flow_smoke"),
+        writes=False,
     ),
     ProductWorkerRole(
         worker_id="repair_worker",

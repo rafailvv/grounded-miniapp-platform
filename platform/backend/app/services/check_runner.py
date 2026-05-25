@@ -706,7 +706,7 @@ class CheckRunner:
         if not contract:
             intent_value = str(intent or "").strip().lower()
             mode_value = str(getattr(generation_mode, "value", generation_mode) or "").strip().lower()
-            if intent_value == "create" or mode_value in {GenerationMode.BALANCED.value, GenerationMode.QUALITY.value}:
+            if intent_value == "create" or mode_value in {GenerationMode.BALANCED.value, GenerationMode.QUALITY.value, GenerationMode.PRODUCTION.value}:
                 return RunCheckResult(
                     name="frontend_interaction_static_smoke",
                     status="failed",
@@ -2524,6 +2524,10 @@ class CheckRunner:
             *[str(item.get("message") or item) for item in mobile_report.get("findings") or []],
         ]
         proof_passed = bool(proof.get("passed"))
+        network_errors = [str(item) for item in proof.get("network_errors") or [] if str(item).strip()]
+        if network_errors:
+            logs.append(f"Browser network errors observed: {network_errors[0]}")
+            proof_passed = False
         mobile_passed = str(mobile_report.get("status") or "") != "failed"
         diagnostics = {
             "workflow_kind": contract.get("workflow_kind") or "create",
@@ -2538,8 +2542,20 @@ class CheckRunner:
             "created_marker": proof.get("created_marker") or proof.get("created_state_marker"),
             "updated_marker": proof.get("updated_marker") or proof.get("updated_state_marker"),
             "console_errors": proof.get("console_errors") or [],
+            "network_errors": network_errors,
+            "network_logs": proof.get("network_logs") or network_errors,
             "visible_errors": proof.get("visible_errors") or [],
             "screenshots": proof.get("screenshots") or [],
+            "screenshot_before": proof.get("screenshot_before"),
+            "screenshot_after": proof.get("screenshot_after"),
+            "dom_snapshots": proof.get("dom_snapshots") or [],
+            "layout_reports": proof.get("layout_reports") or [],
+            "visual_diffs": proof.get("visual_diffs") or [],
+            "playwright_scenario": proof.get("playwright_scenario") or {},
+            "failed_step_context": proof.get("failed_step_context") or {},
+            "dom_selector": proof.get("dom_selector") or proof.get("failed_selector"),
+            "mobile_viewport": proof.get("mobile_viewport") or {"width": 390, "height": 844},
+            "console_logs": proof.get("console_logs") or proof.get("console_errors") or [],
             "api_before": proof.get("api_before"),
             "api_after": proof.get("api_after"),
             "failed_step": proof.get("failed_step"),
@@ -2609,6 +2625,7 @@ class CheckRunner:
             "base_url": preview_url.rstrip("/"),
             "api_paths": api_paths,
             "routes_by_role": routes_by_role,
+            "mobile_viewport": {"width": 390, "height": 844},
             "role_flow": {
                 "source_roles": source_roles,
                 "update_roles": update_roles,
@@ -2663,6 +2680,7 @@ class CheckRunner:
     def _real_browser_ui_flow_python_script() -> str:
         return r'''
 import json
+import hashlib
 import os
 import re
 import sys
@@ -2692,6 +2710,7 @@ PAYLOAD = json.loads(sys.argv[1] or "{}")
 BASE_URL = str(PAYLOAD.get("base_url") or "").rstrip("/")
 ROUTES_BY_ROLE = PAYLOAD.get("routes_by_role") or {}
 REQUESTED_API_PATHS = [str(path) for path in PAYLOAD.get("api_paths") or [] if str(path).startswith("/api/")]
+MOBILE_VIEWPORT = PAYLOAD.get("mobile_viewport") if isinstance(PAYLOAD.get("mobile_viewport"), dict) else {"width": 390, "height": 844}
 ROLE_FLOW = PAYLOAD.get("role_flow") or {}
 SOURCE_ROLES = [str(role) for role in ROLE_FLOW.get("source_roles") or [] if str(role) in ("client", "specialist", "manager")]
 UPDATE_ROLES = [str(role) for role in ROLE_FLOW.get("update_roles") or [] if str(role) in ("client", "specialist", "manager")]
@@ -2701,8 +2720,13 @@ SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 
 STEPS = []
 CONSOLE_ERRORS = []
+NETWORK_ERRORS = []
 VISIBLE_ERRORS = []
 SCREENSHOTS = []
+PLAYWRIGHT_SCENARIO = []
+DOM_SNAPSHOTS = []
+LAYOUT_REPORTS = []
+VISUAL_DIFFS = []
 OPENAPI = {}
 API_PATHS = []
 GET_API_PATHS = []
@@ -2720,27 +2744,223 @@ def emit(result):
 
 def safe_screenshot(page, label):
     try:
-        path = SCREENSHOT_DIR / f"{len(SCREENSHOTS) + 1:02d}-{label}.png"
+        safe_label = re.sub(r"[^a-z0-9_-]+", "-", str(label or "step").lower()).strip("-")[:80] or "step"
+        path = SCREENSHOT_DIR / f"{len(SCREENSHOTS) + 1:02d}-{safe_label}.png"
         page.screenshot(path=str(path), full_page=True)
         SCREENSHOTS.append(str(path))
+        return str(path)
     except Exception:
-        pass
+        return None
+
+
+def file_sha256(path):
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except Exception:
+        return None
+
+
+def record_visual_diff(action, route="", role="", before=None, after=None):
+    if not before and not after:
+        return None
+    before_hash = file_sha256(before) if before else None
+    after_hash = file_sha256(after) if after else None
+    item = {
+        "action": action,
+        "route": route,
+        "role": role,
+        "screenshot_before": before,
+        "screenshot_after": after,
+        "before_sha256": before_hash,
+        "after_sha256": after_hash,
+        "changed": bool(before_hash and after_hash and before_hash != after_hash),
+        "diff_kind": "sha256" if before_hash and after_hash else "before_after_refs",
+        "mobile_viewport": MOBILE_VIEWPORT,
+    }
+    VISUAL_DIFFS.append(item)
+    return item
+
+
+def collect_dom_snapshot(page, route="", role="", phase="after", screenshot=None):
+    try:
+        payload = page.evaluate(
+            """() => {
+                const visible = (el) => {
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+                };
+                const controls = Array.from(document.querySelectorAll("input, textarea, select, button, [role=button]"))
+                    .filter(visible)
+                    .slice(0, 40)
+                    .map((el) => ({
+                        tag: el.tagName.toLowerCase(),
+                        id: el.id || "",
+                        name: el.getAttribute("name") || "",
+                        type: el.getAttribute("type") || "",
+                        text: (el.innerText || el.value || el.getAttribute("aria-label") || "").trim().slice(0, 120),
+                    }));
+                const landmarks = Array.from(document.querySelectorAll("main, section, article, form, [data-view], [data-role]"))
+                    .filter(visible)
+                    .slice(0, 30)
+                    .map((el) => {
+                        const rect = el.getBoundingClientRect();
+                        return {
+                            tag: el.tagName.toLowerCase(),
+                            id: el.id || "",
+                            className: String(el.className || "").slice(0, 120),
+                            dataView: el.getAttribute("data-view") || "",
+                            dataRole: el.getAttribute("data-role") || "",
+                            text: (el.innerText || "").trim().replace(/\\s+/g, " ").slice(0, 180),
+                            rect: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) },
+                        };
+                    });
+                return {
+                    title: document.title || "",
+                    path: location.pathname,
+                    bodyTextExcerpt: (document.body ? document.body.innerText || "" : "").trim().replace(/\\s+/g, " ").slice(0, 500),
+                    controlCount: controls.length,
+                    controls,
+                    landmarks,
+                };
+            }"""
+        )
+    except Exception as exc:
+        payload = {"error": f"{exc.__class__.__name__}: {exc}"}
+    item = {
+        "phase": phase,
+        "route": route,
+        "role": role,
+        "mobile_viewport": MOBILE_VIEWPORT,
+        "screenshot": screenshot,
+        "snapshot": payload,
+    }
+    DOM_SNAPSHOTS.append(item)
+    return item
+
+
+def selector_for(locator):
+    try:
+        return locator.evaluate(
+            """el => {
+                if (!el) return "";
+                if (el.id) return "#" + CSS.escape(el.id);
+                const testId = el.getAttribute("data-testid") || el.getAttribute("data-test-id");
+                if (testId) return `[data-testid="${testId}"]`;
+                const name = el.getAttribute("name");
+                if (name) return `${el.tagName.toLowerCase()}[name="${name}"]`;
+                const role = el.getAttribute("role");
+                if (role) return `${el.tagName.toLowerCase()}[role="${role}"]`;
+                const parts = [];
+                let node = el;
+                while (node && node.nodeType === 1 && parts.length < 5) {
+                    let part = node.tagName.toLowerCase();
+                    const parent = node.parentElement;
+                    if (parent) {
+                        const siblings = Array.from(parent.children).filter(child => child.tagName === node.tagName);
+                        if (siblings.length > 1) part += `:nth-of-type(${siblings.indexOf(node) + 1})`;
+                    }
+                    parts.unshift(part);
+                    node = parent;
+                }
+                return parts.join(" > ");
+            }"""
+        )
+    except Exception:
+        return ""
+
+
+def record_scenario_step(action, route="", role="", selector="", screenshot_before=None, screenshot_after=None, status="passed", **extra):
+    visual_diff = record_visual_diff(action, route=route, role=role, before=screenshot_before, after=screenshot_after)
+    item = {
+        "index": len(PLAYWRIGHT_SCENARIO) + 1,
+        "action": action,
+        "route": route,
+        "role": role,
+        "selector": selector,
+        "status": status,
+        "screenshot_before": screenshot_before,
+        "screenshot_after": screenshot_after,
+        "mobile_viewport": MOBILE_VIEWPORT,
+        "console_errors": CONSOLE_ERRORS[-5:],
+        "network_errors": NETWORK_ERRORS[-5:],
+        "visual_diff": visual_diff,
+        **{key: value for key, value in extra.items() if value not in (None, "", [])},
+    }
+    PLAYWRIGHT_SCENARIO.append(item)
+    return item
+
+
+def failed_context_for(step):
+    for item in reversed(PLAYWRIGHT_SCENARIO):
+        if item.get("action") == step:
+            return item
+    return PLAYWRIGHT_SCENARIO[-1] if PLAYWRIGHT_SCENARIO else {}
+
+
+def ignored_network_url(url):
+    lowered = str(url or "").lower()
+    return lowered.endswith("/favicon.ico") or "favicon" in lowered
+
+
+def request_failure_text(request):
+    try:
+        failure = request.failure
+    except Exception:
+        return "failed"
+    if isinstance(failure, dict):
+        return str(failure.get("errorText") or failure.get("error") or "failed")
+    return str(failure or "failed")
 
 
 def fail(step, message, page=None, **extra):
+    captured = safe_screenshot(page, step) if page is not None else None
+    failed_context = extra.get("failed_step_context") if isinstance(extra.get("failed_step_context"), dict) else failed_context_for(step)
+    screenshot_before = extra.get("screenshot_before") or failed_context.get("screenshot_before")
+    screenshot_after = extra.get("screenshot_after") or captured or failed_context.get("screenshot_after") or (SCREENSHOTS[-1] if SCREENSHOTS else None)
+    dom_selector = extra.get("failed_selector") or failed_context.get("selector")
     if page is not None:
-        safe_screenshot(page, step)
+        record_scenario_step(
+            step,
+            route=str(extra.get("failed_route") or failed_context.get("route") or ""),
+            role=str(extra.get("failed_role") or failed_context.get("role") or ""),
+            selector=str(dom_selector or ""),
+            screenshot_before=screenshot_before,
+            screenshot_after=screenshot_after,
+            status="failed",
+            message=message,
+        )
     result = {
         "passed": False,
         "failed_step": step,
         "logs": [message],
         "ui_steps": STEPS,
+        "playwright_scenario": {
+            "schema": "grounded.browser_playwright_scenario.v1",
+            "base_url": BASE_URL,
+            "mobile_viewport": MOBILE_VIEWPORT,
+            "source_roles": SOURCE_ROLES,
+            "update_roles": UPDATE_ROLES,
+            "observer_roles": OBSERVER_ROLES,
+            "steps": PLAYWRIGHT_SCENARIO,
+        },
+        "failed_step_context": failed_context,
+        "dom_selector": dom_selector,
+        "screenshot_before": screenshot_before,
+        "screenshot_after": screenshot_after,
+        "mobile_viewport": MOBILE_VIEWPORT,
         "created_marker": CREATED_MARKER,
         "updated_marker": UPDATED_MARKER,
         "manager_marker": MANAGER_MARKER,
         "console_errors": CONSOLE_ERRORS[-20:],
+        "console_logs": CONSOLE_ERRORS[-20:],
+        "network_errors": NETWORK_ERRORS[-20:],
+        "network_logs": NETWORK_ERRORS[-20:],
         "visible_errors": VISIBLE_ERRORS[-20:],
         "screenshots": SCREENSHOTS,
+        "dom_snapshots": DOM_SNAPSHOTS,
+        "layout_reports": LAYOUT_REPORTS,
+        "visual_diffs": VISUAL_DIFFS,
         "api_paths": API_PATHS,
         "get_api_paths": GET_API_PATHS,
         "source_roles": SOURCE_ROLES,
@@ -2873,7 +3093,10 @@ def goto(page, route):
         page.wait_for_load_state("networkidle", timeout=4000)
     except PlaywrightTimeoutError:
         pass
-    STEPS.append({"action": "open", "route": route})
+    screenshot_after = safe_screenshot(page, f"open-{route.strip('/') or 'root'}")
+    STEPS.append({"action": "open", "route": route, "screenshot_after": screenshot_after, "mobile_viewport": MOBILE_VIEWPORT})
+    record_scenario_step("open", route=route, screenshot_after=screenshot_after)
+    collect_dom_snapshot(page, route=route, role=route.strip("/").split("/", 1)[0], phase="open", screenshot=screenshot_after)
 
 
 def body_text(page):
@@ -3021,6 +3244,8 @@ def submit_form(page, form, role, route, marker, purpose, created_id=None):
     for index in range(controls.count()):
         if fill_control(controls.nth(index), marker, purpose, created_id):
             filled += 1
+    selector = selector_for(form) or "form"
+    screenshot_before = safe_screenshot(page, f"{role}-{purpose}-before")
     submit = form.locator("button[type=submit], input[type=submit], button:not([type]), button")
     try:
         if submit.count():
@@ -3034,7 +3259,10 @@ def submit_form(page, form, role, route, marker, purpose, created_id=None):
     except PlaywrightTimeoutError:
         pass
     page.wait_for_timeout(700)
-    STEPS.append({"action": f"{role}_{purpose}", "route": route, "filled_controls": filled})
+    screenshot_after = safe_screenshot(page, f"{role}-{purpose}-after")
+    STEPS.append({"action": f"{role}_{purpose}", "route": route, "filled_controls": filled, "selector": selector, "screenshot_before": screenshot_before, "screenshot_after": screenshot_after, "mobile_viewport": MOBILE_VIEWPORT})
+    record_scenario_step(f"{role}_{purpose}", route=route, role=role, selector=selector, screenshot_before=screenshot_before, screenshot_after=screenshot_after, filled_controls=filled)
+    collect_dom_snapshot(page, route=route, role=role, phase=f"{purpose}_after", screenshot=screenshot_after)
     return filled
 
 
@@ -3064,13 +3292,18 @@ def click_update_button(page, scope, role, route):
         if not (data_id or data_action or patterns.search(text)):
             continue
         try:
+            selector = selector_for(button)
+            screenshot_before = safe_screenshot(page, f"{role}-button-update-before")
             button.click(timeout=2500)
             try:
                 page.wait_for_load_state("networkidle", timeout=5000)
             except PlaywrightTimeoutError:
                 pass
             page.wait_for_timeout(700)
-            STEPS.append({"action": f"{role}_button_update", "route": route, "text": text[:80]})
+            screenshot_after = safe_screenshot(page, f"{role}-button-update-after")
+            STEPS.append({"action": f"{role}_button_update", "route": route, "text": text[:80], "selector": selector, "screenshot_before": screenshot_before, "screenshot_after": screenshot_after, "mobile_viewport": MOBILE_VIEWPORT})
+            record_scenario_step(f"{role}_button_update", route=route, role=role, selector=selector, screenshot_before=screenshot_before, screenshot_after=screenshot_after, text=text[:80])
+            collect_dom_snapshot(page, route=route, role=role, phase="button_update_after", screenshot=screenshot_after)
             return True
         except Exception:
             continue
@@ -3208,6 +3441,7 @@ def check_horizontal_overflow(page, route, role):
         )
     except Exception:
         return
+    LAYOUT_REPORTS.append({"route": route, "role": role, "mobile_viewport": MOBILE_VIEWPORT, **dict(report or {})})
     if report.get("overflow"):
         fail("mobile_horizontal_overflow", f"{role} route {route} has horizontal overflow at mobile viewport: scrollWidth={report.get('scrollWidth')} viewport={report.get('viewport')}.", page, failed_role=role, failed_route=route)
     if report.get("overlaps"):
@@ -3311,12 +3545,29 @@ def run_flow(page):
         "observer_roles": OBSERVER_ROLES,
         "created_api_path": created_path,
         "console_errors": CONSOLE_ERRORS[-20:],
+        "network_errors": NETWORK_ERRORS[-20:],
         "visible_errors": VISIBLE_ERRORS[-20:],
         "screenshots": SCREENSHOTS,
+        "dom_snapshots": DOM_SNAPSHOTS,
+        "layout_reports": LAYOUT_REPORTS,
+        "visual_diffs": VISUAL_DIFFS,
+        "playwright_scenario": {
+            "schema": "grounded.browser_playwright_scenario.v1",
+            "base_url": BASE_URL,
+            "mobile_viewport": MOBILE_VIEWPORT,
+            "source_roles": SOURCE_ROLES,
+            "update_roles": UPDATE_ROLES,
+            "observer_roles": OBSERVER_ROLES,
+            "steps": PLAYWRIGHT_SCENARIO,
+        },
+        "mobile_viewport": MOBILE_VIEWPORT,
         "api_paths": API_PATHS,
         "get_api_paths": GET_API_PATHS,
         "api_before": API_BEFORE,
         "api_after": API_AFTER,
+        "dom_snapshots": DOM_SNAPSHOTS,
+        "layout_reports": LAYOUT_REPORTS,
+        "visual_diffs": VISUAL_DIFFS,
     })
 
 
@@ -3328,10 +3579,12 @@ try:
             browser = playwright.chromium.launch(headless=True)
         except Exception as exc:
             fail("browser_infra_unavailable", f"Chromium could not be launched for Playwright browser proof: {exc}", infra_unavailable=True)
-        context = browser.new_context(viewport={"width": 390, "height": 844}, is_mobile=True)
+        context = browser.new_context(viewport={"width": int(MOBILE_VIEWPORT.get("width") or 390), "height": int(MOBILE_VIEWPORT.get("height") or 844)}, is_mobile=True)
         page = context.new_page()
         page.on("console", lambda msg: CONSOLE_ERRORS.append(f"{msg.type}: {msg.text}") if msg.type == "error" and "favicon" not in msg.text.lower() else None)
         page.on("pageerror", lambda exc: CONSOLE_ERRORS.append(f"pageerror: {exc}"))
+        page.on("requestfailed", lambda request: NETWORK_ERRORS.append(f"{request.method} {request.url}: {request_failure_text(request)}") if not ignored_network_url(request.url) else None)
+        page.on("response", lambda response: NETWORK_ERRORS.append(f"{response.status} {response.url}") if response.status >= 400 and not ignored_network_url(response.url) else None)
         try:
             run_flow(page)
         finally:
@@ -3349,8 +3602,22 @@ except Exception as exc:
         "updated_marker": UPDATED_MARKER,
         "manager_marker": MANAGER_MARKER,
         "console_errors": CONSOLE_ERRORS[-20:],
+        "network_errors": NETWORK_ERRORS[-20:],
         "visible_errors": VISIBLE_ERRORS[-20:],
         "screenshots": SCREENSHOTS,
+        "dom_snapshots": DOM_SNAPSHOTS,
+        "layout_reports": LAYOUT_REPORTS,
+        "visual_diffs": VISUAL_DIFFS,
+        "playwright_scenario": {
+            "schema": "grounded.browser_playwright_scenario.v1",
+            "base_url": BASE_URL,
+            "mobile_viewport": MOBILE_VIEWPORT,
+            "source_roles": SOURCE_ROLES,
+            "update_roles": UPDATE_ROLES,
+            "observer_roles": OBSERVER_ROLES,
+            "steps": PLAYWRIGHT_SCENARIO,
+        },
+        "mobile_viewport": MOBILE_VIEWPORT,
         "api_paths": API_PATHS,
         "get_api_paths": GET_API_PATHS,
         "source_roles": SOURCE_ROLES,
@@ -3748,7 +4015,7 @@ except Exception as exc:
     @classmethod
     def _mobile_layout_report(cls, *, source_dir: Path, generation_mode: GenerationMode | str | None) -> dict[str, Any]:
         mode = str(getattr(generation_mode, "value", generation_mode) or "").strip().lower()
-        strict_mode = mode in {GenerationMode.BALANCED.value, GenerationMode.QUALITY.value}
+        strict_mode = mode in {GenerationMode.BALANCED.value, GenerationMode.QUALITY.value, GenerationMode.PRODUCTION.value}
         findings: list[dict[str, Any]] = []
         static_root = source_dir / "miniapp/app/static"
         for role in ROLE_ORDER:
@@ -4791,14 +5058,14 @@ except Exception as exc:
     @staticmethod
     def _role_design_depth_issue(role: str, css_text: str, combined: str, generation_mode: GenerationMode | str | None) -> ValidationIssue | None:
         value = str(getattr(generation_mode, "value", generation_mode) or "").strip().lower()
-        if value not in {GenerationMode.BALANCED.value, GenerationMode.QUALITY.value}:
+        if value not in {GenerationMode.BALANCED.value, GenerationMode.QUALITY.value, GenerationMode.PRODUCTION.value}:
             return None
         css = str(css_text or "").lower()
         del combined
         css_rule_count = len(re.findall(r"[.#]?[a-z][a-z0-9_-]*\s*\{", css))
-        min_rules = 12 if value == GenerationMode.QUALITY.value else 8
-        quality_structure_ok = value != GenerationMode.QUALITY.value or ("@media" in css and ("focus-visible" in css or ":focus" in css))
-        rich_quality_css = value == GenerationMode.QUALITY.value and css_rule_count >= min_rules + 6
+        min_rules = 12 if value in {GenerationMode.QUALITY.value, GenerationMode.PRODUCTION.value} else 8
+        quality_structure_ok = value not in {GenerationMode.QUALITY.value, GenerationMode.PRODUCTION.value} or ("@media" in css and ("focus-visible" in css or ":focus" in css))
+        rich_quality_css = value in {GenerationMode.QUALITY.value, GenerationMode.PRODUCTION.value} and css_rule_count >= min_rules + 6
         if css_rule_count >= min_rules and (quality_structure_ok or rich_quality_css):
             return None
         return ValidationIssue(

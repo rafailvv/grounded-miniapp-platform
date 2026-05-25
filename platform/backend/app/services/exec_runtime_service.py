@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import os
 import threading
 from pathlib import Path
 from typing import Any
@@ -12,10 +13,14 @@ from app.modules.miniapp_agent_loop.agent_process_manager import AgentProcessMan
 from app.repositories.platform_db import PlatformDb
 from app.repositories.state_store import StateStore
 from app.services.event_journal import EventJournalService
+from app.services.output_artifact_service import OutputArtifactService
 from app.services.sandbox_service import SandboxService
 from app.services.rpc_event_hub import RpcEventHub
 from app.services.tool_protocol import tool_envelope
 from app.services.workspace.service import WorkspaceService
+
+
+MANAGED_EXEC_TIMEOUT_SECONDS = int(os.getenv("MANAGED_EXEC_TIMEOUT_SECONDS", "3600"))
 
 
 class ExecRuntimeService:
@@ -30,12 +35,14 @@ class ExecRuntimeService:
         store: StateStore,
         event_journal_service: EventJournalService | None = None,
         sandbox_service: SandboxService | None = None,
+        output_artifact_service: OutputArtifactService | None = None,
     ) -> None:
         self.workspace_service = workspace_service
         self.platform_db = platform_db
         self.event_hub = event_hub
         self.store = store
         self.event_journal_service = event_journal_service
+        self.output_artifact_service = output_artifact_service
         self.sandbox_service = sandbox_service or workspace_service.sandbox_service
         self.process_manager = AgentProcessManager(sandbox_service=self.sandbox_service)
         self._sessions: dict[str, dict[str, Any]] = {}
@@ -52,11 +59,13 @@ class ExecRuntimeService:
         turn_id: str | None = None,
         run_id: str | None = None,
         timeout_seconds: int = 30,
+        managed: bool = False,
     ) -> dict[str, Any]:
         workspace = self.workspace_service.get_workspace(workspace_id)
         source_dir = self.workspace_service.source_dir(workspace_id)
         process_id = new_id("proc")
         started_at = self._now()
+        resolved_timeout = self._resolve_timeout(timeout_seconds, managed=managed)
         session = {
             "process_id": process_id,
             "workspace_id": workspace_id,
@@ -68,9 +77,16 @@ class ExecRuntimeService:
             "exit_code": None,
             "started_at": started_at.isoformat(),
             "updated_at": started_at.isoformat(),
-            "timeout_seconds": timeout_seconds,
+            "timeout_seconds": resolved_timeout,
+            "managed": bool(managed),
+            "lifecycle": "managed" if managed else "oneshot",
             "policy_decision": policy_evaluation.get("decision") or {},
             "sandbox_summary": policy_evaluation.get("sandbox_summary") or {},
+            "sandbox_boundary": None,
+            "environment_snapshot": None,
+            "log_capture": None,
+            "killed_diagnostics": None,
+            "output_offsets": {"stdout": 0, "stderr": 0},
         }
         with self._lock:
             self._sessions[process_id] = session
@@ -91,7 +107,7 @@ class ExecRuntimeService:
         self._publish("command/exec/started", session)
         worker = threading.Thread(
             target=self._run_worker,
-            args=(process_id, workspace.path, source_dir, command, decision, timeout_seconds),
+            args=(process_id, workspace.path, source_dir, command, decision, resolved_timeout),
             daemon=True,
         )
         worker.start()
@@ -116,7 +132,19 @@ class ExecRuntimeService:
         return payload
 
     def read_output(self, process_id: str, *, stream: str = "stdout", start: int | None = None, end: int | None = None) -> dict[str, Any]:
-        return self.process_manager.read_output(process_id, stream=stream, start=start, end=end)
+        output = self.process_manager.read_output(process_id, stream=stream, start=start, end=end)
+        session = self._update_session(
+            process_id,
+            {
+                "output_offsets": {
+                    **dict((self._sessions.get(process_id) or {}).get("output_offsets") or {}),
+                    str(output.get("stream") or stream): output.get("next_start"),
+                }
+            },
+        )
+        output["session_status"] = session.get("status")
+        output["managed"] = bool(session.get("managed"))
+        return output
 
     def snapshot(self) -> dict[str, Any]:
         process_snapshot = self.process_manager.snapshot()
@@ -126,6 +154,11 @@ class ExecRuntimeService:
             "sessions": sessions,
             "active_processes": process_snapshot.get("active_processes") or [],
             "processes": process_snapshot.get("processes") or [],
+            "managed_processes": [
+                item
+                for item in sessions
+                if item.get("managed") and item.get("status") in {"starting", "running"}
+            ],
         }
 
     def _run_worker(
@@ -142,7 +175,16 @@ class ExecRuntimeService:
         def progress(payload: dict[str, Any]) -> None:
             event = {**payload, "process_id": process_id}
             if payload.get("status") == "started":
-                self._update_session(process_id, {"status": "running", "sandbox_summary": payload.get("sandbox") or {}})
+                self._update_session(
+                    process_id,
+                    {
+                        "status": "running",
+                        "sandbox_summary": payload.get("sandbox") or {},
+                        "sandbox_boundary": payload.get("sandbox_boundary"),
+                        "environment_snapshot": payload.get("environment_snapshot"),
+                        "log_capture": payload.get("log_capture"),
+                    },
+                )
             elif payload.get("status") == "output_delta":
                 self._publish("command/exec/output_delta", event)
             elif payload.get("status") == "heartbeat":
@@ -154,10 +196,11 @@ class ExecRuntimeService:
             draft_source=source_dir,
             command=command,
             decision=decision,
-            timeout_seconds=max(1, min(timeout_seconds, 300)),
+            timeout_seconds=timeout_seconds,
             max_output_chars=24000,
             progress_callback=progress,
             process_id=process_id,
+            output_artifact_writer=self._output_artifact_writer(process_id),
         )
         result_payload = result.as_dict()
         completed_at = self._now().isoformat()
@@ -171,6 +214,13 @@ class ExecRuntimeService:
                 "success": result_payload.get("success"),
                 "stdout": result_payload.get("stdout"),
                 "stderr": result_payload.get("stderr"),
+                "stdout_ref": result_payload.get("stdout_ref"),
+                "stderr_ref": result_payload.get("stderr_ref"),
+                "output_artifacts": result_payload.get("output_artifacts") or [],
+                "sandbox_boundary": result_payload.get("sandbox_boundary"),
+                "environment_snapshot": result_payload.get("environment_snapshot"),
+                "log_capture": result_payload.get("log_capture"),
+                "killed_diagnostics": result_payload.get("killed_diagnostics"),
                 "completed_at": completed_at,
                 "updated_at": completed_at,
                 "result": result_payload,
@@ -229,13 +279,18 @@ class ExecRuntimeService:
                         "status": session["status"],
                         "exit_code": session.get("exit_code"),
                         "duration_ms": session.get("duration_ms"),
+                        "sandbox_boundary": session.get("sandbox_boundary"),
+                        "log_capture": session.get("log_capture"),
+                        "killed_diagnostics": session.get("killed_diagnostics"),
                     },
                     risk=(session.get("policy_decision") or {}).get("risk") or "read_only",
                     timing={"duration_ms": session.get("duration_ms")},
                     artifacts=[
-                        {"kind": "stdout", "ref": f"exec:{process_id}:stdout"},
-                        {"kind": "stderr", "ref": f"exec:{process_id}:stderr"},
+                        {"kind": "stdout", "ref": result_payload.get("stdout_ref") or f"exec:{process_id}:stdout"},
+                        {"kind": "stderr", "ref": result_payload.get("stderr_ref") or f"exec:{process_id}:stderr"},
                     ],
+                    stdout_ref=result_payload.get("stdout_ref"),
+                    stderr_ref=result_payload.get("stderr_ref"),
                 ),
             )
             if self.event_journal_service is not None:
@@ -260,6 +315,31 @@ class ExecRuntimeService:
                 except Exception:
                     pass
 
+    def _output_artifact_writer(self, process_id: str):
+        if self.output_artifact_service is None:
+            return None
+
+        def write(payload: dict[str, Any]) -> dict[str, Any] | None:
+            session = dict(self._sessions.get(process_id) or {})
+            run_id = str(session.get("run_id") or "").strip()
+            workspace_id = str(session.get("workspace_id") or "").strip()
+            if not run_id or not workspace_id:
+                return None
+            return self.output_artifact_service.store_command_output(
+                workspace_id=workspace_id,
+                run_id=run_id,
+                process_id=process_id,
+                stream=str(payload.get("stream") or "stdout"),
+                command=str(payload.get("command") or session.get("command") or ""),
+                content=str(payload.get("content") or ""),
+                head_tail=payload.get("head_tail") if isinstance(payload.get("head_tail"), dict) else {},
+                exit_code=payload.get("exit_code") if isinstance(payload.get("exit_code"), int) else None,
+                semantic_status=str(payload.get("semantic_status") or "") or None,
+                metadata={"source": "exec_runtime", "thread_id": session.get("thread_id"), "turn_id": session.get("turn_id")},
+            )
+
+        return write
+
     def _update_session(self, process_id: str, patch: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
             current = dict(self._sessions.get(process_id) or {"process_id": process_id})
@@ -270,6 +350,18 @@ class ExecRuntimeService:
 
     def _publish(self, method: str, payload: dict[str, Any]) -> None:
         self.event_hub.publish(method, payload)
+
+    @staticmethod
+    def _resolve_timeout(timeout_seconds: int, *, managed: bool) -> int:
+        try:
+            requested = int(timeout_seconds)
+        except (TypeError, ValueError):
+            requested = 30
+        if managed:
+            if requested <= 0:
+                return 0
+            return max(1, min(requested, MANAGED_EXEC_TIMEOUT_SECONDS))
+        return max(1, min(requested, 300))
 
     def _record_run_tool_event(self, run_id: str, event: dict[str, Any]) -> None:
         key = f"tool_events:{run_id}"

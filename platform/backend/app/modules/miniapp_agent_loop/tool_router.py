@@ -12,15 +12,17 @@ from typing import Any, Callable
 
 from app.models.domain import CheckExecutionRecord, DraftAction
 from app.modules.miniapp_agent_loop.agent_file_state import AgentFileStateCache
-from app.modules.miniapp_agent_loop.agent_hooks import AgentHookManager
+from app.modules.miniapp_agent_loop.agent_hooks import AgentHookManager, AgentHookOutcome
 from app.modules.miniapp_agent_loop.agent_process_manager import AgentProcessManager
 from app.modules.miniapp_agent_loop.agent_tool_registry import AgentToolBatch, AgentToolRegistry
 from app.modules.miniapp_agent_loop.agent_worker_manager import AgentWorkerManager
+from app.modules.miniapp_agent_loop.dynamic_tool_catalog import DynamicToolCatalog
 from app.modules.miniapp_agent_loop.edit_validator import AgentEditValidator
 from app.modules.miniapp_agent_loop.lsp_tools import LspToolService
 from app.modules.miniapp_agent_loop.product_workers import canonical_worker_id
 from app.modules.miniapp_agent_loop.semantic_tools import semantic_scan
 from app.modules.miniapp_agent_loop.tool_batch_summary import summarize_tool_batch
+from app.modules.miniapp_agent_loop.tool_orchestrator import ToolOrchestrationRequest, ToolOrchestrator
 from app.modules.miniapp_agent_loop.agent_tool_runtime import (
     list_workspace_files,
     run_workspace_command,
@@ -30,9 +32,9 @@ from app.modules.miniapp_agent_loop.agent_tool_runtime import (
 from app.services.tool_protocol import (
     TOOL_INPUT_SCHEMAS,
     canonical_tool_name,
-    default_tool_risk,
     structured_tool_error,
     tool_envelope,
+    tool_protocol_spec,
 )
 from app.services.workspace.service import WorkspaceService
 
@@ -43,6 +45,7 @@ MODEL_TOOL_FOR_CANONICAL: dict[str, str] = {
     "artifact.read": "read_artifact_ref",
     "search.grep": "search_files",
     "semantic.scan": "semantic_scan",
+    "tool.search": "tool_search",
     "diff.inspect": "inspect_diff",
     "checks.run": "run_checks",
     "browser.verify": "browser_verify",
@@ -73,6 +76,16 @@ NORMALIZED_INPUT_KEYS = {
     "worker_id",
     "owner_scope",
     "reason",
+    "domain",
+    "intent",
+    "capability",
+    "question",
+    "choices",
+    "items",
+    "prompt",
+    "generation_mode",
+    "contract_id",
+    "allowed_file_graph",
 }
 MUTATING_MODEL_TOOLS = {"apply_patch_to_draft", "write_file", "edit_file_exact"}
 EXECUTABLE_MODEL_TOOLS = {
@@ -82,9 +95,12 @@ EXECUTABLE_MODEL_TOOLS = {
     "inspect_diff",
     "read_artifact_ref",
     "semantic_scan",
+    "tool_search",
     "lsp_diagnostics",
     "lsp_symbol_context",
+    "lsp_definition",
     "lsp_find_references",
+    "lsp_route_graph",
     "lsp_route_static_context",
     "run_command",
     "run_checks",
@@ -109,6 +125,8 @@ class ToolRouterContext:
     mode: str = "default"
     forced_allowed_tools: set[str] | None = None
     output_spill_writer: Callable[[str, dict[str, Any]], dict[str, Any] | None] | None = None
+    output_artifact_writer: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None
+    denied_action_writer: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None
     max_parallel_read_tools: int = 6
 
 
@@ -128,10 +146,20 @@ class ToolRouteDecision:
     reason: str
     kind: str
     risk: str
+    approval_class: str
     concurrency_safe: bool
+    parallel_safe: bool
     timeout_seconds: int
     output_cap_chars: int
     sandbox_profile: str
+    artifact_spill_policy: str
+    capabilities: list[str] = field(default_factory=list)
+    allowed_paths: dict[str, Any] = field(default_factory=dict)
+    side_effects: list[str] = field(default_factory=list)
+    side_effect_class: str = "unknown"
+    result_summarization: dict[str, Any] = field(default_factory=dict)
+    retry_policy: dict[str, Any] = field(default_factory=dict)
+    failure_signatures: dict[str, Any] = field(default_factory=dict)
     deferred: bool = False
     dynamic: bool = False
 
@@ -239,6 +267,16 @@ class ToolRouter:
             "worker_id": str(item.get("worker_id") or "").strip(),
             "owner_scope": str(item.get("owner_scope") or "").strip(),
             "reason": str(item.get("reason") or "").strip(),
+            "domain": str(item.get("domain") or "").strip().lower(),
+            "intent": str(item.get("intent") or "").strip(),
+            "capability": str(item.get("capability") or "").strip(),
+            "question": str(item.get("question") or "").strip(),
+            "choices": item.get("choices") if isinstance(item.get("choices"), list) else [],
+            "items": item.get("items") if isinstance(item.get("items"), list) else [],
+            "prompt": str(item.get("prompt") or "").strip(),
+            "generation_mode": str(item.get("generation_mode") or "").strip(),
+            "contract_id": str(item.get("contract_id") or "").strip(),
+            "allowed_file_graph": item.get("allowed_file_graph") if isinstance(item.get("allowed_file_graph"), dict) else {},
         }
         return ToolCallRequest(
             tool=tool,
@@ -298,31 +336,59 @@ class ToolRouter:
             if spec is None:
                 continue
             canonical = canonical_tool_name(name)
+            protocol = tool_protocol_spec(canonical)
+            contract = protocol.as_contract()
             tools.append(
                 {
                     "name": name,
                     "canonical": canonical,
                     "kind": spec.kind,
-                    "risk": default_tool_risk(canonical),
-                    "concurrency_safe": spec.concurrency_safe,
-                    "timeout_seconds": spec.timeout_seconds,
-                    "output_cap_chars": spec.output_cap_chars,
+                    "risk": contract["risk"],
+                    "capabilities": contract["capabilities"],
+                    "approval_class": contract["approval_class"],
+                    "sandbox_profile": contract["sandbox_profile"],
+                    "allowed_paths": contract["allowed_paths"],
+                    "side_effects": contract["side_effects"],
+                    "side_effect_class": contract["side_effect_class"],
+                    "concurrency_safe": contract["concurrency_safe"],
+                    "parallel_safe": contract["parallel_safe"],
+                    "timeout_seconds": contract["timeout_seconds"],
+                    "output_cap_chars": contract["output_cap_chars"],
+                    "artifact_spill_policy": contract["artifact_spill_policy"],
+                    "result_summarization": contract["result_summarization"],
+                    "retry_policy": contract["retry_policy"],
+                    "failure_signatures": contract["failure_signatures"],
                     "activity": spec.activity,
                     "progress_label": spec.progress_label,
                     "aliases": list(spec.aliases),
                     "mode_visibility": list(spec.mode_visibility),
-                    "dynamic": bool(spec.dynamic),
-                    "deferred": bool(spec.deferred or spec.kind == "mutating"),
-                    "input_schema": TOOL_INPUT_SCHEMAS.get(canonical, {}),
+                    "dynamic": bool(contract["dynamic"] or spec.dynamic),
+                    "deferred": bool(contract["deferred"] or spec.deferred or spec.kind == "mutating"),
+                    "input_schema": contract["input_schema"],
+                    "output_schema": contract["output_schema"],
                 }
             )
         return {
-            "schema": "grounded.tool_router.manifest.v1",
+            "schema": "grounded.tool_router.manifest.v2",
             "boundary": "model_facing_agent_tools",
             "mutation_boundary": "validate_and_defer_to_draft_apply_pipeline",
             "allowed_modes": ["default", "read_only", "mutation_required", "verification", "worker_branch"],
+            "parallel_execution_policy": {
+                "parallel_safe_field": "parallel_safe",
+                "concurrent_batch_rule": "Only read-only tools with side_effect_class in none/read_workspace and parallel_safe=true are batched concurrently.",
+            },
+            "result_policy": {
+                "summary_field": "result_summary",
+                "spill_policy_field": "artifact_spill_policy",
+                "failure_signature_field": "failure_signature",
+            },
+            "dynamic_tool_discovery": DynamicToolCatalog.manifest(),
             "tools": tools,
         }
+
+    @classmethod
+    def dynamic_tool_manifest(cls) -> dict[str, Any]:
+        return DynamicToolCatalog.manifest()
 
     @classmethod
     def deferred_mutations_from_calls(
@@ -448,13 +514,13 @@ class ToolRouter:
             {
                 "tool": "agent_tool_batch",
                 "contract": "ToolRouter batches safe read-only tools concurrently; verification and deferred mutations are serialized.",
-                "router": "tool_router.v1",
+                "router": "tool_router.v2",
                 "read_only_count": len(plan.read_only_requests),
                 "mutating_count": len(plan.mutating_requests),
                 "verification_count": len(plan.verification_requests),
                 "unknown_count": len(plan.unknown_requests),
                 "ordered_batches": [
-                    {"concurrency_safe": batch.concurrency_safe, "tools": batch.tools}
+                    {"concurrency_safe": batch.concurrency_safe, "parallel_safe": batch.concurrency_safe, "tools": batch.tools}
                     for batch in plan.ordered_batches
                 ],
             }
@@ -504,53 +570,45 @@ class ToolRouter:
             envelopes=envelopes,
             deferred_changes=deferred_changes,
             batch_summary={
-                "schema": "grounded.tool_router.batch.v1",
+                "schema": "grounded.tool_router.batch.v2",
                 "tool_count": len(requests),
                 "duration_ms": int((time.perf_counter() - started_at) * 1000),
                 "envelope_count": len(envelopes),
+                "parallel_safe_count": sum(1 for item in envelopes if item.get("parallel_safe") is True),
+                "hook_context_count": sum(
+                    len(item.get("hook_contexts") or [])
+                    for item in model_results
+                    if isinstance(item.get("hook_contexts"), list)
+                ),
             },
         )
 
     def route_one(self, request: ToolCallRequest) -> ToolRouterResult:
         decision = self._decide(request)
-        validation_error = self._schema_error(request) if decision.allowed else None
-        if validation_error is not None:
-            return self._failed_result(request, decision, validation_error)
-        if not decision.allowed:
-            return self._failed_result(
-                request,
-                decision,
-                structured_tool_error(
-                    code="tool_not_allowed",
-                    message=decision.reason,
-                    details={"tool": request.tool, "mode": self.context.mode},
-                ),
-            )
-        pre_hook_error = self._pre_hook_error(request, decision)
-        if pre_hook_error is not None:
-            result = self._failed_result(request, decision, pre_hook_error)
-            self._post_hook(request, result.envelope, failed=True)
-            return result
-        try:
+        orchestrator = ToolOrchestrator(emit_activity=self._emit_activity)
+
+        def execute() -> ToolRouterResult:
             if decision.deferred:
-                result = self._defer_mutation(request, decision)
+                return self._defer_mutation(request, decision)
             elif decision.kind == "verification":
-                result = self._execute_verification(request, decision)
-            else:
-                result = self._execute_read_only(request, decision)
-        except Exception as exc:
-            result = self._failed_result(
-                request,
-                decision,
-                structured_tool_error(
-                    code="tool_execution_error",
-                    message=str(exc),
-                    retryable=True,
-                    details={"error_class": exc.__class__.__name__},
-                ),
-            )
-        self._post_hook(request, result.envelope, failed=str(result.envelope.get("status") or "") == "failed")
-        return result
+                return self._execute_verification(request, decision)
+            return self._execute_read_only(request, decision)
+
+        result = orchestrator.run(
+            ToolOrchestrationRequest(
+                request=request,
+                decision=decision,
+                protocol_input={**self._protocol_input(request), "mode": self.context.mode},
+                workspace_id=self.context.workspace_id,
+                run_id=self.context.run_id,
+            ),
+            schema_error=lambda: self._schema_error(request),
+            pre_hook_error=lambda: self._pre_hook_error(request, decision),
+            post_hook=lambda router_result, failed: self._post_hook(request, router_result.envelope, failed=failed),
+            execute=execute,
+            failed_result=lambda error: self._failed_result(request, decision, error),
+        )
+        return result.router_result
 
     def _requests_from_tool_calls(self, tool_calls: list[dict[str, Any]]) -> list[ToolCallRequest]:
         requests: list[ToolCallRequest] = []
@@ -576,22 +634,33 @@ class ToolRouter:
     def _decide(self, request: ToolCallRequest) -> ToolRouteDecision:
         spec = AgentToolRegistry.spec(request.tool)
         canonical = request.canonical_tool
+        protocol = tool_protocol_spec(canonical)
         kind = spec.kind if spec is not None else "unknown"
         allowed_names = self.allowed_tool_names(mode=self.context.mode, forced_allowed=self.context.forced_allowed_tools)
         allowed = spec is not None and request.tool in allowed_names
         reason = "allowed" if allowed else f"{request.tool or canonical} is not allowed in {self.context.mode or 'default'} mode."
-        risk = default_tool_risk(canonical)
+        contract = protocol.as_contract()
         return ToolRouteDecision(
             allowed=allowed,
             reason=reason,
             kind=kind,
-            risk=risk,
-            concurrency_safe=bool(spec.concurrency_safe if spec else False),
-            timeout_seconds=int(spec.timeout_seconds if spec else 25),
-            output_cap_chars=int(spec.output_cap_chars if spec else 6000),
-            sandbox_profile="agent_draft_write" if risk == "mutating" else "analysis_readonly",
-            deferred=kind == "mutating",
-            dynamic=bool(spec.dynamic if spec else False),
+            risk=protocol.risk,
+            approval_class=protocol.approval_class,
+            concurrency_safe=protocol.concurrency_safe,
+            parallel_safe=bool(contract["parallel_safe"]),
+            timeout_seconds=protocol.timeout_seconds,
+            output_cap_chars=protocol.output_cap_chars,
+            sandbox_profile=protocol.sandbox_profile,
+            artifact_spill_policy=protocol.artifact_spill_policy,
+            capabilities=list(contract["capabilities"]),
+            allowed_paths=dict(contract["allowed_paths"]),
+            side_effects=list(contract["side_effects"]),
+            side_effect_class=str(contract["side_effect_class"]),
+            result_summarization=dict(contract["result_summarization"]),
+            retry_policy=dict(contract["retry_policy"]),
+            failure_signatures=dict(contract["failure_signatures"]),
+            deferred=bool(protocol.deferred or kind == "mutating"),
+            dynamic=bool(protocol.dynamic or (spec.dynamic if spec else False)),
         )
 
     def _schema_error(self, request: ToolCallRequest) -> dict[str, Any] | None:
@@ -662,6 +731,8 @@ class ToolRouter:
 
     def _pre_hook_error(self, request: ToolCallRequest, decision: ToolRouteDecision) -> dict[str, Any] | None:
         payload = {
+            "workspace_id": self.context.workspace_id,
+            "run_id": self.context.run_id,
             "tool": request.canonical_tool,
             "model_tool": request.tool,
             "tool_use_id": request.tool_call_id,
@@ -686,9 +757,11 @@ class ToolRouter:
             details={"hook": "pre_tool_use", "outcome": outcome.as_dict()},
         )
 
-    def _post_hook(self, request: ToolCallRequest, envelope: dict[str, Any], *, failed: bool) -> None:
+    def _post_hook(self, request: ToolCallRequest, envelope: dict[str, Any], *, failed: bool) -> AgentHookOutcome | None:
         hook = "post_tool_use_failure" if failed else "post_tool_use"
         payload = {
+            "workspace_id": self.context.workspace_id,
+            "run_id": self.context.run_id,
             "tool": request.canonical_tool,
             "model_tool": request.tool,
             "tool_use_id": request.tool_call_id,
@@ -696,13 +769,22 @@ class ToolRouter:
             "risk": envelope.get("risk"),
             "error": envelope.get("error"),
         }
+        outcome = None
         if self.context.hook_manager is not None:
-            self.context.hook_manager.run(self.context.run_id, hook, payload=payload)  # type: ignore[arg-type]
+            outcome = self.context.hook_manager.run(self.context.run_id, hook, payload=payload)  # type: ignore[arg-type]
+            outcome_payload = outcome.as_dict()
+            envelope["hook_evaluation"] = outcome_payload
+            if outcome.additional_contexts:
+                envelope["hook_contexts"] = list(outcome.additional_contexts)
+                result_payload = envelope.get("result")
+                if isinstance(result_payload, dict):
+                    result_payload["hook_contexts"] = list(outcome.additional_contexts)
         self._emit_activity(
             "hook_completed",
             "Tool failure hook" if failed else "Post-tool hook",
             {"hook": hook, "tool_use_id": request.tool_call_id, "tool": request.tool, "status": "failed" if failed else "completed"},
         )
+        return outcome
 
     def _execute_read_only(self, request: ToolCallRequest, decision: ToolRouteDecision) -> ToolRouterResult:
         started_at = time.perf_counter()
@@ -762,6 +844,18 @@ class ToolRouter:
             }
         elif tool_name == "semantic_scan":
             result = {**semantic_scan(root=self.context.draft_source, targets=request_targets), "reason": request.reason, "tool_use_id": request.tool_call_id, "blocked_targets": blocked_targets}
+        elif tool_name in {"tool.search", "tool_search"}:
+            result = {
+                **DynamicToolCatalog.search(
+                    query=str(request.input.get("query") or request.input.get("capability") or ""),
+                    domain=str(request.input.get("domain") or ""),
+                    intent=str(request.input.get("intent") or request.reason or ""),
+                ),
+                "reason": request.reason,
+                "tool_use_id": request.tool_call_id,
+                "blocked_targets": blocked_targets,
+                "visible_now": sorted(self.allowed_tool_names(mode=self.context.mode, forced_allowed=self.context.forced_allowed_tools)),
+            }
         elif tool_name in {"lsp.diagnostics", "lsp_diagnostics"}:
             changed_files = _paths_from_diff(self.context.workspace_service.diff(self.context.workspace_id, run_id=self.context.run_id))
             files = [
@@ -793,6 +887,21 @@ class ToolRouter:
             symbol = str(request.input.get("symbol") or request.input.get("query") or request.input.get("pattern") or "").strip()
             result = {
                 **LspToolService.find_references(root=self.context.draft_source, symbol=symbol, targets=request_targets),
+                "reason": request.reason,
+                "tool_use_id": request.tool_call_id,
+                "blocked_targets": blocked_targets,
+            }
+        elif tool_name in {"lsp.definition", "lsp_definition"}:
+            symbol = str(request.input.get("symbol") or request.input.get("query") or request.input.get("pattern") or "").strip()
+            result = {
+                **LspToolService.definition(root=self.context.draft_source, symbol=symbol, targets=request_targets),
+                "reason": request.reason,
+                "tool_use_id": request.tool_call_id,
+                "blocked_targets": blocked_targets,
+            }
+        elif tool_name in {"lsp.route_graph", "lsp_route_graph"}:
+            result = {
+                **LspToolService.route_graph(root=self.context.draft_source, targets=request_targets),
                 "reason": request.reason,
                 "tool_use_id": request.tool_call_id,
                 "blocked_targets": blocked_targets,
@@ -968,6 +1077,8 @@ class ToolRouter:
             "trace": trace,
             "reason": request.reason,
         }
+        result_summary = self._result_summary(request, decision, result, status="deferred")
+        result["result_summary"] = result_summary
         envelope = self._make_envelope(
             request,
             decision,
@@ -975,6 +1086,7 @@ class ToolRouter:
             status="deferred",
             approval={"required": True, "status": "deferred", "mode": "draft_action_proposal"},
             changed_files=[item.file_path for item in changes],
+            result_summary=result_summary,
         )
         return ToolRouterResult(
             request=request,
@@ -1018,7 +1130,7 @@ class ToolRouter:
                     {"tool_use_id": request.tool_call_id, "process_id": process_id, "tool": request.tool, "command": command, **payload},
                 )
 
-        return {
+        result = {
             **run_workspace_command(
                 draft_source=self.context.draft_source,
                 command=command,
@@ -1027,10 +1139,32 @@ class ToolRouter:
                 progress_callback=command_progress,
                 process_manager=self.context.process_manager,
                 process_id=process_id,
+                output_artifact_writer=self.context.output_artifact_writer,
             ),
             "reason": request.reason,
             "tool_use_id": request.tool_call_id,
         }
+        policy_decision = result.get("policy_decision") if isinstance(result.get("policy_decision"), dict) else {}
+        if (
+            self.context.denied_action_writer is not None
+            and (policy_decision.get("action") == "forbidden" or result.get("semantic_status") in {"blocked_by_policy", "blocked_by_sandbox"})
+        ):
+            artifact = self.context.denied_action_writer(
+                {
+                    "workspace_id": self.context.workspace_id,
+                    "run_id": self.context.run_id,
+                    "tool_call_id": request.tool_call_id,
+                    "tool": request.canonical_tool,
+                    "command": command,
+                    "process_id": process_id,
+                    "semantic_status": result.get("semantic_status"),
+                    "policy_decision": policy_decision,
+                    "error": result.get("error"),
+                }
+            )
+            if artifact:
+                result["denied_action_ref"] = artifact.get("ref") or artifact.get("denial_id")
+        return result
 
     def _flush_concurrent_batch(self, indexed_requests: list[tuple[int, ToolCallRequest]]) -> ToolRouterBatchResult:
         if not indexed_requests:
@@ -1101,7 +1235,9 @@ class ToolRouter:
         loaded_context: dict[str, str] | None = None,
         duration_ms: int | None = None,
     ) -> ToolRouterResult:
+        result_summary = self._result_summary(request, decision, result, status="completed")
         compacted, truncation, artifacts = self._compact_result(request, decision, result)
+        compacted = {**compacted, "result_summary": result_summary}
         envelope = self._make_envelope(
             request,
             decision,
@@ -1110,6 +1246,7 @@ class ToolRouter:
             artifacts=artifacts,
             truncation=truncation,
             duration_ms=duration_ms,
+            result_summary=result_summary,
         )
         return ToolRouterResult(
             request=request,
@@ -1133,7 +1270,20 @@ class ToolRouter:
             "error_code": error.get("code"),
             "details": error.get("details") or {},
         }
-        envelope = self._make_envelope(request, decision, result=result, error=error, status="failed")
+        failure_signature = self._failure_signature(request, error, result=result)
+        result_summary = self._result_summary(request, decision, result, status="failed", error=error, failure_signature=failure_signature)
+        result["failure_signature"] = failure_signature
+        result["result_summary"] = result_summary
+        envelope = self._make_envelope(
+            request,
+            decision,
+            result=result,
+            error=error,
+            status="failed",
+            result_summary=result_summary,
+            failure_class=str(error.get("code") or "tool_error"),
+            failure_signature=failure_signature,
+        )
         return ToolRouterResult(
             request=request,
             decision=decision,
@@ -1154,13 +1304,17 @@ class ToolRouter:
         truncation: dict[str, Any] | None = None,
         duration_ms: int | None = None,
         changed_files: list[str] | None = None,
+        result_summary: dict[str, Any] | None = None,
+        failure_class: str | None = None,
+        failure_signature: str | None = None,
     ) -> dict[str, Any]:
+        resolved_approval = self._approval_payload(decision, approval)
         return tool_envelope(
             tool=request.canonical_tool,
             input_payload=self._protocol_input(request),
             result=result or {},
             risk=decision.risk,  # type: ignore[arg-type]
-            approval=approval,
+            approval=resolved_approval,
             artifacts=artifacts,
             error=error,
             status=status,
@@ -1169,7 +1323,20 @@ class ToolRouter:
             tool_call_id=request.tool_call_id,
             duration_ms=duration_ms,
             changed_files=changed_files,
+            result_summary=result_summary,
+            capabilities=decision.capabilities,
+            allowed_paths=decision.allowed_paths,
+            side_effects=decision.side_effects,
+            side_effect_class=decision.side_effect_class,
+            parallel_safe=decision.parallel_safe,
+            retry_policy=decision.retry_policy,
+            failure_class=failure_class,
+            failure_signature=failure_signature,
         )
+
+    @staticmethod
+    def _approval_payload(decision: ToolRouteDecision, override: dict[str, Any] | None) -> dict[str, Any]:
+        return ToolOrchestrator.approval_payload(decision, override)
 
     @staticmethod
     def _model_result(request: ToolCallRequest, envelope: dict[str, Any], result: dict[str, Any]) -> dict[str, object]:
@@ -1181,6 +1348,79 @@ class ToolRouter:
         payload["tool_envelope"] = envelope
         return payload
 
+    def _result_summary(
+        self,
+        request: ToolCallRequest,
+        decision: ToolRouteDecision,
+        result: dict[str, Any],
+        *,
+        status: str,
+        error: dict[str, Any] | None = None,
+        failure_signature: str | None = None,
+    ) -> dict[str, Any]:
+        targets = self._visible_targets(request)
+        blocked_targets = self._blocked_targets(request)
+        result_keys = sorted(str(key) for key in result.keys())[:24]
+        counts: dict[str, int] = {}
+        for key, value in result.items():
+            if isinstance(value, list):
+                counts[f"{key}_count"] = len(value)
+            elif isinstance(value, dict):
+                counts[f"{key}_keys"] = len(value)
+        changed_files = [
+            str(item.get("file_path") or "")
+            for item in result.get("deferred_changes", [])
+            if isinstance(item, dict) and item.get("file_path")
+        ]
+        if not changed_files and isinstance(result.get("changed_files"), list):
+            changed_files = [str(item) for item in result["changed_files"] if str(item or "").strip()]
+        artifacts = result.get("artifacts") if isinstance(result.get("artifacts"), list) else []
+        summary = {
+            "schema": "grounded.tool_result_summary.v1",
+            "tool": request.canonical_tool,
+            "model_tool": request.tool,
+            "status": status,
+            "capabilities": list(decision.capabilities),
+            "side_effect_class": decision.side_effect_class,
+            "parallel_safe": decision.parallel_safe,
+            "targets": targets,
+            "blocked_targets": blocked_targets,
+            "changed_files": changed_files,
+            "result_keys": result_keys,
+            "counts": counts,
+            "artifact_count": len(artifacts),
+            "failure_signature": failure_signature,
+            "retry_policy": decision.retry_policy,
+            "summarization_policy": decision.result_summarization,
+        }
+        if error is not None:
+            summary["error_code"] = error.get("code")
+            summary["retryable"] = bool(error.get("retryable"))
+        if "semantic_status" in result:
+            summary["semantic_status"] = result.get("semantic_status")
+            summary["exit_code"] = result.get("exit_code")
+        if "failed_checks" in result:
+            summary["failed_check_count"] = len(result.get("failed_checks") or [])
+        if "workflow_results" in result:
+            summary["workflow_result_count"] = len(result.get("workflow_results") or [])
+        return summary
+
+    def _failure_signature(self, request: ToolCallRequest, error: dict[str, Any], *, result: dict[str, Any] | None = None) -> str:
+        details = error.get("details") if isinstance(error.get("details"), dict) else {}
+        file_path = str(request.input.get("file_path") or details.get("file_path") or "").strip()
+        code = str(error.get("code") or "tool_error")
+        if file_path:
+            return f"{request.canonical_tool}:{code}:{file_path}"
+        stable_payload = {
+            "tool": request.canonical_tool,
+            "code": code,
+            "details": details,
+            "input": self._protocol_input(request),
+            "status": (result or {}).get("status"),
+        }
+        digest = hashlib.sha256(json.dumps(stable_payload, sort_keys=True, default=str).encode("utf-8", errors="replace")).hexdigest()[:16]
+        return f"{request.canonical_tool}:{code}:{digest}"
+
     def _compact_result(
         self,
         request: ToolCallRequest,
@@ -1188,7 +1428,11 @@ class ToolRouter:
         result: dict[str, Any],
     ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
         encoded = json.dumps(result, ensure_ascii=True, sort_keys=True, default=str)
-        if len(encoded) <= decision.output_cap_chars:
+        should_truncate = len(encoded) > decision.output_cap_chars
+        should_spill = decision.artifact_spill_policy == "always" or (
+            decision.artifact_spill_policy == "on_truncation" and should_truncate
+        )
+        if decision.artifact_spill_policy == "never" or not should_spill:
             return result, {"truncated": False}, []
         digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
         excerpt = encoded[: max(200, decision.output_cap_chars)]
@@ -1199,7 +1443,40 @@ class ToolRouter:
                 {"tool": request.canonical_tool, "sha256": digest, "result": result},
             )
             if artifact:
-                artifacts.append(artifact)
+                artifacts.append(self._tool_result_artifact_ref(artifact))
+        elif self.context.output_artifact_writer is not None:
+            artifact = self.context.output_artifact_writer(
+                {
+                    "process_id": f"tool:{request.tool_call_id}",
+                    "stream": "tool",
+                    "command": f"tool:{request.canonical_tool}",
+                    "content": encoded,
+                    "head_tail": _head_tail_payload(encoded, max_chars=decision.output_cap_chars),
+                    "semantic_status": "completed",
+                    "metadata": {
+                        "source": "tool_result_spill",
+                        "tool": request.canonical_tool,
+                        "model_tool": request.tool,
+                        "tool_call_id": request.tool_call_id,
+                        "sha256": digest,
+                    },
+                }
+            )
+            if artifact:
+                artifacts.append(self._tool_result_artifact_ref(artifact))
+        artifact_ref = str(artifacts[0].get("ref") or "") if artifacts else ""
+        if not should_truncate:
+            enriched = dict(result)
+            enriched["artifact_ref"] = artifact_ref
+            enriched["artifacts"] = artifacts
+            return enriched, {
+                "truncated": False,
+                "sha256": digest,
+                "original_chars": len(encoded),
+                "artifact_ref": artifact_ref,
+                "spilled": bool(artifacts),
+                "spill_policy": decision.artifact_spill_policy,
+            }, artifacts
         compacted = {
             "tool": str(result.get("tool") or request.tool),
             "tool_use_id": request.tool_call_id,
@@ -1207,8 +1484,27 @@ class ToolRouter:
             "excerpt": excerpt,
             "sha256": digest,
             "original_chars": len(encoded),
+            "artifact_ref": artifact_ref,
+            "artifacts": artifacts,
         }
-        return compacted, {"truncated": True, "sha256": digest, "excerpt_chars": len(excerpt), "original_chars": len(encoded)}, artifacts
+        return compacted, {
+            "truncated": True,
+            "sha256": digest,
+            "excerpt_chars": len(excerpt),
+            "original_chars": len(encoded),
+            "artifact_ref": artifact_ref,
+            "spilled": bool(artifacts),
+            "spill_policy": decision.artifact_spill_policy,
+        }, artifacts
+
+    @staticmethod
+    def _tool_result_artifact_ref(artifact: dict[str, Any]) -> dict[str, Any]:
+        return {
+            **artifact,
+            "kind": "tool_result",
+            "mime_type": "application/json",
+            "label": "Full tool result",
+        }
 
     def _visible_workspace_tree(self) -> list[dict[str, str]]:
         if self._workspace_tree is None:
@@ -1291,6 +1587,33 @@ def _json_type_matches(value: Any, expected: str) -> bool:
     if expected == "number":
         return isinstance(value, int | float) and not isinstance(value, bool)
     return True
+
+
+def _head_tail_payload(content: str, *, max_chars: int) -> dict[str, Any]:
+    text = str(content or "")
+    cap = max(200, int(max_chars or 6000))
+    if len(text) <= cap:
+        return {
+            "head": text,
+            "tail": "",
+            "excerpt": text,
+            "total_chars": len(text),
+            "omitted_chars": 0,
+            "chunk_count": 1 if text else 0,
+        }
+    head_chars = max(100, cap // 2)
+    tail_chars = max(100, cap - head_chars)
+    head = text[:head_chars]
+    tail = text[-tail_chars:]
+    omitted = max(0, len(text) - len(head) - len(tail))
+    return {
+        "head": head,
+        "tail": tail,
+        "excerpt": f"{head}\n...[omitted {omitted} chars]...\n{tail}",
+        "total_chars": len(text),
+        "omitted_chars": omitted,
+        "chunk_count": 1,
+    }
 
 
 def _is_safe_exact_path(file_path: str) -> bool:

@@ -71,10 +71,68 @@ def test_rpc_requires_initialize_and_serves_thread_lifecycle(tmp_path: Path) -> 
         assert snapshot["events"][0]["event_type"] == "thread.started"
 
 
+def test_rpc_validates_unknown_and_invalid_params(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+
+    with client.websocket_connect("/rpc") as ws:
+        ws.send_json({"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "pytest"}}})
+        assert _receive_response(ws, 1)["result"]["protocol"]["schema"] == "grounded.rpc_protocol.v2"
+
+        ws.send_json({"id": 2, "method": "missing/method", "params": {}})
+        missing = _receive_response(ws, 2)
+        assert missing["error"]["code"] == -32601
+
+        ws.send_json({"id": 3, "method": "thread/start", "params": {"title": "Missing workspace"}})
+        invalid = _receive_response(ws, 3)
+        assert invalid["error"]["code"] == -32602
+
+
+def test_rpc_accepts_legacy_param_aliases_paginates_and_dedupes_idempotency(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "RPC Compatibility",
+            "description": "RPC alias and idempotency test",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+
+    with client.websocket_connect("/rpc") as ws:
+        ws.send_json({"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "pytest"}}})
+        _receive_response(ws, 1)
+
+        create = {
+            "method": "thread/start",
+            "params": {"workspaceId": workspace["workspace_id"], "title": "Thread Alias"},
+            "idempotency_key": "thread-start-1",
+        }
+        ws.send_json({"id": 2, **create})
+        first = _receive_response(ws, 2)["result"]
+        ws.send_json({"id": 3, **create})
+        duplicate = _receive_response(ws, 3)["result"]
+        assert duplicate["thread_id"] == first["thread_id"]
+
+        ws.send_json({"id": 4, "method": "thread/start", "params": {"workspace_id": workspace["workspace_id"], "title": "Thread B"}})
+        _receive_response(ws, 4)
+
+        ws.send_json({"id": 5, "method": "thread/list", "params": {"workspaceId": workspace["workspace_id"], "limit": 1}})
+        page_one = _receive_response(ws, 5)["result"]
+        assert len(page_one["items"]) == 1
+        assert page_one["next_cursor"]
+
+        ws.send_json({"id": 6, "method": "thread/list", "params": {"workspace_id": workspace["workspace_id"], "limit": 1, "cursor": page_one["next_cursor"]}})
+        page_two = _receive_response(ws, 6)["result"]
+        assert len(page_two["items"]) == 1
+        assert page_two["items"][0]["thread_id"] != page_one["items"][0]["thread_id"]
+
+
 def _receive_response(ws, request_id: int) -> dict:
     for _ in range(10):
         message = ws.receive_json()
         if message.get("id") == request_id:
             return message
     raise AssertionError(f"response {request_id} not received")
-

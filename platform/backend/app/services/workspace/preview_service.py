@@ -12,6 +12,7 @@ from urllib.request import Request, urlopen
 
 from app.core.config import Settings
 from app.models.domain import PreviewRecord
+from app.models.sandbox import SandboxPreviewLifecycle
 from app.repositories.state_store import StateStore
 from app.services.workspace.log_service import WorkspaceLogService
 from app.services.workspace.runtime_manager import PreviewRuntimeManager
@@ -509,6 +510,59 @@ class PreviewService:
         if not preview.url:
             return {}
         return {role: f"{preview.url}/{role}" for role in ROLE_ORDER}
+
+    def runtime_boundary(self, workspace_id: str) -> dict[str, object]:
+        preview = self.peek(workspace_id)
+        diagnostics: dict[str, object] = {
+            "log_tail": list(preview.logs[-40:]),
+            "role_urls": self.role_urls_from_preview(preview),
+            "reset_endpoint": f"/workspaces/{workspace_id}/preview/reset",
+            "logs_endpoint": f"/workspaces/{workspace_id}/preview/logs",
+            "destroyed_with_workspace": True,
+        }
+        try:
+            source_dir = self.workspace_service.source_dir(workspace_id)
+            diagnostics["source_dir"] = str(source_dir)
+            diagnostics["isolated_generated_app_workspace"] = str(source_dir)
+            if preview.runtime_mode == "docker":
+                diagnostics["containers"] = self.runtime_manager.inspect_containers(workspace_id, source_dir, preview.proxy_port)
+                diagnostics["network_policy"] = {
+                    "container_network_mode": "bridge",
+                    "public_entrypoint": preview.url,
+                    "host_port": preview.proxy_port,
+                }
+            elif preview.runtime_mode == "local":
+                local_process = self.runtime_manager.local_process_snapshot(workspace_id)
+                diagnostics["local_process"] = local_process
+                diagnostics["log_capture"] = {
+                    "stdout_log": local_process.get("stdout_log"),
+                    "stderr_log": local_process.get("stderr_log"),
+                    "captured": bool(local_process.get("stdout_log") or local_process.get("stderr_log")),
+                }
+        except Exception as exc:
+            diagnostics["inspection_error"] = str(exc)
+        lifecycle = SandboxPreviewLifecycle(
+            workspace_id=workspace_id,
+            runtime_mode=preview.runtime_mode,
+            status=preview.status,
+            stage=preview.stage,
+            project_name=preview.project_name,
+            proxy_port=preview.proxy_port,
+            url=preview.url,
+            draft_run_id=preview.draft_run_id,
+            cleanup_attempted=preview.preview_cleanup_attempted,
+            reused_existing_runtime=preview.preview_reused_existing_runtime,
+            failure_kind=preview.preview_failure_kind,
+            cooldown_until=preview.preview_cooldown_until.isoformat() if preview.preview_cooldown_until else None,
+            lifecycle_events=[
+                "start selects an owned preview port",
+                "health probes must pass before status=running",
+                "reset stops local processes or docker compose resources",
+                "workspace deletion destroys preview containers, networks, and volumes",
+            ],
+            diagnostics=diagnostics,
+        )
+        return lifecycle.model_dump(mode="json", by_alias=True)
 
     @staticmethod
     def role_urls_from_preview(preview: PreviewRecord) -> dict[str, str]:

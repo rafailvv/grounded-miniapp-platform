@@ -1,0 +1,228 @@
+{
+  "$defs": {
+    "ExperimentalFieldSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "reason": {
+          "default": "",
+          "title": "Reason",
+          "type": "string"
+        },
+        "replacement": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Replacement"
+        },
+        "since": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Since"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "ExperimentalFieldSpec",
+      "type": "object"
+    },
+    "RpcCursorPage": {
+      "additionalProperties": false,
+      "properties": {
+        "cursor_kind": {
+          "default": "none",
+          "enum": [
+            "none",
+            "opaque_cursor",
+            "sequence_cursor",
+            "offset_cursor"
+          ],
+          "title": "Cursor Kind",
+          "type": "string"
+        },
+        "cursor_param": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cursor Param"
+        },
+        "limit_param": {
+          "default": "limit",
+          "title": "Limit Param",
+          "type": "string"
+        },
+        "next_cursor_field": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Next Cursor Field"
+        }
+      },
+      "title": "RpcCursorPage",
+      "type": "object"
+    },
+    "RpcIdempotency": {
+      "additionalProperties": false,
+      "properties": {
+        "header": {
+          "default": "Idempotency-Key",
+          "title": "Header",
+          "type": "string"
+        },
+        "key_field": {
+          "default": "idempotency_key",
+          "title": "Key Field",
+          "type": "string"
+        },
+        "mode": {
+          "default": "none",
+          "enum": [
+            "none",
+            "optional",
+            "recommended",
+            "required"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "scope": {
+          "default": "request",
+          "enum": [
+            "request",
+            "workspace",
+            "thread",
+            "run",
+            "global"
+          ],
+          "title": "Scope",
+          "type": "string"
+        }
+      },
+      "title": "RpcIdempotency",
+      "type": "object"
+    }
+  },
+  "$id": "https://grounded.local/schemas/app_protocol/rpc_method_spec_v2.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "cursor": {
+      "$ref": "#/$defs/RpcCursorPage"
+    },
+    "description": {
+      "default": "",
+      "title": "Description",
+      "type": "string"
+    },
+    "experimental": {
+      "items": {
+        "$ref": "#/$defs/ExperimentalFieldSpec"
+      },
+      "title": "Experimental",
+      "type": "array",
+      "x-grounded-experimental": true
+    },
+    "idempotency": {
+      "$ref": "#/$defs/RpcIdempotency"
+    },
+    "idempotent": {
+      "default": false,
+      "title": "Idempotent",
+      "type": "boolean"
+    },
+    "method": {
+      "title": "Method",
+      "type": "string"
+    },
+    "notification_models": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Notification Models",
+      "type": "array"
+    },
+    "params_model": {
+      "title": "Params Model",
+      "type": "string"
+    },
+    "params_schema": {
+      "additionalProperties": true,
+      "title": "Params Schema",
+      "type": "object"
+    },
+    "result_model": {
+      "title": "Result Model",
+      "type": "string"
+    },
+    "result_schema": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Result Schema"
+    },
+    "stability": {
+      "default": "stable",
+      "enum": [
+        "stable",
+        "experimental",
+        "deprecated"
+      ],
+      "title": "Stability",
+      "type": "string"
+    },
+    "transport": {
+      "const": "websocket",
+      "default": "websocket",
+      "title": "Transport",
+      "type": "string"
+    },
+    "version": {
+      "const": "v2",
+      "default": "v2",
+      "title": "Version",
+      "type": "string"
+    }
+  },
+  "required": [
+    "method",
+    "params_model",
+    "result_model"
+  ],
+  "title": "RpcMethodSpecV2",
+  "type": "object"
+}

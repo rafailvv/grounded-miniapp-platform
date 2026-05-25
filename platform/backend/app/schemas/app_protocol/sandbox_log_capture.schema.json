@@ -1,0 +1,118 @@
+{
+  "$defs": {
+    "SandboxLogStreamCapture": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact_ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Artifact Ref"
+        },
+        "chunk_count": {
+          "default": 0,
+          "title": "Chunk Count",
+          "type": "integer"
+        },
+        "head_chars": {
+          "default": 0,
+          "title": "Head Chars",
+          "type": "integer"
+        },
+        "omitted_chars": {
+          "default": 0,
+          "title": "Omitted Chars",
+          "type": "integer"
+        },
+        "sha256": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sha256"
+        },
+        "stream": {
+          "enum": [
+            "stdout",
+            "stderr"
+          ],
+          "title": "Stream",
+          "type": "string"
+        },
+        "tail_chars": {
+          "default": 0,
+          "title": "Tail Chars",
+          "type": "integer"
+        },
+        "total_chars": {
+          "default": 0,
+          "title": "Total Chars",
+          "type": "integer"
+        },
+        "truncated_excerpt": {
+          "default": false,
+          "title": "Truncated Excerpt",
+          "type": "boolean"
+        },
+        "truncated_full": {
+          "default": false,
+          "title": "Truncated Full",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "stream"
+      ],
+      "title": "SandboxLogStreamCapture",
+      "type": "object"
+    }
+  },
+  "$id": "https://grounded.local/schemas/app_protocol/sandbox_log_capture.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "full_spool_max_chars": {
+      "title": "Full Spool Max Chars",
+      "type": "integer"
+    },
+    "max_excerpt_chars": {
+      "title": "Max Excerpt Chars",
+      "type": "integer"
+    },
+    "output_delta_count": {
+      "default": 0,
+      "title": "Output Delta Count",
+      "type": "integer"
+    },
+    "schema": {
+      "default": "grounded.sandbox.log_capture.v1",
+      "title": "Schema",
+      "type": "string"
+    },
+    "stderr": {
+      "$ref": "#/$defs/SandboxLogStreamCapture"
+    },
+    "stdout": {
+      "$ref": "#/$defs/SandboxLogStreamCapture"
+    }
+  },
+  "required": [
+    "max_excerpt_chars",
+    "full_spool_max_chars",
+    "stdout",
+    "stderr"
+  ],
+  "title": "SandboxLogCapture",
+  "type": "object"
+}

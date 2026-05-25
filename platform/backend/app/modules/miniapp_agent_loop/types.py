@@ -12,6 +12,7 @@ from app.models.domain import (
     RunIterationRecord,
     ValidationSnapshot,
 )
+from app.modules.miniapp_agent_loop.agent_hooks import AgentHookOutcome
 
 
 LoopOutcome = Literal["changes_ready", "no_op", "needs_context", "fatal_invalid_response"]
@@ -77,7 +78,7 @@ class AgentLoopCallbacks:
     plan_turn: Callable[..., AgentTurnPlan]
     apply_change_sync: Callable[[list[DraftAction]], list[DraftAction]]
     verify_completion: Callable[[CheckExecutionRecord | None, dict[str, Any]], dict[str, Any]] | None
-    before_apply: Callable[[int, list[DraftAction]], None] | None
+    before_apply: Callable[[int, list[DraftAction]], AgentHookOutcome | None] | None
     after_apply: Callable[[int, list[DraftAction], Any, list[str]], None] | None
     post_apply_stabilize: Callable[[str, str, Any, list[str]], list[str]] | None
     append_event: Callable[[JobRecord, str, str, dict[str, Any] | None], None]

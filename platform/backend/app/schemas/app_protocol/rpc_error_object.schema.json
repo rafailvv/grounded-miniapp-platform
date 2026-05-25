@@ -1,0 +1,55 @@
+{
+  "$id": "https://grounded.local/schemas/app_protocol/rpc_error_object.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "code": {
+      "title": "Code",
+      "type": "integer"
+    },
+    "data": {
+      "anyOf": [
+        {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        {
+          "items": {},
+          "type": "array"
+        },
+        {
+          "type": "string"
+        },
+        {
+          "type": "integer"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Data"
+    },
+    "message": {
+      "title": "Message",
+      "type": "string"
+    },
+    "schema": {
+      "default": "grounded.rpc.error.v2",
+      "title": "Schema",
+      "type": "string"
+    }
+  },
+  "required": [
+    "code",
+    "message"
+  ],
+  "title": "RpcErrorObject",
+  "type": "object"
+}

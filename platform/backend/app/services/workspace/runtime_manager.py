@@ -22,6 +22,7 @@ class PreviewRuntimeManager:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self._local_processes: dict[str, subprocess.Popen] = {}
+        self._local_process_meta: dict[str, dict[str, object]] = {}
 
     def preferred_mode(self) -> str:
         configured = str(self.settings.preview_runtime_mode or "local").strip().lower()
@@ -38,6 +39,10 @@ class PreviewRuntimeManager:
         env = os.environ.copy()
         env.update(self._compose_env(proxy_port))
         env["PYTHONPATH"] = str(miniapp_dir)
+        log_dir = source_dir / ".sandbox" / "preview"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        stdout_log = log_dir / "stdout.log"
+        stderr_log = log_dir / "stderr.log"
         command = [
             sys.executable,
             "-m",
@@ -49,16 +54,33 @@ class PreviewRuntimeManager:
             str(proxy_port),
         ]
         started_at = time.perf_counter()
-        process = subprocess.Popen(
-            command,
-            cwd=miniapp_dir,
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-            text=True,
-        )
+        stdout_handle = stdout_log.open("ab")
+        stderr_handle = stderr_log.open("ab")
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=miniapp_dir,
+                env=env,
+                stdout=stdout_handle,
+                stderr=stderr_handle,
+                start_new_session=True,
+                text=True,
+            )
+        finally:
+            stdout_handle.close()
+            stderr_handle.close()
         self._local_processes[workspace_id] = process
+        self._local_process_meta[workspace_id] = {
+            "workspace_id": workspace_id,
+            "pid": process.pid,
+            "command": command,
+            "cwd": str(miniapp_dir),
+            "proxy_port": proxy_port,
+            "stdout_log": str(stdout_log),
+            "stderr_log": str(stderr_log),
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "lifecycle_status": "running",
+        }
         try:
             wait_logs = self.wait_until_ready(proxy_port)
         except Exception:
@@ -91,18 +113,42 @@ class PreviewRuntimeManager:
 
     def reset_local(self, workspace_id: str) -> list[str]:
         process = self._local_processes.pop(workspace_id, None)
+        meta = self._local_process_meta.pop(workspace_id, {})
         if process is None:
             return []
         logs = [f"[runtime] stopping local preview for workspace {workspace_id}"]
+        forced = False
         try:
             os.killpg(process.pid, signal.SIGTERM)
             process.wait(timeout=5)
         except Exception:
             try:
+                forced = True
                 os.killpg(process.pid, signal.SIGKILL)
             except Exception:
                 pass
+        logs.append(
+            "[runtime] local preview stopped "
+            f"pid={process.pid} returncode={process.poll()} forced_kill={str(forced).lower()}"
+        )
+        if meta.get("stdout_log"):
+            logs.append(f"[runtime] local preview stdout captured at {meta.get('stdout_log')}")
+        if meta.get("stderr_log"):
+            logs.append(f"[runtime] local preview stderr captured at {meta.get('stderr_log')}")
         return logs
+
+    def local_process_snapshot(self, workspace_id: str) -> dict[str, object]:
+        process = self._local_processes.get(workspace_id)
+        meta = dict(self._local_process_meta.get(workspace_id) or {})
+        if process is None:
+            return {**meta, "running": False, "returncode": meta.get("returncode")}
+        return {
+            **meta,
+            "running": process.poll() is None,
+            "returncode": process.poll(),
+            "pid": process.pid,
+            "lifecycle_status": "running" if process.poll() is None else "exited",
+        }
 
     def allocate_port(self, workspace_id: str, reserved_ports: set[int] | None = None) -> int:
         reserved_ports = reserved_ports or set()

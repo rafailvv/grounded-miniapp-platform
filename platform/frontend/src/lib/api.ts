@@ -1,4 +1,5 @@
 import type { components } from "./generated/openapi-types";
+import { AppProtocolClient, isRpcConnectionError, type RpcNotificationHandler } from "./appProtocolClient";
 
 type ApiSchemas = components["schemas"];
 type RequiredKeys<T, K extends keyof T> = T & { [P in K]-?: NonNullable<T[P]> };
@@ -35,7 +36,7 @@ export type Run = {
   workspace_id: string;
   prompt: string;
   mode?: "generate" | "fix";
-  generation_mode?: "fast" | "balanced" | "quality" | "basic";
+  generation_mode?: "fast" | "balanced" | "quality" | "production" | "basic";
   intent: "create" | "edit" | "refine" | "role_only_change";
   apply_strategy: "staged_auto_apply" | "manual_approve";
   target_role_scope: Array<"client" | "specialist" | "manager">;
@@ -359,14 +360,89 @@ export type SystemConfiguration = {
     provider?: string | null;
     models?: Record<string, unknown>;
     task_profiles?: Record<string, unknown>;
+    routing?: Record<string, unknown>;
+    provider_routing?: Record<string, unknown>;
+    model_manager?: Record<string, unknown>;
+    model_catalog?: Record<string, unknown>;
   };
   defaults: {
-    generation_mode: "fast" | "balanced" | "quality" | "basic";
+    generation_mode: "fast" | "balanced" | "quality" | "production" | "basic";
     model_profile: string;
   };
   default_coding_profile: string;
   supports_staged_apply: boolean;
   research_artifacts_enabled: boolean;
+};
+
+export type ObservabilityReport = {
+  schema: string;
+  status: string;
+  workspace_id?: string | null;
+  generated_at: string;
+  run_count: number;
+  completed_runs: number;
+  failed_runs: number;
+  blocked_runs: number;
+  running_runs?: number;
+  awaiting_approval_runs?: number;
+  token_usage_total: number;
+  latency_ms_total: number;
+  token_usage: {
+    input_tokens: number;
+    output_tokens: number;
+    reasoning_tokens: number;
+    total_tokens: number;
+    turn_count: number;
+    cached_tokens?: number;
+    cache_write_tokens?: number;
+  };
+  cost: {
+    estimated_cost_usd: number;
+    explicit_cost_usd?: number;
+    estimated_from_tokens_usd?: number;
+    unpriced_tokens?: number;
+    pricing_source?: string;
+    by_model?: Array<Record<string, unknown>>;
+  };
+  latency: {
+    total_ms: number;
+    average_ms: number;
+    p50_ms: number;
+    p95_ms: number;
+    phase_totals_ms: Record<string, number>;
+    slowest_runs?: Array<Record<string, unknown>>;
+  };
+  green_rate_by_generation_mode: Array<{
+    generation_mode: string;
+    run_count: number;
+    terminal_count: number;
+    green_count: number;
+    green_rate: number;
+    status_counts: Record<string, number>;
+    average_total_tokens?: number;
+    estimated_cost_usd?: number;
+  }>;
+  failure_classes: Array<{
+    failure_class: string;
+    count: number;
+    latest_run_id?: string | null;
+    latest_at?: string | null;
+    generation_modes?: Record<string, number>;
+    examples?: Array<Record<string, unknown>>;
+  }>;
+  repair_success: {
+    fix_run_count: number;
+    successful_fix_runs: number;
+    fix_success_rate: number;
+    repair_case_count: number;
+    resolved_case_count: number;
+    case_resolution_rate: number;
+    attempt_count: number;
+    successful_attempt_count: number;
+    attempt_success_rate: number;
+    status_counts?: Record<string, number>;
+  };
+  by_status: Record<string, number>;
 };
 
 export type AgentThread = {
@@ -408,6 +484,24 @@ export type RunTimeline = RequiredKeys<ApiSchemas["RunTimelineReport"], "items">
 export type RunTraceView = RequiredKeys<ApiSchemas["RunTraceViewReport"], "timeline" | "artifact_refs" | "reduced_trace">;
 export type TraceBundleReport = RequiredKeys<ApiSchemas["TraceBundleReport"], "state">;
 export type TraceBundleState = ApiSchemas["TraceState"];
+export type RolloutTraceEvidence = {
+  schema: string;
+  run_id: string;
+  workspace_id: string;
+  status: string;
+  principle: string;
+  raw_events: Array<Record<string, unknown>>;
+  payload_refs: Array<Record<string, unknown>>;
+  evidence_streams: Record<string, unknown>;
+  reduced_graph: { nodes?: Array<Record<string, unknown>>; edges?: Array<Record<string, unknown>>; [key: string]: unknown };
+  inference_calls: Array<Record<string, unknown>>;
+  tool_calls: Array<Record<string, unknown>>;
+  terminal_ops: Array<Record<string, unknown>>;
+  child_agents: Array<Record<string, unknown>>;
+  interpretations: Record<string, unknown>;
+  repair_learning_hooks: Record<string, unknown>;
+  counts: Record<string, number>;
+};
 export type RunProtocolEvent = ApiSchemas["RunProtocolEvent"];
 export type RunBookmark = ApiSchemas["RunBookmark"];
 export type RunProtocolReport = RequiredKeys<ApiSchemas["RunProtocolReport"], "items" | "bookmarks">;
@@ -435,8 +529,16 @@ export type RunCompactionReport = {
   consumed_by_turn_id?: string | null;
   sections?: Record<string, unknown>;
   refs?: Record<string, string | null | undefined>;
+  preserved_tail?: Record<string, unknown>;
+  stale_path_refs?: Array<Record<string, unknown>>;
+  phase_budget?: Record<string, unknown>;
   created_at?: string;
 };
+
+export type ContextPressureReport = RequiredKeys<ApiSchemas["ContextPressureReport"], "items" | "recommendations">;
+export type OutputArtifactIndex = RequiredKeys<ApiSchemas["OutputArtifactIndex"], "items">;
+export type PromptSuggestion = ApiSchemas["PromptSuggestion"];
+export type PromptSuggestionsReport = RequiredKeys<ApiSchemas["PromptSuggestionsReport"], "items">;
 
 export type RunCompactionBoundaries = {
   schema: string;
@@ -486,6 +588,58 @@ export type WorkerReport = {
   mailbox?: Record<string, unknown>;
 };
 
+export type WorkerOrchestrationReport = {
+  schema?: string;
+  branch_schema?: string;
+  run_id: string;
+  workspace_id: string;
+  artifact_run_id?: string;
+  status: string;
+  write_coordination?: string | null;
+  write_scope_report?: Record<string, unknown>;
+  worker_drafts_ref?: string | null;
+  worker_drafts?: Record<string, unknown>;
+  worker_merge_ref?: string | null;
+  worker_merge?: Record<string, unknown>;
+  merge_decision_ref?: string | null;
+  merge_decision?: Record<string, unknown>;
+  workers?: WorkerReport["workers"];
+  worker_memory_refs?: Array<string | null | undefined>;
+  worker_artifact_refs?: Array<string | null | undefined>;
+  post_merge_verifier?: Record<string, unknown>;
+  mailbox?: Record<string, unknown>;
+  branch_plan?: Array<Record<string, unknown>>;
+};
+
+export type SubagentForkContract = {
+  schema: string;
+  status: string;
+  generation_mode?: string;
+  principle?: string;
+  lanes: Array<{
+    lane_id: string;
+    worker_ids: string[];
+    branch_role: string;
+    stage: string;
+    ownership: string;
+    tool_allowlist: string[];
+    file_scope: {
+      allowed_paths: string[];
+      forbidden_paths: string[];
+      exclusive_write: boolean;
+    };
+    writes: boolean;
+    dependencies: string[];
+    required_proof: string[];
+    child_lanes?: Array<Record<string, unknown>>;
+  }>;
+  execution_order: string[];
+  quality_mode_policy?: Record<string, unknown>;
+  ownership_matrix?: Array<Record<string, unknown>>;
+  conflict_policy?: Record<string, unknown>;
+  plan_bindings?: Record<string, unknown>;
+};
+
 export type RunTaskReport = {
   schema?: string;
   run_id: string;
@@ -499,6 +653,9 @@ export type RunTaskReport = {
     owner?: string;
     files?: string[];
     proof?: Record<string, unknown> | string;
+    proof_status?: string;
+    proof_checks?: string[];
+    role?: string | null;
     blocker?: Record<string, unknown> | string | null;
     artifact_refs?: Record<string, string | null | undefined>;
     updated_at?: string | null;
@@ -509,7 +666,77 @@ export type RunTaskReport = {
     output_summary?: string | null;
     linked_refs?: Record<string, unknown>;
   }>;
+  task_ledger?: {
+    schema?: string;
+    source?: string;
+    status?: string;
+    counts?: Record<string, number>;
+    items?: RunTaskReport["items"];
+    updated_at?: string;
+  };
   repair_cases?: RunRepairCases;
+};
+
+export type SkillifyReport = {
+  schema: string;
+  status: string;
+  write_status: "preview" | "written" | string;
+  run_id: string;
+  workspace_id: string;
+  skill_id: string;
+  title: string;
+  scope: string;
+  target_path: string;
+  content: string;
+  evidence?: Record<string, unknown>;
+  warnings?: Array<Record<string, unknown>>;
+  created_at?: string;
+};
+
+export type SimplifyReport = {
+  schema: string;
+  run_id: string;
+  workspace_id: string;
+  status: string;
+  green_required: boolean;
+  green_status: Record<string, unknown>;
+  changed_files: string[];
+  reviewed_files: string[];
+  summary: {
+    finding_count: number;
+    safe_task_count: number;
+    categories: Record<string, number>;
+  };
+  findings: Array<Record<string, unknown>>;
+  safe_refactor_tasks: Array<Record<string, unknown>>;
+  completion_gate: Record<string, unknown>;
+};
+
+export type DiagnosticWorkflowReport = {
+  schema: string;
+  mode: "debug_run" | "stuck_run" | "doctor_workspace" | string;
+  workspace_id: string;
+  run_id?: string | null;
+  status: string;
+  workspace_root?: string;
+  evidence: Record<string, unknown>;
+  diagnosis: Record<string, unknown>;
+  repair_packet: {
+    schema: string;
+    source: string;
+    failure_class: string;
+    failure_signature: string;
+    issue_code: string;
+    severity: string;
+    summary?: string;
+    instruction: string;
+    target_files: string[];
+    owner: string;
+    required_next_tool: string;
+    suggested_tool_after_read: string;
+    proof_required: string[];
+    evidence?: Record<string, unknown>;
+  };
 };
 
 export type BackgroundTask = {
@@ -545,6 +772,23 @@ export type BackgroundTaskOutput = {
   }>;
   next_cursor: number;
   has_more: boolean;
+};
+
+export type PrBabysitterReport = {
+  schema: string;
+  workspace_id: string;
+  run_id?: string | null;
+  export_id?: string | null;
+  status: string;
+  pr?: Record<string, unknown>;
+  checks?: Record<string, unknown>;
+  failed_runs?: Array<Record<string, unknown>>;
+  new_review_items?: Array<Record<string, unknown>>;
+  actions?: string[];
+  retry_state?: Record<string, unknown>;
+  failure_diagnostics?: Record<string, unknown>;
+  automation_plan?: Record<string, unknown>;
+  blocker?: Record<string, unknown>;
 };
 
 export type ReviewReport = {
@@ -635,16 +879,61 @@ export type WorkspaceMemory = {
     memory_id?: string;
     kind: string;
     text: string;
+    status?: string;
+    confidence?: Record<string, unknown>;
+    payload?: Record<string, unknown>;
     citation?: Record<string, unknown> | null;
     created_at?: string;
   }>;
   project_rules?: Array<string | Record<string, unknown>>;
   user_preferences?: Array<string | Record<string, unknown>>;
   product_decisions?: Array<string | Record<string, unknown>>;
+  failure_shields?: Array<string | Record<string, unknown>>;
+  reusable_workflows?: Array<string | Record<string, unknown>>;
   platform_constraints?: Array<string | Record<string, unknown>>;
   repeated_fixes?: Array<string | Record<string, unknown>>;
+  memory_summary?: MemorySummaryReport | null;
+  session_memory?: SessionMemoryReport | null;
   pipeline?: MemoryPipelineReport;
   stale_check?: Record<string, unknown>;
+};
+
+export type SessionMemoryReport = {
+  schema?: string;
+  workspace_id: string;
+  status: string;
+  sections: Array<{
+    id: string;
+    title: string;
+    items: Array<{
+      text?: string;
+      source?: string;
+      ref?: string | null;
+      [key: string]: unknown;
+    }>;
+  }>;
+  counts?: Record<string, number>;
+  text?: string;
+  source_refs?: Record<string, unknown>;
+  generated_at?: string;
+};
+
+export type MemorySummaryReport = {
+  schema?: string;
+  workspace_id: string;
+  status: string;
+  always_loaded?: boolean;
+  generated_at?: string;
+  text?: string;
+  sections?: Array<{
+    kind: string;
+    title: string;
+    items: Array<Record<string, unknown>>;
+  }>;
+  counts?: Record<string, number>;
+  stale?: Record<string, unknown>;
+  detail_retrieval?: Record<string, unknown>;
+  source_refs?: Record<string, unknown>;
 };
 
 export type MemoryPipelineReport = {
@@ -653,6 +942,13 @@ export type MemoryPipelineReport = {
   status: string;
   stage1_count?: number;
   stage1_items?: number;
+  active_count?: number;
+  stale_count?: number;
+  expired_count?: number;
+  superseded_count?: number;
+  retrieval_schema?: string;
+  summary_schema?: string;
+  summary?: MemorySummaryReport;
   consolidated_at?: string | null;
   items?: Array<Record<string, unknown>>;
 };
@@ -675,10 +971,87 @@ export type ToolEventEnvelope = RequiredKeys<
 >;
 export type ToolEventsReport = RequiredKeys<ApiSchemas["ToolEventsReport"], "events">;
 
+export type ProductReadinessChecklistItem = {
+  key: string;
+  label: string;
+  status: string;
+  required?: boolean;
+  check?: string | null;
+  details?: string | null;
+  evidence?: Record<string, unknown>;
+};
+
+export type ProductReadinessResult = {
+  schema?: string;
+  status: string;
+  acceptance_required?: boolean;
+  required_checks?: ProductReadinessChecklistItem[];
+  checklist?: ProductReadinessChecklistItem[];
+  evidence?: Record<string, unknown>;
+  blocking_reasons?: Array<Record<string, unknown>>;
+  repair_case_ids?: string[];
+  next_forced_action?: Record<string, unknown>;
+};
+
+export type BrowserProofScenario = {
+  scenario_id?: string;
+  title?: string;
+  status?: string;
+  role?: string | null;
+  route?: string | null;
+  action?: string;
+  marker?: unknown;
+  evidence?: Record<string, unknown>;
+};
+
+export type BrowserProofReport = {
+  schema?: string;
+  run_id: string;
+  workspace_id: string;
+  status: string;
+  blocking?: boolean;
+  summary?: Record<string, unknown>;
+  proof_statement?: string;
+  final_artifact?: boolean;
+  scenarios?: BrowserProofScenario[];
+  issues?: Array<Record<string, unknown>>;
+  roles_checked?: string[];
+  screenshots?: string[];
+  screenshot_before?: string | null;
+  screenshot_after?: string | null;
+  playwright_scenario?: Record<string, unknown>;
+  failed_step_context?: Record<string, unknown>;
+  dom_selector?: string | null;
+  video_refs?: string[];
+  console_errors?: string[];
+  network_errors?: string[];
+  mobile_layout?: Record<string, unknown>;
+  viewports?: string[];
+  artifact_refs?: Record<string, string | null | undefined>;
+  created_at?: string;
+};
+
+export type BrowserReplayReport = {
+  schema?: string;
+  run_id: string;
+  workspace_id: string;
+  status: string;
+  items?: Array<Record<string, unknown>>;
+  latest_packet?: Record<string, unknown>;
+  replay_first?: boolean;
+  replay_plan?: Record<string, unknown>;
+};
+
+export type VisualRegressionReport = ApiSchemas["VisualRegressionReport"];
+export type GenerationModeSlaManifest = ApiSchemas["GenerationModeSlaManifest"];
+
 export type RunGateReport = RequiredKeys<
   ApiSchemas["GateReport"],
   "issues" | "repair_packets" | "repair_history" | "next_forced_action" | "blocking_repair_packet" | "requirements" | "artifact_refs" | "run_state"
->;
+> & {
+  product_readiness?: ProductReadinessResult | null;
+  auto_repair_continuation?: Record<string, unknown>;
+};
 
 export type RunRepairSignatures = {
   run_id: string;
@@ -714,6 +1087,7 @@ export type RunFinalReport = {
   acceptance_contract: Record<string, unknown>;
   diff_summary: Record<string, unknown>;
   checks: Array<Record<string, unknown>>;
+  product_readiness?: ProductReadinessResult;
   browser_proof: Record<string, unknown>;
   repair_signatures: Array<Record<string, unknown>>;
   preview: Record<string, unknown>;
@@ -748,13 +1122,48 @@ export type LspDiagnosticsReport = {
   workspace_id: string;
   run_id?: string | null;
   status: string;
+  engine?: string;
   items: Array<{ path: string; file?: string; severity: string; message: string; source: string; line?: number; column?: number; code?: string; jump?: { path: string; line: number; column?: number; label?: string } }>;
   symbols?: Array<{ path: string; kind: string; name: string; line: number; column?: number; jump?: { path: string; line: number; column?: number; label?: string } }>;
   tool_status?: Record<string, unknown>;
+  diagnostic_stream?: Array<{ phase: string; status: string; created_at?: string; issue_count?: number; error_count?: number; warning_count?: number; file_count?: number } & Record<string, unknown>>;
+  route_graph?: LspRouteGraphReport;
   error_count?: number;
   warning_count?: number;
   changed_only?: boolean;
   changed_files?: string[];
+};
+
+export type LspDiagnosticsTaskReport = {
+  schema: string;
+  status: string;
+  workspace_id: string;
+  run_id?: string | null;
+  task?: BackgroundTask | null;
+  output?: BackgroundTaskOutput;
+  diagnostics?: LspDiagnosticsReport | null;
+  diagnostics_ref?: string | null;
+  task_diagnostics_ref?: string | null;
+};
+
+export type LspDefinitionReport = {
+  schema?: string;
+  workspace_id?: string;
+  run_id?: string | null;
+  symbol: string;
+  items: Array<{ path: string; kind: string; name: string; line: number; column?: number; excerpt?: string; definition_kind?: string; jump?: { path: string; line: number; column?: number; label?: string } }>;
+};
+
+export type LspRouteGraphReport = {
+  schema?: string;
+  workspace_id?: string;
+  run_id?: string | null;
+  nodes: Array<Record<string, unknown>>;
+  edges: Array<{ from?: string; to?: string; kind?: string; status?: string; file?: string; method?: string; path?: string } & Record<string, unknown>>;
+  missing_edges?: Array<Record<string, unknown>>;
+  api_mismatches?: Array<Record<string, unknown>>;
+  summary?: Record<string, unknown>;
+  static_context?: Record<string, unknown>;
 };
 
 export type CommandPaletteAction = {
@@ -777,6 +1186,19 @@ export type SlashCommandList = {
   items: SlashCommand[];
 };
 
+export type SlashCommandExecution = GeneratedReport & {
+  execution_id?: string;
+  command_id?: string;
+  workflow?: string;
+  workspace_id?: string;
+  run_id?: string | null;
+  run?: Run;
+  report?: Record<string, unknown>;
+  exports?: Record<string, Record<string, unknown>>;
+  artifact_refs?: Record<string, string | null | undefined>;
+  next_forced_action?: Record<string, unknown>;
+};
+
 export type GeneratedReport = {
   schema?: string;
   status?: string;
@@ -786,166 +1208,7 @@ export type GeneratedReport = {
   [key: string]: unknown;
 };
 
-type RpcEnvelope = {
-  id?: number;
-  method?: string;
-  params?: Record<string, unknown>;
-  result?: unknown;
-  error?: { code: number; message: string; data?: unknown };
-};
-
-type RpcNotificationHandler = (message: RpcEnvelope) => void;
-
-class RpcConnectionError extends Error {
-  constructor(message = "RPC socket connection failed.") {
-    super(message);
-    this.name = "RpcConnectionError";
-  }
-}
-
-function isRpcConnectionError(error: unknown): boolean {
-  return (
-    error instanceof RpcConnectionError ||
-    (error instanceof Error &&
-      (error.message === "RPC socket connection failed." || error.message === "RPC socket is not open."))
-  );
-}
-
-class JsonRpcClient {
-  private socket: WebSocket | null = null;
-  private nextId = 1;
-  private pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
-  private connected: Promise<void> | null = null;
-  private handlers = new Set<RpcNotificationHandler>();
-
-  async call<T>(method: string, params: Record<string, unknown> = {}): Promise<T> {
-    await this.ensureConnected();
-    const socket = this.socket;
-    if (!socket || socket.readyState !== WebSocket.OPEN) {
-      throw new Error("RPC socket is not open.");
-    }
-    const id = this.nextId++;
-    const result = new Promise<T>((resolve, reject) => {
-      this.pending.set(id, { resolve: resolve as (value: unknown) => void, reject });
-    });
-    socket.send(JSON.stringify({ id, method, params }));
-    return result;
-  }
-
-  subscribe(handler: RpcNotificationHandler): () => void {
-    this.handlers.add(handler);
-    void this.ensureConnected().catch(() => undefined);
-    return () => {
-      this.handlers.delete(handler);
-    };
-  }
-
-  private async ensureConnected(): Promise<void> {
-    if (this.socket?.readyState === WebSocket.OPEN) {
-      return;
-    }
-    if (this.connected) {
-      return this.connected;
-    }
-    this.connected = new Promise<void>((resolve, reject) => {
-      const socket = new WebSocket(this.rpcUrl());
-      this.socket = socket;
-      let settled = false;
-      const fail = (error: Error) => {
-        if (settled) {
-          return;
-        }
-        settled = true;
-        this.connected = null;
-        if (this.socket === socket) {
-          this.socket = null;
-        }
-        if (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN) {
-          socket.close();
-        }
-        this.rejectPending(error);
-        reject(error);
-      };
-      const succeed = () => {
-        if (settled) {
-          return;
-        }
-        settled = true;
-        resolve();
-      };
-      const timeout = window.setTimeout(() => {
-        fail(new RpcConnectionError("RPC socket connection failed."));
-      }, 5000);
-      socket.addEventListener("open", async () => {
-        try {
-          await this.callRaw("initialize", { clientInfo: { name: "grounded-miniapp-frontend" } });
-          window.clearTimeout(timeout);
-          succeed();
-        } catch (error) {
-          window.clearTimeout(timeout);
-          fail(error instanceof Error ? error : new RpcConnectionError("RPC socket connection failed."));
-        }
-      });
-      socket.addEventListener("message", (event) => {
-        const message = JSON.parse(String(event.data)) as RpcEnvelope;
-        if (typeof message.id === "number") {
-          const pending = this.pending.get(message.id);
-          if (!pending) {
-            return;
-          }
-          this.pending.delete(message.id);
-          if (message.error) {
-            pending.reject(new Error(message.error.message));
-          } else {
-            pending.resolve(message.result);
-          }
-          return;
-        }
-        this.handlers.forEach((handler) => handler(message));
-      });
-      socket.addEventListener("close", () => {
-        this.socket = null;
-        this.connected = null;
-        window.clearTimeout(timeout);
-        if (!settled) {
-          fail(new RpcConnectionError("RPC socket connection failed."));
-        }
-      });
-      socket.addEventListener("error", () => {
-        window.clearTimeout(timeout);
-        fail(new RpcConnectionError("RPC socket connection failed."));
-      });
-    });
-    return this.connected;
-  }
-
-  private async callRaw<T>(method: string, params: Record<string, unknown>): Promise<T> {
-    const socket = this.socket;
-    if (!socket || socket.readyState !== WebSocket.OPEN) {
-      throw new Error("RPC socket is not open.");
-    }
-    const id = this.nextId++;
-    const result = new Promise<T>((resolve, reject) => {
-      this.pending.set(id, { resolve: resolve as (value: unknown) => void, reject });
-    });
-    socket.send(JSON.stringify({ id, method, params }));
-    return result;
-  }
-
-  private rpcUrl(): string {
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    return `${protocol}//${window.location.host}/rpc`;
-  }
-
-  private rejectPending(error: Error): void {
-    for (const pending of this.pending.values()) {
-      pending.reject(error);
-    }
-    this.pending.clear();
-  }
-}
-
-const rpcClient = new JsonRpcClient();
+const rpcClient = new AppProtocolClient();
 const workspaceThreadIds = new Map<string, string>();
 const runTurnRefs = new Map<string, { threadId: string; turnId: string }>();
 
@@ -993,6 +1256,18 @@ export async function listRuns(workspaceId: string): Promise<Run[]> {
   return request<Run[]>(`/workspaces/${workspaceId}/runs`);
 }
 
+export async function getObservabilitySummary(): Promise<ObservabilityReport> {
+  return request<ObservabilityReport>("/system/observability");
+}
+
+export async function getWorkspaceObservability(workspaceId: string): Promise<ObservabilityReport> {
+  return request<ObservabilityReport>(`/workspaces/${workspaceId}/observability`);
+}
+
+export async function getGenerationModes(): Promise<GenerationModeSlaManifest> {
+  return request<GenerationModeSlaManifest>("/system/generation-modes");
+}
+
 export async function createRun(
   workspaceId: string,
   payload: {
@@ -1002,7 +1277,7 @@ export async function createRun(
     apply_strategy?: "staged_auto_apply" | "manual_approve";
     target_role_scope?: Array<"client" | "specialist" | "manager">;
     model_profile?: string;
-    generation_mode?: "fast" | "balanced" | "quality" | "basic";
+    generation_mode?: "fast" | "balanced" | "quality" | "production" | "basic";
     target_platform?: "telegram_mini_app" | "max_mini_app";
     preview_profile?: "telegram_mock" | "max_mock" | "web_preview";
     resume_from_run_id?: string;
@@ -1062,6 +1337,10 @@ export async function getRunTraceView(runId: string): Promise<RunTraceView> {
   return request<RunTraceView>(`/runs/${runId}/trace-view`);
 }
 
+export async function getRunRolloutTrace(runId: string): Promise<RolloutTraceEvidence> {
+  return request<RolloutTraceEvidence>(`/runs/${runId}/rollout-trace`);
+}
+
 export async function getRunTraceBundle(runId: string): Promise<TraceBundleReport> {
   return request<TraceBundleReport>(`/runs/${runId}/trace-bundle`);
 }
@@ -1108,6 +1387,10 @@ export async function getRunBookmarks(runId: string): Promise<RunBookmarksReport
 
 export async function getRunTasks(runId: string): Promise<RunTaskReport> {
   return request<RunTaskReport>(`/runs/${runId}/tasks`);
+}
+
+export async function skillifyRun(runId: string, payload: { skill_id?: string; title?: string; write?: boolean; scope?: string } = {}): Promise<SkillifyReport> {
+  return request<SkillifyReport>(`/runs/${runId}/skillify`, { method: "POST", body: JSON.stringify(payload) });
 }
 
 export async function listBackgroundTasks(params: { workspace_id?: string; run_id?: string; status?: string } = {}): Promise<{ schema: string; status: string; items: BackgroundTask[] }> {
@@ -1157,8 +1440,29 @@ export async function getBackgroundTaskOutput(taskId: string, cursor = 0, limit 
   return request<BackgroundTaskOutput>(`/tasks/${taskId}/output?cursor=${cursor}&limit=${limit}`);
 }
 
+export async function prBabysitterSnapshot(workspaceId: string, payload: Record<string, unknown> = {}): Promise<PrBabysitterReport> {
+  return request<PrBabysitterReport>(`/workspaces/${workspaceId}/pr-babysitter/snapshot`, { method: "POST", body: JSON.stringify(payload) });
+}
+
+export async function startPrBabysitter(workspaceId: string, payload: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
+  return request<Record<string, unknown>>(`/workspaces/${workspaceId}/pr-babysitter/watch`, { method: "POST", body: JSON.stringify(payload) });
+}
+
+export async function getPrBabysitterReports(workspaceId: string, runId?: string): Promise<Record<string, unknown>> {
+  const query = runId ? `?run_id=${encodeURIComponent(runId)}` : "";
+  return request<Record<string, unknown>>(`/workspaces/${workspaceId}/pr-babysitter${query}`);
+}
+
 export async function getRunGate(runId: string): Promise<RunGateReport> {
   return request<RunGateReport>(`/runs/${runId}/gate`);
+}
+
+export async function getRunBrowserProof(runId: string): Promise<BrowserProofReport> {
+  return request<BrowserProofReport>(`/runs/${runId}/browser-proof`);
+}
+
+export async function getRunBrowserReplay(runId: string): Promise<BrowserReplayReport> {
+  return request<BrowserReplayReport>(`/runs/${runId}/browser-replay`);
 }
 
 export async function getRunFinalReport(runId: string): Promise<RunFinalReport> {
@@ -1223,6 +1527,10 @@ export async function getRunCompaction(runId: string): Promise<RunCompactionRepo
   return request<RunCompactionReport>(`/runs/${runId}/compaction`);
 }
 
+export async function getRunContextPressure(runId: string): Promise<ContextPressureReport> {
+  return request<ContextPressureReport>(`/runs/${runId}/context-pressure`);
+}
+
 export async function getRunCompactionBoundaries(runId: string): Promise<RunCompactionBoundaries> {
   return request<RunCompactionBoundaries>(`/runs/${runId}/compaction/boundaries`);
 }
@@ -1235,6 +1543,10 @@ export async function getRunPostCompactMessage(runId: string, boundaryId: string
   return request<Record<string, unknown>>(`/runs/${runId}/compaction/post-message/${boundaryId}`);
 }
 
+export async function getRunOutputArtifacts(runId: string): Promise<OutputArtifactIndex> {
+  return request<OutputArtifactIndex>(`/runs/${runId}/output-artifacts`);
+}
+
 export async function startReviewFix(runId: string): Promise<Run> {
   return request<Run>(`/runs/${runId}/review/fix`, { method: "POST" });
 }
@@ -1245,6 +1557,10 @@ export async function getDoctorReport(): Promise<DoctorReport> {
 
 export async function getRunWorkers(runId: string): Promise<WorkerReport> {
   return request<WorkerReport>(`/runs/${runId}/workers`);
+}
+
+export async function getRunWorkerOrchestration(runId: string): Promise<WorkerOrchestrationReport> {
+  return request<WorkerOrchestrationReport>(`/runs/${runId}/workers/orchestration`);
 }
 
 export async function getRunWorkerContext(runId: string, workerId: string): Promise<Record<string, unknown>> {
@@ -1267,6 +1583,10 @@ export async function getRunReview(runId: string): Promise<ReviewReport> {
   return request<ReviewReport>(`/runs/${runId}/review`);
 }
 
+export async function getRunPromptSuggestions(runId: string): Promise<PromptSuggestionsReport> {
+  return request<PromptSuggestionsReport>(`/runs/${runId}/prompt-suggestions`);
+}
+
 export async function getRunTestMatrix(runId: string): Promise<TestMatrixReport> {
   return request<TestMatrixReport>(`/runs/${runId}/test-matrix`);
 }
@@ -1287,8 +1607,32 @@ export async function getRunVisualQa(runId: string): Promise<GeneratedReport> {
   return request<GeneratedReport>(`/runs/${runId}/visual-qa`);
 }
 
+export async function getRunVisualRegression(runId: string): Promise<VisualRegressionReport> {
+  return request<VisualRegressionReport>(`/runs/${runId}/visual-regression`);
+}
+
 export async function getRunTraceReducer(runId: string): Promise<GeneratedReport> {
   return request<GeneratedReport>(`/runs/${runId}/trace-reducer`);
+}
+
+export async function getRunSimplify(runId: string): Promise<SimplifyReport> {
+  return request<SimplifyReport>(`/runs/${runId}/simplify`);
+}
+
+export async function runSimplify(runId: string): Promise<SimplifyReport> {
+  return request<SimplifyReport>(`/runs/${runId}/simplify`, { method: "POST" });
+}
+
+export async function getRunDebug(runId: string): Promise<DiagnosticWorkflowReport> {
+  return request<DiagnosticWorkflowReport>(`/runs/${runId}/debug`);
+}
+
+export async function getRunStuck(runId: string): Promise<DiagnosticWorkflowReport> {
+  return request<DiagnosticWorkflowReport>(`/runs/${runId}/stuck`);
+}
+
+export async function getDoctorWorkspace(workspaceId: string): Promise<DiagnosticWorkflowReport> {
+  return request<DiagnosticWorkflowReport>(`/workspaces/${workspaceId}/doctor-workspace`);
 }
 
 export async function extractRunMemory(runId: string): Promise<GeneratedReport> {
@@ -1297,6 +1641,14 @@ export async function extractRunMemory(runId: string): Promise<GeneratedReport> 
 
 export async function getWorkspaceMemoryPipeline(workspaceId: string): Promise<MemoryPipelineReport> {
   return request<MemoryPipelineReport>(`/workspaces/${workspaceId}/memory/pipeline`);
+}
+
+export async function getWorkspaceMemorySummary(workspaceId: string): Promise<MemorySummaryReport> {
+  return request<MemorySummaryReport>(`/workspaces/${workspaceId}/memory/summary`);
+}
+
+export async function getWorkspaceSessionMemory(workspaceId: string): Promise<SessionMemoryReport> {
+  return request<SessionMemoryReport>(`/workspaces/${workspaceId}/session-memory`);
 }
 
 export async function consolidateWorkspaceMemory(workspaceId: string): Promise<WorkspaceMemory> {
@@ -1311,6 +1663,10 @@ export async function getWorkerRoles(): Promise<GeneratedReport> {
   return request<GeneratedReport>("/system/worker-roles");
 }
 
+export async function getSubagentForkContract(): Promise<SubagentForkContract> {
+  return request<SubagentForkContract>("/system/subagents");
+}
+
 export async function getSlashCommands(): Promise<SlashCommandList> {
   return request<SlashCommandList>("/slash-commands");
 }
@@ -1319,6 +1675,22 @@ export async function resolveSlashCommand(commandId: string, prompt?: string): P
   return request<GeneratedReport>(`/slash-commands/${commandId}/resolve`, {
     method: "POST",
     body: JSON.stringify({ prompt }),
+  });
+}
+
+export async function executeSlashCommand(commandId: string, payload: {
+  workspace_id?: string;
+  run_id?: string;
+  prompt?: string;
+  detail?: string;
+  target_role_scope?: string[];
+  model_profile?: string;
+  generation_mode?: string;
+  metadata?: Record<string, unknown>;
+}): Promise<SlashCommandExecution> {
+  return request<SlashCommandExecution>(`/slash-commands/${commandId}/execute`, {
+    method: "POST",
+    body: JSON.stringify(payload),
   });
 }
 
@@ -1359,6 +1731,44 @@ export async function getLspDiagnostics(workspaceId: string, runId?: string, opt
   }
   const suffix = params.toString() ? `?${params.toString()}` : "";
   return request<LspDiagnosticsReport>(`/workspaces/${workspaceId}/diagnostics/lsp${suffix}`);
+}
+
+export async function startLspDiagnostics(workspaceId: string, payload: { runId?: string; changedOnly?: boolean; files?: string[] } = {}): Promise<LspDiagnosticsTaskReport> {
+  return request<LspDiagnosticsTaskReport>(`/workspaces/${workspaceId}/diagnostics/lsp/async`, {
+    method: "POST",
+    body: JSON.stringify({
+      run_id: payload.runId,
+      changed_only: Boolean(payload.changedOnly),
+      files: payload.files ?? [],
+    }),
+  });
+}
+
+export async function getLspDiagnosticsTask(workspaceId: string, taskId: string): Promise<LspDiagnosticsTaskReport> {
+  return request<LspDiagnosticsTaskReport>(`/workspaces/${workspaceId}/diagnostics/lsp/async/${taskId}`);
+}
+
+export async function getLspDefinition(workspaceId: string, symbol: string, runId?: string, targets?: string[]): Promise<LspDefinitionReport> {
+  const params = new URLSearchParams({ symbol });
+  if (runId) {
+    params.set("run_id", runId);
+  }
+  if (targets?.length) {
+    params.set("targets", targets.join(","));
+  }
+  return request<LspDefinitionReport>(`/workspaces/${workspaceId}/lsp/definition?${params.toString()}`);
+}
+
+export async function getLspRouteGraph(workspaceId: string, runId?: string, targets?: string[]): Promise<LspRouteGraphReport> {
+  const params = new URLSearchParams();
+  if (runId) {
+    params.set("run_id", runId);
+  }
+  if (targets?.length) {
+    params.set("targets", targets.join(","));
+  }
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  return request<LspRouteGraphReport>(`/workspaces/${workspaceId}/lsp/route-graph${suffix}`);
 }
 
 export async function stopRun(runId: string): Promise<Run> {
@@ -1431,6 +1841,7 @@ export async function execWorkspaceCommand(payload: {
   thread_id?: string;
   turn_id?: string;
   timeout?: number;
+  managed?: boolean;
   approval_id?: string;
   preset?: string;
 }): Promise<Record<string, unknown>> {

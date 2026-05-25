@@ -1,0 +1,140 @@
+{
+  "$id": "https://grounded.local/schemas/app_protocol/sandbox_kill_diagnostics.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "detail": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Detail"
+    },
+    "exit_code": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Exit Code"
+    },
+    "final_signal": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Final Signal"
+    },
+    "grace_seconds": {
+      "anyOf": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Grace Seconds"
+    },
+    "killed": {
+      "default": false,
+      "title": "Killed",
+      "type": "boolean"
+    },
+    "process_group": {
+      "default": false,
+      "title": "Process Group",
+      "type": "boolean"
+    },
+    "reason": {
+      "default": "none",
+      "enum": [
+        "none",
+        "timeout",
+        "manual_terminate",
+        "signal",
+        "startup_failed",
+        "sandbox_blocked",
+        "policy_blocked",
+        "not_started"
+      ],
+      "title": "Reason",
+      "type": "string"
+    },
+    "requested_signal": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Requested Signal"
+    },
+    "return_signal": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Return Signal"
+    },
+    "schema": {
+      "default": "grounded.sandbox.kill_diagnostics.v1",
+      "title": "Schema",
+      "type": "string"
+    },
+    "terminated_at": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Terminated At"
+    },
+    "timed_out": {
+      "default": false,
+      "title": "Timed Out",
+      "type": "boolean"
+    },
+    "timeout_seconds": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Timeout Seconds"
+    }
+  },
+  "title": "SandboxKillDiagnostics",
+  "type": "object"
+}

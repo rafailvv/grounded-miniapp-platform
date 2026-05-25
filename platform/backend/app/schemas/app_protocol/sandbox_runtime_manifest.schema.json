@@ -1,0 +1,76 @@
+{
+  "$id": "https://grounded.local/schemas/app_protocol/sandbox_runtime_manifest.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "enforcement": {
+      "enum": [
+        "hard",
+        "policy_only",
+        "unavailable"
+      ],
+      "title": "Enforcement",
+      "type": "string"
+    },
+    "execution_boundary": {
+      "additionalProperties": true,
+      "title": "Execution Boundary",
+      "type": "object"
+    },
+    "killed_process_diagnostics": {
+      "additionalProperties": true,
+      "title": "Killed Process Diagnostics",
+      "type": "object"
+    },
+    "log_capture": {
+      "additionalProperties": true,
+      "title": "Log Capture",
+      "type": "object"
+    },
+    "network_policy": {
+      "additionalProperties": true,
+      "title": "Network Policy",
+      "type": "object"
+    },
+    "path_safety": {
+      "additionalProperties": true,
+      "title": "Path Safety",
+      "type": "object"
+    },
+    "preview_lifecycle": {
+      "additionalProperties": true,
+      "title": "Preview Lifecycle",
+      "type": "object"
+    },
+    "process_timeout": {
+      "additionalProperties": true,
+      "title": "Process Timeout",
+      "type": "object"
+    },
+    "profiles": {
+      "additionalProperties": true,
+      "title": "Profiles",
+      "type": "object"
+    },
+    "provider": {
+      "title": "Provider",
+      "type": "string"
+    },
+    "reproducibility": {
+      "additionalProperties": true,
+      "title": "Reproducibility",
+      "type": "object"
+    },
+    "schema": {
+      "default": "grounded.sandbox_runtime.manifest.v1",
+      "title": "Schema",
+      "type": "string"
+    }
+  },
+  "required": [
+    "provider",
+    "enforcement"
+  ],
+  "title": "SandboxRuntimeManifest",
+  "type": "object"
+}

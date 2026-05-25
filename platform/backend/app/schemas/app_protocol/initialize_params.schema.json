@@ -1,0 +1,14 @@
+{
+  "$id": "https://grounded.local/schemas/app_protocol/initialize_params.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "client_info": {
+      "additionalProperties": true,
+      "title": "Client Info",
+      "type": "object"
+    }
+  },
+  "title": "InitializeParams",
+  "type": "object"
+}

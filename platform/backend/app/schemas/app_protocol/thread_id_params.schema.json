@@ -1,0 +1,16 @@
+{
+  "$id": "https://grounded.local/schemas/app_protocol/thread_id_params.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "thread_id": {
+      "title": "Thread Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "thread_id"
+  ],
+  "title": "ThreadIdParams",
+  "type": "object"
+}

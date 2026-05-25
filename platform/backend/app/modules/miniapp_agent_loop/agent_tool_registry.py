@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from app.services.tool_protocol import canonical_tool_name, tool_protocol_spec
+
 
 AgentToolKind = Literal["read_only", "mutating", "verification", "unknown"]
 AgentActivityKind = Literal[
@@ -127,6 +129,14 @@ class AgentToolRegistry:
             activity="searching",
             progress_label="Scanning source semantics",
         ),
+        "tool_search": AgentToolSpec(
+            name="tool_search",
+            kind="read_only",
+            concurrency_safe=True,
+            output_cap_chars=9000,
+            activity="searching",
+            progress_label="Discovering optional deferred tools",
+        ),
         "lsp.diagnostics": AgentToolSpec(
             name="lsp.diagnostics",
             kind="read_only",
@@ -150,6 +160,22 @@ class AgentToolRegistry:
             output_cap_chars=10000,
             activity="searching",
             progress_label="Finding symbol references",
+        ),
+        "lsp.definition": AgentToolSpec(
+            name="lsp.definition",
+            kind="read_only",
+            concurrency_safe=True,
+            output_cap_chars=8000,
+            activity="searching",
+            progress_label="Finding symbol definition",
+        ),
+        "lsp.route_graph": AgentToolSpec(
+            name="lsp.route_graph",
+            kind="read_only",
+            concurrency_safe=True,
+            output_cap_chars=14000,
+            activity="searching",
+            progress_label="Building route graph",
         ),
         "lsp.route_static_context": AgentToolSpec(
             name="lsp.route_static_context",
@@ -182,6 +208,22 @@ class AgentToolRegistry:
             output_cap_chars=10000,
             activity="searching",
             progress_label="Finding symbol references",
+        ),
+        "lsp_definition": AgentToolSpec(
+            name="lsp_definition",
+            kind="read_only",
+            concurrency_safe=True,
+            output_cap_chars=8000,
+            activity="searching",
+            progress_label="Finding symbol definition",
+        ),
+        "lsp_route_graph": AgentToolSpec(
+            name="lsp_route_graph",
+            kind="read_only",
+            concurrency_safe=True,
+            output_cap_chars=14000,
+            activity="searching",
+            progress_label="Building route graph",
         ),
         "lsp_route_static_context": AgentToolSpec(
             name="lsp_route_static_context",
@@ -281,6 +323,15 @@ class AgentToolRegistry:
             concurrency_safe=True,
             activity="searching",
             progress_label="Listing files through the unified tool protocol",
+        ),
+        "tool.search": AgentToolSpec(
+            name="tool.search",
+            kind="read_only",
+            concurrency_safe=True,
+            output_cap_chars=9000,
+            activity="searching",
+            progress_label="Discovering optional deferred tools",
+            aliases=("tool_search",),
         ),
         "shell.exec": AgentToolSpec(
             name="shell.exec",
@@ -387,6 +438,9 @@ class AgentToolRegistry:
                 unknown.append(request)
                 append_batch(request, concurrency_safe=False)
                 continue
+            protocol = tool_protocol_spec(canonical_tool_name(request.get("tool")))
+            contract = protocol.as_contract()
+            parallel_safe = bool(contract.get("parallel_safe")) and str(contract.get("side_effect_class") or "") in {"none", "read_workspace"}
             if spec.kind == "mutating":
                 mutating.append(request)
             elif spec.kind == "verification":
@@ -394,7 +448,7 @@ class AgentToolRegistry:
                 read_only.append(request)
             else:
                 read_only.append(request)
-            append_batch(request, concurrency_safe=spec.concurrency_safe and spec.kind == "read_only")
+            append_batch(request, concurrency_safe=parallel_safe and spec.kind == "read_only")
 
         return AgentToolBatchPlan(
             read_only_requests=read_only,
@@ -413,6 +467,7 @@ class AgentToolRegistry:
             if allowed_names is not None and name not in allowed_names:
                 continue
             spec = cls._SPECS[name]
+            contract = tool_protocol_spec(canonical_tool_name(name)).as_contract()
             if name == "apply_patch_to_draft":
                 properties = {
                     "file_path": {
@@ -460,6 +515,20 @@ class AgentToolRegistry:
                     "reason": {"type": "string"},
                 }
                 required = ["file_path", "old_string", "new_string", "reason"]
+            elif name == "tool_search":
+                properties = {
+                    "query": {
+                        "type": "string",
+                        "description": "Short description of the optional capability to discover, such as deploy, browser verification, database, payments, CMS, GitHub, or Vercel.",
+                    },
+                    "domain": {
+                        "type": "string",
+                        "enum": ["", "deploy", "browser", "database", "payments", "cms", "github", "vercel"],
+                    },
+                    "intent": {"type": "string"},
+                    "reason": {"type": "string"},
+                }
+                required = ["query", "reason"]
             else:
                 properties = {
                     "mode": {"type": "string", "enum": ["exact", "final"]},
@@ -481,6 +550,8 @@ class AgentToolRegistry:
                     "name": name,
                     "description": (
                         f"{spec.progress_label}. Kind: {spec.kind}. "
+                        f"Capabilities: {', '.join(contract.get('capabilities') or [])}. "
+                        f"Side effects: {contract.get('side_effect_class')}; parallel_safe={str(contract.get('parallel_safe')).lower()}. "
                         "Use this product-neutral code-agent tool only when it directly advances the current plan. "
                         + (
                             "This mutating tool applies exactly one app-owned file_path per call; for multiple files, call the tool once per file with that file's own content or diff. Generated/platform-owned paths are rejected."

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import re
 import json
 from dataclasses import dataclass, field
 from typing import Any
+
+from app.services.repair_classifier import RepairClassifier
 
 
 @dataclass(frozen=True)
@@ -319,7 +322,7 @@ REPAIR_CATALOG: tuple[RepairCatalogEntry, ...] = (
         instruction="Create or route all required role pages and keep role navigation consistent with the manifest.",
         required_next_tool="read_files",
         verification_command="browser_verify",
-        patterns=(_rx(r"no(?: declared)? pages?.*role"), _rx(r"missing_role_page"), _rx(r"missing.*role.*page"), _rx(r"/(?:client|specialist|manager)")),
+        patterns=(_rx(r"no(?: declared)? pages?.*role"), _rx(r"missing_role_page"), _rx(r"missing.*role.*page")),
     ),
     RepairCatalogEntry(
         signature="preview.boot_failed",
@@ -572,25 +575,638 @@ REPAIR_CATALOG: tuple[RepairCatalogEntry, ...] = (
 )
 
 
+ROLE_NAMES = ("client", "specialist", "manager")
+
+
+def _text_blob(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _compact_text(value: object, *, max_chars: int = 420) -> str:
+    text = str(value or "").strip()
+    return text if len(text) <= max_chars else f"{text[:max_chars]}..."
+
+
+def _walk_values(value: Any) -> list[Any]:
+    values: list[Any] = []
+
+    def visit(item: Any) -> None:
+        if item is None:
+            return
+        values.append(item)
+        if isinstance(item, dict):
+            for nested in item.values():
+                visit(nested)
+            return
+        if isinstance(item, (list, tuple, set)):
+            for nested in item:
+                visit(nested)
+
+    visit(value)
+    return values
+
+
+def _first_key(value: Any, keys: tuple[str, ...], *, route_like: bool = False, api_like: bool = False) -> str:
+    normalized = {key.lower() for key in keys}
+
+    def visit(item: Any) -> str:
+        if isinstance(item, dict):
+            for key, nested in item.items():
+                if str(key).lower() in normalized:
+                    text = _compact_text(nested)
+                    if api_like:
+                        text = _api_path_from_text(text)
+                    elif route_like:
+                        text = _route_from_text(text)
+                    if text:
+                        return text
+            for nested in item.values():
+                found = visit(nested)
+                if found:
+                    return found
+        elif isinstance(item, (list, tuple, set)):
+            for nested in item:
+                found = visit(nested)
+                if found:
+                    return found
+        return ""
+
+    return visit(value)
+
+
+def _method_from_text(text: str) -> str:
+    match = re.search(r"\b(GET|POST|PUT|PATCH|DELETE)\b", text, flags=re.IGNORECASE)
+    return match.group(1).upper() if match else ""
+
+
+def _api_path_from_text(text: str) -> str:
+    value = str(text or "").strip()
+    if value.startswith("http://") or value.startswith("https://"):
+        match = re.search(r"https?://[^/]+([^?#\s\"']+)", value)
+        value = match.group(1) if match else value
+    match = re.search(r"(/api/[A-Za-z0-9_{}./:-]+)", value)
+    if not match:
+        return ""
+    return match.group(1).rstrip(".,;:)'\"")
+
+
+def _route_from_text(text: str) -> str:
+    value = str(text or "").strip()
+    if value.startswith("http://") or value.startswith("https://"):
+        match = re.search(r"https?://[^/]+([^?#\s\"']*)", value)
+        value = match.group(1) if match else value
+    if value.startswith("/"):
+        return value.rstrip(".,;:)'\"")
+    match = re.search(r"\b(/(?:client|specialist|manager)(?:/[A-Za-z0-9_./:-]*)?)", value)
+    return match.group(1).rstrip(".,;:)'\"") if match else ""
+
+
+def _status_code(value: Any) -> str:
+    for item in _walk_values(value):
+        if not isinstance(item, dict):
+            continue
+        for key in ("status_code", "http_status", "response_status"):
+            text = str(item.get(key) or "").strip()
+            if re.fullmatch(r"[1-5][0-9]{2}", text):
+                return text
+    match = re.search(r"\b([1-5][0-9]{2})\b", _text_blob(value))
+    return match.group(1) if match else ""
+
+
+def _role_from_packet(packet: dict[str, Any]) -> str:
+    evidence = packet.get("evidence") if isinstance(packet.get("evidence"), dict) else {}
+    role = _first_key(
+        [packet, evidence],
+        ("failed_role", "role", "target_role", "source_role", "viewer_role"),
+    )
+    if role in ROLE_NAMES:
+        return role
+    text = " ".join([_text_blob(packet), _text_blob(evidence)])
+    for match in re.finditer(r"(?:miniapp/app/static/|/)(client|specialist|manager)(?:/|\b)", text):
+        return match.group(1)
+    return ""
+
+
+def _paths_from_any(value: Any) -> list[str]:
+    paths: list[str] = []
+
+    def add(candidate: object) -> None:
+        text = str(candidate or "").strip().replace("\\", "/")
+        while text.startswith("./"):
+            text = text[2:]
+        if ":" in text and text.startswith("miniapp/"):
+            text = text.split(":", 1)[0].strip()
+        if text.startswith("miniapp/") and text not in paths:
+            paths.append(text)
+
+    def visit(item: Any) -> None:
+        if item is None:
+            return
+        if isinstance(item, str):
+            for match in re.finditer(r"(miniapp/[A-Za-z0-9_./*{}-]+(?:\.(?:py|js|mjs|html|css|json))?)", item):
+                add(match.group(1))
+            return
+        if isinstance(item, dict):
+            for key in ("path", "file", "file_path", "location", "frontend_ref", "suggested_patch_target"):
+                add(item.get(key))
+            for key in ("paths", "files", "target_files", "changed_files", "likely_files"):
+                nested = item.get(key)
+                if isinstance(nested, list):
+                    for candidate in nested:
+                        add(candidate)
+            for nested in item.values():
+                visit(nested)
+            return
+        if isinstance(item, (list, tuple, set)):
+            for nested in item:
+                visit(nested)
+
+    visit(value)
+    return paths[:20]
+
+
+def _failed_check(packet: dict[str, Any]) -> str:
+    evidence = packet.get("evidence") if isinstance(packet.get("evidence"), dict) else {}
+    for value in (
+        packet.get("failed_check"),
+        packet.get("verification_check"),
+        packet.get("failure_class"),
+        evidence.get("check") if isinstance(evidence, dict) else None,
+        evidence.get("failure_class") if isinstance(evidence, dict) else None,
+    ):
+        text = str(value or "").strip()
+        if text:
+            return text
+    return "checks.run"
+
+
+def _broken_surface(packet: dict[str, Any]) -> dict[str, Any]:
+    evidence = packet.get("evidence") if isinstance(packet.get("evidence"), dict) else {}
+    blob = _text_blob([packet, evidence])
+    check = _failed_check(packet)
+    selector = _first_key([packet, evidence], ("failed_selector", "selector", "expected_selector", "missing_selector"))
+    api_path = (
+        _first_key([packet, evidence], ("api_path", "api_route", "endpoint", "request_url", "url"), api_like=True)
+        or _api_path_from_text(blob)
+    )
+    route = _first_key([packet, evidence], ("failed_route", "route", "page_url", "page", "url"), route_like=True) or _route_from_text(blob)
+    method = _first_key([packet, evidence], ("method", "http_method")) or _method_from_text(blob)
+    role = _role_from_packet(packet)
+    step = _first_key([packet, evidence], ("failed_step", "step", "scenario", "action"))
+    error = _first_key([packet, evidence], ("error", "message", "details", "failure_reason"))
+    paths = _paths_from_any([packet, evidence])
+    check_l = check.lower()
+    code_l = str(packet.get("issue_code") or packet.get("code") or "").lower()
+    if "mobile" in check_l or "mobile" in code_l or "overflow" in blob.lower() or "overlap" in blob.lower():
+        kind = "mobile_layout"
+    elif api_path or "api_workflow" in check_l or "connectivity" in check_l:
+        kind = "api_route"
+    elif selector:
+        kind = "selector"
+    elif "generated_app_" in check_l or "test" in code_l:
+        kind = "test"
+    elif route:
+        kind = "route"
+    elif paths:
+        kind = "file"
+    else:
+        kind = "check"
+    surface = {
+        "kind": kind,
+        "check": check,
+        "role": role,
+        "route": route,
+        "selector": selector,
+        "api_route": api_path,
+        "method": method,
+        "step": step,
+        "file": paths[0] if paths else "",
+        "status_code": _status_code([packet, evidence]),
+        "error": _compact_text(error, max_chars=500),
+    }
+    return {key: value for key, value in surface.items() if value}
+
+
+def _expanded_role_files(path: str, role: str) -> list[str]:
+    if role not in ROLE_NAMES:
+        return []
+    if not path.startswith("miniapp/app/static/"):
+        return []
+    if "/**/" in path or path.endswith("/**") or path == "miniapp/app/static/**":
+        if path.endswith("app.js"):
+            return [f"miniapp/app/static/{role}/app.js"]
+        if path.endswith("index.html"):
+            return [f"miniapp/app/static/{role}/index.html"]
+        if path.endswith("styles.css"):
+            return [f"miniapp/app/static/{role}/styles.css"]
+        return [
+            f"miniapp/app/static/{role}/index.html",
+            f"miniapp/app/static/{role}/app.js",
+            f"miniapp/app/static/{role}/styles.css",
+        ]
+    return []
+
+
+def _likely_files(packet: dict[str, Any], broken_surface: dict[str, Any]) -> list[str]:
+    role = str(broken_surface.get("role") or "")
+    check = str(broken_surface.get("check") or _failed_check(packet)).lower()
+    kind = str(broken_surface.get("kind") or "")
+    target_files = [str(item or "").strip().replace("\\", "/") for item in packet.get("target_files") or []]
+    evidence = packet.get("evidence") if isinstance(packet.get("evidence"), dict) else {}
+    ordered: list[str] = []
+
+    def add(path: object) -> None:
+        text = str(path or "").strip().replace("\\", "/")
+        while text.startswith("./"):
+            text = text[2:]
+        if text.startswith("miniapp/") and text not in ordered:
+            ordered.append(text)
+
+    for path in _paths_from_any(evidence):
+        add(path)
+    for path in target_files:
+        for expanded in _expanded_role_files(path, role):
+            add(expanded)
+    if role in ROLE_NAMES and kind in {"selector", "route", "file", "check"}:
+        add(f"miniapp/app/static/{role}/index.html")
+        add(f"miniapp/app/static/{role}/app.js")
+    if role in ROLE_NAMES and kind == "mobile_layout":
+        add(f"miniapp/app/static/{role}/styles.css")
+        add(f"miniapp/app/static/{role}/index.html")
+        add("miniapp/app/static/shared/base.css")
+    if kind == "api_route" or "api_workflow" in check or "connectivity" in check:
+        add("miniapp/app/routes/api.py")
+        add("miniapp/app/db.py")
+        add("miniapp/app/schemas.py")
+        if role in ROLE_NAMES:
+            add(f"miniapp/app/static/{role}/app.js")
+    if "generated_app_python_tests" in check:
+        add("miniapp/tests/test_generated_app.py")
+    if "generated_app_js_tests" in check:
+        add("miniapp/tests/generated_app.test.mjs")
+    for path in target_files:
+        add(path)
+    return ordered[:12]
+
+
+def _post_fix_proof(packet: dict[str, Any], failed_check: str, broken_surface: dict[str, Any]) -> dict[str, Any]:
+    command = str(packet.get("verification_command") or "run_checks").strip()
+    expected = str(packet.get("expected_proof") or failed_check or "rerun failing check successfully")
+    check_l = failed_check.lower()
+    kind = str(broken_surface.get("kind") or "")
+    evidence_required = [f"{failed_check} passes"]
+    if "browser_flow" in check_l or kind in {"selector", "route"}:
+        evidence_required = [
+            "browser scenario reaches the failed step",
+            "screenshot refs are captured for the repaired route",
+            "console and network errors are empty",
+            "UI renders the persisted marker after reload",
+        ]
+        if kind == "api_route":
+            evidence_required.append("API route used by the browser step responds successfully")
+    elif "api_workflow" in check_l or kind == "api_route":
+        evidence_required = [
+            "API create/update succeeds",
+            "fresh read/list returns the persisted marker",
+            "response shape matches the frontend payload contract",
+        ]
+    elif kind == "mobile_layout":
+        evidence_required = [
+            "mobile viewport proof has no overflow/overlap",
+            "mobile screenshot ref is captured",
+        ]
+    elif "generated_app_python_tests" in check_l:
+        evidence_required = ["generated Python acceptance tests pass"]
+    elif "generated_app_js_tests" in check_l:
+        evidence_required = ["generated JS acceptance tests pass"]
+    elif "role" in check_l:
+        evidence_required = ["all required role pages/actions are covered"]
+    return {
+        "check": failed_check,
+        "command": command,
+        "expected": expected,
+        "evidence_required": evidence_required,
+    }
+
+
+def _normalize_error_signature(packet: dict[str, Any], failed_check: str) -> dict[str, str]:
+    raw = str(
+        packet.get("failure_signature")
+        or packet.get("signature")
+        or packet.get("details")
+        or packet.get("message")
+        or failed_check
+        or "repair"
+    ).strip()
+    stable_signature = str(packet.get("signature") or "").strip()
+    evidence = packet.get("evidence") if isinstance(packet.get("evidence"), dict) else {}
+    known_signatures = {entry.signature for entry in REPAIR_CATALOG}
+    embedded_recipe = isinstance(evidence.get("repair_recipe"), dict)
+    if stable_signature and (stable_signature in known_signatures or embedded_recipe):
+        normalized = stable_signature.lower()
+    else:
+        normalized = raw.lower()
+        normalized = re.sub(r"https?://[^\s\"')]+", "<url>", normalized)
+        normalized = re.sub(r"/(?:private/)?(?:tmp|var|users|workspace|app|source)/[A-Za-z0-9_./:-]+", "<path>", normalized)
+        normalized = re.sub(r"\b[0-9a-f]{8,}\b", "<hex>", normalized)
+        normalized = re.sub(r"\b(run|job|task|thread|ws|attempt|case|rc)_[A-Za-z0-9_-]+\b", r"\1_<id>", normalized)
+        normalized = re.sub(r"\bline\s+\d+\b", "line <n>", normalized)
+        normalized = re.sub(r":\d{2,5}\b", ":<port>", normalized)
+        normalized = re.sub(r"\b\d{2,}\b", "<n>", normalized)
+        normalized = re.sub(r"\s+", " ", normalized).strip(" .,:;")
+        prefix = str(packet.get("failure_class") or failed_check or packet.get("verification_check") or "").strip().lower()
+        if prefix and not normalized.startswith(prefix):
+            normalized = f"{prefix}:{normalized}"
+    return {
+        "raw": raw,
+        "normalized": normalized or "repair",
+        "digest": hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12],
+        "algorithm": "repair_signature_normalizer.v2",
+    }
+
+
+def _probable_files(packet: dict[str, Any], broken_surface: dict[str, Any], likely_files: list[str]) -> list[dict[str, Any]]:
+    role = str(broken_surface.get("role") or "")
+    kind = str(broken_surface.get("kind") or "")
+    check = str(broken_surface.get("check") or _failed_check(packet))
+    result: list[dict[str, Any]] = []
+
+    def add(path: str, reason: str, confidence: float) -> None:
+        text = str(path or "").strip().replace("\\", "/")
+        if not text.startswith("miniapp/"):
+            return
+        if any(item.get("path") == text for item in result):
+            return
+        result.append({"path": text, "reason": reason, "confidence": round(max(0.05, min(confidence, 0.99)), 2)})
+
+    for path in likely_files:
+        reason = "direct evidence path"
+        confidence = 0.78
+        if role and f"/{role}/" in path:
+            reason = f"{role} role surface implicated by failed proof"
+            confidence = 0.86
+        if kind == "api_route" and "/routes" in path:
+            reason = "failed check points to backend API route contract"
+            confidence = 0.88
+        if kind == "mobile_layout" and path.endswith((".css", ".html")):
+            reason = "mobile overflow/overlap usually lives in CSS or layout markup"
+            confidence = 0.9
+        if "generated_app_python_tests" in check and path.endswith("test_generated_app.py"):
+            reason = "Python acceptance test failure includes test context"
+            confidence = 0.82
+        if "generated_app_js_tests" in check and path.endswith("generated_app.test.mjs"):
+            reason = "JS acceptance test failure includes test context"
+            confidence = 0.82
+        add(path, reason, confidence)
+    if not result:
+        for path in packet.get("target_files") or []:
+            add(str(path), "catalog target fallback", 0.56)
+    return result[:12]
+
+
+def _known_fix_recipes(
+    packet: dict[str, Any],
+    *,
+    failed_check: str,
+    broken_surface: dict[str, Any],
+    likely_files: list[str],
+    post_fix_proof: dict[str, Any],
+    classification: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    issue_code = str(packet.get("issue_code") or packet.get("code") or "repair_case")
+    recipe = classification.get("recipe") if isinstance(classification, dict) and isinstance(classification.get("recipe"), dict) else {}
+    if recipe:
+        compatible_recipe = dict(recipe)
+        compatible_recipe["classifier_recipe_id"] = compatible_recipe.get("recipe_id")
+        compatible_recipe["recipe_id"] = str(packet.get("repair_recipe_id") or f"catalog.{issue_code}")
+        return [compatible_recipe]
+    signature = str(packet.get("signature") or packet.get("failure_signature") or issue_code)
+    kind = str(broken_surface.get("kind") or "")
+    base_steps = [
+        "Read only the probable files and the failing evidence.",
+        "Patch the smallest code slice that explains the failed proof.",
+        "Rerun the post-repair proof before widening scope.",
+    ]
+    if kind == "api_route" or "api_workflow" in failed_check.lower():
+        base_steps = [
+            "Trace the failing request from frontend payload to backend route/schema.",
+            "Patch the route, schema, DB write, or frontend payload together only where they disagree.",
+            "Rerun API workflow proof, then rerun browser proof if the browser used the same route.",
+        ]
+    elif kind == "mobile_layout":
+        base_steps = [
+            "Read the role HTML and CSS implicated by the overflow/overlap report.",
+            "Patch responsive constraints, wrapping, min-width, and spacing without changing product behavior.",
+            "Rerun mobile viewport browser proof and capture screenshots.",
+        ]
+    elif "generated_app_js_tests" in failed_check.lower() or "generated_app_python_tests" in failed_check.lower():
+        base_steps = [
+            "Read the failing generated test and the product code it asserts.",
+            "Patch product code only if it violates the prompt contract; otherwise update stale generated test expectations.",
+            "Rerun the exact generated app test suite.",
+        ]
+    return [
+        {
+            "recipe_id": str(packet.get("repair_recipe_id") or f"catalog.{issue_code}"),
+            "signature": signature,
+            "title": issue_code.replace("_", " ").replace(".", " ").strip().title() or "Repair Case",
+            "failure_type": failed_check,
+            "steps": base_steps,
+            "target_files": likely_files[:12],
+            "verification": post_fix_proof,
+        }
+    ]
+
+
+def _retry_strategy(packet: dict[str, Any], broken_surface: dict[str, Any], post_fix_proof: dict[str, Any]) -> dict[str, Any]:
+    policy = str(packet.get("retry_policy") or "evidence_driven_repair_case")
+    issue_code = str(packet.get("issue_code") or packet.get("code") or "").lower()
+    failed_check = str(packet.get("verification_check") or post_fix_proof.get("check") or "").lower()
+    kind = str(broken_surface.get("kind") or "")
+    strategy = {
+        "policy_id": policy,
+        "failure_type": failed_check or issue_code or "repair",
+        "max_attempts": 2,
+        "first_tool": str(packet.get("required_next_tool") or "read_files"),
+        "steps": ["collect_exact_evidence", "constrained_patch", "rerun_post_repair_proof"],
+        "stop_conditions": ["same_patch_hash_repeated", "post_repair_proof_still_fails_twice"],
+        "escalation": "open_focused_repair_case",
+    }
+    if "stale" in issue_code or "read_state" in issue_code:
+        strategy.update({"max_attempts": 1, "first_tool": "read_files", "steps": ["fresh_read", "single_patch_retry", "rerun_changed_files_static"]})
+    elif "boot" in issue_code or "preview_boot" in failed_check:
+        strategy.update({"first_tool": "lsp.diagnostics", "steps": ["inspect_import_traceback", "patch_boot_slice", "rerun_preview_boot_smoke"], "stop_conditions": [*strategy["stop_conditions"], "do_not_run_browser_until_boot_passes"]})
+    elif kind == "api_route" or "api_workflow" in failed_check:
+        strategy.update({"first_tool": "lsp.route_static_context", "steps": ["map_route_schema_payload", "patch_api_contract", "rerun_api_workflow_smoke", "rerun_browser_flow_if_impacted"]})
+    elif kind == "mobile_layout":
+        strategy.update({"first_tool": "read_files", "steps": ["patch_css_html_layout_slice", "rerun_mobile_browser_proof", "compare_mobile_screenshots"]})
+    if policy == "do_not_retry_same_patch":
+        strategy.update({"max_attempts": 1, "stop_conditions": ["same_failure_signature_seen_again", "same_patch_hash_repeated"], "escalation": "require_new_evidence_or_human_review"})
+    return strategy
+
+
+def _product_guardrails(packet: dict[str, Any], likely_files: list[str]) -> dict[str, Any]:
+    return {
+        "do_not_redesign_product": True,
+        "preserve_prompt_contract": True,
+        "allowed_scope": likely_files[:12] or list(packet.get("target_files") or [])[:12],
+        "forbidden_changes": [
+            "do not replace the app with a new product concept",
+            "do not remove required role workflows to make tests pass",
+            "do not edit only tests when product runtime behavior is broken",
+            "do not broaden beyond the failed check without fresh evidence",
+        ],
+        "minimality_rule": "Patch the smallest product/runtime slice that explains the normalized failure signature.",
+    }
+
+
+def _repair_confidence(packet: dict[str, Any], probable_files: list[dict[str, Any]], known_fix_recipes: list[dict[str, Any]]) -> dict[str, Any]:
+    signature = str(packet.get("signature") or "")
+    known_signatures = {entry.signature for entry in REPAIR_CATALOG}
+    embedded = isinstance((packet.get("evidence") or {}).get("repair_recipe"), dict) if isinstance(packet.get("evidence"), dict) else False
+    if embedded:
+        score = 0.92
+        reason = "validator emitted a typed repair recipe"
+    elif signature in known_signatures:
+        score = 0.82
+        reason = "catalog signature matched known failure"
+    else:
+        score = 0.48
+        reason = "uncatalogued failure uses generic evidence-driven repair"
+    if probable_files:
+        score += 0.06
+    if known_fix_recipes:
+        score += 0.04
+    return {"score": round(min(score, 0.98), 2), "reason": reason}
+
+
 class RepairCatalog:
     @staticmethod
     def entries() -> list[dict[str, Any]]:
-        return [entry.packet() for entry in REPAIR_CATALOG]
+        return [RepairCatalog.enrich_packet(entry.packet()) for entry in REPAIR_CATALOG]
+
+    @staticmethod
+    def enrich_packet(packet: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(packet, dict):
+            return {}
+        enriched = dict(packet)
+        failed_check = _failed_check(enriched)
+        broken_surface = _broken_surface(enriched)
+        likely_files = _likely_files(enriched, broken_surface)
+        probable_files = _probable_files(enriched, broken_surface, likely_files)
+        post_fix_proof = _post_fix_proof(enriched, failed_check, broken_surface)
+        signature_normalization = _normalize_error_signature(enriched, failed_check)
+        classification = RepairClassifier.classify(
+            {
+                **enriched,
+                "failed_check": failed_check,
+                "broken_surface": broken_surface,
+                "likely_files": likely_files,
+                "post_fix_proof": post_fix_proof,
+            }
+        )
+        known_fix_recipes = _known_fix_recipes(
+            enriched,
+            failed_check=failed_check,
+            broken_surface=broken_surface,
+            likely_files=likely_files,
+            post_fix_proof=post_fix_proof,
+            classification=classification,
+        )
+        retry_strategy = _retry_strategy(enriched, broken_surface, post_fix_proof)
+        if isinstance(classification, dict):
+            escalation = classification.get("escalation") if isinstance(classification.get("escalation"), dict) else {}
+            relevant_checks = classification.get("relevant_checks") if isinstance(classification.get("relevant_checks"), list) else []
+            if relevant_checks:
+                retry_strategy = {
+                    **retry_strategy,
+                    "check_profile": classification.get("check_profile") or retry_strategy.get("check_profile"),
+                    "relevant_checks": relevant_checks,
+                    "escalation": escalation or retry_strategy.get("escalation"),
+                }
+        product_guardrails = _product_guardrails(enriched, likely_files)
+        repair_confidence = _repair_confidence(enriched, probable_files, known_fix_recipes)
+        if isinstance(classification.get("confidence"), dict):
+            repair_confidence = {
+                **repair_confidence,
+                "classifier_score": classification["confidence"].get("score"),
+                "repair_class": classification.get("repair_class"),
+            }
+        repair_packet = {
+            "schema": "grounded.repair_packet.v2",
+            "failed_check": failed_check,
+            "normalized_signature": signature_normalization["normalized"],
+            "signature_normalization": signature_normalization,
+            "repair_class": classification.get("repair_class"),
+            "repair_classification": classification,
+            "focused_patch_plan": classification.get("focused_patch_plan"),
+            "relevant_checks": classification.get("relevant_checks") or [],
+            "check_profile": classification.get("check_profile"),
+            "escalation": classification.get("escalation") or {},
+            "likely_files": likely_files,
+            "probable_files": probable_files,
+            "broken_surface": broken_surface,
+            "known_fix_recipe": known_fix_recipes[0] if known_fix_recipes else {},
+            "known_fix_recipes": known_fix_recipes,
+            "retry_strategy": retry_strategy,
+            "product_guardrails": product_guardrails,
+            "repair_confidence": repair_confidence,
+            "post_fix_proof": post_fix_proof,
+            "post_repair_proof": post_fix_proof,
+        }
+        enriched["failed_check"] = failed_check
+        enriched["repair_catalog_version"] = "v2"
+        enriched["normalized_signature"] = signature_normalization["normalized"]
+        enriched["signature_normalization"] = signature_normalization
+        enriched["repair_class"] = classification.get("repair_class")
+        enriched["repair_classification"] = classification
+        enriched["focused_patch_plan"] = classification.get("focused_patch_plan")
+        enriched["relevant_checks"] = classification.get("relevant_checks") or []
+        enriched["check_profile"] = classification.get("check_profile")
+        enriched["escalation"] = classification.get("escalation") or {}
+        enriched["likely_files"] = likely_files
+        enriched["probable_files"] = probable_files
+        enriched["broken_surface"] = broken_surface
+        enriched["known_fix_recipe"] = known_fix_recipes[0] if known_fix_recipes else {}
+        enriched["known_fix_recipes"] = known_fix_recipes
+        enriched["retry_strategy"] = retry_strategy
+        enriched["product_guardrails"] = product_guardrails
+        enriched["repair_confidence"] = repair_confidence
+        enriched["post_fix_proof"] = post_fix_proof
+        enriched["post_repair_proof"] = post_fix_proof
+        existing_packet = enriched.get("repair_packet") if isinstance(enriched.get("repair_packet"), dict) else {}
+        enriched["repair_packet"] = {**existing_packet, **repair_packet}
+        next_action = enriched.get("next_forced_action")
+        if isinstance(next_action, dict):
+            enriched["next_forced_action"] = {
+                **next_action,
+                "failed_check": failed_check,
+                "normalized_signature": signature_normalization["normalized"],
+                "broken_surface": broken_surface,
+                "probable_files": probable_files,
+                "retry_strategy": retry_strategy,
+                "post_fix_proof": post_fix_proof,
+                "post_repair_proof": post_fix_proof,
+            }
+        return enriched
 
     @staticmethod
     def classify_issue(issue: dict[str, Any]) -> dict[str, Any]:
         embedded = RepairCatalog._packet_from_embedded_recipe(issue)
         if embedded:
-            return embedded
+            return RepairCatalog.enrich_packet(embedded)
         text = RepairCatalog._issue_text(issue)
         for entry in REPAIR_CATALOG:
             if entry.signature in text or entry.issue_code in text:
-                return entry.packet(evidence=issue)
+                return RepairCatalog.enrich_packet(entry.packet(evidence=issue))
         for entry in REPAIR_CATALOG:
             if any(pattern.search(text) for pattern in entry.patterns):
-                return entry.packet(evidence=issue)
+                return RepairCatalog.enrich_packet(entry.packet(evidence=issue))
         issue_code = str(issue.get("code") or issue.get("check") or "uncatalogued_repair_case")
-        return {
+        return RepairCatalog.enrich_packet({
             "signature": str(issue.get("signature") or issue.get("failure_signature") or f"repair.uncatalogued_repair_case:{issue_code}"),
             "issue_code": issue_code,
             "code": issue_code,
@@ -617,7 +1233,7 @@ class RepairCatalog:
                 "verification_check": str(issue.get("check") or "checks.run"),
             },
             "evidence": issue,
-        }
+        })
 
     @staticmethod
     def _issue_text(value: Any) -> str:
@@ -652,7 +1268,7 @@ class RepairCatalog:
             if not isinstance(issue, dict):
                 continue
             packet = cls.classify_issue(issue)
-            key = str(packet.get("signature") or packet.get("issue_code") or len(packets))
+            key = str(packet.get("normalized_signature") or packet.get("signature") or packet.get("issue_code") or len(packets))
             if key in seen:
                 continue
             seen.add(key)

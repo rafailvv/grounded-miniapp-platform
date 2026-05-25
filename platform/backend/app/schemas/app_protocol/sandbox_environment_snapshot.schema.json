@@ -1,0 +1,148 @@
+{
+  "$id": "https://grounded.local/schemas/app_protocol/sandbox_environment_snapshot.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "argv": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Argv",
+      "type": "array"
+    },
+    "created_at": {
+      "title": "Created At",
+      "type": "string"
+    },
+    "cwd": {
+      "title": "Cwd",
+      "type": "string"
+    },
+    "enforcement": {
+      "enum": [
+        "hard",
+        "policy_only",
+        "unavailable"
+      ],
+      "title": "Enforcement",
+      "type": "string"
+    },
+    "env_keys": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Env Keys",
+      "type": "array"
+    },
+    "env_sha256": {
+      "title": "Env Sha256",
+      "type": "string"
+    },
+    "home_dir": {
+      "title": "Home Dir",
+      "type": "string"
+    },
+    "host_pid": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Host Pid"
+    },
+    "isolated_workspace": {
+      "title": "Isolated Workspace",
+      "type": "string"
+    },
+    "network_mode": {
+      "enum": [
+        "blocked",
+        "allowed"
+      ],
+      "title": "Network Mode",
+      "type": "string"
+    },
+    "os_name": {
+      "title": "Os Name",
+      "type": "string"
+    },
+    "process_id": {
+      "title": "Process Id",
+      "type": "string"
+    },
+    "profile": {
+      "enum": [
+        "analysis_readonly",
+        "agent_draft_write",
+        "source_apply_gate",
+        "developer_bypass"
+      ],
+      "title": "Profile",
+      "type": "string"
+    },
+    "provider": {
+      "title": "Provider",
+      "type": "string"
+    },
+    "resolved_argv": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Resolved Argv",
+      "type": "array"
+    },
+    "resource_limits": {
+      "additionalProperties": {
+        "type": "integer"
+      },
+      "title": "Resource Limits",
+      "type": "object"
+    },
+    "schema": {
+      "default": "grounded.sandbox.environment_snapshot.v1",
+      "title": "Schema",
+      "type": "string"
+    },
+    "snapshot_sha256": {
+      "title": "Snapshot Sha256",
+      "type": "string"
+    },
+    "tmp_dir": {
+      "title": "Tmp Dir",
+      "type": "string"
+    },
+    "workspace_root": {
+      "title": "Workspace Root",
+      "type": "string"
+    },
+    "wrapped_argv": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Wrapped Argv",
+      "type": "array"
+    }
+  },
+  "required": [
+    "process_id",
+    "created_at",
+    "workspace_root",
+    "isolated_workspace",
+    "cwd",
+    "env_sha256",
+    "tmp_dir",
+    "home_dir",
+    "os_name",
+    "profile",
+    "provider",
+    "enforcement",
+    "network_mode",
+    "snapshot_sha256"
+  ],
+  "title": "SandboxEnvironmentSnapshot",
+  "type": "object"
+}

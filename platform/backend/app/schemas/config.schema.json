@@ -84,6 +84,17 @@
       "properties": {
         "project_instructions": { "type": "boolean", "default": true },
         "runtime_skills": { "type": "boolean", "default": true },
+        "scoped_skills": { "type": "boolean", "default": true },
+        "skill_roots": {
+          "type": "object",
+          "properties": {
+            "system": { "type": "boolean", "default": true },
+            "repo": { "type": "boolean", "default": true },
+            "plugin": { "type": "boolean", "default": true },
+            "user": { "type": "boolean", "default": true }
+          },
+          "additionalProperties": false
+        },
         "workspace_memory": { "type": "boolean", "default": true },
         "magic_docs": { "type": "boolean", "default": true },
         "slash_commands": { "type": "boolean", "default": true },

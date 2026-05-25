@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "vite",
     "generate:api": "mkdir -p src/lib/generated && (cd ../backend && python3 -m app.openapi_export --output /tmp/grounded-platform-openapi.json) && openapi-typescript /tmp/grounded-platform-openapi.json -o src/lib/generated/openapi-types.ts",
+    "test:snapshots": "node tests/render-component-snapshots.mjs",
+    "test": "npm run test:snapshots",
     "build": "tsc -b && vite build",
     "preview": "vite preview"
   },

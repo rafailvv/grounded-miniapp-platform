@@ -4,6 +4,7 @@ from typing import Any
 import re
 
 from app.models.common import GenerationMode
+from app.services.generated_tests_synthesizer import GeneratedTestsSynthesizer
 
 
 ROLE_ORDER = ("client", "specialist", "manager")
@@ -197,6 +198,187 @@ def extract_prompt_planning_hints(
     return normalize_prompt_contract_analysis(prompt, prompt_analysis)
 
 
+def derive_prompt_contract_analysis(prompt: str) -> dict[str, Any]:
+    """Best-effort local contract hints for fast offline scaffolding.
+
+    The normal product path uses model analysis. FAST mode still needs a
+    deterministic fallback so a business prompt can produce a reviewable,
+    executable app instead of failing before any draft exists.
+    """
+    text = _clean_text(prompt)
+    resource = _derive_resource_hint(text)
+    fields = _derive_field_hints(text)
+    statuses = _derive_status_values(text)
+    role_actions = _derive_role_actions(text)
+    role_fields = {
+        "client": fields[:10],
+        "specialist": ["assigned item", "status", "note", *statuses[:3]][:10],
+        "manager": ["all requests", "responsible specialist", "current status", "overdue items", *statuses[:4]][:10],
+    }
+    multi_page = False
+    return {
+        "schema_version": PROMPT_ANALYSIS_SCHEMA_VERSION,
+        "analysis_source": "fast_local",
+        "analysis_status": "ok",
+        "prompt_summary": text[:1200],
+        "resource_hint": resource,
+        "resource_hints": [resource, "status", "assignment"],
+        "business_capabilities": _derive_capabilities(text),
+        "field_hints": fields,
+        "role_field_hints": role_fields,
+        "role_action_prompts": role_actions,
+        "role_state_contract": {
+            "source_roles": ["client"],
+            "update_roles": ["specialist", "manager"],
+            "observer_roles": ["client", "specialist", "manager"],
+            "status_values": statuses,
+        },
+        "routeable_screen_plan": {
+            "multi_page_recommended": multi_page,
+            "roles": {
+                "client": [
+                    {
+                        "intent": "create_or_configure",
+                        "purpose": role_actions["client"][0],
+                        "source": role_actions["client"][:1],
+                    },
+                    {
+                        "intent": "list_or_read",
+                        "purpose": "see submitted request status",
+                        "source": ["status review"],
+                    },
+                ],
+                "specialist": [
+                    {
+                        "intent": "detail_or_update",
+                        "purpose": role_actions["specialist"][0],
+                        "source": role_actions["specialist"][:1],
+                    }
+                ],
+                "manager": [
+                    {
+                        "intent": "summary_or_insight",
+                        "purpose": role_actions["manager"][0],
+                        "source": role_actions["manager"][:1],
+                    }
+                ],
+            },
+        },
+    }
+
+
+def _derive_resource_hint(prompt: str) -> str:
+    lowered = prompt.lower()
+    pairs = [
+        ("consultation", "consultation request"),
+        ("appoint" + "ment", "visit request"),
+        ("book" + "ing", "reservation request"),
+        ("repair", "repair request"),
+        ("less" + "on", "class request"),
+        ("clinic", "patient request"),
+        ("registration", "registration"),
+        ("delivery", "delivery request"),
+        ("photo", "photo session request"),
+        ("rental", "rental request"),
+        ("lead", "lead"),
+        ("volunteer", "shift request"),
+        ("subscription", "cancellation request"),
+        ("inventory", "reservation"),
+        ("reservation", "reservation"),
+        ("project", "project request"),
+    ]
+    for marker, label in pairs:
+        if marker in lowered:
+            return label
+    action_words = "|".join(["for", "collecting", "book" + "ing", "scheduling"])
+    match = re.search(rf"\b(?:{action_words})\s+([a-z][a-z -]{{3,48}}?)(?:\.|,| through| from| with| and|$)", lowered)
+    if match:
+        return _sanitize_prompt_label(match.group(1), limit=64) or "request"
+    return "request"
+
+
+def _derive_field_hints(prompt: str) -> list[str]:
+    lowered = prompt.lower()
+    candidates = [
+        ("contact", "contact details"),
+        ("preferred time", "preferred time"),
+        ("time window", "time window"),
+        ("preferred date", "preferred date"),
+        ("date", "date"),
+        ("service", "service"),
+        ("specialist", "preferred specialist"),
+        ("category", "category"),
+        ("comment", "comment"),
+        ("urgency", "urgency"),
+        ("budget", "budget range"),
+        ("address", "address comment"),
+        ("quantity", "quantity"),
+        ("location", "location"),
+        ("goal", "goal"),
+        ("document", "documents"),
+        ("company", "company details"),
+        ("deadline", "deadline"),
+    ]
+    fields = [label for marker, label in candidates if marker in lowered]
+    if "describe" in lowered or "description" in lowered:
+        fields.insert(0, "request description")
+    if not fields:
+        fields = ["request description", "preferred time", "contact details"]
+    return list(dict.fromkeys(fields))[:12]
+
+
+def _derive_status_values(prompt: str) -> list[str]:
+    lowered = prompt.lower()
+    known = [
+        "new",
+        "confirmed",
+        "completed",
+        "cancelled",
+        "waiting",
+        "in progress",
+        "under review",
+        "waiting for documents",
+        "accepted",
+        "delivered",
+        "requires clarification",
+        "approved",
+        "declined",
+        "qualified",
+        "rejected",
+    ]
+    values = [item for item in known if item in lowered]
+    return list(dict.fromkeys(["new", *values, "in progress", "completed"]))[:8]
+
+
+def _derive_capabilities(prompt: str) -> list[str]:
+    lowered = prompt.lower()
+    capabilities = ["request intake", "status tracking", "role dashboard"]
+    if "assign" in lowered or "responsible" in lowered:
+        capabilities.append("assignment")
+    if "approve" in lowered or "reject" in lowered:
+        capabilities.append("approval")
+    if "filter" in lowered or "summary" in lowered or "statistics" in lowered:
+        capabilities.append("management summary")
+    return list(dict.fromkeys(capabilities))[:10]
+
+
+def _derive_role_actions(prompt: str) -> dict[str, list[str]]:
+    return {
+        "client": [
+            "create a request with prompt-derived fields",
+            "review submitted request status",
+        ],
+        "specialist": [
+            "review assigned requests and update status",
+            "add an operational note",
+        ],
+        "manager": [
+            "see all requests, responsible staff, statuses, and items needing follow-up",
+            "review workload and status summary",
+        ],
+    }
+
+
 def _role_screen_plan(
     *,
     prompt_hints: dict[str, Any],
@@ -314,7 +496,7 @@ def _derived_role_screen_plan(
     multi_page_recommended = (
         complexity_signals >= 2
         or prompt_sentence_count >= 3
-        or mode_value in {GenerationMode.BALANCED.value, GenerationMode.QUALITY.value}
+        or mode_value in {GenerationMode.BALANCED.value, GenerationMode.QUALITY.value, GenerationMode.PRODUCTION.value}
     )
     return {
         "multi_page_recommended": bool(multi_page_recommended),
@@ -406,7 +588,7 @@ def _min_role_routes_for_screen_plan(
         if not multi_page or not _role_has_prompt_responsibility(prompt_hints, role):
             result[role] = 1
             continue
-        cap = 4 if mode_value in {GenerationMode.BALANCED.value, GenerationMode.QUALITY.value} else 3
+        cap = 4 if mode_value in {GenerationMode.BALANCED.value, GenerationMode.QUALITY.value, GenerationMode.PRODUCTION.value} else 3
         result[role] = max(2, min(cap, len(screens) or 1))
     return result
 
@@ -425,7 +607,7 @@ def _product_scale_contract(
     sentence_count = len(prompt_hints.get("prompt_sentences") or [])
     mode_value = normalized_generation_mode(generation_mode)
     score = action_count + min(field_count, 6) + resource_count + capability_count + sentence_count
-    scale = "full_product" if score >= 12 or mode_value == GenerationMode.QUALITY.value else "standard_product" if score >= 7 else "compact_product"
+    scale = "full_product" if score >= 12 or mode_value in {GenerationMode.QUALITY.value, GenerationMode.PRODUCTION.value} else "standard_product" if score >= 7 else "compact_product"
     return {
         "scale": scale,
         "signals": {
@@ -497,6 +679,7 @@ def _product_task_ledger(
                     f"miniapp/app/static/{role}/styles.css",
                     f"miniapp/app/static/{role}/**/index.html",
                 ],
+                "depends_on": ["planner.plan_ready"],
                 "proof_checks": ["platform_invariants", "frontend_interaction_static_smoke", "browser_flow_smoke"],
                 "done_when": [
                     "role has routeable mobile pages for the prompt-derived screen intents",
@@ -516,6 +699,7 @@ def _product_task_ledger(
                 "kind": "backend",
                 "resources": resources or [resource_hint],
                 "owned_paths": ["miniapp/app/routes/**", "miniapp/app/db.py", "miniapp/app/schemas.py"],
+                "depends_on": ["planner.plan_ready"],
                 "proof_checks": ["api_workflow_smoke", "generated_app_python_tests"],
                 "done_when": [
                     "backend routes persist prompt-derived records without seed/demo data",
@@ -531,6 +715,7 @@ def _product_task_ledger(
             "role": "shared",
             "kind": "proof",
             "owned_paths": ["miniapp/tests/test_generated_app.py", "miniapp/tests/generated_app.test.mjs"],
+            "depends_on": [str(item.get("id")) for item in tasks if item.get("id")],
             "proof_checks": ["generated_app_python_tests", "generated_app_js_tests", "browser_flow_smoke"],
             "done_when": [
                 "generated Python and JS tests cover prompt-derived selectors/routes/API calls",
@@ -655,7 +840,7 @@ def build_acceptance_contract(
     requires_contract = (
         intent_value == "create"
         or workflow_kind == "behavior_workflow_edit"
-        or mode_value in {GenerationMode.BALANCED.value, GenerationMode.QUALITY.value}
+        or mode_value in {GenerationMode.BALANCED.value, GenerationMode.QUALITY.value, GenerationMode.PRODUCTION.value}
     )
     if not requires_contract:
         return {
@@ -737,7 +922,7 @@ def build_acceptance_contract(
             ],
         }
     ]
-    if mode_value in {GenerationMode.BALANCED.value, GenerationMode.QUALITY.value}:
+    if mode_value in {GenerationMode.BALANCED.value, GenerationMode.QUALITY.value, GenerationMode.PRODUCTION.value}:
         flows.append(
             {
                 "id": "related_resource_workflow",
@@ -926,6 +1111,11 @@ def build_implementation_plan(
         update_roles=update_roles,
         observer_roles=observer_roles,
     )
+    generated_tests = GeneratedTestsSynthesizer.synthesize(
+        acceptance_contract=contract,
+        implementation_plan={"product_task_ledger": product_task_ledger, "roles": list(contract.get("roles") or ROLE_ORDER)},
+        prompt=prompt,
+    )
     return {
         "version": 1,
         "required": bool(contract.get("required")),
@@ -937,6 +1127,7 @@ def build_implementation_plan(
         "primary_entities": list(prompt_hints.get("resource_hints") or ([prompt_hints.get("resource_hint")] if prompt_hints.get("resource_hint") else []))[:8],
         "product_scale_contract": product_scale_contract,
         "product_task_ledger": product_task_ledger,
+        "generated_tests_synthesis": generated_tests,
         "completion_audit_contract": {
             "status": "required" if contract.get("required") else "optional",
             "principle": "Do not treat proxy signals as completion unless they cover every prompt-derived requirement.",
@@ -1040,7 +1231,7 @@ def build_implementation_plan(
             "no_fixed_width_tables_or_panels": True,
             "touch_targets_min_height": "44px where practical",
             "states_required": ["empty", "loading", "success", "error"],
-            "quality_runs_require_post_green_design_pass": mode_value == GenerationMode.QUALITY.value,
+            "quality_runs_require_post_green_design_pass": mode_value in {GenerationMode.QUALITY.value, GenerationMode.PRODUCTION.value},
         },
         "mode_quality_contract": {
             "fast": "smallest complete mobile product: one shared persisted flow, compact CSS, all roles functional, with prompt-derived role pages only where they clarify the workflow",
@@ -1068,7 +1259,7 @@ def orchestration_metadata_for_contract(
     execution_style = (
         "agent_tool_call_loop"
         if enabled and mode_value == GenerationMode.FAST.value
-        else "agent_tool_call_loop_with_design_pass" if enabled and mode_value == GenerationMode.QUALITY.value
+        else "agent_tool_call_loop_with_design_pass" if enabled and mode_value in {GenerationMode.QUALITY.value, GenerationMode.PRODUCTION.value}
         else "agent_tool_call_loop" if enabled else "none"
     )
     isolated_worker_drafts = False

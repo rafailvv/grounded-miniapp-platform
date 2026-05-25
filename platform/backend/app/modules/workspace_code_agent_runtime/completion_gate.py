@@ -5,6 +5,10 @@ from typing import Any
 
 from app.models.domain import CheckExecutionRecord, RunCheckResult, ValidationSnapshot
 from app.services.check_runner import CheckRunner
+from app.services.generation_sla import GenerationSla
+from app.services.product_readiness import ProductReadinessContract
+from app.services.requirement_traceability import RequirementTraceabilityMatrix
+from app.services.run_task_ledger import RunTaskLedger
 from app.services.workspace.service import WorkspaceService
 
 
@@ -29,82 +33,65 @@ class WorkspaceAgentCompletionGate:
         focused_visual_edit: bool = False,
     ) -> dict[str, object]:
         failed = [result for result in results if result.status in {"failed", "blocked"}]
-        by_name = {result.name: result for result in results}
         diff_text = self.workspace_service.diff(workspace_id, run_id=run_id)
         has_diff = bool(diff_text.strip())
-        product_paths = self._product_paths_from_diff(diff_text)
         no_app_diff = request_mode in {"generate", "fix"} and not has_diff
-        mode_value = str(generation_mode or "").lower()
-        acceptance_required = bool((acceptance_contract or {}).get("required")) or request_mode == "generate" or mode_value in {"quality", "balanced"}
-        require_product_proof = acceptance_required and not focused_visual_edit
-        remaining_issues = [
-            {
-                "kind": "check_failure",
-                "check": result.name,
-                "details": result.details,
-                "logs": result.logs[-8:],
-                "blocking": True,
-            }
-            for result in failed
-        ]
-        if no_app_diff:
-            remaining_issues.append(
-                {
-                    "kind": "meaningful_diff",
-                    "check": "meaningful_diff",
-                    "details": "Generation must create a contract-derived draft diff before completion.",
-                    "blocking": True,
-                }
-            )
-        if require_product_proof and has_diff and not product_paths:
-            remaining_issues.append(
-                {
-                    "kind": "product_source_diff",
-                    "check": "meaningful_product_diff",
-                    "details": "Acceptance runs must change product runtime source, not only generated tests or contract metadata.",
-                    "blocking": True,
-                }
-            )
-        if require_product_proof:
-            remaining_issues.extend(self._product_task_ledger_issues(results, implementation_plan=implementation_plan))
-            required_checks = (
-                "api_workflow_smoke",
-                "browser_flow_smoke",
-                "generated_app_python_tests",
-                "generated_app_js_tests",
-            )
-            for check_name in required_checks:
-                result = by_name.get(check_name)
-                if result is None or result.status != "passed":
-                    remaining_issues.append(
-                        {
-                            "kind": "required_product_proof",
-                            "check": check_name,
-                            "details": f"{check_name} must pass before a generate/balanced/quality run can complete.",
-                            "blocking": True,
-                        }
-                    )
-            browser = by_name.get("browser_flow_smoke")
-            mobile = browser.diagnostics.get("mobile_layout") if browser and isinstance(browser.diagnostics, dict) else None
-            if isinstance(mobile, dict) and mobile.get("status") == "failed":
-                remaining_issues.append(
-                    {
-                        "kind": "mobile_layout",
-                        "check": "browser_flow_smoke",
-                        "details": "Mobile layout report contains blocking issues.",
-                        "diagnostics": mobile,
-                        "blocking": True,
-                    }
-                )
+        readiness = ProductReadinessContract.evaluate(
+            run_mode=request_mode,
+            generation_mode=generation_mode,
+            intent=intent,
+            acceptance_contract=acceptance_contract,
+            implementation_plan=implementation_plan,
+            results=results,
+            diff_text=diff_text,
+            touched_files=None,
+            require_diff=True,
+            require_product_source_change=True,
+            require_apply=False,
+        )
+        acceptance_required = readiness.acceptance_required
+        require_product_proof = acceptance_required
+        remaining_issues = [item.model_dump(mode="json") if hasattr(item, "model_dump") else dict(item) for item in readiness.blocking_reasons]
+        traceability = RequirementTraceabilityMatrix.build(
+            run={
+                "run_id": run_id,
+                "workspace_id": workspace_id,
+                "prompt": "",
+                "mode": request_mode,
+                "intent": intent,
+                "generation_mode": generation_mode,
+                "acceptance_contract": acceptance_contract or {},
+                "implementation_plan": implementation_plan or {},
+            },
+            artifacts={
+                "run_id": run_id,
+                "workspace_id": workspace_id,
+                "diff": diff_text,
+                "check_results": [result.model_dump(mode="json") for result in results],
+            },
+        )
+        if GenerationSla.requires_full_audit(generation_mode):
+            remaining_issues.extend(RequirementTraceabilityMatrix.blocking_issues(traceability))
         if validation_snapshot is not None:
             remaining_issues.extend(
                 issue
                 for issue in validation_snapshot.issues
                 if isinstance(issue, dict) and issue.get("blocking", False)
             )
+        remaining_issues.extend(
+            RunTaskLedger.blocking_issues(
+                run_id=run_id,
+                workspace_id=workspace_id,
+                implementation_plan=implementation_plan,
+                run_status="completed",
+                current_stage="completion_gate",
+                results=results,
+                remaining_issues=remaining_issues,
+            )
+        )
         blocking_issues = [issue for issue in remaining_issues if isinstance(issue, dict) and issue.get("blocking", True)]
         complete = not failed and not no_app_diff and not blocking_issues
-        optimistic = complete or (focused_visual_edit and not failed and not no_app_diff)
+        optimistic = complete
         return {
             "strict_green": complete,
             "optimistic_complete": optimistic,
@@ -115,6 +102,8 @@ class WorkspaceAgentCompletionGate:
             "acceptance_required": acceptance_required,
             "product_proof_required": require_product_proof,
             "remaining_issues": remaining_issues,
+            "product_readiness": readiness.model_dump(mode="json", by_alias=True),
+            "requirement_traceability": traceability,
         }
 
     @classmethod

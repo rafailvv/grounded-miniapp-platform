@@ -118,6 +118,7 @@ DEFAULT_PROFILE_BY_MODE = {
     GenerationMode.FAST: "openai_code_fast",
     GenerationMode.BALANCED: "research_balanced",
     GenerationMode.QUALITY: "openai_code_quality",
+    GenerationMode.PRODUCTION: "openai_code_quality",
     GenerationMode.BASIC: "openai_code_fast",
 }
 
@@ -139,7 +140,7 @@ def resolve_model_profile(requested_profile: str | None, generation_mode: Genera
         return default_profile
     if mode == GenerationMode.BALANCED and normalized == "openai_code_fast":
         return default_profile
-    if mode == GenerationMode.QUALITY and normalized in {"openai_code_fast", "research_balanced"}:
+    if mode in {GenerationMode.QUALITY, GenerationMode.PRODUCTION} and normalized in {"openai_code_fast", "research_balanced"}:
         return default_profile
     if mode in {GenerationMode.FAST, GenerationMode.BASIC} and normalized == "openai_code_quality":
         return default_profile

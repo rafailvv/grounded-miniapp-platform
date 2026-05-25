@@ -46,6 +46,7 @@ class AgentTranscriptStore:
         self._last_tool_call_ids: dict[str, list[str]] = {}
         self._pending_tool_results: dict[str, list[dict[str, Any]]] = {}
         self._pending_post_compact_messages: dict[str, list[dict[str, Any]]] = {}
+        self._preserved_tails: dict[str, list[dict[str, Any]]] = {}
         self._writers: dict[str, Callable[[dict[str, Any]], None]] = {}
         self._microcompact_writers: dict[str, Callable[[dict[str, Any], str], dict[str, Any]]] = {}
 
@@ -89,6 +90,9 @@ class AgentTranscriptStore:
         compact_messages = snapshot.get("post_compact_messages") if isinstance(snapshot, dict) else None
         if isinstance(compact_messages, list):
             self._pending_post_compact_messages[run_key] = [item for item in compact_messages if isinstance(item, dict)]
+        tails = snapshot.get("preserved_tails") if isinstance(snapshot, dict) else None
+        if isinstance(tails, list):
+            self._preserved_tails[run_key] = [item for item in tails if isinstance(item, dict)]
 
     def _persist(self, run_key: str) -> None:
         writer = self._writers.get(run_key)
@@ -157,6 +161,7 @@ class AgentTranscriptStore:
             "previous_response_id": previous_response_id,
             "tool_result_messages": pending,
             "post_compact_messages": list(self._pending_post_compact_messages.get(run_key, [])),
+            "preserved_tails": list(self._preserved_tails.get(run_key, [])),
         }
 
     def clear_model_context(self, run_key: str) -> None:
@@ -292,10 +297,19 @@ class AgentTranscriptStore:
                     },
                 )
 
-    def compact_model_context(self, run_key: str, *, reason: str, preserve_response_id: bool = True) -> dict[str, Any]:
+    def compact_model_context(
+        self,
+        run_key: str,
+        *,
+        reason: str,
+        preserve_response_id: bool = True,
+        preserved_tail: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         previous_response_id = self._last_response_id.get(run_key)
         pending_count = len(self._pending_tool_results.get(run_key, []))
         last_tool_call_count = len(self._last_tool_call_ids.get(run_key, []))
+        tail = preserved_tail if isinstance(preserved_tail, dict) else self._build_preserved_tail(run_key, reason=reason)
+        self._preserved_tails[run_key] = [*self._preserved_tails.get(run_key, []), tail][-20:]
         self._pending_tool_results[run_key] = []
         if not preserve_response_id or pending_count or last_tool_call_count:
             self._last_response_id.pop(run_key, None)
@@ -309,6 +323,7 @@ class AgentTranscriptStore:
                 "pending_tool_result_count": pending_count,
                 "last_tool_call_count": last_tool_call_count,
                 "preserve_response_id": preserve_response_id,
+                "preserved_tail": tail,
             },
         )
         return dict(event.get("payload") or {})
@@ -391,6 +406,7 @@ class AgentTranscriptStore:
             "events": events,
             "tool_result_messages": list(self._pending_tool_results.get(run_key, [])),
             "post_compact_messages": list(self._pending_post_compact_messages.get(run_key, [])),
+            "preserved_tails": list(self._preserved_tails.get(run_key, [])),
             "all_tool_result_messages": [
                 event.get("payload")
                 for event in events
@@ -398,6 +414,53 @@ class AgentTranscriptStore:
             ],
             "reduced_graph": [self._reduce(event) for event in events],
         }
+
+    def _build_preserved_tail(self, run_key: str, *, reason: str, max_events: int = 10) -> dict[str, Any]:
+        events = list(self._events.get(run_key, []))
+        tail = [self._tail_event(event) for event in events[-max_events:] if isinstance(event, dict)]
+        return {
+            "schema": "grounded.preserved_tail.v1",
+            "reason": reason,
+            "mode": "last_events_before_compact",
+            "start_sequence": tail[0].get("sequence") if tail else None,
+            "end_sequence": tail[-1].get("sequence") if tail else None,
+            "event_count": len(tail),
+            "events": tail,
+            "created_at": _now(),
+        }
+
+    @classmethod
+    def _tail_event(cls, event: dict[str, Any]) -> dict[str, Any]:
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        result = {
+            "sequence": event.get("sequence"),
+            "event_type": event.get("event_type"),
+            "created_at": event.get("created_at"),
+            "tool": payload.get("tool"),
+            "tool_use_id": payload.get("tool_use_id"),
+            "response_id": payload.get("response_id"),
+            "summary": str(payload.get("assistant_message") or payload.get("reason") or payload.get("tool") or "")[:900],
+        }
+        for key in ("microcompact_ref", "artifact_ref", "digest", "original_chars", "status"):
+            if payload.get(key) is not None:
+                result[key] = payload.get(key)
+        if isinstance(payload.get("tool_calls"), list):
+            result["tool_calls"] = [
+                {
+                    "tool_use_id": call.get("tool_use_id"),
+                    "tool": call.get("tool"),
+                    "targets": list(call.get("targets") or [])[:8] if isinstance(call.get("targets"), list) else [],
+                }
+                for call in payload.get("tool_calls")[:8]
+                if isinstance(call, dict)
+            ]
+        if isinstance(payload.get("usage"), dict):
+            result["usage"] = {
+                key: payload["usage"].get(key)
+                for key in ("input_tokens", "output_tokens", "reasoning_tokens", "total_tokens", "estimated_cost_usd")
+                if payload["usage"].get(key) is not None
+            }
+        return {key: value for key, value in result.items() if value not in (None, "", [], {})}
 
     @staticmethod
     def _reduce(event: dict[str, Any]) -> dict[str, Any]:

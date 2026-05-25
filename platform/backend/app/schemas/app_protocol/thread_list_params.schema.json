@@ -1,0 +1,43 @@
+{
+  "$id": "https://grounded.local/schemas/app_protocol/thread_list_params.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "cursor": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Cursor"
+    },
+    "include_archived": {
+      "default": false,
+      "title": "Include Archived",
+      "type": "boolean"
+    },
+    "limit": {
+      "default": 50,
+      "title": "Limit",
+      "type": "integer"
+    },
+    "workspace_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Workspace Id"
+    }
+  },
+  "title": "ThreadListParams",
+  "type": "object"
+}

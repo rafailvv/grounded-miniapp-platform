@@ -1,0 +1,29 @@
+{
+  "$id": "https://grounded.local/schemas/app_protocol/initialize_result.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "capabilities": {
+      "additionalProperties": true,
+      "title": "Capabilities",
+      "type": "object"
+    },
+    "protocol": {
+      "additionalProperties": true,
+      "title": "Protocol",
+      "type": "object"
+    },
+    "server": {
+      "additionalProperties": true,
+      "title": "Server",
+      "type": "object"
+    }
+  },
+  "required": [
+    "server",
+    "capabilities",
+    "protocol"
+  ],
+  "title": "InitializeResult",
+  "type": "object"
+}
