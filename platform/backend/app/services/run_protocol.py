@@ -204,6 +204,41 @@ class RunProtocolService:
             item["sequence"] = int(wrapper.get("sequence") or item.get("sequence") or 0)
             item.setdefault("created_at", wrapper.get("created_at"))
             items.append(item)
+        if self.event_journal_service is not None:
+            for event in self.event_journal_service.list_run(run_id, after_sequence=after_sequence, limit=limit):
+                if not (event.event_type.startswith("protocol.") or event.event_type in {"run.started", "run.completed", "tool.requested", "tool.completed", "tool.failed", "artifact.created", "proof.started", "proof.completed", "bookmark.created"}):
+                    continue
+                payload_record = self.event_journal_service.read_payload(event.payload_ref)
+                payload = dict(payload_record.payload) if payload_record is not None else {}
+                protocol_payload = payload if payload.get("schema") == RUN_PROTOCOL_EVENT_SCHEMA else {}
+                event_type = str(protocol_payload.get("type") or event.event_type.replace("protocol.", "").replace(".", "_"))
+                converted = {
+                    "schema": RUN_PROTOCOL_EVENT_SCHEMA,
+                    "event_id": event.event_id,
+                    "run_id": event.run_id,
+                    "workspace_id": event.workspace_id,
+                    "session_id": protocol_payload.get("session_id") or payload.get("session_id"),
+                    "task_id": protocol_payload.get("task_id") or payload.get("task_id") or event.run_id,
+                    "turn_id": protocol_payload.get("turn_id") or payload.get("turn_id"),
+                    "sequence": event.sequence,
+                    "type": event_type,
+                    "status": protocol_payload.get("status") or payload.get("status") or ("failed" if event.event_type.endswith(".failed") else "completed"),
+                    "message": event.summary,
+                    "payload": protocol_payload.get("payload") if isinstance(protocol_payload.get("payload"), dict) else payload,
+                    "refs": protocol_payload.get("refs") if isinstance(protocol_payload.get("refs"), dict) else payload.get("refs") if isinstance(payload.get("refs"), dict) else {},
+                    "bookmark_id": protocol_payload.get("bookmark_id") or payload.get("bookmark_id"),
+                    "source_event_type": event.event_type,
+                    "created_at": event.created_at,
+                }
+                items.append(converted)
+        items.sort(
+            key=lambda item: (
+                0 if str(item.get("source_event_type") or "").startswith("job_") else 1,
+                int(item.get("sequence") or 0),
+                str(item.get("created_at") or ""),
+                str(item.get("event_id") or ""),
+            )
+        )
         return {
             "schema": "grounded.run_protocol.v1",
             "run_id": run_id,
@@ -227,11 +262,14 @@ class RunProtocolService:
         todo_state_ref: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        run_payload = self.store.get("runs", run_id) or {}
+        session_id = (metadata or {}).get("session_id") or (run_payload.get("session_id") if isinstance(run_payload, dict) else None)
         bookmark = {
             "schema": RUN_BOOKMARK_SCHEMA,
             "bookmark_id": f"bookmark_{uuid4().hex}",
             "run_id": run_id,
             "workspace_id": workspace_id,
+            "session_id": session_id or None,
             "turn_id": turn_id,
             "response_id": response_id or None,
             "checkpoint_ref": checkpoint_ref or None,
@@ -254,7 +292,7 @@ class RunProtocolService:
                 self.event_journal_service.append_run(
                     workspace_id=workspace_id,
                     run_id=run_id,
-                    event_type="protocol.bookmark_created",
+                    event_type="bookmark.created",
                     actor="system",
                     payload=bookmark,
                     summary="Run protocol bookmark created.",

@@ -8,14 +8,28 @@ from app.models.common import StrictModel
 
 
 HookSource = Literal["builtin", "project", "workspace"]
-HookActionKind = Literal["block", "add_context", "tag"]
+HookActionKind = Literal["block", "add_context", "tag", "request_permission"]
 HookName = Literal[
+    "session_start",
+    "user_prompt_submit",
+    "before_run",
+    "after_run",
     "pre_tool_use",
     "post_tool_use",
     "post_tool_use_failure",
+    "permission_request",
+    "stop",
     "before_apply",
+    "after_apply",
+    "before_checks",
     "after_checks",
     "on_check_failed",
+    "pre_apply_patch",
+    "post_apply_patch",
+    "post_browser_verify",
+    "after_gate",
+    "on_memory_update",
+    "on_export",
 ]
 
 
@@ -105,6 +119,24 @@ class HookEvaluation(HookApiModel):
     tags: dict[str, Any] = Field(default_factory=dict)
     matched_rules: list[dict[str, Any]] = Field(default_factory=list)
     validation_issues: list[HookValidationIssue] = Field(default_factory=list)
+
+
+class HookRuntimePayload(HookApiModel):
+    schema_: str = Field(default="grounded.hook_payload.v1", alias="schema")
+    hook: str
+    workspace_id: str | None = None
+    run_id: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class HookOutput(HookApiModel):
+    schema_: str = Field(default="grounded.hook_output.v1", alias="schema")
+    should_block: bool = False
+    block_reason: str | None = None
+    added_contexts: list[HookContextItem] = Field(default_factory=list)
+    tags: dict[str, Any] = Field(default_factory=dict)
+    permission_request: dict[str, Any] | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class HookTrace(HookApiModel):

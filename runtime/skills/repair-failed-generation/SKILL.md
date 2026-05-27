@@ -1,4 +1,5 @@
 ---
+metadata_schema: grounded.skill.v2
 description: Repair a failed generation from its failure signature, repair packet, and proof requirements.
 whenToUse:
   - failed generation
@@ -18,10 +19,18 @@ allowedTools:
   - browser_verify
 model: default
 effort: high
+triggerRules:
+  - Match prompts using this skill domain and path scope.
 validation:
   - failing_check
   - changed_files_static
   - final_gate
+requiredProof:
+  - Final readiness proof covers this skill.
+incompatibleSkills:
+  - ""
+outputExpectations:
+  - Produce working product changes and cite proof artifacts.
 ---
 # Repair Failed Generation
 

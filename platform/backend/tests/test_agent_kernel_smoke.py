@@ -41,7 +41,7 @@ from app.modules.miniapp_agent_loop.repair_packets import RepairTransitionPolicy
 from app.modules.miniapp_agent_loop.rollout_trace import RolloutTraceRecorder
 from app.modules.miniapp_agent_loop.semantic_tools import semantic_scan
 from app.modules.miniapp_agent_loop.agent_tool_runtime import validate_workspace_command
-from app.services.tool_protocol import TOOL_EXECUTION_DEFAULTS, TOOL_RISK_DEFAULTS, tool_registry_contract
+from app.services.tool_protocol import TOOL_EXECUTION_DEFAULTS, TOOL_RISK_DEFAULTS, tool_definitions, tool_registry_contract
 from app.modules.miniapp_agent_loop.turn_diff_tracker import AgentTurnDiffTracker
 from app.modules.miniapp_agent_loop.types import AgentTurnPlan
 from app.modules.miniapp_agent_loop.guardian_review import GuardianReview
@@ -601,15 +601,17 @@ def test_lsp_tool_service_detects_api_method_mismatch_and_route_definitions(tmp_
     assert route_graph["edges"][0]["status"] == "method_mismatch"
 
 
-def test_lsp_agent_tools_are_model_visible_aliases_with_canonical_protocol() -> None:
+def test_lsp_agent_tools_are_dynamic_aliases_with_canonical_protocol() -> None:
     tool_names = {tool["name"] for tool in AgentToolRegistry.openai_tools()}
+    forced_tool_names = {tool["name"] for tool in AgentToolRegistry.openai_tools({"lsp_diagnostics", "lsp_symbol_context", "lsp_definition", "lsp_find_references", "lsp_route_graph", "lsp_route_static_context"}, include_dynamic=True)}
 
-    assert "lsp_diagnostics" in tool_names
-    assert "lsp_symbol_context" in tool_names
-    assert "lsp_definition" in tool_names
-    assert "lsp_find_references" in tool_names
-    assert "lsp_route_graph" in tool_names
-    assert "lsp_route_static_context" in tool_names
+    assert "lsp_diagnostics" not in tool_names
+    assert "lsp_symbol_context" not in tool_names
+    assert "lsp_definition" not in tool_names
+    assert "lsp_find_references" not in tool_names
+    assert "lsp_route_graph" not in tool_names
+    assert "lsp_route_static_context" not in tool_names
+    assert {"lsp_diagnostics", "lsp_symbol_context", "lsp_definition", "lsp_find_references", "lsp_route_graph", "lsp_route_static_context"} == forced_tool_names
     assert AgentToolRegistry.kind("lsp.diagnostics") == "read_only"
 
 
@@ -1552,7 +1554,8 @@ def test_tool_router_schema_validation_reports_extra_and_missing_args(tmp_path: 
     router = ToolRouter(_router_context(tmp_path))
 
     extra = router.route_batch([{"tool": "read_files", "tool_use_id": "bad_1", "targets": [], "reason": "x", "unexpected": True}])
-    missing = router.route_batch([{"tool": "run_command", "tool_use_id": "bad_2", "reason": "x"}])
+    forced_context = replace(_router_context(tmp_path), forced_allowed_tools={"run_command"})
+    missing = ToolRouter(forced_context).route_batch([{"tool": "run_command", "tool_use_id": "bad_2", "reason": "x"}])
 
     assert extra.model_results[1]["status"] == "failed"
     assert extra.model_results[1]["envelope"]["error"]["code"] == "tool_schema_invalid"  # type: ignore[index]
@@ -1567,13 +1570,82 @@ def test_tool_router_mode_filtering_and_forced_tools() -> None:
     default_names = {tool["name"] for tool in ToolRouter.allowed_openai_tools()}
     mutation_names = {tool["name"] for tool in ToolRouter.allowed_openai_tools(mode="mutation_required", forced_allowed={"write_file"})}
     forced_browser_names = {tool["name"] for tool in ToolRouter.allowed_openai_tools(forced_allowed={"browser_verify"})}
+    forced_lsp_names = {tool["name"] for tool in ToolRouter.allowed_openai_tools(forced_allowed={"lsp_diagnostics", "lsp_definition"})}
+    default_plus_lsp_names = {tool["name"] for tool in ToolRouter.allowed_openai_tools(forced_allowed={"lsp_diagnostics"}, include_default_with_forced=True)}
 
     assert "read_files" in default_names
     assert "tool_search" in default_names
+    assert "run_command" not in default_names
+    assert "run_checks" not in default_names
+    assert "lsp_diagnostics" not in default_names
+    assert "write_file" not in default_names
+    assert "apply_patch_to_draft" not in default_names
     assert "ask_user" not in default_names
     assert "browser_verify" not in default_names
     assert mutation_names == {"write_file"}
     assert forced_browser_names == {"browser_verify"}
+    assert forced_lsp_names == {"lsp_definition", "lsp_diagnostics"}
+    assert {"read_files", "tool_search", "lsp_diagnostics"}.issubset(default_plus_lsp_names)
+
+
+def test_unified_tool_definitions_govern_model_visible_tools() -> None:
+    definitions = tool_definitions()
+    model_tools = {tool["name"]: tool for tool in ToolRouter.allowed_openai_tools()}
+
+    assert model_tools
+    for canonical, definition in definitions.items():
+        if definition.parallel_safe:
+            assert definition.side_effect_class in {"none", "read_workspace"}
+        if definition.internal_only:
+            assert not definition.model_visible
+        if definition.model_visible and definition.model_name and "default" in definition.mode_visibility and not definition.dynamic:
+            assert definition.model_name in model_tools, canonical
+            assert definition.input_schema.get("type") == "object"
+            assert definition.output_schema.get("type") == "object"
+            assert definition.kind in {"read_only", "mutating", "verification"}
+            assert definition.progress_label
+            assert definition.output_cap_chars > 0
+
+
+def test_openai_tool_schemas_hide_runtime_injected_fields() -> None:
+    for tool in ToolRouter.allowed_openai_tools(mode="mutation_required", forced_allowed={"write_file", "apply_patch_to_draft", "edit_file_exact"}):
+        properties = tool["parameters"]["properties"]
+        assert "workspace_id" not in properties
+        assert "run_id" not in properties
+    for tool in ToolRouter.allowed_openai_tools():
+        properties = tool["parameters"]["properties"]
+        assert "workspace_id" not in properties
+        assert "run_id" not in properties
+
+
+def test_mutating_tool_defer_and_argument_progress_redacts_large_payload(tmp_path: Path) -> None:
+    activities: list[dict[str, object]] = []
+    context = _router_context(tmp_path, mode="mutation_required")
+    context = replace(context, append_activity=lambda kind, label, details: activities.append({"kind": kind, "label": label, "details": details}))
+    router = ToolRouter(context)
+    large_content = "const secret = 'x';\n" * 200
+
+    result = router.route_batch(
+        [
+            {
+                "tool": "write_file",
+                "tool_use_id": "write_large",
+                "file_path": "miniapp/app/static/client/app.js",
+                "content": large_content,
+                "reason": "large write",
+            }
+        ]
+    )
+
+    envelope = result.envelopes[0]
+    progress = envelope["progress"]
+    content_progress = next(item for item in progress if item["field"] == "content")
+    assert envelope["status"] == "deferred"
+    assert content_progress["chars"] == len(large_content)
+    assert content_progress["sha256"]
+    assert len(content_progress["preview"]) <= 120
+    assert content_progress["preview"] != large_content
+    assert any(item["kind"] == "tool_progress" and item["details"]["status"] == "input_prepared" for item in activities)  # type: ignore[index]
 
 
 def test_tool_router_manifest_v2_surfaces_capabilities_paths_and_retry_policy() -> None:
@@ -1611,7 +1683,24 @@ def test_tool_router_dynamic_tool_search_discovers_deferred_capabilities(tmp_pat
     assert result.envelopes[0]["tool"] == "tool.search"
     assert {"deploy", "vercel", "database", "payments"}.issubset(domains)
     assert payload["summary"]["deferred_count"] >= 3  # type: ignore[index]
+    assert payload["activation"]["forced_allowed_tools"]  # type: ignore[index]
     assert "browser_verify" not in {tool["name"] for tool in ToolRouter.allowed_openai_tools()}
+
+    lsp_result = router.route_batch(
+        [
+            {
+                "tool": "tool_search",
+                "tool_use_id": "search_lsp",
+                "query": "need symbol diagnostics and route references",
+                "domain": "lsp",
+                "reason": "Discover LSP tools only when needed.",
+            }
+        ]
+    )
+    lsp_payload = lsp_result.model_results[1]
+    forced = set(lsp_payload["activation"]["forced_allowed_tools"])  # type: ignore[index]
+    assert {"lsp_diagnostics", "lsp_definition", "lsp_find_references"}.issubset(forced)
+    assert "lsp_diagnostics" in {tool["name"] for tool in ToolRouter.allowed_openai_tools(forced_allowed=forced)}
 
 
 def test_tool_router_disallowed_and_hook_block_return_failed_envelopes(tmp_path: Path, monkeypatch) -> None:
@@ -1664,7 +1753,7 @@ def test_tool_router_post_hook_adds_context_without_changing_envelope_shape(tmp_
 
 def test_tool_router_mutating_tools_defer_without_writing_files(tmp_path: Path) -> None:
     target = tmp_path / "miniapp/app/static/client/app.js"
-    router = ToolRouter(_router_context(tmp_path))
+    router = ToolRouter(_router_context(tmp_path, mode="mutation_required"))
 
     result = router.route_batch(
         [
@@ -2099,6 +2188,91 @@ def test_agent_transcript_persists_and_restores_pending_tool_results() -> None:
     assert len(writes) >= 3
     assert context["previous_response_id"] == "resp_1"
     assert context["tool_result_messages"][0]["tool_use_id"] == "call_1"
+
+
+def test_agent_transcript_normalizes_history_versions_and_extra_tool_results() -> None:
+    transcript = AgentTranscriptStore()
+    transcript.append_model_turn(
+        "run_1",
+        attempt=1,
+        tool_round=0,
+        response_id="resp_1",
+        assistant_message="Read one file.",
+        tool_calls=[{"tool_use_id": "call_1", "tool": "read_files"}],
+        model="gpt-5.4-mini",
+    )
+    transcript.append_tool_results(
+        "run_1",
+        [
+            {"tool_use_id": "call_1", "tool": "read_files", "files": []},
+            {"tool_use_id": "extra_1", "tool": "read_files", "files": []},
+        ],
+    )
+
+    before = transcript.normalize_history("run_1")
+    context = transcript.next_model_context("run_1")
+    snapshot = transcript.snapshot("run_1")
+
+    assert before["status"] == "needs_normalization"
+    assert before["extra_tool_result_ids"] == ["extra_1"]
+    assert context["tool_result_messages"][0]["tool_use_id"] == "call_1"
+    assert len(context["tool_result_messages"]) == 1
+    assert context["history_version"] >= 3
+    assert snapshot["counts"]["tool_result_context_normalized"] == 1
+    assert snapshot["normalization"]["status"] == "ok"
+
+
+def test_agent_transcript_context_fragments_ghost_snapshots_and_token_budget() -> None:
+    transcript = AgentTranscriptStore()
+
+    fragment = transcript.append_context_fragment(
+        "run_1",
+        role="developer",
+        content="Prefer focused repairs.",
+        source="AGENTS.md",
+        metadata={"scope": "miniapp"},
+    )
+    transcript.append_context_fragment("run_1", role="user", content="Make the manager dashboard denser.", source="prompt")
+    transcript.append_ghost_snapshot("run_1", label="pre_compact", reason="pressure", payload={"summary": "state"})
+    context = transcript.next_model_context("run_1")
+    snapshot = transcript.snapshot("run_1")
+
+    assert fragment["role"] == "developer"
+    assert context["context_fragments"][0]["source"] == "AGENTS.md"
+    assert snapshot["ghost_snapshots"][0]["schema"] == "grounded.ghost_snapshot.v1"
+    assert snapshot["token_budget"]["estimated_tokens"] > 0
+    assert snapshot["token_budget"]["sections"]["context_fragments"] > 0
+    assert snapshot["history_version"] == snapshot["event_count"]
+
+
+def test_agent_transcript_compacts_old_tool_outputs_by_policy() -> None:
+    transcript = AgentTranscriptStore()
+    run_key = "run_compact_outputs"
+    for index in range(4):
+        transcript.append_tool_results(
+            run_key,
+            [
+                {
+                    "tool_use_id": f"call_{index}",
+                    "tool": "read_files",
+                    "output": "x" * 5000,
+                }
+            ],
+        )
+
+    report = transcript.compact_old_tool_outputs(run_key, keep_last=1, max_output_chars=1000)
+    snapshot = transcript.snapshot(run_key)
+    compacted = [
+        event["payload"]
+        for event in snapshot["events"]
+        if event["event_type"] == "tool_result" and event["payload"].get("compacted_by_policy")
+    ]
+
+    assert report["compacted_count"] == 3
+    assert len(compacted) == 3
+    assert compacted[0]["compacted_by_policy"]["original_chars"] > 4000
+    assert len(str(compacted[0]["output"])) < 1300
+    assert snapshot["counts"]["tool_outputs_compacted"] == 1
 
 
 def test_agent_edit_validator_rejects_unsafe_or_invalid_file_changes() -> None:
@@ -2861,7 +3035,7 @@ def test_context_pressure_recommends_compaction_for_large_payload() -> None:
     assert pressure["compact_recommended"] is True
     assert {item["kind"] for item in pressure["suggestions"]} & {"narrow_file_context", "spill_tool_results", "compact_memory"}
     assert pressure["schema"] == "grounded.context_pressure_snapshot.v2"
-    assert {"files", "tool_outputs", "memory", "diff", "skills", "checks", "prompt_contract", "full_payload"} <= set(pressure["sections"])
+    assert {"files", "tool_outputs", "memory", "diff", "skills", "transcript", "checks", "prompt_contract", "full_payload"} <= set(pressure["sections"])
     assert {item["code"] for item in pressure["recommendations"]} & {"avoid_broad_file_reads", "use_artifact_ref", "compact_memory_context"}
     assert pressure["sections"]["files"]["top_contributors"][0]["label"] == "miniapp/app/main.py"
 
@@ -2942,6 +3116,17 @@ def test_context_pressure_accounts_for_budgeted_context_packs() -> None:
 
     assert "context_packs" in pressure["sections"]
     assert pressure["section_tokens"]["context_packs"] > 0
+
+
+def test_context_pressure_accounts_for_transcript_context_manager_fields() -> None:
+    transcript = AgentTranscriptStore()
+    transcript.append_context_fragment("run_1", role="developer", content="Keep edits focused.", source="AGENTS.md")
+    transcript.append_ghost_snapshot("run_1", label="state", payload={"summary": "compact state"})
+
+    pressure = AgentContextPressureAnalyzer().analyze_payload({"transcript": transcript.snapshot("run_1")})
+
+    assert "transcript" in pressure["sections"]
+    assert pressure["section_tokens"]["transcript"] > 0
 
 
 def test_context_pressure_detects_duplicate_reads_from_transcript() -> None:
@@ -3250,6 +3435,33 @@ def test_worker_manager_maps_serial_coordinator_edits_to_path_owner() -> None:
     assert report["owners"]["miniapp/app/static/manager/app.js"] == "manager_surface_worker"  # type: ignore[index]
 
 
+def test_worker_manager_exposes_product_owner_contract_and_merge_evidence() -> None:
+    mailbox = AgentWorkerManager.mailbox_for_plan(
+        generation_mode=GenerationMode.QUALITY,
+        implementation_plan={"prompt_contract_v1": {"required": True, "entities": ["case"]}},
+    )
+    by_id = {str(worker["worker_id"]): worker for worker in mailbox["workers"]}  # type: ignore[index]
+    evidence = AgentWorkerManager.merge_evidence_packet(
+        worker_id="persistence_api_worker",
+        changed_files=["miniapp/app/routes/cases.py", "miniapp/app/db.py"],
+        decision="accepted",
+        output_ref="worker_output:ws:run:backend_api_worker",
+        apply_result={"status": "applied"},
+        proof_refs=["lsp_diagnostics:ws:run:changed"],
+    )
+
+    assert by_id["backend_api_worker"]["lane_id"] == "backend"
+    assert by_id["backend_api_worker"]["ownership_kind"] == "backend_api_persistence"
+    assert "persistence_api_worker" in by_id["backend_api_worker"]["alias_ids"]
+    assert by_id["client_surface_worker"]["lane_id"] == "role_ui"
+    assert by_id["test_verifier_worker"]["lane_id"] == "tests"
+    assert by_id["mobile_polish_worker"]["lane_id"] == "verifier"
+    assert evidence["worker_id"] == "backend_api_worker"
+    assert evidence["status"] == "passed"
+    assert evidence["product_owner_contract"]["ownership_kind"] == "backend_api_persistence"
+    assert evidence["runtime_proof"]["proof_refs"] == ["lsp_diagnostics:ws:run:changed"]
+
+
 def test_progress_does_not_jump_for_metadata_only_patch() -> None:
     stage, progress = WorkspaceCodeAgentRuntime._run_progress_for_event(
         "patch_apply_completed",
@@ -3343,7 +3555,7 @@ def test_quality_mode_uses_real_worker_branch_plan_by_default(monkeypatch) -> No
     assert production_mailbox["worker_groups"]["verifier"] == ["mobile_polish_worker"]  # type: ignore[index]
     assert any(worker["worker_id"] == "backend_api_worker" for worker in quality_mailbox["workers"])  # type: ignore[index]
     assert any(worker["worker_id"] == "mobile_polish_worker" and worker["branch_role"] == "verifier" for worker in quality_mailbox["workers"])  # type: ignore[index]
-    assert all(worker["alias_ids"] == [] for worker in quality_mailbox["workers"])  # type: ignore[index]
+    assert any("persistence_api_worker" in worker["alias_ids"] for worker in quality_mailbox["workers"])  # type: ignore[index]
     monkeypatch.setenv("GROUNDED_ENABLE_WORKER_BRANCHES", "0")
     disabled_quality = AgentWorkerManager.mailbox_for_plan(
         generation_mode=GenerationMode.QUALITY,
@@ -3468,7 +3680,7 @@ def test_worker_task_planner_builds_self_contained_owner_prompts() -> None:
     by_id = {task["worker_id"]: task for task in tasks}
 
     assert "client_surface_worker" in by_id
-    assert by_id["client_surface_worker"]["alias_ids"] == []
+    assert "client_ui_worker" in by_id["client_surface_worker"]["alias_ids"]
     assert by_id["client_surface_worker"]["branch_role"] == "writer"
     assert "patch_files" in by_id["client_surface_worker"]["tool_allowlist"]
     assert by_id["mobile_polish_worker"]["branch_role"] == "verifier"

@@ -17,11 +17,13 @@ from app.core.config import get_settings
 from app.main import create_app
 from app.models.common import GenerationMode
 from app.models.context_pressure import ContextPressureReport
-from app.models.domain import CreateRunRequest, GenerateRequest, JobRecord, PreviewRecord, RunCheckResult, RunRecord
+from app.models.artifacts import PatchEnvelope, PatchOperationModel
+from app.models.domain import CreateRunRequest, DraftAction, GenerateRequest, JobRecord, PreviewRecord, RunCheckResult, RunRecord
 from app.models.event_journal import EventJournalPage, RunJournalState, ThreadJournalState
 from app.models.memory import MemoryRetrievalResult
 from app.models.output_artifacts import CommandOutputArtifact, OutputArtifactIndex
 from app.models.prompt_suggestions import PromptSuggestionsReport
+from app.models.threads import TurnRecord
 from app.models.workbench import (
     GateReport,
     PromptCompletionAuditReport,
@@ -39,9 +41,11 @@ from app.models.workbench import (
     VisualRegressionReport,
 )
 from app.modules.miniapp_agent_loop.agent_command_policy import AgentCommandPolicy, CommandPolicyDecision, CommandPolicyRule
+from app.modules.miniapp_agent_loop.agent_hooks import AgentHookManager
 from app.modules.miniapp_agent_loop.agent_process_manager import AgentProcessManager
 from app.modules.miniapp_agent_loop.agent_tool_call_loop import AgentToolCallLoop
 from app.modules.miniapp_agent_loop.agent_transcript import AgentTranscriptStore
+from app.modules.miniapp_agent_loop.guardian_review import GuardianReview
 from app.modules.workspace_code_agent_runtime.budget import completion_budget_for_mode, completion_budget_status
 from app.openapi_export import export_openapi
 from app.repositories.platform_db import PlatformDb
@@ -197,6 +201,11 @@ def test_exec_policy_classifies_and_redacts_commands() -> None:
     assert allowed["command_class"] == "read_only"
     assert allowed["approval_gate"]["gate"] == "auto"
     assert allowed["canonical_command"]["normalized_command"] == "rg api miniapp/app"
+    assert allowed["canonical_command"]["executable_name"] == "rg"
+    assert allowed["canonical_command"]["canonical_string"]
+    assert allowed["command_prefix"]["prefix"] == ["rg"]
+    assert allowed["decision_trace"]["schema"] == "grounded.exec_policy_decision_trace.v1"
+    assert [step["step"] for step in allowed["decision_trace"]["steps"][:3]] == ["parse_shell_subset", "extract_executable", "network_policy"]
     assert allowed["read_write_network_policy"]["read"]["allowed"] is True
     assert allowed["read_write_network_policy"]["write"]["allowed"] is False
     assert allowed["read_write_network_policy"]["network"]["allowed"] is False
@@ -227,6 +236,8 @@ def test_exec_policy_classifies_and_redacts_commands() -> None:
     assert package_network["safety"]["class"] == "network"
     assert package_network["approval_template"]["template_id"] == "network_exception"
     assert package_network["read_write_network_policy"]["network"]["blocked"] is True
+    assert package_network["network_policy_decision"]["blocked"] is True
+    assert package_network["network_policy_decision"]["code"] == "package_network_operation"
     assert redirection["decision"]["action"] == "forbidden"
     assert redirection["decision"]["blocked_syntax"]["code"] == "shell_metacharacter"
     assert redirection["dangerous_command_classifier"]["matched_class"] == "shell_escape"
@@ -295,12 +306,20 @@ def test_workspace_policy_records_denials_and_scoped_approval_grants(tmp_path: P
         f"/workspaces/{workspace_id}/policy/evaluate-command",
         json={"command": "python -m pytest miniapp/tests", "run_id": run.run_id},
     ).json()
+    prefix_granted_eval = client.post(
+        f"/workspaces/{workspace_id}/policy/evaluate-command",
+        json={"command": "python -m pytest miniapp/tests -q", "run_id": run.run_id},
+    ).json()
     audit_after_grant = client.get(f"/workspaces/{workspace_id}/permissions/command-audit").json()
 
     assert approved["status"] == "approved"
-    assert grants["items"][0]["command_fingerprint"] == prompt_eval["command_fingerprint"]
+    assert any(item["command_fingerprint"] == prompt_eval["command_fingerprint"] for item in grants["items"])
+    assert any(item.get("grant_scope") == "approved_command_prefix" and item.get("prefix_fingerprint") == prompt_eval["command_prefix"]["prefix_fingerprint"] for item in grants["items"])
     assert granted_eval["approval"]["required"] is False
     assert granted_eval["approval"]["status"] == "approved_by_workspace_grant"
+    assert prefix_granted_eval["approval"]["required"] is False
+    assert prefix_granted_eval["approval"]["status"] == "approved_by_workspace_grant"
+    assert prefix_granted_eval["approval"]["grant_scope"] == "approved_command_prefix"
     assert granted_eval["decision"]["action"] == "allow"
     assert granted_eval["decision"]["original_action"] == "prompt"
     assert any(item["outcome"] == "allowed" and item["command_fingerprint"] == granted_eval["command_fingerprint"] for item in audit_after_grant["items"])
@@ -783,11 +802,21 @@ def test_skillify_successful_run_generates_and_writes_user_skill(tmp_path: Path)
 
     assert preview["schema"] == "grounded.skillify.v1"
     assert preview["write_status"] == "preview"
+    assert "metadata_schema: grounded.skill.v2" in preview["content"]
+    assert "triggerRules:" in preview["content"]
+    assert "requiredProof:" in preview["content"]
+    assert "outputExpectations:" in preview["content"]
+    assert "## Incompatible Skills" in preview["content"]
     assert "Client chooses a service" in preview["content"]
     assert "browser_flow_smoke" in preview["content"]
     assert written["write_status"] == "written"
     assert Path(written["target_path"]).exists()
-    assert any(item["id"] == skill_id and item["scope"] == "user" for item in skills["items"])
+    generated = next(item for item in skills["items"] if item["id"] == skill_id and item["scope"] == "user")
+    assert generated["metadata_schema"] == "grounded.skill.v2"
+    assert generated["trigger_rules"]
+    assert "browser_flow_smoke" in generated["required_proof"]
+    assert "repair-failed-generation" in generated["incompatible_skills"]
+    assert generated["output_expectations"]
     assert any(item["id"] == "skillify" for item in slash_commands["items"])
     assert slash["workflow"] == "skillify_successful_run"
     assert slash["report"]["skill_id"] == skill_id + "-preview"
@@ -864,6 +893,83 @@ def test_session_memory_sections_are_exposed_and_embedded_in_workspace_memory(tm
     assert "miniapp/app/static/manager/dashboard.js" in session["text"]
     assert "manager_dashboard_missing_total" in session["text"]
     assert memory["session_memory"]["schema"] == "grounded.session_memory.v1"
+
+
+def test_workspace_memory_is_split_into_product_memory_types(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Typed Product Memory Workspace",
+            "description": "typed memory test",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    run = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Create invoice workflow. Use label Invoice total and persist invoice_status field in SQLite.",
+        intent="create",
+        target_role_scope=["client", "manager"],
+        status="completed",
+        apply_status="applied",
+        touched_files=["miniapp/app/routes/invoices.py", "miniapp/app/static/client/app.js"],
+        acceptance_contract={
+            "required": True,
+            "roles": ["client", "manager"],
+            "flows": [{"id": "invoice_pay", "name": "Pay invoice", "roles": ["client"], "api_paths": ["/api/invoices"]}],
+        },
+        implementation_plan={
+            "primary_entities": ["invoice"],
+            "role_state_contract": {"entity": "invoice", "fields": ["invoice_status", "invoice_total"]},
+            "product_task_ledger": [
+                {"id": "client.invoice", "role": "client", "content": "Client sees Invoice total label.", "owned_paths": ["miniapp/app/static/client/app.js"]}
+            ],
+        },
+    )
+    app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+    app.state.container.store.upsert(
+        "reports",
+        f"run_artifacts:{run.run_id}",
+        {
+            "check_results": [
+                RunCheckResult(name="api_workflow_smoke", status="passed", details="invoice persisted").model_dump(mode="json"),
+                RunCheckResult(name="browser_flow_smoke", status="passed", details="invoice visible").model_dump(mode="json"),
+            ]
+        },
+    )
+
+    client.post(f"/workspaces/{workspace['workspace_id']}/memory", json={"memory_type": "preferences", "text": "Prefer compact manager tables."})
+    client.post(f"/workspaces/{workspace['workspace_id']}/memory", json={"memory_type": "rejected_approaches", "text": "Do not use seeded invoice records as proof."})
+    client.post(f"/workspaces/{workspace['workspace_id']}/memory", json={"memory_type": "persistence_schema_decisions", "text": "Keep invoice_status as the persisted field name."})
+    extracted = client.post(f"/runs/{run.run_id}/memory/extract").json()
+    memory = client.get(f"/workspaces/{workspace['workspace_id']}/memory").json()
+    retrieved = client.post(
+        f"/workspaces/{workspace['workspace_id']}/memory/retrieve",
+        json={"prompt": "invoice_status Invoice total manager table", "top_k": 8},
+    ).json()
+
+    assert extracted["schema"] == "grounded.memory_stage1.v1"
+    assert {item["memory_type"] for item in extracted["items"]} >= {"product_facts", "successful_patterns", "ui_vocabulary", "persistence_schema_decisions"}
+    assert set(memory["product_memory_types"]) == {
+        "preferences",
+        "product_facts",
+        "known_failures",
+        "successful_patterns",
+        "rejected_approaches",
+        "ui_vocabulary",
+        "persistence_schema_decisions",
+    }
+    assert memory["preferences"][0]["memory_type"] == "preferences"
+    assert any("invoice" in item["text"].lower() for item in memory["product_facts"])
+    assert memory["successful_patterns"]
+    assert memory["rejected_approaches"]
+    assert memory["ui_vocabulary"]
+    assert memory["persistence_schema_decisions"]
+    assert memory["pipeline"]["type_counts"]["persistence_schema_decisions"] >= 1
+    assert retrieved["stats"]["type_counts"]["ui_vocabulary"] >= 1
+    assert any("type:" in reason for hit in retrieved["hits"] for reason in hit["selection_reason"])
 
 
 def test_rollout_trace_exposes_raw_evidence_before_interpretation(tmp_path: Path) -> None:
@@ -1033,6 +1139,45 @@ fetch("/api/checkout");
     assert any(task["task_id"].startswith("simplify.") for task in report["safe_refactor_tasks"])
     assert slash["workflow"] == "post_green_simplify"
     assert slash["report"]["status"] == "needs_simplify"
+
+
+def test_guardian_pre_mutation_review_blocks_destructive_repeated_actions(tmp_path: Path) -> None:
+    draft_source = tmp_path / "draft"
+    target = draft_source / "miniapp" / "app"
+    target.mkdir(parents=True)
+    (target / "main.py").write_text("API_KEY = 'sk-secretvalue1234567890'\n", encoding="utf-8")
+    changes = [
+        DraftAction(file_path="miniapp/app/main.py", operation="replace", content="API_KEY = 'sk-secretvalue1234567890'\n", reason="update"),
+        DraftAction(file_path="miniapp/app/old.py", operation="delete", reason="remove"),
+    ]
+
+    first = GuardianReview.review_risky_action(
+        workspace_id="ws_guardian",
+        run_id="run_guardian",
+        draft_source=draft_source,
+        file_changes=changes,
+        action_kind="draft_apply",
+    ).model_dump(mode="json", by_alias=True)
+    prior = [
+        {"signature": GuardianReview._rejection_signature(code=str(item["code"]), paths=first["evidence"]["changed_files"])}
+        for item in first["findings"]
+    ]
+    repeated = GuardianReview.review_risky_action(
+        workspace_id="ws_guardian",
+        run_id="run_guardian",
+        draft_source=draft_source,
+        file_changes=changes,
+        action_kind="draft_apply",
+        previous_rejections=prior,
+    ).model_dump(mode="json", by_alias=True)
+
+    assert first["status"] == "failed"
+    assert first["summary"]["risk_level"] == "critical"
+    assert any(item["code"] == "guardian.destructive_action.delete_operation" for item in first["findings"])
+    assert any(item["code"] == "guardian.security_privacy.hardcoded_secret" for item in first["findings"])
+    assert repeated["final_review_gate"]["rejection_circuit_open"] is True
+    assert any(item["code"] == "guardian.rejection_circuit.repeated_rejected_action" for item in repeated["findings"])
+    assert repeated["review_prompt"]["action_kind"] == "draft_apply"
 
 
 def test_debug_stuck_and_doctor_workflows_emit_repair_packets(tmp_path: Path) -> None:
@@ -1421,6 +1566,64 @@ def test_hook_policy_apis_validate_store_and_evaluate(tmp_path: Path) -> None:
     assert evaluation["matched_rules"][0]["rule_id"] == "block_shell"
 
 
+def test_hook_runtime_manifest_output_parser_and_context_injection(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Hook Runtime Workspace",
+            "description": "Hook runtime test",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    client.put(
+        f"/workspaces/{workspace['workspace_id']}/hooks",
+        json={
+            "policy_id": "runtime-hooks",
+            "rules": [
+                {
+                    "rule_id": "prompt_context",
+                    "conditions": {"hook": "user_prompt_submit"},
+                    "actions": [{"action": "add_context", "text": "Prefer small, repairable product increments.", "target": "system_context", "priority": 50}],
+                },
+                {
+                    "rule_id": "permission_tag",
+                    "conditions": {"hook": "permission_request", "canonical_tool": "shell.exec"},
+                    "actions": [{"action": "request_permission", "reason": "Shell requires explicit audit metadata.", "metadata": {"approval": "audit"}}],
+                },
+            ],
+        },
+    )
+    manifest = client.get("/system/policies/hooks").json()
+    manager = AgentHookManager(policy_service=app.state.container.hook_policy_service)
+
+    prompt_outcome = manager.run(
+        "run_hook_runtime",
+        "user_prompt_submit",
+        payload={"workspace_id": workspace["workspace_id"], "prompt": "Build a CRM", "generation_mode": "fast"},
+    )
+    permission_outcome = manager.run(
+        "run_hook_runtime",
+        "permission_request",
+        payload={"workspace_id": workspace["workspace_id"], "tool": "shell.exec", "canonical_tool": "shell.exec", "reason": "run command"},
+    )
+    parsed = AgentHookManager.parse_output(
+        json.dumps({"additional_contexts": ["Use the failing check as the next edit target."], "tags": {"source": "test"}})
+    )
+
+    assert manifest["runtime"]["schema"] == "grounded.hook_runtime_manifest.v1"
+    assert "user_prompt_submit" in manifest["supported_hooks"]
+    assert "stop" in manifest["supported_hooks"]
+    assert manifest["runtime"]["output_schema"]["properties"]["permission_request"]["type"] == "object"
+    assert prompt_outcome.additional_contexts == ["Prefer small, repairable product increments."]
+    assert permission_outcome.evaluation is not None
+    assert permission_outcome.evaluation["tags"]["permission_tag"]["permission_request"]["approval"] == "audit"
+    assert parsed is not None
+    assert parsed["added_contexts"][0]["text"] == "Use the failing check as the next edit target."
+
+
 def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
     app = create_app(data_dir=tmp_path)
     client = TestClient(app)
@@ -1729,8 +1932,13 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
     assert skill_manifest["scopes"]["repo"] >= 1
     assert skill_evaluation["schema"] == "grounded.skill_search.v2"
     assert skill_evaluation["effective"]["allowedTools"]
+    assert skill_evaluation["effective"]["requiredProof"]
+    assert skill_evaluation["ranking"]["algorithm"]
+    assert all(item["ranking"]["score"] == item["activation_score"] for item in skill_evaluation["selected"])
     assert workers["schema"] == "grounded.product_workers.v1"
-    assert any(item["worker_id"] == "backend_api_worker" and item["alias_ids"] == [] for item in workers["workers"])
+    assert any(item["worker_id"] == "backend_api_worker" and "persistence_api_worker" in item["alias_ids"] for item in workers["workers"])
+    assert workers["ownership_contract"]["schema"] == "grounded.product_worker_ownership_contract.v1"
+    assert workers["ownership_contract"]["lanes"]["role_ui"] == ["client_surface_worker", "specialist_surface_worker", "manager_surface_worker"]
     assert any(item["status"] == "available_disabled" for item in workers["workers"])
     assert worker_orchestration["schema"] == "grounded.worker_orchestration.v1"
     assert worker_orchestration["write_scope_report"]["schema"] == "grounded.worker_write_scope_report.v1"
@@ -1757,6 +1965,9 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
     assert event_payload["payload_ref"] == thread_events_v2["items"][0]["payload_ref"]
     assert resumed_thread["status"] == "active"
     assert patch_preflight["status"] == "passed"
+    assert patch_preflight["lsp_pre_edit_context"]["schema"] == "grounded.lsp_symbol_context.v1"
+    assert patch_preflight["lsp_pre_edit_context"]["policy"]["required_before_patch"] is True
+    assert patch_preflight["lsp_pre_edit_context"]["policy"]["targets"] == ["README.md"]
 
 
 def test_run_events_are_persisted_by_platform_db(tmp_path: Path) -> None:
@@ -1807,6 +2018,130 @@ def test_run_events_are_persisted_by_platform_db(tmp_path: Path) -> None:
     assert {"trace.event_recorded", "run.started", "protocol.run_started"}.issubset({item["event_type"] for item in events_v2["items"]})
     assert state_v2["status"] == "available"
     assert state_v2["latest_status"] in {"running", "started"}
+
+
+def test_patch_preflight_rejects_invalid_partial_edit_with_conflict_packet(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Patch Grammar Workspace",
+            "description": "Strict patch preflight",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+
+    report = client.post(
+        f"/workspaces/{workspace['workspace_id']}/patch/preflight",
+        json={
+            "ops": [
+                {
+                    "operation_id": "op_bad_partial",
+                    "op": "patch",
+                    "file_path": "README.md",
+                    "diff": "replace the title with Better App",
+                    "explanation": "invalid partial edit",
+                }
+            ]
+        },
+    ).json()
+
+    assert report["status"] == "conflict"
+    assert report["validation_report"]["schema"] == "grounded.patch_validation.v1"
+    assert report["validation_report"]["status"] == "failed"
+    assert report["patch_sha256"]
+    assert report["conflict_packet"]["schema"] == "grounded.patch_conflict_packet.v1"
+    assert report["conflict_packet"]["forbidden_repeat_action"]["sha256"] == report["patch_sha256"]
+    assert any(item["code"] in {"malformed_unified_diff", "missing_patch_path", "missing_hunk"} for item in report["validation_report"]["issues"])
+
+
+def test_patch_apply_validator_blocks_malformed_hunk_without_mutating_draft(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Patch Apply Grammar Workspace",
+            "description": "Strict patch apply",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    run = RunRecord(workspace_id=workspace["workspace_id"], prompt="Patch README", intent="edit")
+    app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+    workspace_service = app.state.container.workspace_service
+    draft = workspace_service.prepare_draft(workspace["workspace_id"], run.run_id)
+    readme = draft / "README.md"
+    readme.write_text("hello\n", encoding="utf-8")
+    malformed = PatchEnvelope(
+        workspace_id=workspace["workspace_id"],
+        summary="Malformed patch",
+        ops=[
+            PatchOperationModel(
+                operation_id="op_bad_hunk",
+                op="patch",
+                file_path="README.md",
+                diff="--- a/README.md\n+++ b/README.md\n@@\n-hello\n+hello world\n",
+                explanation="malformed hunk",
+            )
+        ],
+    )
+
+    result = workspace_service.apply_patch_envelope_to_draft(workspace["workspace_id"], run.run_id, malformed)
+
+    assert result.status == "failed"
+    assert result.patch_sha256
+    assert result.validation_report["status"] == "failed"
+    assert result.conflict_packet["schema"] == "grounded.patch_conflict_packet.v1"
+    assert any(item["code"] == "malformed_hunk_header" for item in result.validation_report["issues"])
+    assert readme.read_text(encoding="utf-8") == "hello\n"
+
+
+def test_patch_apply_records_hash_and_validation_for_valid_unified_diff(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Patch Apply Hash Workspace",
+            "description": "Patch hash audit",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    run = RunRecord(workspace_id=workspace["workspace_id"], prompt="Patch README", intent="edit")
+    app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+    workspace_service = app.state.container.workspace_service
+    draft = workspace_service.prepare_draft(workspace["workspace_id"], run.run_id)
+    readme = draft / "README.md"
+    readme.write_text("hello\n", encoding="utf-8")
+    envelope = PatchEnvelope(
+        workspace_id=workspace["workspace_id"],
+        summary="Valid patch",
+        ops=[
+            PatchOperationModel(
+                operation_id="op_valid",
+                op="patch",
+                file_path="README.md",
+                diff="--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-hello\n+hello world\n",
+                explanation="valid hunk",
+            )
+        ],
+    )
+
+    result = workspace_service.apply_patch_envelope_to_draft(workspace["workspace_id"], run.run_id, envelope)
+    stored = app.state.container.store.get("patch_applies", result.apply_id)
+
+    assert result.status == "applied"
+    assert result.changed_files == ["README.md"]
+    assert result.patch_sha256
+    assert result.validation_report["status"] == "passed"
+    assert result.validation_report["operations"][0]["diff_kind"] == "unified_diff"
+    assert readme.read_text(encoding="utf-8") == "hello world\n"
+    assert stored["patch_sha256"] == result.patch_sha256
+    assert stored["validation_report"]["status"] == "passed"
 
 
 def test_run_protocol_appends_events_and_bookmarks(tmp_path: Path) -> None:
@@ -2321,9 +2656,11 @@ def test_reliability_gate_passes_applied_run_with_product_proof(tmp_path: Path) 
         status="completed",
         apply_status="applied",
         draft_status="approved",
-        acceptance_contract={"required": True},
+        acceptance_contract={"required": True, "flows": [{"id": "client_create_task", "role": "client"}]},
         touched_files=["miniapp/app/main.py"],
     )
+    screenshot = tmp_path / "client-proof.png"
+    screenshot.write_bytes(b"proof")
     check_results = [
         {"name": "changed_files_static", "status": "passed", "details": "ok"},
         {"name": "frontend_interaction_static_smoke", "status": "passed", "details": "ok"},
@@ -2352,9 +2689,19 @@ def test_reliability_gate_passes_applied_run_with_product_proof(tmp_path: Path) 
             "details": "ok",
             "diagnostics": {
                 "roles_checked": ["client", "specialist", "manager"],
-                "ui_steps": [{"role": "client", "status": "passed"}],
+                "ui_steps": [{"role": "client", "status": "passed", "flow_id": "client_create_task", "screenshot_after": str(screenshot)}],
+                "role_screenshots": {
+                    "client": str(screenshot),
+                    "specialist": str(screenshot),
+                    "manager": str(screenshot),
+                },
+                "acceptance_scenarios": [{"id": "client_create_task", "role": "client", "status": "passed", "source": "acceptance_contract"}],
                 "persisted_state_marker": "task-1",
-                "mobile_layout": {"status": "passed"},
+                "persisted_marker_after_reload": "task-1",
+                "reload_verified": True,
+                "console_errors": [],
+                "network_errors": [],
+                "mobile_layout": {"status": "passed", "horizontal_overflow": False, "critical_overlap": False},
             },
         },
         {"name": "generated_app_python_tests", "status": "passed", "details": "ok"},
@@ -2453,10 +2800,16 @@ def test_requirement_traceability_matrix_links_prompt_to_route_api_state_tests_a
                     "details": "ok",
                     "diagnostics": {
                         "roles_checked": ["client", "manager"],
-                        "ui_steps": [{"role": "client", "route": "/client", "action": "create task", "status": "passed"}],
+                        "ui_steps": [{"role": "client", "route": "/client", "action": "create task", "status": "passed", "flow_id": "create_task", "screenshot_after": "/tmp/task-client.png"}],
+                        "role_screenshots": {"client": "/tmp/task-client.png", "manager": "/tmp/task-manager.png"},
+                        "acceptance_scenarios": [{"id": "create_task", "role": "client", "status": "passed", "source": "acceptance_contract"}],
                         "persisted_state_marker": "task-1",
+                        "persisted_marker_after_reload": "task-1",
+                        "reload_verified": True,
                         "screenshots": ["/tmp/task-client.png"],
-                        "mobile_layout": {"status": "passed"},
+                        "console_errors": [],
+                        "network_errors": [],
+                        "mobile_layout": {"status": "passed", "horizontal_overflow": False, "critical_overlap": False},
                     },
                 },
                 {"name": "generated_app_python_tests", "status": "passed", "details": "ok"},
@@ -3111,7 +3464,21 @@ def test_reliability_gate_final_report_and_empty_repair_queue(tmp_path: Path) ->
         apply_status="applied",
         touched_files=["miniapp/app/static/client/app.js"],
         acceptance_contract={"required": True, "flows": [{"id": "create_role_owned_entity"}]},
-        browser_flow_proof={"steps": [{"status": "passed", "route": "/client"}]},
+        browser_flow_proof={
+            "steps": [{"role": "client", "status": "passed", "route": "/client", "flow_id": "create_role_owned_entity", "screenshot_after": "/tmp/client-proof.png"}],
+            "role_screenshots": {
+                "client": "/tmp/client-proof.png",
+                "specialist": "/tmp/specialist-proof.png",
+                "manager": "/tmp/manager-proof.png",
+            },
+            "acceptance_scenarios": [{"id": "create_role_owned_entity", "status": "passed", "source": "acceptance_contract"}],
+            "persisted_state_marker": "briefing-1",
+            "persisted_marker_after_reload": "briefing-1",
+            "reload_verified": True,
+            "console_errors": [],
+            "network_errors": [],
+            "mobile_layout": {"status": "passed", "horizontal_overflow": False, "critical_overlap": False},
+        },
         mobile_layout_report={"status": "passed"},
     )
     app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
@@ -3150,9 +3517,19 @@ def test_reliability_gate_final_report_and_empty_repair_queue(tmp_path: Path) ->
                     "logs": [],
                     "diagnostics": {
                         "roles_checked": ["client", "specialist", "manager"],
-                        "ui_steps": [{"role": "client", "status": "passed"}],
+                        "ui_steps": [{"role": "client", "status": "passed", "flow_id": "create_role_owned_entity", "screenshot_after": "/tmp/client-proof.png"}],
+                        "role_screenshots": {
+                            "client": "/tmp/client-proof.png",
+                            "specialist": "/tmp/specialist-proof.png",
+                            "manager": "/tmp/manager-proof.png",
+                        },
+                        "acceptance_scenarios": [{"id": "create_role_owned_entity", "status": "passed", "source": "acceptance_contract"}],
                         "persisted_state_marker": "briefing-1",
-                        "mobile_layout": {"status": "passed"},
+                        "persisted_marker_after_reload": "briefing-1",
+                        "reload_verified": True,
+                        "console_errors": [],
+                        "network_errors": [],
+                        "mobile_layout": {"status": "passed", "horizontal_overflow": False, "critical_overlap": False},
                     },
                 },
                 {"name": "generated_app_python_tests", "status": "passed", "details": "ok", "logs": []},
@@ -3302,6 +3679,127 @@ def test_browser_proof_final_artifact_includes_scenarios_errors_and_screenshots(
         assert "manifest.json" in names
         assert f"reports/browser_proof:{run.run_id}.json" in names
         assert any(name.startswith(f"screenshots/{run.run_id}/") for name in names)
+
+
+def test_browser_product_proof_requires_contract_scenarios_and_reload_evidence(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Browser Product Proof",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    screenshot = tmp_path / "client-role.png"
+    screenshot.write_bytes(b"proof")
+    run = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Build a client request workflow",
+        intent="create",
+        target_role_scope=["client"],
+        model_profile="test",
+        status="completed",
+        apply_status="applied",
+        touched_files=["miniapp/app/static/client/app.js"],
+        acceptance_contract={"required": True, "flows": [{"id": "client_create_request", "role": "client"}]},
+    )
+    base_checks = [
+        {"name": "changed_files_static", "status": "passed", "details": "ok"},
+        {"name": "frontend_interaction_static_smoke", "status": "passed", "details": "ok"},
+        {"name": "backend_static_validators", "status": "passed", "details": "ok"},
+        {
+            "name": "platform_invariants",
+            "status": "passed",
+            "details": "ok",
+            "diagnostics": {"role_coverage": {"client": {"status": "present", "route_count": 1}}},
+        },
+        {
+            "name": "api_workflow_smoke",
+            "status": "passed",
+            "details": "ok",
+            "diagnostics": {"persisted_state_marker": "request-1", "api_after": [{"id": "request-1"}]},
+        },
+        {"name": "generated_app_python_tests", "status": "passed", "details": "ok"},
+        {"name": "generated_app_js_tests", "status": "passed", "details": "ok"},
+    ]
+    app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+    app.state.container.store.upsert(
+        "reports",
+        f"run_artifacts:{run.run_id}",
+        {
+            "diff": "diff --git a/miniapp/app/static/client/app.js b/miniapp/app/static/client/app.js\n",
+            "check_results": [
+                *base_checks,
+                {
+                    "name": "browser_flow_smoke",
+                    "status": "passed",
+                    "details": "ok",
+                    "diagnostics": {
+                        "roles_checked": ["client"],
+                        "ui_steps": [{"role": "client", "status": "passed"}],
+                        "persisted_state_marker": "request-1",
+                        "mobile_layout": {"status": "passed"},
+                    },
+                },
+            ],
+        },
+    )
+
+    blocked_gate = client.get(f"/runs/{run.run_id}/gate").json()
+
+    blocked_kinds = {issue["kind"] for issue in blocked_gate["browser_product_proof"]["issues"]}
+    assert blocked_gate["browser_product_proof"]["status"] == "failed"
+    assert "browser_product_proof_missing_role_screenshots" in blocked_kinds
+    assert "browser_product_proof_missing_console_capture" in blocked_kinds
+    assert "browser_product_proof_missing_network_capture" in blocked_kinds
+    assert "browser_product_proof_missing_reload_marker" in blocked_kinds
+    assert "browser_product_proof_missing_acceptance_scenarios" in blocked_kinds
+
+    app.state.container.store.upsert(
+        "reports",
+        f"run_artifacts:{run.run_id}",
+        {
+            "diff": "diff --git a/miniapp/app/static/client/app.js b/miniapp/app/static/client/app.js\n",
+            "check_results": [
+                *base_checks,
+                {
+                    "name": "browser_flow_smoke",
+                    "status": "passed",
+                    "details": "ok",
+                    "diagnostics": {
+                        "roles_checked": ["client"],
+                        "ui_steps": [
+                            {
+                                "role": "client",
+                                "status": "passed",
+                                "flow_id": "client_create_request",
+                                "screenshot_after": str(screenshot),
+                            }
+                        ],
+                        "role_screenshots": [{"role": "client", "route": "/client", "path": str(screenshot)}],
+                        "acceptance_scenarios": [
+                            {"id": "client_create_request", "role": "client", "status": "passed", "source": "acceptance_contract"}
+                        ],
+                        "persisted_state_marker": "request-1",
+                        "persisted_marker_after_reload": "request-1",
+                        "reload_verified": True,
+                        "console_errors": [],
+                        "network_errors": [],
+                        "mobile_layout": {"status": "passed", "horizontal_overflow": False, "critical_overlap": False},
+                    },
+                },
+            ],
+        },
+    )
+    app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+
+    passed_gate = client.get(f"/runs/{run.run_id}/gate").json()
+
+    assert passed_gate["browser_product_proof"]["status"] == "passed"
+    assert not any(issue["check"] == "browser_product_proof" for issue in passed_gate["issues"])
+    assert passed_gate["product_readiness"]["evidence"]["browser_product_proof"]["report_ref"] == f"browser_product_proof:{run.run_id}"
 
 
 def test_visual_regression_blocks_gate_on_mobile_overflow_and_overlap(tmp_path: Path) -> None:
@@ -3633,6 +4131,64 @@ def test_reliability_gate_blocks_test_only_acceptance_diff(tmp_path: Path) -> No
     assert any(issue["kind"] == "product_source_diff" for issue in gate["issues"])
 
 
+def test_gate_requires_changed_files_lsp_diagnostics_after_patch(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "LSP Gate Workspace",
+            "description": "Changed file diagnostics gate",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    run = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Patch FastAPI route",
+        intent="edit",
+        status="completed",
+        apply_status="applied",
+        touched_files=["miniapp/app/routes/broken.py"],
+    )
+    app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+    draft = app.state.container.workspace_service.prepare_draft(workspace["workspace_id"], run.run_id)
+    target = draft / "miniapp/app/routes/broken.py"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("def broken(:\n    pass\n", encoding="utf-8")
+    app.state.container.store.upsert(
+        "reports",
+        f"run_artifacts:{run.run_id}",
+        {
+            "diff": "diff --git a/miniapp/app/routes/broken.py b/miniapp/app/routes/broken.py\n",
+            "check_results": [],
+        },
+    )
+
+    gate = client.get(f"/runs/{run.run_id}/gate").json()
+    public_diagnostics = client.get(
+        f"/workspaces/{workspace['workspace_id']}/diagnostics/lsp",
+        params={"run_id": run.run_id, "changed_only": "true"},
+    ).json()
+    lsp_report = app.state.container.store.get("reports", f"lsp_verification:{run.run_id}")
+    changed_report = app.state.container.store.get("reports", f"lsp_diagnostics:{workspace['workspace_id']}:{run.run_id}:changed")
+
+    assert gate["status"] == "blocked"
+    assert gate["lsp_verification"]["status"] == "failed"
+    assert any(issue["kind"] == "lsp_changed_files_diagnostics" for issue in gate["issues"])
+    assert gate["artifact_refs"]["lsp_verification"] == f"lsp_verification:{run.run_id}"
+    assert gate["requirements"]["lsp_changed_files_diagnostics"] is True
+    assert lsp_report["changed_only"] is True
+    assert lsp_report["policy"]["diagnostics_after_each_patch"] is True
+    assert lsp_report["policy"]["find_references_before_rename"]
+    assert lsp_report["route_graph_ref"] == f"lsp_route_graph:{workspace['workspace_id']}:{run.run_id}"
+    assert changed_report["changed_files"] == ["miniapp/app/routes/broken.py"]
+    assert changed_report["gate_required"] is True
+    assert any(item["source"] == "python_compile" for item in changed_report["items"])
+    assert public_diagnostics["changed_only"] is True
+    assert public_diagnostics["changed_files"] == ["miniapp/app/routes/broken.py"]
+
+
 def test_review_report_prioritizes_acceptance_blockers_with_locations(tmp_path: Path) -> None:
     app = create_app(data_dir=tmp_path)
     client = TestClient(app)
@@ -3705,6 +4261,89 @@ def test_review_report_prioritizes_acceptance_blockers_with_locations(tmp_path: 
     assert repair_cases["items"]
     assert any(item["source"] == "review" for item in repair_cases["items"])
     assert any("miniapp/app/static/client/app.js" in item["target_files"] for item in repair_cases["items"])
+
+
+def test_review_report_exposes_and_filters_review_targets(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Review Targets Workspace",
+            "description": "Review target filtering",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    previous = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Previous successful app",
+        intent="create",
+        status="completed",
+        apply_status="applied",
+        result_revision_id="rev_previous_success",
+        touched_files=["miniapp/app/static/client/app.js"],
+    )
+    current = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Repair failed client flow",
+        mode="fix",
+        intent="edit",
+        status="failed",
+        apply_status="failed",
+        failure_class="browser_flow",
+        failure_signature="selector-missing",
+        fix_targets=["miniapp/app/static/client/app.js"],
+        touched_files=[
+            "miniapp/app/static/client/app.js",
+            "miniapp/tests/generated_app.test.mjs",
+            "README.md",
+        ],
+        remaining_issues=[{"code": "selector_missing", "file_path": "miniapp/app/static/client/app.js"}],
+    )
+    app.state.container.store.upsert("runs", previous.run_id, previous.model_dump(mode="json"))
+    app.state.container.store.upsert("runs", current.run_id, current.model_dump(mode="json"))
+    app.state.container.store.upsert(
+        "reports",
+        f"run_artifacts:{current.run_id}",
+        {
+            "diff": "\n".join(
+                [
+                    "diff --git a/miniapp/app/static/client/app.js b/miniapp/app/static/client/app.js",
+                    "+document.querySelector('[data-action=\"save\"]')",
+                    "diff --git a/miniapp/tests/generated_app.test.mjs b/miniapp/tests/generated_app.test.mjs",
+                    "+test('client save', async () => {})",
+                    "diff --git a/README.md b/README.md",
+                    "+notes",
+                ]
+            ),
+            "check_results": [],
+        },
+    )
+
+    default_review = client.get(f"/runs/{current.run_id}/review").json()
+    runtime_review = client.get(f"/runs/{current.run_id}/review", params={"target": "product_runtime_files"}).json()
+    failed_patch_review = client.get(f"/runs/{current.run_id}/review", params={"target": "failed_repair_patch"}).json()
+    since_success_review = client.get(f"/runs/{current.run_id}/review", params={"target": "since_last_successful_run"}).json()
+    default_review_after_target = client.get(f"/runs/{current.run_id}/review").json()
+
+    assert default_review["schema"] == "grounded.review_report.v2"
+    assert default_review["review_target"]["id"] == "current_draft"
+    assert {item["id"] for item in default_review["review_targets"]} == {
+        "current_draft",
+        "against_base_template",
+        "since_last_successful_run",
+        "product_runtime_files",
+        "failed_repair_patch",
+    }
+    assert runtime_review["review_target"]["id"] == "product_runtime_files"
+    assert runtime_review["evidence"]["changed_files"] == ["miniapp/app/static/client/app.js"]
+    assert all(not path.startswith("miniapp/tests/") for path in runtime_review["evidence"]["changed_files"])
+    assert failed_patch_review["review_target"]["available"] is True
+    assert failed_patch_review["review_target"]["metadata"]["failure_signature"] == "selector-missing"
+    assert since_success_review["review_target"]["metadata"]["base_run_id"] == previous.run_id
+    assert since_success_review["review_target"]["metadata"]["shared_files"] == ["miniapp/app/static/client/app.js"]
+    assert default_review_after_target["review_target"]["id"] == "current_draft"
 
 
 def test_prompt_suggestions_are_product_specific_followups(tmp_path: Path) -> None:
@@ -4832,6 +5471,124 @@ def test_thread_snapshots_are_persistent(tmp_path: Path) -> None:
 
     assert created["reason"] == "test"
     assert snapshots["items"][0]["snapshot_id"] == created["snapshot_id"]
+
+
+def test_thread_metadata_archive_resume_and_fork_are_append_only(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Thread Store Workspace",
+            "description": "thread metadata test",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    service = app.state.container.thread_service
+    thread = service.start_thread(workspace_id=workspace["workspace_id"], title="Thread store")
+
+    archived = service.archive_thread(thread.thread_id)
+    resumed = service.resume_thread(thread.thread_id)
+    fork = service.fork_thread(thread.thread_id, title="Thread fork")
+    events = app.state.container.platform_db.list_events(thread.thread_id, limit=50)
+    fork_events = app.state.container.platform_db.list_events(fork.thread_id, limit=20)
+    snapshots = app.state.container.platform_db.list_thread_snapshots(thread.thread_id, limit=10)
+
+    assert archived.metadata["stable_thread"]["schema"] == "grounded.thread_metadata.v1"
+    assert resumed.archived is False
+    assert resumed.metadata["stable_thread"]["status"] == "idle"
+    assert [event.sequence for event in events] == sorted(event.sequence for event in events)
+    assert {event.event_type for event in events} >= {"thread.started", "thread.archived", "thread.unarchived", "thread.snapshot"}
+    assert fork.forked_from_thread_id == thread.thread_id
+    assert fork.metadata["fork"]["source_snapshot_id"] == snapshots[0]["snapshot_id"]
+    assert fork_events[-1].event_type == "thread.forked"
+
+
+def test_thread_live_writer_and_recovery_persist_unfinished_run_state(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Live Writer Workspace",
+            "description": "thread live writer test",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    service = app.state.container.thread_service
+    thread = service.start_thread(workspace_id=workspace["workspace_id"], title="Live writer")
+    turn = TurnRecord(thread_id=thread.thread_id, workspace_id=workspace["workspace_id"], status="running", prompt="Build app", started_at=service._now())
+    app.state.container.platform_db.insert_turn(turn)
+    run = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Build app",
+        intent="create",
+        status="running",
+        current_stage="generating_code",
+        progress_percent=42,
+        session_id=thread.thread_id,
+    )
+    app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+    turn.linked_run_id = run.run_id
+    app.state.container.platform_db.insert_turn(turn)
+    thread.status = "running"
+    thread.current_turn_id = turn.turn_id
+    app.state.container.platform_db.upsert_thread(thread)
+
+    live = service.write_live_snapshot(thread.thread_id, reason="test")
+    recovered = service.recover_thread_state(thread.thread_id)
+    events = app.state.container.platform_db.list_events(thread.thread_id, limit=50)
+    run_snapshots = app.state.container.platform_db.list_run_state_snapshots(run.run_id, limit=10)
+
+    assert live["schema"] == "grounded.thread_live_writer.v1"
+    assert live["run"]["current_stage"] == "generating_code"
+    assert live["run"]["progress_percent"] == 42
+    assert recovered.status == "running"
+    assert any(event.event_type == "run.live_snapshot" for event in events)
+    assert any(snapshot["reason"].startswith("thread_live:") for snapshot in run_snapshots)
+
+
+def test_thread_recovery_closes_terminal_linked_run_after_crash(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Recovery Workspace",
+            "description": "thread recovery test",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    service = app.state.container.thread_service
+    thread = service.start_thread(workspace_id=workspace["workspace_id"], title="Recovery")
+    turn = TurnRecord(thread_id=thread.thread_id, workspace_id=workspace["workspace_id"], status="running", prompt="Build app", started_at=service._now())
+    run = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Build app",
+        intent="create",
+        status="completed",
+        apply_status="applied",
+        current_stage="completed",
+        progress_percent=100,
+        session_id=thread.thread_id,
+    )
+    app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+    turn.linked_run_id = run.run_id
+    app.state.container.platform_db.insert_turn(turn)
+    thread.status = "running"
+    thread.current_turn_id = turn.turn_id
+    app.state.container.platform_db.upsert_thread(thread)
+
+    recovered = service.recover_thread_state(thread.thread_id)
+    recovered_turn = app.state.container.platform_db.get_turn(turn.turn_id)
+    events = app.state.container.platform_db.list_events(thread.thread_id, limit=50)
+
+    assert recovered.status == "idle"
+    assert recovered_turn is not None and recovered_turn.status == "completed"
+    assert any(event.event_type == "thread.recovered" for event in events)
 
 
 def test_exec_runtime_streams_and_blocks_workspace_escape(tmp_path: Path) -> None:

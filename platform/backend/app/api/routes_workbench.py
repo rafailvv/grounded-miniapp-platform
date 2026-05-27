@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from app.api.deps import get_container
+from app.models.context_manager import ContextManagerReport
 from app.models.context_pressure import ContextPressureReport
 from app.models.domain import RunRecord
 from app.models.event_journal import EventJournalPage, EventJournalPayload, RunJournalState, ThreadJournalState
@@ -39,12 +40,15 @@ from app.models.workbench import (
     RunEventReplayReport,
     RunEventsReport,
     RunProtocolReport,
+    RunProtocolReportV2,
     RunSessionCheckpointsReport,
     RpcProtocolReport,
+    SessionProtocolReport,
     RunTimelineReport,
     RunTraceViewReport,
     SystemSchemaManifest,
     ToolEventsReport,
+    TurnProtocolReport,
     TraceBundleReport,
     TraceState,
     VisualRegressionReport,
@@ -83,6 +87,7 @@ class SkillEvaluateRequest(BaseModel):
 
 class MemoryRequest(BaseModel):
     kind: str = "note"
+    memory_type: str | None = None
     text: str
     citation: dict[str, Any] | None = None
 
@@ -447,6 +452,39 @@ def get_run_journal_state(run_id: str, container: ServiceContainer = Depends(get
 def get_run_protocol(run_id: str, container: ServiceContainer = Depends(get_container)) -> RunProtocolReport:
     try:
         return container.workbench_service.protocol(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/runs/{run_id}/protocol-v2", response_model=RunProtocolReportV2)
+def get_run_protocol_v2(run_id: str, container: ServiceContainer = Depends(get_container)) -> RunProtocolReportV2:
+    try:
+        return container.session_protocol_reducer.run_protocol(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/turns/{turn_id}/protocol", response_model=TurnProtocolReport)
+def get_turn_protocol(turn_id: str, container: ServiceContainer = Depends(get_container)) -> TurnProtocolReport:
+    try:
+        return container.session_protocol_reducer.turn_protocol(turn_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/sessions/{session_id}/protocol", response_model=SessionProtocolReport)
+def get_session_protocol(session_id: str, container: ServiceContainer = Depends(get_container)) -> SessionProtocolReport:
+    try:
+        return container.session_protocol_reducer.session_protocol(session_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/sessions/{session_id}/resume", response_model=SessionProtocolReport)
+def resume_session_protocol(session_id: str, container: ServiceContainer = Depends(get_container)) -> SessionProtocolReport:
+    try:
+        container.thread_service.resume_thread(session_id)
+        return container.session_protocol_reducer.session_protocol(session_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -1341,6 +1379,30 @@ def get_run_context_pressure(run_id: str, container: ServiceContainer = Depends(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@router.get("/runs/{run_id}/context-manager", response_model=ContextManagerReport)
+def get_run_context_manager(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.context_manager(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/sessions/{session_id}/context-manager")
+def get_session_context_manager(session_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.session_context_manager(session_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/runs/{run_id}/context-manager/compact")
+def compact_run_context_manager(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.compact_context_manager(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.get("/runs/{run_id}/compaction/boundaries")
 def get_run_compaction_boundaries(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     try:
@@ -1608,9 +1670,9 @@ def get_worker_merge_decision(run_id: str, container: ServiceContainer = Depends
 
 
 @router.post("/runs/{run_id}/review")
-def start_run_review(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+def start_run_review(run_id: str, target: str | None = None, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     try:
-        return container.workbench_service.review(run_id)
+        return container.workbench_service.review(run_id, target=target)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -1624,8 +1686,10 @@ def start_run_review_fix(run_id: str, container: ServiceContainer = Depends(get_
 
 
 @router.get("/runs/{run_id}/review")
-def get_run_review(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+def get_run_review(run_id: str, target: str | None = None, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     try:
+        if target:
+            return container.workbench_service.review(run_id, target=target)
         return container.store.get("reports", f"review:{run_id}") or container.workbench_service.review(run_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

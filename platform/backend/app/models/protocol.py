@@ -148,6 +148,10 @@ class ThreadIdParams(StrictModel):
     thread_id: str = Field(validation_alias=AliasChoices("thread_id", "threadId"))
 
 
+class SessionIdParams(StrictModel):
+    session_id: str = Field(validation_alias=AliasChoices("session_id", "sessionId", "thread_id", "threadId"))
+
+
 class ThreadForkParams(ThreadIdParams):
     title: str | None = None
 
@@ -165,6 +169,10 @@ class TurnStartParams(StrictModel):
 
 
 class TurnInterruptParams(ThreadIdParams):
+    turn_id: str = Field(validation_alias=AliasChoices("turn_id", "turnId"))
+
+
+class TurnIdParams(StrictModel):
     turn_id: str = Field(validation_alias=AliasChoices("turn_id", "turnId"))
 
 

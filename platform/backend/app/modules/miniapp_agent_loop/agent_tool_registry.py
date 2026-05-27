@@ -3,7 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from app.services.tool_protocol import canonical_tool_name, tool_protocol_spec
+from app.services.tool_protocol import (
+    canonical_tool_name,
+    model_visible_tool_names,
+    registry_tool_names,
+    tool_definition,
+    tool_protocol_spec,
+)
 
 
 AgentToolKind = Literal["read_only", "mutating", "verification", "unknown"]
@@ -35,6 +41,22 @@ AgentActivityKind = Literal[
     "completed",
 ]
 
+MODEL_INJECTED_FIELDS = {"workspace_id", "run_id"}
+MUTATING_FILE_FIELD_DESCRIPTIONS = {
+    "file_path": "One app-owned miniapp/... file. Do not target generated/platform-owned files such as app/main.py, app/routes/role_pages.py, app/routes/role_routes.py, or app/generated/*.json.",
+    "diff": "A unified diff for this one file. It must include @@ hunks with context and +/- lines.",
+    "content": "The complete resulting file content for this one file.",
+    "old_string": "Exact text currently present in the file. It must match exactly and uniquely unless replace_all is true.",
+    "new_string": "Replacement text.",
+}
+DEFAULT_MODEL_REQUIRED = ("reason",)
+MODEL_REQUIRED_OVERRIDES: dict[str, tuple[str, ...]] = {
+    "apply_patch_to_draft": ("file_path", "diff", "reason"),
+    "write_file": ("file_path", "content", "reason"),
+    "edit_file_exact": ("file_path", "old_string", "new_string", "reason"),
+    "tool_search": ("query", "reason"),
+}
+
 
 @dataclass(frozen=True)
 class AgentToolSpec:
@@ -49,6 +71,11 @@ class AgentToolSpec:
     mode_visibility: tuple[str, ...] = ("default", "read_only", "mutation_required", "verification", "worker_branch")
     dynamic: bool = False
     deferred: bool = False
+    canonical: str = ""
+    parallel_safe: bool = False
+    model_visible: bool = False
+    internal_only: bool = False
+    argument_progress_fields: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -75,337 +102,37 @@ class AgentToolBatchPlan:
 
 
 class AgentToolRegistry:
-    """Single source of truth for model-facing agent tools.
-
-    The registry is intentionally product-neutral: it describes tool semantics, safety,
-    progress labels, and batching behavior. It does not know product categories or
-    generated app resource names.
-    """
-
-    _SPECS: dict[str, AgentToolSpec] = {
-        "list_files": AgentToolSpec(
-            name="list_files",
-            kind="read_only",
-            concurrency_safe=True,
-            activity="reading",
-            progress_label="Reading workspace file list",
-        ),
-        "read_files": AgentToolSpec(
-            name="read_files",
-            kind="read_only",
-            concurrency_safe=True,
-            output_cap_chars=9000,
-            activity="reading",
-            progress_label="Reading selected files",
-        ),
-        "search_files": AgentToolSpec(
-            name="search_files",
-            kind="read_only",
-            concurrency_safe=True,
-            activity="searching",
-            progress_label="Searching workspace",
-        ),
-        "inspect_diff": AgentToolSpec(
-            name="inspect_diff",
-            kind="read_only",
-            concurrency_safe=True,
-            output_cap_chars=12000,
-            activity="reading",
-            progress_label="Inspecting draft diff",
-        ),
-        "read_artifact_ref": AgentToolSpec(
-            name="read_artifact_ref",
-            kind="read_only",
-            concurrency_safe=True,
-            output_cap_chars=12000,
-            activity="reading",
-            progress_label="Reading stored tool artifact",
-        ),
-        "semantic_scan": AgentToolSpec(
-            name="semantic_scan",
-            kind="read_only",
-            concurrency_safe=True,
-            output_cap_chars=12000,
-            activity="searching",
-            progress_label="Scanning source semantics",
-        ),
-        "tool_search": AgentToolSpec(
-            name="tool_search",
-            kind="read_only",
-            concurrency_safe=True,
-            output_cap_chars=9000,
-            activity="searching",
-            progress_label="Discovering optional deferred tools",
-        ),
-        "lsp.diagnostics": AgentToolSpec(
-            name="lsp.diagnostics",
-            kind="read_only",
-            concurrency_safe=True,
-            output_cap_chars=12000,
-            activity="checking",
-            progress_label="Running targeted file diagnostics",
-        ),
-        "lsp.symbol_context": AgentToolSpec(
-            name="lsp.symbol_context",
-            kind="read_only",
-            concurrency_safe=True,
-            output_cap_chars=10000,
-            activity="searching",
-            progress_label="Reading symbol context",
-        ),
-        "lsp.find_references": AgentToolSpec(
-            name="lsp.find_references",
-            kind="read_only",
-            concurrency_safe=True,
-            output_cap_chars=10000,
-            activity="searching",
-            progress_label="Finding symbol references",
-        ),
-        "lsp.definition": AgentToolSpec(
-            name="lsp.definition",
-            kind="read_only",
-            concurrency_safe=True,
-            output_cap_chars=8000,
-            activity="searching",
-            progress_label="Finding symbol definition",
-        ),
-        "lsp.route_graph": AgentToolSpec(
-            name="lsp.route_graph",
-            kind="read_only",
-            concurrency_safe=True,
-            output_cap_chars=14000,
-            activity="searching",
-            progress_label="Building route graph",
-        ),
-        "lsp.route_static_context": AgentToolSpec(
-            name="lsp.route_static_context",
-            kind="read_only",
-            concurrency_safe=True,
-            output_cap_chars=12000,
-            activity="searching",
-            progress_label="Reading route and static UI context",
-        ),
-        "lsp_diagnostics": AgentToolSpec(
-            name="lsp_diagnostics",
-            kind="read_only",
-            concurrency_safe=True,
-            output_cap_chars=12000,
-            activity="checking",
-            progress_label="Running targeted file diagnostics",
-        ),
-        "lsp_symbol_context": AgentToolSpec(
-            name="lsp_symbol_context",
-            kind="read_only",
-            concurrency_safe=True,
-            output_cap_chars=10000,
-            activity="searching",
-            progress_label="Reading symbol context",
-        ),
-        "lsp_find_references": AgentToolSpec(
-            name="lsp_find_references",
-            kind="read_only",
-            concurrency_safe=True,
-            output_cap_chars=10000,
-            activity="searching",
-            progress_label="Finding symbol references",
-        ),
-        "lsp_definition": AgentToolSpec(
-            name="lsp_definition",
-            kind="read_only",
-            concurrency_safe=True,
-            output_cap_chars=8000,
-            activity="searching",
-            progress_label="Finding symbol definition",
-        ),
-        "lsp_route_graph": AgentToolSpec(
-            name="lsp_route_graph",
-            kind="read_only",
-            concurrency_safe=True,
-            output_cap_chars=14000,
-            activity="searching",
-            progress_label="Building route graph",
-        ),
-        "lsp_route_static_context": AgentToolSpec(
-            name="lsp_route_static_context",
-            kind="read_only",
-            concurrency_safe=True,
-            output_cap_chars=12000,
-            activity="searching",
-            progress_label="Reading route and static UI context",
-        ),
-        "run_command": AgentToolSpec(
-            name="run_command",
-            kind="read_only",
-            concurrency_safe=True,
-            timeout_seconds=25,
-            activity="running_command",
-            progress_label="Running diagnostic command",
-        ),
-        "run_checks": AgentToolSpec(
-            name="run_checks",
-            kind="verification",
-            concurrency_safe=False,
-            timeout_seconds=120,
-            output_cap_chars=10000,
-            activity="checking",
-            progress_label="Running validation checks",
-        ),
-        "browser_verify": AgentToolSpec(
-            name="browser_verify",
-            kind="verification",
-            concurrency_safe=False,
-            timeout_seconds=180,
-            output_cap_chars=14000,
-            activity="browser_verifying",
-            progress_label="Running browser workflow proof",
-            dynamic=True,
-        ),
-        "apply_patch_to_draft": AgentToolSpec(
-            name="apply_patch_to_draft",
-            kind="mutating",
-            concurrency_safe=False,
-            activity="applying_patch",
-            progress_label="Applying one draft file patch",
-            deferred=True,
-        ),
-        "write_file": AgentToolSpec(
-            name="write_file",
-            kind="mutating",
-            concurrency_safe=False,
-            activity="editing",
-            progress_label="Writing one draft file",
-            deferred=True,
-        ),
-        "edit_file_exact": AgentToolSpec(
-            name="edit_file_exact",
-            kind="mutating",
-            concurrency_safe=False,
-            activity="editing",
-            progress_label="Applying an exact old/new string edit to one draft file",
-            deferred=True,
-        ),
-        "file.read": AgentToolSpec(
-            name="file.read",
-            kind="read_only",
-            concurrency_safe=True,
-            output_cap_chars=9000,
-            activity="reading",
-            progress_label="Reading files through the unified tool protocol",
-        ),
-        "file.write": AgentToolSpec(
-            name="file.write",
-            kind="mutating",
-            concurrency_safe=False,
-            activity="editing",
-            progress_label="Writing a file through the unified tool protocol",
-            aliases=("write_file",),
-            deferred=True,
-        ),
-        "file.edit": AgentToolSpec(
-            name="file.edit",
-            kind="mutating",
-            concurrency_safe=False,
-            activity="applying_patch",
-            progress_label="Editing a file through the unified tool protocol",
-            aliases=("edit_file_exact",),
-            deferred=True,
-        ),
-        "search.grep": AgentToolSpec(
-            name="search.grep",
-            kind="read_only",
-            concurrency_safe=True,
-            activity="searching",
-            progress_label="Searching file contents through the unified tool protocol",
-        ),
-        "search.glob": AgentToolSpec(
-            name="search.glob",
-            kind="read_only",
-            concurrency_safe=True,
-            activity="searching",
-            progress_label="Listing files through the unified tool protocol",
-        ),
-        "tool.search": AgentToolSpec(
-            name="tool.search",
-            kind="read_only",
-            concurrency_safe=True,
-            output_cap_chars=9000,
-            activity="searching",
-            progress_label="Discovering optional deferred tools",
-            aliases=("tool_search",),
-        ),
-        "shell.exec": AgentToolSpec(
-            name="shell.exec",
-            kind="read_only",
-            concurrency_safe=True,
-            timeout_seconds=30,
-            activity="running_command",
-            progress_label="Running a governed shell command",
-        ),
-        "browser.verify": AgentToolSpec(
-            name="browser.verify",
-            kind="verification",
-            concurrency_safe=False,
-            timeout_seconds=180,
-            output_cap_chars=14000,
-            activity="browser_verifying",
-            progress_label="Running browser verification through the unified tool protocol",
-            aliases=("browser_verify",),
-            dynamic=True,
-        ),
-        "patch.apply": AgentToolSpec(
-            name="patch.apply",
-            kind="mutating",
-            concurrency_safe=False,
-            activity="applying_patch",
-            progress_label="Applying a strict patch through the unified tool protocol",
-            aliases=("apply_patch_to_draft",),
-            deferred=True,
-        ),
-        "contract.compile": AgentToolSpec(
-            name="contract.compile",
-            kind="read_only",
-            concurrency_safe=False,
-            activity="planning",
-            progress_label="Compiling the typed mini-app contract",
-        ),
-        "registry.sync": AgentToolSpec(
-            name="registry.sync",
-            kind="mutating",
-            concurrency_safe=False,
-            activity="checking",
-            progress_label="Synchronizing prompt-contract metadata",
-            deferred=True,
-        ),
-        "ask_user": AgentToolSpec(
-            name="ask_user",
-            kind="read_only",
-            concurrency_safe=False,
-            activity="tool_progress",
-            progress_label="Requesting user input",
-        ),
-        "todo.write": AgentToolSpec(
-            name="todo.write",
-            kind="read_only",
-            concurrency_safe=False,
-            activity="planning",
-            progress_label="Updating the agent task plan",
-        ),
-        "review.start": AgentToolSpec(
-            name="review.start",
-            kind="verification",
-            concurrency_safe=False,
-            activity="checking",
-            progress_label="Starting an automated review",
-        ),
-    }
+    """Compatibility facade over the canonical tool protocol registry."""
 
     @classmethod
     def names(cls) -> set[str]:
-        return set(cls._SPECS)
+        return registry_tool_names()
 
     @classmethod
     def spec(cls, tool_name: object) -> AgentToolSpec | None:
-        return cls._SPECS.get(str(tool_name or "").strip().lower())
+        name = str(tool_name or "").strip().lower()
+        if not name or name not in cls.names():
+            return None
+        canonical = canonical_tool_name(name)
+        definition = tool_definition(canonical)
+        return AgentToolSpec(
+            name=name,
+            canonical=definition.canonical,
+            kind=definition.kind,
+            concurrency_safe=definition.concurrency_safe,
+            timeout_seconds=definition.timeout_seconds,
+            output_cap_chars=definition.output_cap_chars,
+            activity=definition.activity,  # type: ignore[arg-type]
+            progress_label=definition.progress_label,
+            aliases=definition.aliases,
+            mode_visibility=definition.mode_visibility,
+            dynamic=definition.dynamic,
+            deferred=definition.deferred,
+            parallel_safe=definition.parallel_safe,
+            model_visible=definition.model_visible,
+            internal_only=definition.internal_only,
+            argument_progress_fields=definition.argument_progress_fields,
+        )
 
     @classmethod
     def kind(cls, tool_name: object) -> AgentToolKind:
@@ -438,8 +165,7 @@ class AgentToolRegistry:
                 unknown.append(request)
                 append_batch(request, concurrency_safe=False)
                 continue
-            protocol = tool_protocol_spec(canonical_tool_name(request.get("tool")))
-            contract = protocol.as_contract()
+            contract = tool_protocol_spec(canonical_tool_name(request.get("tool"))).as_contract()
             parallel_safe = bool(contract.get("parallel_safe")) and str(contract.get("side_effect_class") or "") in {"none", "read_workspace"}
             if spec.kind == "mutating":
                 mutating.append(request)
@@ -461,93 +187,31 @@ class AgentToolRegistry:
     @classmethod
     def openai_tools(cls, allowed_names: set[str] | None = None, *, include_dynamic: bool = False) -> list[dict[str, Any]]:
         tools: list[dict[str, Any]] = []
-        for name in sorted(cls._SPECS):
-            if "." in name or (name == "browser_verify" and not include_dynamic):
+        visible_names = model_visible_tool_names(include_dynamic=include_dynamic)
+        for model_name in sorted(visible_names):
+            if allowed_names is not None and model_name not in allowed_names:
                 continue
-            if allowed_names is not None and name not in allowed_names:
+            spec = cls.spec(model_name)
+            if spec is None or spec.internal_only:
                 continue
-            spec = cls._SPECS[name]
-            contract = tool_protocol_spec(canonical_tool_name(name)).as_contract()
-            if name == "apply_patch_to_draft":
-                properties = {
-                    "file_path": {
-                        "type": "string",
-                        "description": "One app-owned miniapp/... file. Do not target generated/platform-owned files such as app/main.py, app/routes/role_pages.py, app/routes/role_routes.py, or app/generated/*.json.",
-                    },
-                    "diff": {
-                        "type": "string",
-                        "description": "A unified diff for this one file. It must include @@ hunks with context and +/- lines.",
-                    },
-                    "worker_id": {"type": "string"},
-                    "owner_scope": {"type": "string"},
-                    "reason": {"type": "string"},
-                }
-                required = ["file_path", "diff", "reason"]
-            elif name == "write_file":
-                properties = {
-                    "file_path": {
-                        "type": "string",
-                        "description": "One app-owned miniapp/... file. Do not target generated/platform-owned files such as app/main.py, app/routes/role_pages.py, app/routes/role_routes.py, or app/generated/*.json.",
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "The complete resulting file content for this one file.",
-                    },
-                    "worker_id": {"type": "string"},
-                    "owner_scope": {"type": "string"},
-                    "reason": {"type": "string"},
-                }
-                required = ["file_path", "content", "reason"]
-            elif name == "edit_file_exact":
-                properties = {
-                    "file_path": {
-                        "type": "string",
-                        "description": "One app-owned miniapp/... file. Do not target generated/platform-owned files such as app/main.py, app/routes/role_pages.py, app/routes/role_routes.py, or app/generated/*.json.",
-                    },
-                    "old_string": {
-                        "type": "string",
-                        "description": "Exact text currently present in the file. It must match exactly and uniquely unless replace_all is true.",
-                    },
-                    "new_string": {"type": "string", "description": "Replacement text."},
-                    "replace_all": {"type": "boolean"},
-                    "worker_id": {"type": "string"},
-                    "owner_scope": {"type": "string"},
-                    "reason": {"type": "string"},
-                }
-                required = ["file_path", "old_string", "new_string", "reason"]
-            elif name == "tool_search":
-                properties = {
-                    "query": {
-                        "type": "string",
-                        "description": "Short description of the optional capability to discover, such as deploy, browser verification, database, payments, CMS, GitHub, or Vercel.",
-                    },
-                    "domain": {
-                        "type": "string",
-                        "enum": ["", "deploy", "browser", "database", "payments", "cms", "github", "vercel"],
-                    },
-                    "intent": {"type": "string"},
-                    "reason": {"type": "string"},
-                }
-                required = ["query", "reason"]
-            else:
-                properties = {
-                    "mode": {"type": "string", "enum": ["exact", "final"]},
-                    "targets": {"type": "array", "items": {"type": "string"}},
-                    "files": {"type": "array", "items": {"type": "string"}},
-                    "pattern": {"type": "string"},
-                    "query": {"type": "string"},
-                    "symbol": {"type": "string"},
-                    "changed_only": {"type": "boolean"},
-                    "command": {"type": "string"},
-                    "process_id": {"type": "string"},
-                    "artifact_ref": {"type": "string"},
-                    "reason": {"type": "string"},
-                }
-                required = ["reason"]
+            if spec.dynamic and not include_dynamic and not spec.model_visible:
+                continue
+            contract = tool_protocol_spec(spec.canonical).as_contract()
+            schema = dict(contract.get("input_schema") or {})
+            properties = {
+                key: _model_property_schema(model_name, key, value)
+                for key, value in dict(schema.get("properties") or {}).items()
+                if key not in MODEL_INJECTED_FIELDS
+            }
+            required = [
+                key
+                for key in MODEL_REQUIRED_OVERRIDES.get(model_name, DEFAULT_MODEL_REQUIRED)
+                if key in properties
+            ]
             tools.append(
                 {
                     "type": "function",
-                    "name": name,
+                    "name": model_name,
                     "description": (
                         f"{spec.progress_label}. Kind: {spec.kind}. "
                         f"Capabilities: {', '.join(contract.get('capabilities') or [])}. "
@@ -570,9 +234,18 @@ class AgentToolRegistry:
         return tools
 
 
+def _model_property_schema(model_name: str, key: str, value: Any) -> dict[str, Any]:
+    schema = dict(value) if isinstance(value, dict) else {"type": "string"}
+    if key in MUTATING_FILE_FIELD_DESCRIPTIONS:
+        schema["description"] = MUTATING_FILE_FIELD_DESCRIPTIONS[key]
+    if model_name == "tool_search" and key == "query":
+        schema["description"] = "Short description of the optional capability to discover, such as deploy, browser verification, database, payments, CMS, GitHub, or Vercel."
+    return schema
+
+
 READ_ONLY_AGENT_TOOLS = frozenset(
-    name for name, spec in AgentToolRegistry._SPECS.items() if spec.kind in {"read_only", "verification"}
+    name for name in AgentToolRegistry.names() if AgentToolRegistry.kind(name) in {"read_only", "verification"}
 )
 MUTATING_AGENT_TOOLS = frozenset(
-    name for name, spec in AgentToolRegistry._SPECS.items() if spec.kind == "mutating"
+    name for name in AgentToolRegistry.names() if AgentToolRegistry.kind(name) == "mutating"
 )

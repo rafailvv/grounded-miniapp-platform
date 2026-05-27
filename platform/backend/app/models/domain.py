@@ -236,6 +236,7 @@ class JobRecord(StrictModel):
     worker_branch_refs: list[str] = Field(default_factory=list)
     verifier_review_ref: str | None = None
     browser_step_refs: list[str] = Field(default_factory=list)
+    context_manager_ref: str | None = None
     context_pressure_ref: str | None = None
     hook_trace_ref: str | None = None
     semantic_graph_ref: str | None = None
@@ -630,6 +631,7 @@ class RunRecord(StrictModel):
     worker_branch_refs: list[str] = Field(default_factory=list)
     verifier_review_ref: str | None = None
     browser_step_refs: list[str] = Field(default_factory=list)
+    context_manager_ref: str | None = None
     context_pressure_ref: str | None = None
     hook_trace_ref: str | None = None
     semantic_graph_ref: str | None = None

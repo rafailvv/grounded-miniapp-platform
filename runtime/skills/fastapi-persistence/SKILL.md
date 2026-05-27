@@ -1,4 +1,5 @@
 ---
+metadata_schema: grounded.skill.v2
 description: Align FastAPI routes, schemas, SQLite persistence, frontend payloads, and generated tests.
 whenToUse:
   - backend state
@@ -19,10 +20,18 @@ allowedTools:
   - run_checks
 model: default
 effort: high
+triggerRules:
+  - Match prompts using this skill domain and path scope.
 validation:
   - api_workflow_smoke
   - generated_app_python_tests
   - generated_app_js_tests
+requiredProof:
+  - Final readiness proof covers this skill.
+incompatibleSkills:
+  - ""
+outputExpectations:
+  - Produce working product changes and cite proof artifacts.
 ---
 # FastAPI Persistence
 

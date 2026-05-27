@@ -10,11 +10,13 @@ import tempfile
 import threading
 from pathlib import Path
 from subprocess import CalledProcessError
+from typing import Any
 
 from app.core.config import Settings
 from app.models.artifacts import ApplyPatchResult, PatchEnvelope, PatchOperationModel
 from app.models.domain import DraftAction, RevisionRecord, SaveFileRequest, WorkspaceRecord, utc_now
 from app.repositories.state_store import StateStore
+from app.services.patch_validator import PatchGrammarValidator
 from app.services.sandbox_service import SandboxService, SandboxViolationError
 from app.services.workspace.log_service import WorkspaceLogService
 
@@ -611,9 +613,9 @@ class WorkspaceService:
                 op_name = "patch"
                 content = None
             else:
-                diff = self._unified_diff(current_content, operation.content or "", operation.file_path)
                 op_name = "delete" if operation.operation == "delete" else ("create" if not target_path.exists() else "update")
-                content = operation.content
+                diff = None if op_name == "delete" else self._unified_diff(current_content, operation.content or "", operation.file_path)
+                content = None if op_name == "delete" else operation.content
             prepared_ops.append(
                 PatchOperationModel(
                     operation_id=operation.operation_id,
@@ -754,6 +756,26 @@ class WorkspaceService:
     ) -> ApplyPatchResult:
         profile = "agent_draft_write" if run_id else "source_apply_gate"
         allow_generated = run_id is None
+        validation_report = PatchGrammarValidator.validate_operations(envelope.ops)
+        patch_sha256 = str(validation_report.get("patch_sha256") or "")
+        if validation_report.get("status") != "passed":
+            conflict_reason = self._patch_validation_reason(validation_report)
+            return ApplyPatchResult(
+                workspace_id=workspace_id,
+                run_id=run_id,
+                base_revision_id=envelope.base_revision_id,
+                status="failed",
+                conflict_reason=conflict_reason,
+                patch_sha256=patch_sha256,
+                validation_report=validation_report,
+                conflict_packet=PatchGrammarValidator.conflict_packet(
+                    workspace_id=workspace_id,
+                    run_id=run_id,
+                    validation_report=validation_report,
+                    conflict_reason=conflict_reason,
+                ),
+                changed_files=[],
+            )
         operation_paths = [str(operation.file_path or "") for operation in envelope.ops]
         preflight = self.sandbox_service.preflight_apply(
             target_root,
@@ -770,6 +792,27 @@ class WorkspaceService:
                 base_revision_id=envelope.base_revision_id,
                 status="blocked",
                 conflict_reason="; ".join(item.message for item in preflight.violations) or "Sandbox preflight failed.",
+                patch_sha256=patch_sha256,
+                validation_report=validation_report,
+                conflict_packet=PatchGrammarValidator.conflict_packet(
+                    workspace_id=workspace_id,
+                    run_id=run_id,
+                    validation_report={
+                        **validation_report,
+                        "issues": [
+                            {
+                                "code": item.code,
+                                "message": item.message,
+                                "path": item.path,
+                                "operation_id": getattr(item, "operation_id", None),
+                                "blocking": True,
+                                "severity": "high",
+                            }
+                            for item in preflight.violations
+                        ],
+                    },
+                    conflict_reason="; ".join(item.message for item in preflight.violations) or "Sandbox preflight failed.",
+                ),
                 changed_files=[],
             )
         snapshots = {item.path: item.snapshot for item in preflight.items}
@@ -808,12 +851,21 @@ class WorkspaceService:
 
         def failed(status: str, reason: str) -> ApplyPatchResult:
             rollback()
+            conflict_validation = self._patch_conflict_validation_report(validation_report, status=status, reason=reason)
             return ApplyPatchResult(
                 workspace_id=workspace_id,
                 run_id=run_id,
                 base_revision_id=envelope.base_revision_id,
                 status=status,
                 conflict_reason=reason,
+                patch_sha256=patch_sha256,
+                validation_report=validation_report,
+                conflict_packet=PatchGrammarValidator.conflict_packet(
+                    workspace_id=workspace_id,
+                    run_id=run_id,
+                    validation_report=conflict_validation,
+                    conflict_reason=reason,
+                ),
                 changed_files=[],
             )
 
@@ -957,6 +1009,8 @@ class WorkspaceService:
             run_id=run_id,
             base_revision_id=envelope.base_revision_id,
             status="applied",
+            patch_sha256=patch_sha256,
+            validation_report=validation_report,
             changed_files=changed_files,
         )
         self.store.upsert(
@@ -965,6 +1019,34 @@ class WorkspaceService:
             result.model_dump(mode="json"),
         )
         return result
+
+    @staticmethod
+    def _patch_validation_reason(validation_report: dict[str, object]) -> str:
+        issues = validation_report.get("issues") if isinstance(validation_report.get("issues"), list) else []
+        first = next((item for item in issues if isinstance(item, dict)), None)
+        if first:
+            return str(first.get("message") or first.get("code") or "Patch validation failed.")
+        return "Patch validation failed."
+
+    @staticmethod
+    def _patch_conflict_validation_report(validation_report: dict[str, Any], *, status: str, reason: str) -> dict[str, Any]:
+        issues = [item for item in validation_report.get("issues") or [] if isinstance(item, dict)]
+        if issues:
+            return validation_report
+        return {
+            **validation_report,
+            "issues": [
+                {
+                    "code": "patch_apply_conflict" if status == "conflict" else "patch_apply_failed" if status == "failed" else "patch_apply_blocked",
+                    "message": reason,
+                    "severity": "high",
+                    "blocking": True,
+                    "path": "",
+                    "operation_id": "",
+                    "evidence": {"status": status},
+                }
+            ],
+        }
 
     def _apply_unified_diff_via_staging(
         self,

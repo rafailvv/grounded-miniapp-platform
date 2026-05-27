@@ -382,6 +382,7 @@ class RunService:
             {
                 "run_id": run.run_id,
                 "workspace_id": run.workspace_id,
+                "session_id": run.session_id,
                 "status": run.status,
                 "apply_status": run.apply_status,
                 "current_stage": run.current_stage,
@@ -414,6 +415,7 @@ class RunService:
             {
                 "run_id": run.run_id,
                 "workspace_id": run.workspace_id,
+                "session_id": run.session_id,
                 "status": run.status,
                 "apply_status": run.apply_status,
                 "current_stage": run.current_stage,
@@ -1292,6 +1294,7 @@ class RunService:
                 "artifact_read_trace_ref",
                 "resume_checkpoint_ref",
                 "verifier_review_ref",
+                "context_manager_ref",
                 "context_pressure_ref",
                 "hook_trace_ref",
                 "semantic_graph_ref",
@@ -1465,6 +1468,7 @@ class RunService:
                 "artifact_read_trace_ref",
                 "resume_checkpoint_ref",
                 "verifier_review_ref",
+                "context_manager_ref",
                 "context_pressure_ref",
                 "hook_trace_ref",
                 "semantic_graph_ref",
@@ -1885,6 +1889,7 @@ class RunService:
             run.worker_branch_refs = list(getattr(job, "worker_branch_refs", []) or run.worker_branch_refs)
             run.verifier_review_ref = getattr(job, "verifier_review_ref", None) or run.verifier_review_ref
             run.browser_step_refs = list(getattr(job, "browser_step_refs", []) or run.browser_step_refs)
+            run.context_manager_ref = getattr(job, "context_manager_ref", None) or run.context_manager_ref
             run.context_pressure_ref = getattr(job, "context_pressure_ref", None) or run.context_pressure_ref
             run.hook_trace_ref = getattr(job, "hook_trace_ref", None) or run.hook_trace_ref
             run.semantic_graph_ref = getattr(job, "semantic_graph_ref", None) or run.semantic_graph_ref
@@ -2522,6 +2527,7 @@ class RunService:
             "verifier_review_ref": run.verifier_review_ref,
             "browser_step_refs": run.browser_step_refs,
             "active_tool_uses": run.active_tool_uses,
+            "context_manager_ref": run.context_manager_ref,
             "context_pressure_ref": run.context_pressure_ref,
             "hook_trace_ref": run.hook_trace_ref,
             "semantic_graph_ref": run.semantic_graph_ref,
@@ -2541,6 +2547,7 @@ class RunService:
             "resume_checkpoint": self.store.get("reports", run.resume_checkpoint_ref) if run.resume_checkpoint_ref else None,
             "verifier_review": self.store.get("reports", run.verifier_review_ref) if run.verifier_review_ref else None,
             "browser_steps": [self.store.get("reports", ref) for ref in run.browser_step_refs if ref],
+            "context_manager": self.store.get("reports", run.context_manager_ref) if run.context_manager_ref else None,
             "context_pressure": self.store.get("reports", run.context_pressure_ref) if run.context_pressure_ref else None,
             "hook_trace": self.store.get("reports", run.hook_trace_ref) if run.hook_trace_ref else None,
             "semantic_graph": self.store.get("reports", run.semantic_graph_ref) if run.semantic_graph_ref else None,

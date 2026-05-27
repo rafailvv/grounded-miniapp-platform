@@ -67,19 +67,28 @@ def test_golden_generated_app_catalog_is_available_and_contract_owned() -> None:
 
     assert catalog["schema"] == "grounded.golden.generated_apps.v1"
     assert catalog["status"] == "ready"
-    assert set(catalog["ids"]) == {
+    assert catalog["count"] >= 20
+    assert {
         salon_app_id,
         "restaurant-reservations",
         "shop-catalog-orders",
         "crm-request-pipeline",
         "specialist-schedule",
         "event-registration",
-    }
+    }.issubset(set(catalog["ids"]))
+    assert catalog["regression_score"]["schema"] == "grounded.golden.generated_app_regression_score.v1"
+    assert catalog["regression_score"]["status"] == "passed"
+    assert catalog["regression_score"]["score"] == 1.0
     assert catalog["issues"] == []
     for item in catalog["items"]:
         assert item["prompt"]
         assert item["prompt_analysis"]["resource_hint"]
         assert set(READINESS_CHECKLIST_KEYS).issubset(set(item["readiness_required_checks"]))
+        assert item["expected_roles"] == ["client", "specialist", "manager"]
+        assert item["expected_routes"]
+        assert item["expected_api"]
+        assert item["expected_persistence_markers"]
+        assert item["visual_mobile_thresholds"]["max_horizontal_overflow_px"] == 0
         assert "source-code templates" in catalog["description"]
 
 
@@ -89,7 +98,10 @@ def test_golden_generated_apps_compile_to_acceptance_and_skill_regressions() -> 
     for item in catalog["items"]:
         compiled = GoldenGeneratedAppCatalog.compile(item, runtime_dir=ROOT / "runtime", repo_root=ROOT, max_skills=8)
         assert compiled["status"] == "passed", (item["id"], compiled["issues"])
+        assert compiled["regression_score"]["score"] == 1.0
         assert set(item["expected_skill_ids"]).issubset(set(compiled["selected_skill_ids"]))
+        assert compiled["benchmark_expectations"]["expected_api"]
+        assert compiled["benchmark_expectations"]["expected_persistence_markers"]
 
         contract = compiled["contract"]
         assert contract["required"] is True
@@ -134,7 +146,9 @@ def test_golden_generated_apps_are_exposed_through_workbench_api(tmp_path: Path)
 
     assert catalog["schema"] == "grounded.golden.generated_apps.v1"
     assert catalog["status"] == "ready"
-    assert catalog["count"] == 6
+    assert catalog["count"] >= 20
+    assert catalog["regression_score"]["score"] == 1.0
     assert detail["id"] == salon_app_id
     assert detail["compiled"]["status"] == "passed"
+    assert detail["compiled"]["regression_score"]["score"] == 1.0
     assert reservations_skill_id in detail["compiled"]["selected_skill_ids"]

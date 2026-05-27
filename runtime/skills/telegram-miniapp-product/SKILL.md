@@ -1,4 +1,5 @@
 ---
+metadata_schema: grounded.skill.v2
 description: Generate or refine production-quality Telegram mini-app role surfaces.
 whenToUse:
   - telegram mini app
@@ -18,10 +19,18 @@ allowedTools:
   - browser_verify
 model: default
 effort: high
+triggerRules:
+  - Match prompts using this skill domain and path scope.
 validation:
   - platform_invariants
   - frontend_interaction_static_smoke
   - browser_flow_smoke
+requiredProof:
+  - Final readiness proof covers this skill.
+incompatibleSkills:
+  - ""
+outputExpectations:
+  - Produce working product changes and cite proof artifacts.
 ---
 # Telegram Mini-App Product
 

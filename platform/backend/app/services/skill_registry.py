@@ -57,41 +57,61 @@ class SkillRegistryService:
             {
                 "id": "state-workflow",
                 "name": "State workflow",
+                "metadata_schema": "grounded.skill.v2",
                 "activation": "create_or_behavior_edit",
                 "invocationPolicy": "auto",
+                "trigger_rules": ["create persisted workflow", "edit behavior with shared state", "prompt mentions state transitions"],
                 "constraints": ["Persist only the shared records and state transitions implied by the prompt."],
+                "required_proof": ["api_workflow_smoke", "browser_flow_smoke"],
+                "output_expectations": ["Connected state model, API routes, and role UI readback."],
                 "validation_hints": ["Prompt-derived persisted workflow exists."],
             },
             {
                 "id": "role-surfaces",
                 "name": "Role surfaces",
+                "metadata_schema": "grounded.skill.v2",
                 "activation": "create_or_role_edit",
                 "invocationPolicy": "auto",
+                "trigger_rules": ["prompt names client specialist manager roles", "role-specific UI surfaces are needed"],
                 "constraints": ["Role pages share connected state while exposing distinct actions."],
+                "required_proof": ["browser_flow_smoke", "role_coverage"],
+                "output_expectations": ["Distinct role surfaces with prompt-derived actions."],
                 "validation_hints": ["Each role has a distinct action surface."],
             },
             {
                 "id": "route-manifest",
                 "name": "Route manifest",
+                "metadata_schema": "grounded.skill.v2",
                 "activation": "route_change",
                 "invocationPolicy": "auto",
+                "trigger_rules": ["routeable pages changed", "static page route manifest needed"],
                 "constraints": ["Route metadata must match real static pages."],
+                "required_proof": ["lsp_route_graph", "route_manifest_static"],
+                "output_expectations": ["Generated route metadata matches actual pages."],
                 "validation_hints": ["Every role page is routeable."],
             },
             {
                 "id": "mobile-shell",
                 "name": "Mobile shell",
+                "metadata_schema": "grounded.skill.v2",
                 "activation": "visual_or_quality",
                 "invocationPolicy": "auto",
+                "trigger_rules": ["quality generation mode", "mobile layout or Telegram UI requested"],
                 "constraints": ["Mobile-first role pages for Telegram widths."],
+                "required_proof": ["mobile_layout"],
+                "output_expectations": ["Compact mobile UI without overflow."],
                 "validation_hints": ["No horizontal overflow on mobile."],
             },
             {
                 "id": "preview-profile",
                 "name": "Preview profile",
+                "metadata_schema": "grounded.skill.v2",
                 "activation": "preview_or_platform",
                 "invocationPolicy": "auto",
+                "trigger_rules": ["preview profile matters", "Telegram mock shell needed"],
                 "constraints": ["Preview profile selects the right host shell."],
+                "required_proof": ["browser_flow_smoke"],
+                "output_expectations": ["Preview profile and shell remain aligned."],
                 "validation_hints": ["Preview profile supports configured mock surface."],
             },
         ]
@@ -191,6 +211,8 @@ class SkillRegistryService:
             skill_id = str(skill.get("id") or "")
             scoped_id = str(skill.get("scoped_id") or skill_id)
             explicit = skill_id in explicit_mentions or scoped_id in explicit_mentions
+            phrase_hits: list[str] = []
+            trigger_hits: list[str] = []
             if explicit:
                 score += 100
                 reasons.append("explicit_mention")
@@ -212,6 +234,14 @@ class SkillRegistryService:
                 if phrase_hits:
                     score += min(9, len(phrase_hits) * 3)
                     reasons.append("whenToUse")
+                trigger_hits = [
+                    phrase
+                    for phrase in [str(item).lower() for item in cls.list_field(skill.get("trigger_rules"))]
+                    if cls.phrase_matches(phrase, haystack)
+                ]
+                if trigger_hits:
+                    score += min(12, len(trigger_hits) * 4)
+                    reasons.append("trigger_rules")
                 for path_pattern in skill.get("paths") or []:
                     if any(cls.path_matches(str(path_pattern), str(path)) for path in paths or []):
                         score += 3
@@ -242,7 +272,21 @@ class SkillRegistryService:
                     score += 2
                     reasons.append("proof")
             if score:
-                candidates.append({**skill, "activation_reason": ", ".join(dict.fromkeys(reasons)), "activation_score": score, "explicit": explicit})
+                candidates.append(
+                    {
+                        **skill,
+                        "activation_reason": ", ".join(dict.fromkeys(reasons)),
+                        "activation_score": score,
+                        "explicit": explicit,
+                        "ranking": {
+                            "score": score,
+                            "reasons": list(dict.fromkeys(reasons)),
+                            "trigger_hits": trigger_hits,
+                            "phrase_hits": phrase_hits,
+                            "prompt_terms": cls.prompt_terms(prompt)[:12],
+                        },
+                    }
+                )
             else:
                 skipped.append({"id": skill_id, "scoped_id": scoped_id, "reason": "no intent/path/failure match", "source": skill.get("source")})
         selected = cls._select_with_budget(candidates, skipped, budget)
@@ -257,6 +301,18 @@ class SkillRegistryService:
             "explicit_mentions": sorted(explicit_mentions),
             "budget": {**budget, "used_body_chars": used_body_chars},
             "effective": cls.effective_policy(selected),
+            "ranking": {
+                "algorithm": "explicit > trigger_rules > whenToUse > paths > failure/proof heuristics",
+                "selected": [
+                    {
+                        "id": item.get("id"),
+                        "scoped_id": item.get("scoped_id"),
+                        "score": item.get("activation_score"),
+                        "reasons": (item.get("ranking") or {}).get("reasons") or str(item.get("activation_reason") or "").split(", "),
+                    }
+                    for item in selected
+                ],
+            },
             "validation_issues": [*(validation_issues or []), *dependency_issues],
             "prefetch": prefetch or {},
             "created_at": _now(),
@@ -273,10 +329,16 @@ class SkillRegistryService:
             constraints = "; ".join(str(item) for item in (skill.get("constraints") or [])[:4])
             validation = "; ".join(str(item) for item in (skill.get("validation_hints") or skill.get("validation") or [])[:4])
             allowed_tools = ", ".join(str(item) for item in (skill.get("allowedTools") or [])[:8])
+            required_proof = "; ".join(str(item) for item in (skill.get("required_proof") or [])[:4])
+            output_expectations = "; ".join(str(item) for item in (skill.get("output_expectations") or [])[:4])
             if constraints:
                 lines.append(f"  Rules: {constraints}")
             if validation:
                 lines.append(f"  Validation: {validation}")
+            if required_proof:
+                lines.append(f"  Required proof: {required_proof}")
+            if output_expectations:
+                lines.append(f"  Output: {output_expectations}")
             if allowed_tools:
                 lines.append(f"  Tool hint: {allowed_tools}")
             body = str(skill.get("body") or "").strip()
@@ -329,6 +391,8 @@ class SkillRegistryService:
             "allowedTools": allowed_tools,
             "model": (explicit_models or auto_models or [""])[0],
             "effort": effort,
+            "requiredProof": sorted({str(item) for skill in selected for item in (skill.get("required_proof") or []) if str(item).strip()}),
+            "outputExpectations": [str(item) for skill in selected for item in (skill.get("output_expectations") or []) if str(item).strip()][:12],
         }
 
     @classmethod
@@ -381,6 +445,10 @@ class SkillRegistryService:
         return bool(tokens and all(token in haystack for token in tokens[:4]))
 
     @staticmethod
+    def prompt_terms(prompt: str) -> list[str]:
+        return list(dict.fromkeys(token.lower() for token in re.findall(r"[A-Za-zА-Яа-яЁё0-9_-]{3,}", str(prompt or ""))))[:30]
+
+    @staticmethod
     def path_matches(pattern: str, path: str) -> bool:
         pattern = str(pattern or "").strip().replace("\\", "/")
         path = str(path or "").strip().replace("\\", "/")
@@ -425,7 +493,11 @@ class SkillRegistryService:
             source="system",
             activation=str(raw.get("activation") or "builtin"),
             invocationPolicy=str(raw.get("invocationPolicy") or "auto"),
+            metadata_schema=str(raw.get("metadata_schema") or "grounded.skill.v2"),
+            trigger_rules=[str(item) for item in raw.get("trigger_rules") or []],
             constraints=[str(item) for item in raw.get("constraints") or []],
+            required_proof=[str(item) for item in raw.get("required_proof") or []],
+            output_expectations=[str(item) for item in raw.get("output_expectations") or []],
             validation_hints=[str(item) for item in raw.get("validation_hints") or []],
             metadata={key: value for key, value in raw.items() if key not in {"id", "name", "activation", "constraints", "validation_hints"}},
         )
@@ -460,7 +532,9 @@ class SkillRegistryService:
         if not text:
             return None, [SkillValidationIssue(code="skill_empty", message="Skill file is empty or unreadable.", scope=scope, source=str(path))]
         frontmatter_raw, body = self.frontmatter(text)
-        rules, acceptance = self.sections(text)
+        section_items = self.sections(text)
+        rules = section_items.get("rules", [])
+        acceptance = section_items.get("acceptance", [])
         dependencies = self.dependencies(frontmatter_raw.get("dependencies"))
         invocation_policy = self.invocation_policy(frontmatter_raw)
         skill_id = path.parent.name
@@ -468,13 +542,18 @@ class SkillRegistryService:
         source = str(path.relative_to(self.repo_root)) if path.is_relative_to(self.repo_root) else str(path)
         try:
             frontmatter = SkillFrontmatter(
+                metadata_schema=str(frontmatter_raw.get("metadata_schema") or frontmatter_raw.get("metadataSchema") or frontmatter_raw.get("schema") or "grounded.skill.v2").strip(),
                 description=str(frontmatter_raw.get("description") or "").strip() or None,
                 whenToUse=self.list_field(frontmatter_raw.get("whenToUse") or frontmatter_raw.get("when_to_use")),
+                trigger_rules=self.list_field(frontmatter_raw.get("triggerRules") or frontmatter_raw.get("trigger_rules")) or section_items.get("trigger_rules", []),
                 paths=self.list_field(frontmatter_raw.get("paths")),
                 allowedTools=self.list_field(frontmatter_raw.get("allowedTools") or frontmatter_raw.get("allowed_tools")),
                 model=str(frontmatter_raw.get("model") or "").strip(),
                 effort=str(frontmatter_raw.get("effort") or "").strip(),
                 validation=self.list_field(frontmatter_raw.get("validation")),
+                required_proof=self.list_field(frontmatter_raw.get("requiredProof") or frontmatter_raw.get("required_proof")) or section_items.get("required_proof", []),
+                incompatible_skills=self.list_field(frontmatter_raw.get("incompatibleSkills") or frontmatter_raw.get("incompatible_skills")) or section_items.get("incompatible_skills", []),
+                output_expectations=self.list_field(frontmatter_raw.get("outputExpectations") or frontmatter_raw.get("output_expectations")) or section_items.get("output_expectations", []),
                 dependencies=dependencies,
                 invocationPolicy=invocation_policy,
             )
@@ -486,13 +565,18 @@ class SkillRegistryService:
                 source=source,
                 activation="frontmatter_match" if frontmatter_raw else "skill_match",
                 invocationPolicy=frontmatter.invocationPolicy or "explicit",
+                metadata_schema=frontmatter.metadata_schema or "grounded.skill.v2",
                 whenToUse=frontmatter.whenToUse,
+                trigger_rules=frontmatter.trigger_rules or frontmatter.whenToUse,
                 paths=frontmatter.paths,
                 allowedTools=frontmatter.allowedTools,
                 model=frontmatter.model,
                 effort=frontmatter.effort,
                 validation=frontmatter.validation,
                 validation_hints=acceptance[:8],
+                required_proof=frontmatter.required_proof or frontmatter.validation or acceptance[:4],
+                incompatible_skills=frontmatter.incompatible_skills,
+                output_expectations=frontmatter.output_expectations or section_items.get("output", [])[:4],
                 dependencies=frontmatter.dependencies,
                 constraints=rules[:8],
                 body=body or text,
@@ -500,6 +584,13 @@ class SkillRegistryService:
                 plugin_id=plugin_id,
                 mtime_ns=path.stat().st_mtime_ns if path.exists() else 0,
                 enabled=invocation_policy != "disabled",
+                metadata={
+                    "schema": frontmatter.metadata_schema or "grounded.skill.v2",
+                    "trigger_rules": frontmatter.trigger_rules or frontmatter.whenToUse,
+                    "required_proof": frontmatter.required_proof or frontmatter.validation or acceptance[:4],
+                    "incompatible_skills": frontmatter.incompatible_skills,
+                    "output_expectations": frontmatter.output_expectations,
+                },
             )
             return item, []
         except Exception as exc:
@@ -540,24 +631,46 @@ class SkillRegistryService:
         return {}, text
 
     @staticmethod
-    def sections(text: str) -> tuple[list[str], list[str]]:
-        rules: list[str] = []
-        acceptance: list[str] = []
+    def sections(text: str) -> dict[str, list[str]]:
+        sections: dict[str, list[str]] = {
+            "rules": [],
+            "acceptance": [],
+            "trigger_rules": [],
+            "required_proof": [],
+            "incompatible_skills": [],
+            "output_expectations": [],
+            "output": [],
+        }
         current: list[str] | None = None
         for line in text.splitlines():
             lowered = line.strip().lower()
             if lowered.startswith("## rules"):
-                current = rules
+                current = sections["rules"]
                 continue
             if lowered.startswith("## acceptance"):
-                current = acceptance
+                current = sections["acceptance"]
+                continue
+            if lowered.startswith("## trigger"):
+                current = sections["trigger_rules"]
+                continue
+            if lowered.startswith("## required proof") or lowered.startswith("## proof"):
+                current = sections["required_proof"]
+                continue
+            if lowered.startswith("## incompatible"):
+                current = sections["incompatible_skills"]
+                continue
+            if lowered.startswith("## skill output") or lowered.startswith("## output expectation"):
+                current = sections["output_expectations"]
+                continue
+            if lowered.startswith("## output"):
+                current = sections["output"]
                 continue
             if lowered.startswith("## "):
                 current = None
                 continue
             if current is not None and line.strip().startswith("-"):
                 current.append(line.strip("- ").strip())
-        return rules, acceptance
+        return sections
 
     @staticmethod
     def title(text: str, default_title: str) -> str:
@@ -689,9 +802,12 @@ class SkillRegistryService:
         selected: list[dict[str, Any]] = []
         used_body_chars = 0
         conflict_groups: set[str] = set()
+        selected_ids: set[str] = set()
         for item in candidates:
             group = cls.conflict_group(item)
             body_chars = min(len(str(item.get("body") or "")), int(budget["max_body_chars"]))
+            item_ids = {str(item.get("id") or ""), str(item.get("scoped_id") or "")}
+            incompatible = {str(value) for value in item.get("incompatible_skills") or [] if str(value).strip()}
             if len(selected) >= int(budget["max_skills"]):
                 skipped.append({"id": item.get("id"), "scoped_id": item.get("scoped_id"), "reason": "activation_budget_exceeded", "activation_score": item.get("activation_score")})
                 continue
@@ -701,7 +817,14 @@ class SkillRegistryService:
             if group and group in conflict_groups and not item.get("explicit"):
                 skipped.append({"id": item.get("id"), "scoped_id": item.get("scoped_id"), "reason": f"conflict_group:{group}", "activation_score": item.get("activation_score")})
                 continue
+            if incompatible & selected_ids and not item.get("explicit"):
+                skipped.append({"id": item.get("id"), "scoped_id": item.get("scoped_id"), "reason": "incompatible_skill_selected", "incompatible_with": sorted(incompatible & selected_ids), "activation_score": item.get("activation_score")})
+                continue
+            if any(item_ids & {str(value) for value in selected_item.get("incompatible_skills") or []} for selected_item in selected) and not item.get("explicit"):
+                skipped.append({"id": item.get("id"), "scoped_id": item.get("scoped_id"), "reason": "blocked_by_selected_incompatible_skill", "activation_score": item.get("activation_score")})
+                continue
             selected.append({**item, "body_budget_chars": int(budget["max_body_chars"])})
+            selected_ids.update(item for item in item_ids if item)
             used_body_chars += body_chars
             if group:
                 conflict_groups.add(group)

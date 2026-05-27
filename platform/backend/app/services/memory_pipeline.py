@@ -24,7 +24,10 @@ from app.services.repair_catalog import RepairCatalog
 
 MEMORY_KINDS = {
     "preference",
+    "product_fact",
     "product_decision",
+    "ui_vocabulary",
+    "persistence_schema_decision",
     "working_pattern",
     "reusable_workflow",
     "failure_signature",
@@ -32,6 +35,34 @@ MEMORY_KINDS = {
     "known_failure_recipe",
     "successful_app_pattern",
     "avoidance",
+}
+PRODUCT_MEMORY_TYPES = (
+    "preferences",
+    "product_facts",
+    "known_failures",
+    "successful_patterns",
+    "rejected_approaches",
+    "ui_vocabulary",
+    "persistence_schema_decisions",
+)
+KIND_TO_MEMORY_TYPE = {
+    "preference": "preferences",
+    "user_preference": "preferences",
+    "project_rule": "preferences",
+    "product_fact": "product_facts",
+    "product_decision": "product_facts",
+    "architecture": "product_facts",
+    "failure_signature": "known_failures",
+    "failure_shield": "known_failures",
+    "known_failure_recipe": "known_failures",
+    "working_pattern": "successful_patterns",
+    "reusable_workflow": "successful_patterns",
+    "successful_app_pattern": "successful_patterns",
+    "avoidance": "rejected_approaches",
+    "rejected_approach": "rejected_approaches",
+    "ui_vocabulary": "ui_vocabulary",
+    "ux_rule": "ui_vocabulary",
+    "persistence_schema_decision": "persistence_schema_decisions",
 }
 SECRET_PATTERNS = (
     re.compile(r"(api[_-]?key|token|secret|password)\s*=", re.I),
@@ -62,7 +93,10 @@ WORKFLOW_RE = re.compile(
 )
 SUMMARY_KIND_ORDER = (
     "preference",
+    "product_fact",
     "product_decision",
+    "ui_vocabulary",
+    "persistence_schema_decision",
     "failure_shield",
     "known_failure_recipe",
     "successful_app_pattern",
@@ -151,6 +185,7 @@ class WorkspaceMemoryPipeline:
             raw = RawMemoryItem(
                 memory_id=f"stage1_{run.run_id}_{len(items) + 1}",
                 kind=kind,
+                memory_type=WorkspaceMemoryPipeline.memory_type_for_kind(kind),
                 text=text,
                 status="candidate",
                 fingerprint=WorkspaceMemoryPipeline._fingerprint(kind, text),
@@ -173,10 +208,26 @@ class WorkspaceMemoryPipeline:
         resource = prompt_hints.get("resource_hint") or (primary_entities[0] if primary_entities else None)
         if resource:
             add(
-                "product_decision",
-                f"Product workflow centers on `{resource}` with role responsibilities from the prompt contract.",
+                "product_fact",
+                f"Product fact: workflow centers on `{resource}` with role responsibilities from the prompt contract.",
                 {"resource_hint": resource, "roles": contract.get("roles", [])},
                 {"source": "acceptance_contract", "resource_hint": resource},
+            )
+        role_state_contract = (run.implementation_plan or {}).get("role_state_contract") if isinstance(run.implementation_plan, dict) else {}
+        if isinstance(role_state_contract, dict) and role_state_contract:
+            add(
+                "persistence_schema_decision",
+                "Persistence schema decision: keep role state contract fields and API payload names aligned across backend, UI, and tests.",
+                {"role_state_contract": role_state_contract},
+                {"source": "implementation_plan_role_state_contract"},
+            )
+        vocabulary = WorkspaceMemoryPipeline._ui_vocabulary_from_run(run)
+        if vocabulary:
+            add(
+                "ui_vocabulary",
+                f"UI vocabulary: prefer product labels {', '.join(vocabulary[:12])}.",
+                {"labels": vocabulary[:40], "roles": list(getattr(run, "target_role_scope", []) or [])},
+                {"source": "run_prompt_ui_vocabulary"},
             )
         if run.status == "completed" and run.apply_status == "applied":
             add(
@@ -329,12 +380,14 @@ class WorkspaceMemoryPipeline:
         current["workspace_id"] = workspace_id
         current["schema"] = "grounded.workspace_memory.v2"
         current["items"] = items
+        type_buckets = WorkspaceMemoryPipeline.type_buckets(items)
         counts = WorkspaceMemoryPipeline._status_counts(items)
         current["pipeline"] = {
             "schema": "grounded.memory_pipeline.v1",
             "phase1": {"schema": "grounded.memory_stage1.v1", "batch_count": len(stage1_payloads), "raw_count": sum(len(p.get("items") or []) for p in stage1_payloads)},
             "phase2": {"schema": "grounded.workspace_memory.v2", **counts, "deduped_count": deduped_count},
             "category_counts": WorkspaceMemoryPipeline._category_counts(items),
+            "type_counts": {key: len(value) for key, value in type_buckets.items()},
             "stage1_count": len(stage1_payloads),
             "stage1_items": sum(len(payload.get("items") or []) for payload in stage1_payloads),
             "active_count": counts["active_count"],
@@ -346,6 +399,9 @@ class WorkspaceMemoryPipeline:
             "updated_at": _now(),
         }
         WorkspaceMemoryPipeline._populate_buckets(current)
+        current["product_memory_types"] = type_buckets
+        for type_name, bucket_items in type_buckets.items():
+            current[type_name] = bucket_items
         current["memory_summary"] = WorkspaceMemoryPipeline.summary(workspace_id, current)
         return current
 
@@ -385,6 +441,7 @@ class WorkspaceMemoryPipeline:
             if not isinstance(raw_item, dict):
                 continue
             item = WorkspaceMemoryPipeline._normalize_consolidated_item(raw_item)
+            memory_type = str(item.get("memory_type") or WorkspaceMemoryPipeline.memory_type_for_kind(str(item.get("kind") or "")))
             text = str(item.get("text") or "")
             status = str(item.get("status") or "active")
             expired = bool((item.get("expiry") or {}).get("expired"))
@@ -404,6 +461,8 @@ class WorkspaceMemoryPipeline:
             if score <= 0:
                 skipped.append(WorkspaceMemoryPipeline._skip(item, "low_relevance"))
                 continue
+            if memory_type:
+                reasons.append(f"type:{memory_type}")
             hits.append({"item": item, "score": round(score, 4), "selection_reason": reasons})
         hits.sort(key=lambda hit: (-float(hit["score"]), str(hit["item"].get("memory_id") or "")))
         selected = hits[:top_k]
@@ -422,6 +481,7 @@ class WorkspaceMemoryPipeline:
                 "selected_count": len(selected),
                 "skipped_count": len(skipped),
                 "include_inactive": include_inactive,
+                "type_counts": {key: len(value) for key, value in WorkspaceMemoryPipeline.type_buckets(memory.get("items") or []).items()},
             },
             source_refs={"workspace_memory": f"workspace_memory:{workspace_id}"},
             created_at=_now(),
@@ -490,6 +550,7 @@ class WorkspaceMemoryPipeline:
         if stale_items:
             lines.append(f"- Stale memory hidden: {len(stale_items)} item(s); use memory retrieval with include_inactive for audit details.")
 
+        type_counts = {key: len(value) for key, value in WorkspaceMemoryPipeline.type_buckets(items).items()}
         counts = {
             "active_count": len(items),
             "section_count": len(sections),
@@ -497,6 +558,7 @@ class WorkspaceMemoryPipeline:
             "stale_count": len(stale_items),
             "expired_count": expired_count,
             "superseded_count": superseded_count,
+            **{f"type_count_{key}": value for key, value in type_counts.items()},
         }
         detail_query = {
             "schema": "grounded.memory_retrieval.v1",
@@ -560,10 +622,28 @@ class WorkspaceMemoryPipeline:
             if PRODUCT_DECISION_RE.search(sentence):
                 candidates.append(
                     (
-                        "product_decision",
-                        f"Product decision from prompt: {sentence}",
+                        "product_fact",
+                        f"Product fact from prompt: {sentence}",
                         {"source_text": sentence},
-                        {"source": "prompt_product_decision"},
+                        {"source": "prompt_product_fact"},
+                    )
+                )
+            if any(token in lowered for token in ("label", "button", "copy", "термин", "назов", "текст", "кнопк", "лейбл")):
+                candidates.append(
+                    (
+                        "ui_vocabulary",
+                        f"UI vocabulary from prompt: {sentence}",
+                        {"source_text": sentence, "labels": WorkspaceMemoryPipeline._ui_terms(sentence)},
+                        {"source": "prompt_ui_vocabulary"},
+                    )
+                )
+            if any(token in lowered for token in ("schema", "field", "payload", "database", "sqlite", "persist", "схем", "поле", "баз", "сохраня")):
+                candidates.append(
+                    (
+                        "persistence_schema_decision",
+                        f"Persistence schema decision from prompt: {sentence}",
+                        {"source_text": sentence},
+                        {"source": "prompt_persistence_schema"},
                     )
                 )
             if WORKFLOW_RE.search(sentence) or ("созда" in lowered and "исправ" in lowered):
@@ -576,6 +656,30 @@ class WorkspaceMemoryPipeline:
                     )
                 )
         return candidates
+
+    @staticmethod
+    def _ui_vocabulary_from_run(run: Any) -> list[str]:
+        text_parts = [str(getattr(run, "prompt", "") or "")]
+        contract = getattr(run, "acceptance_contract", None) if isinstance(getattr(run, "acceptance_contract", None), dict) else {}
+        plan = getattr(run, "implementation_plan", None) if isinstance(getattr(run, "implementation_plan", None), dict) else {}
+        for flow in contract.get("flows") or []:
+            if isinstance(flow, dict):
+                text_parts.extend(str(flow.get(key) or "") for key in ("id", "name", "title"))
+        for item in plan.get("product_task_ledger") or []:
+            if isinstance(item, dict):
+                text_parts.extend(str(item.get(key) or "") for key in ("content", "description", "intent"))
+        return WorkspaceMemoryPipeline._ui_terms(" ".join(text_parts))
+
+    @staticmethod
+    def _ui_terms(text: str) -> list[str]:
+        terms: list[str] = []
+        for token in re.findall(r"[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё0-9_-]{2,}", str(text or "")):
+            lowered = token.lower()
+            if lowered in STOP_WORDS or len(lowered) < 4:
+                continue
+            if lowered not in terms:
+                terms.append(lowered)
+        return terms[:40]
 
     @staticmethod
     def _prompt_sentences(prompt: object) -> list[str]:
@@ -768,7 +872,10 @@ class WorkspaceMemoryPipeline:
     def _initial_confidence(kind: str, evidence: dict[str, Any]) -> MemoryConfidence:
         base = {
             "preference": 0.7,
+            "product_fact": 0.68,
             "product_decision": 0.66,
+            "ui_vocabulary": 0.64,
+            "persistence_schema_decision": 0.74,
             "working_pattern": 0.82,
             "reusable_workflow": 0.78,
             "failure_signature": 0.76,
@@ -806,6 +913,8 @@ class WorkspaceMemoryPipeline:
             "working_pattern": 120,
             "reusable_workflow": 120,
             "successful_app_pattern": 180,
+            "ui_vocabulary": 180,
+            "persistence_schema_decision": 180,
         }
         ttl = ttl_by_kind.get(kind)
         expires_at = None
@@ -867,6 +976,7 @@ class WorkspaceMemoryPipeline:
         item = {
             "memory_id": str(raw_item.get("memory_id") or f"mem_{WorkspaceMemoryPipeline._fingerprint(kind, text)[:12]}"),
             "kind": kind,
+            "memory_type": str(raw_item.get("memory_type") or WorkspaceMemoryPipeline.memory_type_for_kind(kind)),
             "text": text,
             "status": str(raw_item.get("status") or "active"),
             "fingerprint": str(raw_item.get("fingerprint") or WorkspaceMemoryPipeline._fingerprint(kind, text)),
@@ -885,6 +995,25 @@ class WorkspaceMemoryPipeline:
             "retrieval": raw_item.get("retrieval") if isinstance(raw_item.get("retrieval"), dict) else {},
         }
         return ConsolidatedMemoryItem.model_validate(item).model_dump(mode="json", by_alias=True)
+
+    @staticmethod
+    def memory_type_for_kind(kind: str) -> str:
+        return KIND_TO_MEMORY_TYPE.get(str(kind or ""), "product_facts")
+
+    @staticmethod
+    def type_buckets(items: list[Any]) -> dict[str, list[dict[str, Any]]]:
+        buckets: dict[str, list[dict[str, Any]]] = {type_name: [] for type_name in PRODUCT_MEMORY_TYPES}
+        for raw_item in items:
+            if not isinstance(raw_item, dict):
+                continue
+            item = WorkspaceMemoryPipeline._normalize_consolidated_item(raw_item)
+            if item.get("status") != "active":
+                continue
+            memory_type = str(item.get("memory_type") or WorkspaceMemoryPipeline.memory_type_for_kind(str(item.get("kind") or "")))
+            if memory_type not in buckets:
+                memory_type = "product_facts"
+            buckets[memory_type].append(item)
+        return {key: value[:60] for key, value in buckets.items()}
 
     @staticmethod
     def _merge_memory_item(target: dict[str, Any], incoming: dict[str, Any]) -> None:
@@ -963,11 +1092,17 @@ class WorkspaceMemoryPipeline:
         active_items = [item for item in items if item.get("status") == "active"]
         return {
             "user_preferences": sum(1 for item in active_items if item.get("kind") == "preference"),
+            "preferences": sum(1 for item in active_items if item.get("memory_type") == "preferences"),
+            "product_facts": sum(1 for item in active_items if item.get("memory_type") == "product_facts"),
             "known_failure_recipes": sum(1 for item in active_items if item.get("kind") == "known_failure_recipe"),
             "successful_app_patterns": sum(1 for item in active_items if item.get("kind") == "successful_app_pattern"),
+            "successful_patterns": sum(1 for item in active_items if item.get("memory_type") == "successful_patterns"),
             "known_failures": sum(1 for item in active_items if item.get("kind") == "failure_signature"),
             "failure_shields": sum(1 for item in active_items if item.get("kind") == "failure_shield"),
+            "rejected_approaches": sum(1 for item in active_items if item.get("memory_type") == "rejected_approaches"),
             "reusable_workflows": sum(1 for item in active_items if item.get("kind") == "reusable_workflow"),
+            "ui_vocabulary": sum(1 for item in active_items if item.get("memory_type") == "ui_vocabulary"),
+            "persistence_schema_decisions": sum(1 for item in active_items if item.get("memory_type") == "persistence_schema_decisions"),
         }
 
     @staticmethod
@@ -995,8 +1130,11 @@ class WorkspaceMemoryPipeline:
             reasons.append("failure_match")
         kind = str(item.get("kind") or "")
         kind_weight = {
+            "product_fact": 2.25,
             "product_decision": 2.2,
             "preference": 2.0,
+            "persistence_schema_decision": 2.15,
+            "ui_vocabulary": 1.75,
             "successful_app_pattern": 2.05,
             "known_failure_recipe": 2.0,
             "failure_shield": 1.95,
@@ -1065,15 +1203,21 @@ class WorkspaceMemoryPipeline:
                 summary += f" for {entities}"
             if checks:
                 summary += f"; proof {checks}"
+        elif kind == "ui_vocabulary":
+            labels = ", ".join(str(value) for value in list(payload.get("labels") or [])[:8])
+            summary = f"labels: {labels}" if labels else summary
+        elif kind == "persistence_schema_decision":
+            summary = text[:280]
         return {
             "memory_id": item.get("memory_id"),
             "kind": kind,
+            "memory_type": item.get("memory_type") or WorkspaceMemoryPipeline.memory_type_for_kind(kind),
             "summary": summary,
             "text": text[:320],
             "confidence": item.get("confidence") or {},
             "payload": {
                 key: payload.get(key)
-                for key in ("polarity", "failure_signature", "workflow_steps", "touched_files", "passed_checks", "primary_entities", "reuse_instruction")
+                for key in ("polarity", "failure_signature", "workflow_steps", "touched_files", "passed_checks", "primary_entities", "reuse_instruction", "labels", "role_state_contract")
                 if key in payload
             },
         }
@@ -1100,7 +1244,10 @@ class WorkspaceMemoryPipeline:
     def _summary_title(kind: str) -> str:
         return {
             "preference": "User likes and dislikes",
+            "product_fact": "Product facts",
             "product_decision": "Product decisions",
+            "ui_vocabulary": "UI vocabulary",
+            "persistence_schema_decision": "Persistence schema decisions",
             "failure_shield": "Failure shields",
             "known_failure_recipe": "Known failure recipes",
             "successful_app_pattern": "Successful app patterns",
@@ -1124,7 +1271,10 @@ class WorkspaceMemoryPipeline:
     def _populate_buckets(payload: dict[str, Any]) -> None:
         bucket_map = {
             "preference": "user_preferences",
+            "product_fact": "product_facts",
             "product_decision": "product_decisions",
+            "ui_vocabulary": "ui_vocabulary",
+            "persistence_schema_decision": "persistence_schema_decisions",
             "working_pattern": "architecture_summary",
             "reusable_workflow": "reusable_workflows",
             "successful_app_pattern": "successful_app_patterns",
@@ -1135,9 +1285,21 @@ class WorkspaceMemoryPipeline:
         }
         for bucket in bucket_map.values():
             payload[bucket] = []
+        for bucket in PRODUCT_MEMORY_TYPES:
+            payload[bucket] = []
         for item in payload.get("items") or []:
             if not isinstance(item, dict):
                 continue
             bucket = bucket_map.get(str(item.get("kind") or ""))
             if bucket:
                 payload.setdefault(bucket, []).append(item)
+            memory_type = str(item.get("memory_type") or WorkspaceMemoryPipeline.memory_type_for_kind(str(item.get("kind") or "")))
+            if memory_type in PRODUCT_MEMORY_TYPES:
+                payload.setdefault(memory_type, []).append(item)
+        payload["preferences"] = payload.get("preferences") or payload.get("user_preferences") or []
+        payload["successful_patterns"] = payload.get("successful_patterns") or [
+            *payload.get("successful_app_patterns", []),
+            *payload.get("reusable_workflows", []),
+            *payload.get("architecture_summary", []),
+        ]
+        payload["product_memory_types"] = {bucket: list(payload.get(bucket) or [])[:60] for bucket in PRODUCT_MEMORY_TYPES}

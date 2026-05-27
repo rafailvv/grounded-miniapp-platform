@@ -7,6 +7,8 @@ from typing import Any, Callable
 
 
 MICROCOMPACT_THRESHOLD_CHARS = 6000
+DEFAULT_CONTEXT_WINDOW_TOKENS = 128_000
+DEFAULT_TOOL_OUTPUT_COMPACT_CHARS = 2400
 
 
 def _now() -> str:
@@ -30,6 +32,15 @@ def _payload_text(value: Any) -> str:
         return str(value)
 
 
+def _estimate_tokens(value: Any) -> int:
+    text = _payload_text(value)
+    return max(1, (len(text) + 3) // 4) if text else 0
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+
+
 class AgentTranscriptStore:
     """Append-only model/tool transcript for a code-agent run.
 
@@ -47,6 +58,8 @@ class AgentTranscriptStore:
         self._pending_tool_results: dict[str, list[dict[str, Any]]] = {}
         self._pending_post_compact_messages: dict[str, list[dict[str, Any]]] = {}
         self._preserved_tails: dict[str, list[dict[str, Any]]] = {}
+        self._context_fragments: dict[str, list[dict[str, Any]]] = {}
+        self._history_version: dict[str, int] = {}
         self._writers: dict[str, Callable[[dict[str, Any]], None]] = {}
         self._microcompact_writers: dict[str, Callable[[dict[str, Any], str], dict[str, Any]]] = {}
 
@@ -93,6 +106,12 @@ class AgentTranscriptStore:
         tails = snapshot.get("preserved_tails") if isinstance(snapshot, dict) else None
         if isinstance(tails, list):
             self._preserved_tails[run_key] = [item for item in tails if isinstance(item, dict)]
+        fragments = snapshot.get("context_fragments") if isinstance(snapshot, dict) else None
+        if isinstance(fragments, list):
+            self._context_fragments[run_key] = [item for item in fragments if isinstance(item, dict)]
+        version = snapshot.get("history_version") if isinstance(snapshot, dict) else None
+        if isinstance(version, int):
+            self._history_version[run_key] = max(0, version)
 
     def _persist(self, run_key: str) -> None:
         writer = self._writers.get(run_key)
@@ -112,15 +131,22 @@ class AgentTranscriptStore:
             "event_type": event_type,
             "payload": payload or {},
             "created_at": _now(),
+            "history_version": self._bump_history_version(run_key),
         }
         events.append(event)
         self._persist(run_key)
         return event
 
+    def _bump_history_version(self, run_key: str) -> int:
+        next_version = int(self._history_version.get(run_key, 0) or 0) + 1
+        self._history_version[run_key] = next_version
+        return next_version
+
     def next_model_context(self, run_key: str) -> dict[str, Any]:
         previous_response_id = self._last_response_id.get(run_key) or None
         pending = list(self._pending_tool_results.get(run_key, []))
         last_tool_call_ids = list(self._last_tool_call_ids.get(run_key, []))
+        normalization = self.normalize_history(run_key)
         if previous_response_id and last_tool_call_ids:
             pending_by_id = {
                 str(item.get("tool_use_id") or item.get("call_id") or "").strip(): item
@@ -145,6 +171,18 @@ class AgentTranscriptStore:
                 pending = []
             else:
                 pending = [pending_by_id[call_id] for call_id in last_tool_call_ids]
+                extras = sorted(call_id for call_id in pending_by_id if call_id not in set(last_tool_call_ids))
+                if extras:
+                    self._pending_tool_results[run_key] = pending
+                    self.append(
+                        run_key,
+                        "tool_result_context_normalized",
+                        {
+                            "previous_response_id": previous_response_id,
+                            "dropped_extra_tool_call_ids": extras[:12],
+                            "pending_tool_result_count": len(pending),
+                        },
+                    )
         elif pending and not previous_response_id:
             self._pending_tool_results[run_key] = []
             self.append(
@@ -162,6 +200,10 @@ class AgentTranscriptStore:
             "tool_result_messages": pending,
             "post_compact_messages": list(self._pending_post_compact_messages.get(run_key, [])),
             "preserved_tails": list(self._preserved_tails.get(run_key, [])),
+            "context_fragments": list(self._context_fragments.get(run_key, [])),
+            "history_version": self._history_version.get(run_key, 0),
+            "normalization": normalization,
+            "token_budget": self.token_budget(run_key),
         }
 
     def clear_model_context(self, run_key: str) -> None:
@@ -171,6 +213,108 @@ class AgentTranscriptStore:
         self._pending_tool_results[run_key] = []
         self._pending_post_compact_messages[run_key] = []
         self.append(run_key, "compact_model_context_reset", {"reason": "context_window_pressure"})
+
+    def append_context_fragment(
+        self,
+        run_key: str,
+        *,
+        role: str,
+        content: str,
+        source: str = "",
+        fragment_type: str = "contextual",
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        normalized_role = str(role or "").strip().lower()
+        if normalized_role not in {"developer", "user"}:
+            normalized_role = "user"
+        fragment = {
+            "schema": "grounded.context_fragment.v1",
+            "fragment_id": f"context_fragment:{run_key}:{len(self._context_fragments.get(run_key, [])) + 1}",
+            "role": normalized_role,
+            "type": str(fragment_type or "contextual"),
+            "source": str(source or ""),
+            "content": str(content or "")[:12000],
+            "metadata": dict(metadata or {}),
+            "created_at": _now(),
+        }
+        self._context_fragments.setdefault(run_key, []).append(fragment)
+        self.append(run_key, "context_fragment", fragment)
+        return fragment
+
+    def append_ghost_snapshot(
+        self,
+        run_key: str,
+        *,
+        label: str,
+        payload: dict[str, Any],
+        reason: str = "",
+    ) -> dict[str, Any]:
+        snapshot = {
+            "schema": "grounded.ghost_snapshot.v1",
+            "label": str(label or "snapshot"),
+            "reason": str(reason or ""),
+            "payload": payload,
+            "token_estimate": _estimate_tokens(payload),
+            "created_at": _now(),
+        }
+        return self.append(run_key, "ghost_snapshot", snapshot)
+
+    def normalize_history(self, run_key: str) -> dict[str, Any]:
+        events = list(self._events.get(run_key, []))
+        model_turns = [event for event in events if event.get("event_type") == "model_turn"]
+        latest_turn = model_turns[-1] if model_turns else {}
+        latest_payload = latest_turn.get("payload") if isinstance(latest_turn.get("payload"), dict) else {}
+        expected_ids = [
+            str(item.get("tool_use_id") or "").strip()
+            for item in latest_payload.get("tool_calls") or []
+            if isinstance(item, dict) and str(item.get("tool_use_id") or "").strip()
+        ]
+        pending = [item for item in self._pending_tool_results.get(run_key, []) if isinstance(item, dict)]
+        pending_ids = [str(item.get("tool_use_id") or item.get("call_id") or "").strip() for item in pending]
+        missing = [call_id for call_id in expected_ids if call_id not in set(pending_ids)]
+        extra = [call_id for call_id in pending_ids if call_id and call_id not in set(expected_ids)]
+        duplicate = sorted({call_id for call_id in pending_ids if call_id and pending_ids.count(call_id) > 1})
+        ordered_pair_count = sum(1 for call_id in expected_ids if call_id in set(pending_ids))
+        status = "ok"
+        if missing:
+            status = "missing_tool_results"
+        elif extra or duplicate:
+            status = "needs_normalization"
+        return {
+            "schema": "grounded.transcript_normalization.v1",
+            "status": status,
+            "history_version": self._history_version.get(run_key, 0),
+            "latest_response_id": latest_payload.get("response_id"),
+            "expected_tool_call_ids": expected_ids,
+            "pending_tool_result_ids": pending_ids,
+            "ordered_pair_count": ordered_pair_count,
+            "missing_tool_result_ids": missing,
+            "extra_tool_result_ids": extra,
+            "duplicate_tool_result_ids": duplicate,
+        }
+
+    def token_budget(self, run_key: str, *, context_window_tokens: int = DEFAULT_CONTEXT_WINDOW_TOKENS) -> dict[str, Any]:
+        events = list(self._events.get(run_key, []))
+        pending = list(self._pending_tool_results.get(run_key, []))
+        fragments = list(self._context_fragments.get(run_key, []))
+        preserved_tails = list(self._preserved_tails.get(run_key, []))
+        sections = {
+            "events": _estimate_tokens(events),
+            "pending_tool_results": _estimate_tokens(pending),
+            "context_fragments": _estimate_tokens(fragments),
+            "preserved_tails": _estimate_tokens(preserved_tails),
+            "post_compact_messages": _estimate_tokens(self._pending_post_compact_messages.get(run_key, [])),
+        }
+        total = sum(sections.values())
+        return {
+            "schema": "grounded.transcript_token_budget.v1",
+            "history_version": self._history_version.get(run_key, 0),
+            "context_window_tokens": context_window_tokens,
+            "estimated_tokens": total,
+            "pressure_ratio": round(total / context_window_tokens, 4) if context_window_tokens else 0,
+            "sections": sections,
+            "status": "near_capacity" if context_window_tokens and total >= int(context_window_tokens * 0.8) else "within_budget",
+        }
 
     def append_model_turn(
         self,
@@ -390,6 +534,68 @@ class AgentTranscriptStore:
     def append_repair(self, run_key: str, payload: dict[str, Any]) -> None:
         self.append(run_key, "repair", payload)
 
+    def compact_old_tool_outputs(
+        self,
+        run_key: str,
+        *,
+        keep_last: int = 12,
+        max_output_chars: int = DEFAULT_TOOL_OUTPUT_COMPACT_CHARS,
+        reason: str = "tool_output_policy",
+    ) -> dict[str, Any]:
+        events = self._events.get(run_key, [])
+        tool_result_indexes = [
+            index
+            for index, event in enumerate(events)
+            if event.get("event_type") == "tool_result" and isinstance(event.get("payload"), dict)
+        ]
+        compactable = tool_result_indexes[: max(0, len(tool_result_indexes) - max(0, keep_last))]
+        compacted: list[dict[str, Any]] = []
+        for index in compactable:
+            payload = events[index].get("payload")
+            if not isinstance(payload, dict):
+                continue
+            output = payload.get("output")
+            output_text = output if isinstance(output, str) else _payload_text(output)
+            if len(output_text) <= max_output_chars or payload.get("compacted_by_policy"):
+                continue
+            digest = _sha256_text(output_text)
+            payload["output"] = _compact_payload(output_text, max_chars=max_output_chars)
+            payload["compacted_by_policy"] = {
+                "reason": reason,
+                "original_chars": len(output_text),
+                "sha256": digest,
+                "max_output_chars": max_output_chars,
+                "compacted_at": _now(),
+            }
+            compacted.append(
+                {
+                    "sequence": events[index].get("sequence"),
+                    "tool_use_id": payload.get("tool_use_id"),
+                    "tool": payload.get("tool"),
+                    "original_chars": len(output_text),
+                    "sha256": digest,
+                }
+            )
+        if compacted:
+            self.append(
+                run_key,
+                "tool_outputs_compacted",
+                {
+                    "reason": reason,
+                    "keep_last": keep_last,
+                    "max_output_chars": max_output_chars,
+                    "compacted_count": len(compacted),
+                    "items": compacted[:40],
+                },
+            )
+            self._persist(run_key)
+        return {
+            "schema": "grounded.tool_output_compaction.v1",
+            "history_version": self._history_version.get(run_key, 0),
+            "compacted_count": len(compacted),
+            "items": compacted,
+        }
+
     def snapshot(self, run_key: str) -> dict[str, Any]:
         events = list(self._events.get(run_key, []))
         counts: dict[str, int] = {}
@@ -397,6 +603,8 @@ class AgentTranscriptStore:
             event_type = str(event.get("event_type") or "")
             counts[event_type] = counts.get(event_type, 0) + 1
         return {
+            "schema": "grounded.agent_transcript.v2",
+            "history_version": self._history_version.get(run_key, 0),
             "event_count": len(events),
             "counts": counts,
             "last_response_id": self._last_response_id.get(run_key),
@@ -407,6 +615,14 @@ class AgentTranscriptStore:
             "tool_result_messages": list(self._pending_tool_results.get(run_key, [])),
             "post_compact_messages": list(self._pending_post_compact_messages.get(run_key, [])),
             "preserved_tails": list(self._preserved_tails.get(run_key, [])),
+            "context_fragments": list(self._context_fragments.get(run_key, [])),
+            "ghost_snapshots": [
+                event.get("payload")
+                for event in events
+                if event.get("event_type") == "ghost_snapshot" and isinstance(event.get("payload"), dict)
+            ],
+            "normalization": self.normalize_history(run_key),
+            "token_budget": self.token_budget(run_key),
             "all_tool_result_messages": [
                 event.get("payload")
                 for event in events

@@ -154,6 +154,95 @@ class RunProtocolReport(WorkbenchApiModel):
     latest_bookmark: RunBookmark | None = None
 
 
+class ProtocolTimelineItem(WorkbenchApiModel):
+    sequence: int | None = None
+    source: str = "journal"
+    subject: str = "event"
+    event_id: str | None = None
+    event_type: str
+    status: str = "completed"
+    actor: str = "system"
+    summary: str = ""
+    session_id: str | None = None
+    thread_id: str | None = None
+    turn_id: str | None = None
+    run_id: str | None = None
+    tool_call_id: str | None = None
+    artifact_ref: str | None = None
+    proof_ref: str | None = None
+    payload_ref: str | None = None
+    payload_sha256: str | None = None
+    refs: dict[str, Any] = Field(default_factory=dict)
+    payload: dict[str, Any] = Field(default_factory=dict)
+    created_at: str
+
+
+class ProtocolResumeCandidate(WorkbenchApiModel):
+    candidate_id: str
+    kind: str
+    status: str = "available"
+    session_id: str | None = None
+    turn_id: str | None = None
+    run_id: str | None = None
+    bookmark_id: str | None = None
+    reason: str = ""
+    refs: dict[str, Any] = Field(default_factory=dict)
+    created_at: str | None = None
+
+
+class RunProtocolReportV2(WorkbenchApiModel):
+    schema_: str = Field(default="grounded.run_protocol.v2", alias="schema")
+    status: str = "ok"
+    session_id: str | None = None
+    thread_id: str | None = None
+    run_id: str
+    workspace_id: str | None = None
+    turns: list[dict[str, Any]] = Field(default_factory=list)
+    timeline: list[ProtocolTimelineItem] = Field(default_factory=list)
+    artifacts: list[dict[str, Any]] = Field(default_factory=list)
+    proofs: list[dict[str, Any]] = Field(default_factory=list)
+    bookmarks: list[RunBookmark] = Field(default_factory=list)
+    latest_bookmark: RunBookmark | None = None
+    resume: dict[str, Any] = Field(default_factory=dict)
+    next_sequence: int = 0
+    items: list[RunProtocolEvent] = Field(default_factory=list)
+
+
+class TurnProtocolReport(WorkbenchApiModel):
+    schema_: str = Field(default="grounded.turn_protocol.v1", alias="schema")
+    status: str = "ok"
+    session_id: str
+    thread_id: str
+    turn_id: str
+    workspace_id: str | None = None
+    turns: list[dict[str, Any]] = Field(default_factory=list)
+    timeline: list[ProtocolTimelineItem] = Field(default_factory=list)
+    artifacts: list[dict[str, Any]] = Field(default_factory=list)
+    proofs: list[dict[str, Any]] = Field(default_factory=list)
+    bookmarks: list[RunBookmark] = Field(default_factory=list)
+    resume: dict[str, Any] = Field(default_factory=dict)
+    next_sequence: int = 0
+
+
+class SessionProtocolReport(WorkbenchApiModel):
+    schema_: str = Field(default="grounded.session_protocol.v1", alias="schema")
+    status: str = "ok"
+    session_id: str
+    thread_id: str
+    workspace_id: str | None = None
+    session: dict[str, Any] = Field(default_factory=dict)
+    turns: list[dict[str, Any]] = Field(default_factory=list)
+    linked_runs: list[dict[str, Any]] = Field(default_factory=list)
+    timeline: list[ProtocolTimelineItem] = Field(default_factory=list)
+    artifacts: list[dict[str, Any]] = Field(default_factory=list)
+    proofs: list[dict[str, Any]] = Field(default_factory=list)
+    bookmarks: list[RunBookmark] = Field(default_factory=list)
+    latest_bookmark: RunBookmark | None = None
+    resume: dict[str, Any] = Field(default_factory=dict)
+    failure_point: dict[str, Any] = Field(default_factory=dict)
+    next_sequence: int = 0
+
+
 class RunBookmarksReport(WorkbenchApiModel):
     schema_: str = Field(default="grounded.run_bookmarks.v1", alias="schema")
     run_id: str
@@ -555,6 +644,11 @@ class SystemSchemaShapes(WorkbenchApiModel):
     protocol_approval_state: ProtocolApprovalState | None = None
     protocol_event_state: ProtocolEventState | None = None
     protocol_worker_update: ProtocolWorkerUpdate | None = None
+    protocol_timeline_item: ProtocolTimelineItem | None = None
+    protocol_resume_candidate: ProtocolResumeCandidate | None = None
+    session_protocol_report: SessionProtocolReport | None = None
+    turn_protocol_report: TurnProtocolReport | None = None
+    run_protocol_report_v2: RunProtocolReportV2 | None = None
     artifact_ref: ArtifactRef | None = None
     check_result: CheckResult | None = None
     run_event: RunEvent | None = None
@@ -601,6 +695,11 @@ SYSTEM_SCHEMA_MODEL_REFS: tuple[SchemaModelRef, ...] = (
     SchemaModelRef(name="ProtocolApprovalState", purpose="Versioned approval request payload."),
     SchemaModelRef(name="ProtocolEventState", purpose="Versioned event journal payload."),
     SchemaModelRef(name="ProtocolWorkerUpdate", purpose="Versioned worker update payload."),
+    SchemaModelRef(name="ProtocolTimelineItem", purpose="Canonical session/turn/run protocol timeline item."),
+    SchemaModelRef(name="ProtocolResumeCandidate", purpose="Resumable bookmark, turn, or failed-run candidate."),
+    SchemaModelRef(name="SessionProtocolReport", purpose="Canonical session/thread protocol report."),
+    SchemaModelRef(name="TurnProtocolReport", purpose="Canonical turn protocol report."),
+    SchemaModelRef(name="RunProtocolReportV2", purpose="Canonical run protocol report assembled from v2 journals and bookmarks."),
     SchemaModelRef(name="RunEvent", purpose="Append-only run event wrapper."),
     SchemaModelRef(name="RunEventV2", purpose="Append-only run journal event with payload ref."),
     SchemaModelRef(name="ThreadEventV2", purpose="Append-only thread journal event with payload ref."),
@@ -631,6 +730,7 @@ SYSTEM_SCHEMA_MODEL_REFS: tuple[SchemaModelRef, ...] = (
     SchemaModelRef(name="RepairCase", purpose="Evidence-driven repair case."),
     SchemaModelRef(name="TraceState", purpose="Reduced trace bundle state."),
     SchemaModelRef(name="ThreadSnapshot", purpose="Typed thread read snapshot."),
+    SchemaModelRef(name="ContextManagerReport", purpose="Canonical context budget manifest and decisions."),
     SchemaModelRef(name="ContextPressureReport", purpose="Context budget pressure report and recommendations."),
     SchemaModelRef(name="OutputArtifactIndex", purpose="Indexed head/tail command output artifacts."),
     SchemaModelRef(name="PromptSuggestionsReport", purpose="Product follow-up prompts generated after a run."),

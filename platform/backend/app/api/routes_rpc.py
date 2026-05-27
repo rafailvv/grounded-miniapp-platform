@@ -107,6 +107,10 @@ async def _dispatch(container: ServiceContainer, method: str, params: dict[str, 
     if method == "thread/read":
         snapshot = service.read_thread(str(params.get("thread_id") or params.get("threadId") or ""))
         return _snapshot_payload(snapshot)
+    if method == "session/protocol":
+        return container.session_protocol_reducer.session_protocol(str(params.get("thread_id") or params.get("threadId") or params.get("session_id") or params.get("sessionId") or ""))
+    if method == "session/context_manager":
+        return container.workbench_service.session_context_manager(str(params.get("thread_id") or params.get("threadId") or params.get("session_id") or params.get("sessionId") or ""))
     if method == "thread/snapshot":
         return service.create_snapshot(
             str(params.get("thread_id") or params.get("threadId") or ""),
@@ -120,6 +124,10 @@ async def _dispatch(container: ServiceContainer, method: str, params: dict[str, 
         )
     if method == "thread/resume":
         return service.resume_thread(str(params.get("thread_id") or params.get("threadId") or "")).model_dump(mode="json")
+    if method == "session/resume":
+        session_id = str(params.get("thread_id") or params.get("threadId") or params.get("session_id") or params.get("sessionId") or "")
+        service.resume_thread(session_id)
+        return container.session_protocol_reducer.session_protocol(session_id)
     if method == "thread/fork":
         return service.fork_thread(str(params.get("thread_id") or params.get("threadId") or ""), title=params.get("title")).model_dump(mode="json")
     if method == "thread/archive":
@@ -128,6 +136,8 @@ async def _dispatch(container: ServiceContainer, method: str, params: dict[str, 
         return service.rollback_thread(str(params.get("thread_id") or params.get("threadId") or "")).model_dump(mode="json")
     if method == "turn/start":
         return service.start_turn(str(params.get("thread_id") or params.get("threadId") or ""), params).model_dump(mode="json")
+    if method == "turn/protocol":
+        return container.session_protocol_reducer.turn_protocol(str(params.get("turn_id") or params.get("turnId") or ""))
     if method == "turn/interrupt":
         return service.interrupt_turn(str(params.get("thread_id") or params.get("threadId") or ""), str(params.get("turn_id") or params.get("turnId") or "")).model_dump(mode="json")
     if method == "turn/steer":
@@ -140,6 +150,10 @@ async def _dispatch(container: ServiceContainer, method: str, params: dict[str, 
         return service.compact_thread(str(params.get("thread_id") or params.get("threadId") or "")).model_dump(mode="json")
     if method == "review/start":
         return service.review_thread(str(params.get("thread_id") or params.get("threadId") or "")).model_dump(mode="json")
+    if method == "run/protocol":
+        return container.session_protocol_reducer.run_protocol(str(params.get("run_id") or params.get("runId") or ""))
+    if method == "run/context_manager":
+        return container.workbench_service.context_manager(str(params.get("run_id") or params.get("runId") or ""))
     if method == "fs/readFile":
         return service.fs_read_file(workspace_id=str(params.get("workspace_id") or params.get("workspaceId") or ""), path=str(params.get("path") or ""), run_id=params.get("run_id") or params.get("runId"))
     if method == "fs/writeFile":

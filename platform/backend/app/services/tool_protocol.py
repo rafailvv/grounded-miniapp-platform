@@ -14,7 +14,12 @@ ToolRisk = Literal["safe", "read_only", "mutating", "network", "destructive", "f
 ToolApprovalClass = Literal["none", "policy", "human", "forbidden"]
 ToolArtifactSpillPolicy = Literal["never", "on_truncation", "always"]
 ToolSideEffectClass = Literal["none", "read_workspace", "write_draft", "execute_process", "verification", "external_browser", "approval_request", "unknown"]
+ToolKind = Literal["read_only", "mutating", "verification", "unknown"]
 SandboxProfile = Literal["analysis_readonly", "agent_draft_write", "source_apply_gate", "developer_bypass", "analysis_only", "agent_draft", "apply_gate"]
+
+DEFAULT_MODE_VISIBILITY = ("default", "read_only", "worker_branch")
+MUTATION_MODE_VISIBILITY = ("mutation_required", "mutating", "worker_branch")
+VERIFICATION_MODE_VISIBILITY = ("default", "verification")
 
 
 @dataclass(frozen=True)
@@ -41,6 +46,14 @@ class ToolProtocolSpec:
     result_summarization: dict[str, Any] | None = None
     retry_policy: dict[str, Any] | None = None
     failure_signatures: dict[str, Any] | None = None
+    kind: ToolKind = "unknown"
+    model_name: str | None = None
+    model_visible: bool = False
+    internal_only: bool = False
+    mode_visibility: tuple[str, ...] = ()
+    activity: str = "reading"
+    progress_label: str = "Reading workspace context"
+    argument_progress_fields: tuple[str, ...] = ()
 
     def as_contract(self) -> dict[str, Any]:
         return {
@@ -63,11 +76,53 @@ class ToolProtocolSpec:
             "result_summarization": self.result_summarization or default_tool_result_summarization(self.canonical),
             "retry_policy": self.retry_policy or default_tool_retry_policy(self.canonical),
             "failure_signatures": self.failure_signatures or default_tool_failure_signatures(self.canonical),
+            "kind": self.kind,
+            "model_name": self.model_name,
+            "model_visible": self.model_visible,
+            "internal_only": self.internal_only,
+            "mode_visibility": list(self.mode_visibility),
+            "activity": self.activity,
+            "progress_label": self.progress_label,
+            "argument_progress_fields": list(self.argument_progress_fields),
             "deferred": self.deferred,
             "dynamic": self.dynamic,
             "input_schema": self.input_schema,
             "output_schema": self.output_schema,
         }
+
+
+@dataclass(frozen=True)
+class ToolDefinition:
+    canonical: str
+    aliases: tuple[str, ...]
+    risk: ToolRisk
+    kind: ToolKind
+    approval_class: ToolApprovalClass
+    sandbox_profile: str
+    concurrency_safe: bool
+    parallel_safe: bool
+    timeout_seconds: int
+    output_cap_chars: int
+    artifact_spill_policy: ToolArtifactSpillPolicy
+    input_schema: dict[str, Any]
+    output_schema: dict[str, Any]
+    description: str
+    capability_tags: tuple[str, ...]
+    allowed_paths: dict[str, Any]
+    side_effects: tuple[ToolSideEffectClass, ...]
+    side_effect_class: ToolSideEffectClass
+    result_summarization: dict[str, Any]
+    retry_policy: dict[str, Any]
+    failure_signatures: dict[str, Any]
+    deferred: bool
+    dynamic: bool
+    model_name: str | None
+    model_visible: bool
+    internal_only: bool
+    mode_visibility: tuple[str, ...]
+    activity: str
+    progress_label: str
+    argument_progress_fields: tuple[str, ...]
 
 
 CANONICAL_TOOL_ALIASES: dict[str, str] = {
@@ -146,14 +201,14 @@ TOOL_EXECUTION_DEFAULTS: dict[str, dict[str, Any]] = {
     "search.grep": {"concurrency_safe": True, "timeout_seconds": 25, "output_cap_chars": 6000},
     "semantic.scan": {"concurrency_safe": True, "timeout_seconds": 25, "output_cap_chars": 12000},
     "tool.search": {"concurrency_safe": True, "timeout_seconds": 25, "output_cap_chars": 9000},
-    "lsp.diagnostics": {"concurrency_safe": True, "timeout_seconds": 25, "output_cap_chars": 12000},
-    "lsp.symbol_context": {"concurrency_safe": True, "timeout_seconds": 25, "output_cap_chars": 10000},
-    "lsp.definition": {"concurrency_safe": True, "timeout_seconds": 25, "output_cap_chars": 8000},
-    "lsp.find_references": {"concurrency_safe": True, "timeout_seconds": 25, "output_cap_chars": 10000},
-    "lsp.route_graph": {"concurrency_safe": True, "timeout_seconds": 25, "output_cap_chars": 14000},
-    "lsp.route_static_context": {"concurrency_safe": True, "timeout_seconds": 25, "output_cap_chars": 12000},
+    "lsp.diagnostics": {"concurrency_safe": True, "timeout_seconds": 25, "output_cap_chars": 12000, "dynamic": True},
+    "lsp.symbol_context": {"concurrency_safe": True, "timeout_seconds": 25, "output_cap_chars": 10000, "dynamic": True},
+    "lsp.definition": {"concurrency_safe": True, "timeout_seconds": 25, "output_cap_chars": 8000, "dynamic": True},
+    "lsp.find_references": {"concurrency_safe": True, "timeout_seconds": 25, "output_cap_chars": 10000, "dynamic": True},
+    "lsp.route_graph": {"concurrency_safe": True, "timeout_seconds": 25, "output_cap_chars": 14000, "dynamic": True},
+    "lsp.route_static_context": {"concurrency_safe": True, "timeout_seconds": 25, "output_cap_chars": 12000, "dynamic": True},
     "diff.inspect": {"concurrency_safe": True, "timeout_seconds": 25, "output_cap_chars": 12000},
-    "checks.run": {"concurrency_safe": False, "timeout_seconds": 120, "output_cap_chars": 10000, "approval_class": "policy"},
+    "checks.run": {"concurrency_safe": False, "timeout_seconds": 120, "output_cap_chars": 10000, "approval_class": "policy", "dynamic": True},
     "browser.verify": {
         "concurrency_safe": False,
         "timeout_seconds": 180,
@@ -161,7 +216,7 @@ TOOL_EXECUTION_DEFAULTS: dict[str, dict[str, Any]] = {
         "approval_class": "policy",
         "dynamic": True,
     },
-    "shell.exec": {"concurrency_safe": True, "timeout_seconds": 30, "output_cap_chars": 6000, "approval_class": "policy"},
+    "shell.exec": {"concurrency_safe": True, "timeout_seconds": 30, "output_cap_chars": 6000, "approval_class": "policy", "dynamic": True},
     "file.write": {"concurrency_safe": False, "timeout_seconds": 25, "output_cap_chars": 6000, "approval_class": "human", "deferred": True},
     "file.edit": {"concurrency_safe": False, "timeout_seconds": 25, "output_cap_chars": 6000, "approval_class": "human", "deferred": True},
     "patch.apply": {"concurrency_safe": False, "timeout_seconds": 25, "output_cap_chars": 6000, "approval_class": "human", "deferred": True},
@@ -303,6 +358,338 @@ TOOL_FAILURE_SIGNATURES: dict[str, dict[str, Any]] = {
     "browser.verify": {"format": "browser.verify:{first_failed_workflow}", "fields": ["tool", "result.workflow_results.0.name"]},
 }
 
+TOOL_MODEL_METADATA: dict[str, dict[str, Any]] = {
+    "file.list": {
+        "kind": "read_only",
+        "model_name": "list_files",
+        "model_visible": True,
+        "mode_visibility": DEFAULT_MODE_VISIBILITY,
+        "activity": "reading",
+        "progress_label": "Reading workspace file list",
+        "argument_progress_fields": ("targets",),
+    },
+    "file.read": {
+        "kind": "read_only",
+        "model_name": "read_files",
+        "model_visible": True,
+        "mode_visibility": DEFAULT_MODE_VISIBILITY,
+        "activity": "reading",
+        "progress_label": "Reading selected files",
+        "argument_progress_fields": ("targets", "files"),
+    },
+    "search.grep": {
+        "kind": "read_only",
+        "model_name": "search_files",
+        "model_visible": True,
+        "mode_visibility": DEFAULT_MODE_VISIBILITY,
+        "activity": "searching",
+        "progress_label": "Searching workspace",
+        "argument_progress_fields": ("pattern", "targets"),
+    },
+    "diff.inspect": {
+        "kind": "read_only",
+        "model_name": "inspect_diff",
+        "model_visible": True,
+        "mode_visibility": DEFAULT_MODE_VISIBILITY,
+        "activity": "reading",
+        "progress_label": "Inspecting draft diff",
+        "argument_progress_fields": ("targets",),
+    },
+    "artifact.read": {
+        "kind": "read_only",
+        "model_name": "read_artifact_ref",
+        "model_visible": True,
+        "mode_visibility": DEFAULT_MODE_VISIBILITY,
+        "activity": "reading",
+        "progress_label": "Reading stored tool artifact",
+        "argument_progress_fields": ("artifact_ref", "targets"),
+    },
+    "semantic.scan": {
+        "kind": "read_only",
+        "model_name": "semantic_scan",
+        "model_visible": True,
+        "mode_visibility": DEFAULT_MODE_VISIBILITY,
+        "activity": "searching",
+        "progress_label": "Scanning source semantics",
+        "argument_progress_fields": ("targets",),
+    },
+    "tool.search": {
+        "kind": "read_only",
+        "model_name": "tool_search",
+        "model_visible": True,
+        "mode_visibility": DEFAULT_MODE_VISIBILITY,
+        "activity": "searching",
+        "progress_label": "Discovering optional deferred tools",
+        "argument_progress_fields": ("query", "domain", "intent"),
+    },
+    "lsp.diagnostics": {
+        "kind": "read_only",
+        "model_name": "lsp_diagnostics",
+        "model_visible": False,
+        "mode_visibility": DEFAULT_MODE_VISIBILITY,
+        "activity": "checking",
+        "progress_label": "Running targeted file diagnostics",
+        "argument_progress_fields": ("targets", "files"),
+    },
+    "lsp.symbol_context": {
+        "kind": "read_only",
+        "model_name": "lsp_symbol_context",
+        "model_visible": False,
+        "mode_visibility": DEFAULT_MODE_VISIBILITY,
+        "activity": "searching",
+        "progress_label": "Reading symbol context",
+        "argument_progress_fields": ("query", "pattern", "targets"),
+    },
+    "lsp.definition": {
+        "kind": "read_only",
+        "model_name": "lsp_definition",
+        "model_visible": False,
+        "mode_visibility": DEFAULT_MODE_VISIBILITY,
+        "activity": "searching",
+        "progress_label": "Finding symbol definition",
+        "argument_progress_fields": ("symbol", "query", "pattern", "targets"),
+    },
+    "lsp.find_references": {
+        "kind": "read_only",
+        "model_name": "lsp_find_references",
+        "model_visible": False,
+        "mode_visibility": DEFAULT_MODE_VISIBILITY,
+        "activity": "searching",
+        "progress_label": "Finding symbol references",
+        "argument_progress_fields": ("symbol", "query", "pattern", "targets"),
+    },
+    "lsp.route_graph": {
+        "kind": "read_only",
+        "model_name": "lsp_route_graph",
+        "model_visible": False,
+        "mode_visibility": DEFAULT_MODE_VISIBILITY,
+        "activity": "searching",
+        "progress_label": "Building route graph",
+        "argument_progress_fields": ("targets",),
+    },
+    "lsp.route_static_context": {
+        "kind": "read_only",
+        "model_name": "lsp_route_static_context",
+        "model_visible": False,
+        "mode_visibility": DEFAULT_MODE_VISIBILITY,
+        "activity": "searching",
+        "progress_label": "Reading route and static UI context",
+        "argument_progress_fields": ("targets",),
+    },
+    "shell.exec": {
+        "kind": "read_only",
+        "model_name": "run_command",
+        "model_visible": False,
+        "mode_visibility": DEFAULT_MODE_VISIBILITY,
+        "activity": "running_command",
+        "progress_label": "Running diagnostic command",
+        "argument_progress_fields": ("command", "process_id"),
+    },
+    "checks.run": {
+        "kind": "verification",
+        "model_name": "run_checks",
+        "model_visible": False,
+        "mode_visibility": VERIFICATION_MODE_VISIBILITY,
+        "activity": "checking",
+        "progress_label": "Running validation checks",
+        "argument_progress_fields": ("targets", "mode"),
+    },
+    "browser.verify": {
+        "kind": "verification",
+        "model_name": "browser_verify",
+        "model_visible": False,
+        "mode_visibility": VERIFICATION_MODE_VISIBILITY,
+        "activity": "browser_verifying",
+        "progress_label": "Running browser workflow proof",
+        "argument_progress_fields": ("targets",),
+    },
+    "patch.apply": {
+        "kind": "mutating",
+        "model_name": "apply_patch_to_draft",
+        "model_visible": True,
+        "mode_visibility": MUTATION_MODE_VISIBILITY,
+        "activity": "applying_patch",
+        "progress_label": "Applying one draft file patch",
+        "argument_progress_fields": ("file_path", "diff"),
+    },
+    "file.write": {
+        "kind": "mutating",
+        "model_name": "write_file",
+        "model_visible": True,
+        "mode_visibility": MUTATION_MODE_VISIBILITY,
+        "activity": "editing",
+        "progress_label": "Writing one draft file",
+        "argument_progress_fields": ("file_path", "content"),
+    },
+    "file.edit": {
+        "kind": "mutating",
+        "model_name": "edit_file_exact",
+        "model_visible": True,
+        "mode_visibility": MUTATION_MODE_VISIBILITY,
+        "activity": "editing",
+        "progress_label": "Applying an exact old/new string edit to one draft file",
+        "argument_progress_fields": ("file_path", "old_string", "new_string"),
+    },
+    "contract.compile": {
+        "kind": "read_only",
+        "model_name": None,
+        "model_visible": False,
+        "internal_only": True,
+        "mode_visibility": (),
+        "activity": "planning",
+        "progress_label": "Compiling the typed mini-app contract",
+        "argument_progress_fields": ("prompt", "generation_mode"),
+    },
+    "registry.sync": {
+        "kind": "mutating",
+        "model_name": None,
+        "model_visible": False,
+        "internal_only": True,
+        "mode_visibility": (),
+        "activity": "checking",
+        "progress_label": "Synchronizing prompt-contract metadata",
+        "argument_progress_fields": ("contract_id",),
+    },
+    "todo.write": {
+        "kind": "read_only",
+        "model_name": None,
+        "model_visible": False,
+        "internal_only": True,
+        "mode_visibility": (),
+        "activity": "planning",
+        "progress_label": "Updating the agent task plan",
+        "argument_progress_fields": ("items",),
+    },
+    "user.ask": {
+        "kind": "read_only",
+        "model_name": None,
+        "model_visible": False,
+        "internal_only": True,
+        "mode_visibility": (),
+        "activity": "tool_progress",
+        "progress_label": "Requesting user input",
+        "argument_progress_fields": ("question", "choices"),
+    },
+    "review.start": {
+        "kind": "verification",
+        "model_name": None,
+        "model_visible": False,
+        "internal_only": True,
+        "mode_visibility": (),
+        "activity": "checking",
+        "progress_label": "Starting an automated review",
+        "argument_progress_fields": ("targets",),
+    },
+}
+
+
+def _all_canonical_tool_names() -> list[str]:
+    return sorted(
+        set(CANONICAL_TOOL_ALIASES.values())
+        | set(TOOL_RISK_DEFAULTS)
+        | set(TOOL_INPUT_SCHEMAS)
+        | set(TOOL_OUTPUT_SCHEMAS)
+        | set(TOOL_EXECUTION_DEFAULTS)
+        | set(TOOL_MODEL_METADATA)
+    )
+
+
+def tool_aliases(canonical: object) -> tuple[str, ...]:
+    resolved = canonical_tool_name(canonical)
+    return tuple(sorted(alias for alias, target in CANONICAL_TOOL_ALIASES.items() if target == resolved and alias != resolved))
+
+
+def tool_definition(tool: object) -> ToolDefinition:
+    canonical = canonical_tool_name(tool)
+    configured = TOOL_EXECUTION_DEFAULTS.get(canonical, {})
+    risk = default_tool_risk(canonical)
+    metadata = default_tool_capability_metadata(canonical)
+    model_metadata = TOOL_MODEL_METADATA.get(canonical, {})
+    side_effects = default_tool_side_effects(canonical)
+    side_effect_class = tool_side_effect_class(side_effects)
+    spill_policy = configured.get("artifact_spill_policy") or ("never" if risk in {"safe", "forbidden"} else "on_truncation")
+    if spill_policy not in {"never", "on_truncation", "always"}:
+        spill_policy = "on_truncation"
+    kind = str(model_metadata.get("kind") or ("mutating" if risk in {"mutating", "destructive"} else "read_only" if risk in {"safe", "read_only"} else "unknown"))
+    if kind not in {"read_only", "mutating", "verification", "unknown"}:
+        kind = "unknown"
+    concurrency_safe = bool(configured.get("concurrency_safe", False))
+    parallel_safe = bool(configured.get("parallel_safe", concurrency_safe and side_effect_class in {"none", "read_workspace"}))
+    model_name = model_metadata.get("model_name")
+    return ToolDefinition(
+        canonical=canonical,
+        aliases=tool_aliases(canonical),
+        risk=risk,
+        kind=kind,  # type: ignore[arg-type]
+        approval_class=default_tool_approval_class(canonical),
+        sandbox_profile=default_tool_sandbox_profile(canonical),
+        concurrency_safe=concurrency_safe,
+        parallel_safe=parallel_safe,
+        timeout_seconds=int(configured.get("timeout_seconds") or 25),
+        output_cap_chars=int(configured.get("output_cap_chars") or 6000),
+        artifact_spill_policy=spill_policy,  # type: ignore[arg-type]
+        input_schema=TOOL_INPUT_SCHEMAS.get(canonical, {}),
+        output_schema=TOOL_OUTPUT_SCHEMAS.get(canonical, {}),
+        description=str(metadata.get("description") or canonical),
+        capability_tags=tuple(str(item) for item in metadata.get("capabilities") or []),
+        allowed_paths=default_tool_allowed_paths(canonical),
+        side_effects=side_effects,
+        side_effect_class=side_effect_class,
+        result_summarization=default_tool_result_summarization(canonical),
+        retry_policy=default_tool_retry_policy(canonical),
+        failure_signatures=default_tool_failure_signatures(canonical),
+        deferred=bool(configured.get("deferred") or risk in {"mutating", "destructive"}),
+        dynamic=bool(configured.get("dynamic")),
+        model_name=str(model_name) if model_name else None,
+        model_visible=bool(model_metadata.get("model_visible", False)),
+        internal_only=bool(model_metadata.get("internal_only", False)),
+        mode_visibility=tuple(str(item) for item in model_metadata.get("mode_visibility") or ()),
+        activity=str(model_metadata.get("activity") or "reading"),
+        progress_label=str(model_metadata.get("progress_label") or "Reading workspace context"),
+        argument_progress_fields=tuple(str(item) for item in model_metadata.get("argument_progress_fields") or ()),
+    )
+
+
+def tool_definitions() -> dict[str, ToolDefinition]:
+    return {canonical: tool_definition(canonical) for canonical in _all_canonical_tool_names()}
+
+
+def tool_model_name(tool: object) -> str | None:
+    return tool_definition(tool).model_name
+
+
+def model_tool_for_canonical(tool: object) -> str:
+    definition = tool_definition(tool)
+    return definition.model_name or definition.canonical
+
+
+def canonical_tool_for_model(tool: object) -> str:
+    return canonical_tool_name(tool)
+
+
+def model_visible_tool_names(*, include_dynamic: bool = False, include_internal: bool = False) -> set[str]:
+    names: set[str] = set()
+    for definition in tool_definitions().values():
+        if not definition.model_name:
+            continue
+        if definition.internal_only and not include_internal:
+            continue
+        if not definition.model_visible and not include_dynamic:
+            continue
+        if definition.dynamic and not include_dynamic and not definition.model_visible:
+            continue
+        names.add(definition.model_name)
+    return names
+
+
+def registry_tool_names() -> set[str]:
+    names = set(_all_canonical_tool_names())
+    for definition in tool_definitions().values():
+        if definition.model_name:
+            names.add(definition.model_name)
+        names.update(definition.aliases)
+    return names
+
 
 def canonical_tool_name(tool: object) -> str:
     raw = str(tool or "").strip().lower()
@@ -406,49 +793,43 @@ def default_tool_failure_signatures(tool: object) -> dict[str, Any]:
 
 
 def tool_protocol_spec(tool: object) -> ToolProtocolSpec:
-    canonical = canonical_tool_name(tool)
-    configured = TOOL_EXECUTION_DEFAULTS.get(canonical, {})
-    risk = default_tool_risk(canonical)
-    spill_policy = configured.get("artifact_spill_policy") or ("never" if risk in {"safe", "forbidden"} else "on_truncation")
-    if spill_policy not in {"never", "on_truncation", "always"}:
-        spill_policy = "on_truncation"
-    metadata = default_tool_capability_metadata(canonical)
-    side_effects = default_tool_side_effects(canonical)
+    definition = tool_definition(tool)
     return ToolProtocolSpec(
-        canonical=canonical,
+        canonical=definition.canonical,
         version=TOOL_PROTOCOL_VERSION,
-        aliases=tuple(sorted(alias for alias, target in CANONICAL_TOOL_ALIASES.items() if target == canonical and alias != canonical)),
-        risk=risk,
-        approval_class=default_tool_approval_class(canonical),
-        sandbox_profile=default_tool_sandbox_profile(canonical),
-        concurrency_safe=bool(configured.get("concurrency_safe", False)),
-        timeout_seconds=int(configured.get("timeout_seconds") or 25),
-        output_cap_chars=int(configured.get("output_cap_chars") or 6000),
-        artifact_spill_policy=spill_policy,  # type: ignore[arg-type]
-        input_schema=TOOL_INPUT_SCHEMAS.get(canonical, {}),
-        output_schema=TOOL_OUTPUT_SCHEMAS.get(canonical, {}),
-        deferred=bool(configured.get("deferred") or risk in {"mutating", "destructive"}),
-        dynamic=bool(configured.get("dynamic")),
-        description=str(metadata.get("description") or canonical),
-        capability_tags=tuple(str(item) for item in metadata.get("capabilities") or []),
-        allowed_paths=default_tool_allowed_paths(canonical),
-        side_effects=side_effects,
-        parallel_safe=bool(configured.get("concurrency_safe", False)) and tool_side_effect_class(side_effects) in {"none", "read_workspace"},
-        result_summarization=default_tool_result_summarization(canonical),
-        retry_policy=default_tool_retry_policy(canonical),
-        failure_signatures=default_tool_failure_signatures(canonical),
+        aliases=definition.aliases,
+        risk=definition.risk,
+        approval_class=definition.approval_class,
+        sandbox_profile=definition.sandbox_profile,
+        concurrency_safe=definition.concurrency_safe,
+        timeout_seconds=definition.timeout_seconds,
+        output_cap_chars=definition.output_cap_chars,
+        artifact_spill_policy=definition.artifact_spill_policy,
+        input_schema=definition.input_schema,
+        output_schema=definition.output_schema,
+        deferred=definition.deferred,
+        dynamic=definition.dynamic,
+        description=definition.description,
+        capability_tags=definition.capability_tags,
+        allowed_paths=definition.allowed_paths,
+        side_effects=definition.side_effects,
+        parallel_safe=definition.parallel_safe,
+        result_summarization=definition.result_summarization,
+        retry_policy=definition.retry_policy,
+        failure_signatures=definition.failure_signatures,
+        kind=definition.kind,
+        model_name=definition.model_name,
+        model_visible=definition.model_visible,
+        internal_only=definition.internal_only,
+        mode_visibility=definition.mode_visibility,
+        activity=definition.activity,
+        progress_label=definition.progress_label,
+        argument_progress_fields=definition.argument_progress_fields,
     )
 
 
 def tool_registry_contract() -> dict[str, Any]:
-    canonical_tools = sorted(
-        set(CANONICAL_TOOL_ALIASES.values())
-        | set(TOOL_RISK_DEFAULTS)
-        | set(TOOL_INPUT_SCHEMAS)
-        | set(TOOL_OUTPUT_SCHEMAS)
-        | set(TOOL_EXECUTION_DEFAULTS)
-    )
-    tools = [tool_protocol_spec(canonical).as_contract() for canonical in canonical_tools]
+    tools = [tool_protocol_spec(canonical).as_contract() for canonical in _all_canonical_tool_names()]
     return {
         "tool_protocol_version": TOOL_PROTOCOL_VERSION,
         "schema": "grounded.tool_registry_contract.v2",
@@ -509,6 +890,14 @@ def tool_registry_contract() -> dict[str, Any]:
             "result_summarization",
             "retry_policy",
             "failure_signatures",
+            "kind",
+            "model_name",
+            "model_visible",
+            "internal_only",
+            "mode_visibility",
+            "activity",
+            "progress_label",
+            "argument_progress_fields",
         ],
         "json_schema_tools": {
             "input_schema_field": "input_schema",
@@ -650,7 +1039,7 @@ TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
             "workspace_id": {"type": "string"},
             "run_id": {"type": "string"},
             "query": {"type": "string"},
-            "domain": {"type": "string", "enum": ["", "deploy", "browser", "database", "payments", "cms", "github", "vercel"]},
+            "domain": {"type": "string", "enum": ["", "deploy", "browser", "lsp", "verification", "shell", "image", "docs", "database", "payments", "cms", "github", "vercel"]},
             "intent": {"type": "string"},
             "reason": {"type": "string"},
         },

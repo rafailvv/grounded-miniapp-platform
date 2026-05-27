@@ -34,7 +34,7 @@ from app.models.domain import (
 from app.modules.miniapp_agent_loop.agent_file_state import AgentFileStateCache
 from app.modules.miniapp_agent_loop.agent_command_policy import command_policy_snapshot
 from app.modules.miniapp_agent_loop.agent_coordinator import AgentCoordinator
-from app.modules.miniapp_agent_loop.agent_hooks import AgentHookManager
+from app.modules.miniapp_agent_loop.agent_hooks import AgentHookManager, AgentHookOutcome
 from app.modules.miniapp_agent_loop.agent_process_manager import AgentProcessManager
 from app.modules.miniapp_agent_loop.agent_transcript import AgentTranscriptStore
 from app.modules.miniapp_agent_loop.agent_tool_call_loop import AgentToolCallLoop
@@ -51,6 +51,7 @@ from app.modules.miniapp_agent_loop.product_workers import (
     canonical_worker_id,
     ownership_for_worker,
     path_is_allowed,
+    product_owner_contract,
     select_memory_items,
     stale_path_checks,
     worker_refs,
@@ -93,6 +94,7 @@ from app.services.check_runner import CheckRunner
 from app.services.miniapp_contract import MiniAppContractCompiler, MiniAppContractMaterializer, MiniAppRouteRegistry
 from app.services.platform_shell import BASE_STYLESHEET_HREF, BASE_STYLESHEET_PATH, PAGE_SHELL_INLINE_STYLE
 from app.services.run_compaction import RunCompactionService
+from app.services.context_manager import ContextManagerService
 from app.services.event_journal import EventJournalService
 from app.services.hook_policy_service import HookPolicyService
 from app.services.memory_pipeline import WorkspaceMemoryPipeline
@@ -175,6 +177,7 @@ class WorkspaceCodeAgentRuntime:
         platform_db: PlatformDb | None = None,
         run_protocol_service: RunProtocolService | None = None,
         run_compaction_service: RunCompactionService | None = None,
+        context_manager_service: ContextManagerService | None = None,
         event_journal_service: EventJournalService | None = None,
         hook_policy_service: HookPolicyService | None = None,
         output_artifact_service: OutputArtifactService | None = None,
@@ -227,6 +230,7 @@ class WorkspaceCodeAgentRuntime:
         self.platform_db = platform_db
         self.run_protocol_service = run_protocol_service
         self.run_compaction_service = run_compaction_service
+        self.context_manager_service = context_manager_service
         self.event_journal_service = event_journal_service
 
     def get_job(self, job_id: str) -> JobRecord:
@@ -401,6 +405,19 @@ class WorkspaceCodeAgentRuntime:
             hook="session_start",
             status="completed",
             payload={"run_id": run_id, "workspace_id": workspace_id},
+        )
+        self._record_hook(
+            job=job,
+            hook="user_prompt_submit",
+            status="completed",
+            payload={
+                "run_id": run_id,
+                "workspace_id": workspace_id,
+                "prompt": request.prompt,
+                "mode": request.mode,
+                "intent": request.intent,
+                "generation_mode": generation_mode.value,
+            },
         )
         self._record_hook(
             job=job,
@@ -1714,6 +1731,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         job.tool_result_messages_ref = f"tool_result_messages:{workspace_id}:{artifact_run_id}"
         job.resume_checkpoint_ref = f"resume_checkpoint:{workspace_id}:{artifact_run_id}"
         job.command_policy_ref = f"command_policy:{workspace_id}:{artifact_run_id}"
+        job.context_manager_ref = f"context_manager:{workspace_id}:{artifact_run_id}"
         job.context_pressure_ref = f"context_pressure:{workspace_id}:{artifact_run_id}"
         job.hook_trace_ref = f"hook_trace:{workspace_id}:{artifact_run_id}"
         job.semantic_graph_ref = f"semantic_graph:{workspace_id}:{artifact_run_id}"
@@ -1789,6 +1807,15 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             },
         )
         self._store_report(job.command_policy_ref, {"workspace_id": workspace_id, "run_id": run_id, **command_policy_snapshot()})
+        if self.context_manager_service is not None:
+            self._store_report(
+                job.context_manager_ref,
+                self.context_manager_service.get_run_report(
+                    workspace_id=workspace_id,
+                    run_id=artifact_run_id,
+                    session_id=getattr(job, "session_id", None),
+                ),
+            )
         self._store_report(
             job.context_pressure_ref,
             self._context_pressure_report(workspace_id=workspace_id, run_id=run_id, items=[]),
@@ -2584,6 +2611,48 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
 
         def _before_apply(turn: int, file_changes: list[DraftAction]):
             paths = [operation.file_path for operation in file_changes]
+            previous_rejections = self._guardian_rejections(artifact_run_id)
+            action_review = GuardianReview.review_risky_action(
+                workspace_id=workspace_id,
+                run_id=run_id,
+                draft_source=draft_source,
+                file_changes=file_changes,
+                action_kind="draft_apply",
+                previous_rejections=previous_rejections,
+                diff_text=self.workspace_service.diff(workspace_id, run_id=run_id),
+            ).model_dump(mode="json", by_alias=True)
+            action_review_ref = f"guardian_action_review:{workspace_id}:{artifact_run_id}:turn_{turn}"
+            self._store_report(action_review_ref, action_review)
+            self.rollout_trace.append(artifact_run_id, "guardian_action_review", {"turn": turn, "status": action_review.get("status"), "ref": action_review_ref})
+            if action_review.get("status") != "passed":
+                self._record_guardian_rejection(artifact_run_id, action_review)
+                self._append_event(
+                    job,
+                    "validation_failed",
+                    "Guardian reviewer blocked risky draft action.",
+                    {"turn": turn, "guardian_action_review_ref": action_review_ref, "findings": action_review.get("findings") or []},
+                )
+                return AgentHookOutcome(
+                    hook="before_apply",
+                    should_block=True,
+                    block_reason="Guardian reviewer blocked risky draft action.",
+                    additional_contexts=[
+                        str((action_review.get("review_prompt") or {}).get("instructions") or ""),
+                        "Do not repeat the rejected workaround; choose a narrower implementation path.",
+                    ],
+                    event={"schema": "grounded.hook_event.v1", "hook": "before_apply", "status": "failed", "payload": {"guardian_action_review_ref": action_review_ref}},
+                    evaluation={"guardian_action_review": action_review, "matched_rules": [], "tags": {"guardian_blocked": True}},
+                    context_items=[
+                        {
+                            "text": "Guardian blocked the previous risky mutation. Do not repeat the same workaround; reduce the patch and address the finding directly.",
+                            "priority": 100,
+                            "target": "repair_turn",
+                            "source": "guardian",
+                            "source_rule_id": "guardian.rejection_circuit",
+                            "metadata": {"guardian_action_review_ref": action_review_ref},
+                        }
+                    ],
+                )
             self._record_hook(
                 job=job,
                 hook="pre_apply_patch",
@@ -3087,6 +3156,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                 "branch_policy": branch_policy,
                 "generation_mode": str(generation_mode.value),
                 "ownership": ownership,
+                "product_owner_contract": product_owner_contract(worker_id),
                 "contract_slice": self._worker_contract_slice(
                     worker_id=worker_id,
                     implementation_plan=implementation_plan,
@@ -3109,6 +3179,8 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                 "branch_role": branch_role,
                 "branch_stage": branch_stage,
                 "branch_policy": branch_policy,
+                "lane_id": product_owner_contract(worker_id).get("lane_id"),
+                "ownership_kind": product_owner_contract(worker_id).get("ownership_kind"),
                 "status": (
                     "context_ready"
                     if enabled and branch_role == "writer"
@@ -3124,6 +3196,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                     else "available_disabled"
                 ),
                 "ownership": ownership,
+                "product_owner_contract": product_owner_contract(worker_id),
                 "changed_files": [],
                 "diff_ref": None,
                 "proof_refs": [],
@@ -3408,6 +3481,9 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             worker_id = canonical_worker_id(result.worker_id)
             changed = list(result.changed_files)
             blocked_paths = sorted({path for path in changed if path in conflict_paths or path in forbidden_paths})
+            output_ref = worker_refs(workspace_id, artifact_run_id, worker_id)["output_ref"]
+            current_output = self.store.get("reports", output_ref)
+            proof_refs = list((current_output or {}).get("proof_refs") or []) if isinstance(current_output, dict) else []
             if result.status == "failed":
                 decision = "needs_repair"
             elif blocked_paths:
@@ -3425,11 +3501,25 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                     "branch_role": AgentWorkerManager.branch_role(worker_id),
                     "branch_stage": AgentWorkerManager.branch_stage(worker_id),
                     "branch_policy": AgentWorkerManager.branch_policy(worker_id),
+                    "lane_id": product_owner_contract(worker_id).get("lane_id"),
+                    "ownership_kind": product_owner_contract(worker_id).get("ownership_kind"),
+                    "product_owner_contract": product_owner_contract(worker_id),
                     "decision": decision,
                     "changed_files": changed,
                     "blocked_paths": blocked_paths,
                     "failure_reason": result.error or "",
-                    "output_ref": worker_refs(workspace_id, artifact_run_id, worker_id)["output_ref"],
+                    "output_ref": output_ref,
+                    "proof_refs": proof_refs,
+                    "merge_evidence": AgentWorkerManager.merge_evidence_packet(
+                        worker_id=worker_id,
+                        changed_files=changed,
+                        decision=decision,
+                        output_ref=output_ref,
+                        apply_result=apply_result,
+                        proof_refs=proof_refs,
+                        blocked_paths=blocked_paths,
+                        failure_reason=result.error or "",
+                    ),
                     "repair_worker_required": decision in {"needs_repair", "rejected"},
                 }
             )
@@ -3459,6 +3549,19 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             "branch_policy": AgentWorkerManager.branch_policy("mobile_polish_worker"),
             "proof_refs": [],
         }
+        evidence_packets = [item.get("merge_evidence") for item in decisions if isinstance(item.get("merge_evidence"), dict)]
+        evidence_summary = {
+            "schema": "grounded.worker_merge_evidence_summary.v1",
+            "status": "passed" if evidence_packets and all(packet.get("status") in {"passed", "pending"} for packet in evidence_packets) else "empty" if not evidence_packets else "failed",
+            "worker_count": len(evidence_packets),
+            "failed_workers": [packet.get("worker_id") for packet in evidence_packets if packet.get("status") == "failed"],
+            "runtime_proof_planned_workers": [
+                packet.get("worker_id")
+                for packet in evidence_packets
+                if (packet.get("runtime_proof") or {}).get("status") == "planned_after_merge"
+            ],
+            "policy": "manager decisions require owner contract, owned path evidence, output refs, and planned or present runtime proof",
+        }
         payload = {
             "schema": "grounded.worker_manager_merge_decision.v1",
             "branch_schema": "grounded.worker_branch_plan.v2",
@@ -3467,6 +3570,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             "artifact_run_id": artifact_run_id,
             "status": status,
             "decisions": decisions,
+            "evidence_summary": evidence_summary,
             "merge_report": merge_report,
             "conflict_report": conflict_report if isinstance(conflict_report, dict) else {},
             "apply_result": apply_result or {},
@@ -4110,6 +4214,14 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             pending_post_compact_messages = list(transcript_context.get("post_compact_messages") or [])
             if pending_post_compact_messages:
                 user_prompt = self._with_post_compact_messages(user_prompt, pending_post_compact_messages)
+            user_prompt = self._apply_context_manager_policy(
+                job=job,
+                workspace_id=workspace_id,
+                run_id=run_id,
+                request=request,
+                prompt_payload=user_prompt,
+                transcript_context=transcript_context,
+            )
             skill_allowed_tools = self._selected_skill_allowed_tools(
                 prompt=request.prompt,
                 intent=str(request.intent or ""),
@@ -4121,11 +4233,17 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                 ][:32],
                 failure_class=str(job.failure_class or ""),
             )
+            dynamic_forced_tools = self._dynamic_forced_tools_from_results(tool_results)
             available_tools = (
                 ToolRouter.allowed_openai_tools(forced_allowed=skill_allowed_tools)
                 if skill_allowed_tools
                 else ToolRouter.allowed_openai_tools()
             )
+            if dynamic_forced_tools and not skill_allowed_tools:
+                available_tools = ToolRouter.allowed_openai_tools(
+                    forced_allowed=dynamic_forced_tools,
+                    include_default_with_forced=True,
+                )
             forced_tool_names = {
                 str(item)
                 for item in (next_forced_action or {}).get("forced_tool_names", [])
@@ -4897,6 +5015,29 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                 "deferred": bool(spec.deferred or spec.kind == "mutating"),
             }
         return payload
+
+    @staticmethod
+    def _dynamic_forced_tools_from_results(tool_results: list[dict[str, object]]) -> set[str]:
+        forced: set[str] = set()
+        for item in tool_results[-12:]:
+            if not isinstance(item, dict):
+                continue
+            payloads = [item]
+            envelope = item.get("envelope")
+            if isinstance(envelope, dict):
+                result = envelope.get("result")
+                if isinstance(result, dict):
+                    payloads.append(result)
+            for payload in payloads:
+                activation = payload.get("activation") if isinstance(payload.get("activation"), dict) else {}
+                for tool in activation.get("forced_allowed_tools") or []:
+                    if str(tool).strip():
+                        forced.add(str(tool).strip())
+                summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+                for tool in summary.get("available_model_tools") or []:
+                    if str(tool).strip():
+                        forced.add(str(tool).strip())
+        return forced
 
     @staticmethod
     def _worker_prefix_payload(
@@ -5838,6 +5979,83 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             self.rollout_trace.append(artifact_run_id, "context_suggestion", pressure)
         return json.dumps(payload, ensure_ascii=False)
 
+    def _apply_context_manager_policy(
+        self,
+        *,
+        job: JobRecord,
+        workspace_id: str,
+        run_id: str,
+        request: GenerateRequest,
+        prompt_payload: str,
+        transcript_context: dict[str, Any],
+    ) -> str:
+        if self.context_manager_service is None:
+            return prompt_payload
+        artifact_run_id = run_id or job.job_id
+        try:
+            payload = json.loads(prompt_payload)
+        except json.JSONDecodeError:
+            payload = {"raw_prompt": prompt_payload}
+        context_pressure = payload.get("context_pressure") if isinstance(payload, dict) and isinstance(payload.get("context_pressure"), dict) else {}
+        transcript_snapshot = self.transcript_store.snapshot(artifact_run_id)
+        if transcript_context:
+            transcript_snapshot = {
+                **transcript_snapshot,
+                "next_model_context": transcript_context,
+                "normalization": transcript_context.get("normalization") or transcript_snapshot.get("normalization") or {},
+                "token_budget": transcript_context.get("token_budget") or transcript_snapshot.get("token_budget") or {},
+            }
+        run_artifacts = self.store.get("reports", f"run_artifacts:{run_id}") if run_id else {}
+        bookmarks = []
+        if self.run_protocol_service is not None and run_id:
+            try:
+                bookmarks = self.run_protocol_service.bookmarks(run_id).get("items") or []
+            except Exception:
+                bookmarks = []
+        try:
+            prepared = self.context_manager_service.prepare_turn_context(
+                workspace_id=workspace_id,
+                run_id=artifact_run_id,
+                session_id=getattr(job, "session_id", None),
+                prompt=request.prompt,
+                generation_mode=self._generation_mode(request.generation_mode),
+                run_mode=str(request.mode or job.mode or "generate"),
+                prompt_payload=payload if isinstance(payload, dict) else prompt_payload,
+                transcript_snapshot=transcript_snapshot,
+                context_pressure=context_pressure,
+                artifacts=run_artifacts if isinstance(run_artifacts, dict) else {},
+                proofs={
+                    "browser_proof_ref": job.browser_proof_ref,
+                    "verification_report_ref": job.verification_report_ref,
+                    "trace_bundle_ref": job.trace_bundle_ref,
+                },
+                bookmarks=bookmarks if isinstance(bookmarks, list) else [],
+            )
+        except Exception:
+            logger.exception("context_manager_prepare_failed workspace_id=%s run_id=%s", workspace_id, artifact_run_id)
+            return prompt_payload
+        report = prepared.get("report") if isinstance(prepared.get("report"), dict) else {}
+        report_ref = str(prepared.get("report_ref") or report.get("report_ref") or "").strip()
+        if report_ref:
+            job.context_manager_ref = report_ref
+        manifest = report.get("manifest") if isinstance(report.get("manifest"), dict) else {}
+        if manifest:
+            self._append_event(
+                job,
+                "context_manager",
+                "Context manager applied budget policy.",
+                {
+                    "context_manager_ref": report_ref,
+                    "manifest_ref": prepared.get("manifest_ref") or report.get("manifest_ref"),
+                    "included_sections": manifest.get("included_sections") or [],
+                    "summarized_sections": manifest.get("summarized_sections") or [],
+                    "ref_sections": manifest.get("ref_sections") or [],
+                    "dropped_sections": manifest.get("dropped_sections") or [],
+                },
+                save=False,
+            )
+        return str(prepared.get("prompt_payload") or prompt_payload)
+
     @staticmethod
     def _draft_relative_path_exists(draft_source: Path, relative_path: str) -> bool | None:
         normalized = WorkspaceCodeAgentRuntime._strip_leading_dot_slash(str(relative_path or "").replace("\\", "/"))
@@ -6071,6 +6289,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                 reason=reason,
                 source="autocompact",
                 boundary_id=boundary_id,
+                context_manager_ref=job.context_manager_ref,
             )
             reset = self.transcript_store.compact_model_context(
                 artifact_run_id,
@@ -6243,6 +6462,38 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         contexts = record.get("contexts") if isinstance(record.get("contexts"), list) else []
         normalized = [item for item in contexts if isinstance(item, dict) and str(item.get("text") or "").strip()]
         return sorted(normalized[-20:], key=lambda value: int(value.get("priority") or 0), reverse=True)[:8]
+
+    def _guardian_rejections(self, artifact_run_id: str) -> list[dict[str, Any]]:
+        record = self.store.get("reports", f"guardian_rejection_circuit:{artifact_run_id}") or {}
+        items = record.get("items") if isinstance(record.get("items"), list) else []
+        return [item for item in items if isinstance(item, dict)][-50:]
+
+    def _record_guardian_rejection(self, artifact_run_id: str, review: dict[str, Any]) -> None:
+        key = f"guardian_rejection_circuit:{artifact_run_id}"
+        record = self.store.get("reports", key) or {"schema": "grounded.guardian_rejection_circuit.v1", "run_id": artifact_run_id, "items": []}
+        items = [item for item in record.get("items") or [] if isinstance(item, dict)]
+        changed_files = [str(path) for path in ((review.get("evidence") or {}).get("changed_files") or []) if str(path or "").strip()]
+        created_at = datetime.now(timezone.utc).isoformat()
+        for finding in review.get("findings") or []:
+            if not isinstance(finding, dict):
+                continue
+            code = str(finding.get("code") or "")
+            if not code:
+                continue
+            items.append(
+                {
+                    "signature": GuardianReview._rejection_signature(code=code, paths=changed_files),
+                    "code": code,
+                    "severity": finding.get("severity"),
+                    "category": finding.get("category"),
+                    "changed_files": changed_files[:40],
+                    "review_status": review.get("status"),
+                    "created_at": created_at,
+                }
+            )
+        record["items"] = items[-100:]
+        record["updated_at"] = created_at
+        self._store_report(key, record)
 
     @staticmethod
     def _tool_result_json(item: dict[str, object]) -> str:
@@ -7523,6 +7774,13 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         if loop_result.latest_preview_details:
             self._store_report(f"fix_runtime:{job.workspace_id}", {"workspace_id": job.workspace_id, **loop_result.latest_preview_details})
         event_type = "job_completed" if job.status == "completed" else "job_failed"
+        if job.failure_class == "stopped_by_user" or loop_result.failure_class == "stopped_by_user":
+            self._record_hook(
+                job=job,
+                hook="stop",
+                status="completed",
+                payload={"reason": loop_result.failure_reason or "Run stopped by user.", "status": job.status},
+            )
         self._record_hook(
             job=job,
             hook="after_run",

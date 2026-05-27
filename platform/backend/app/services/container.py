@@ -11,6 +11,7 @@ from app.services.thread_service import ThreadService
 from app.services.check_runner import CheckRunner
 from app.services.code_index_service import CodeIndexService
 from app.services.context_pack_builder import ContextPackBuilder
+from app.services.context_manager import ContextManagerService
 from app.services.document_intelligence import DocumentIntelligenceService
 from app.services.export_service import ExportService
 from app.services.engine import (
@@ -39,6 +40,7 @@ from app.services.background_task_service import BackgroundTaskService
 from app.services.pr_babysitter import PrBabysitterService
 from app.services.run_compaction import RunCompactionService
 from app.services.run_protocol import RunProtocolService
+from app.services.session_protocol import SessionProtocolReducer
 from app.services.repair_cases import RepairCaseService
 from app.services.workbench_service import WorkbenchService
 from app.services.starter_workspace_service import StarterWorkspaceService
@@ -52,6 +54,12 @@ class ServiceContainer:
         self.event_journal_service = EventJournalService(self.platform_db)
         self.output_artifact_service = OutputArtifactService(self.store, event_journal_service=self.event_journal_service)
         self.run_protocol_service = RunProtocolService(self.platform_db, self.store, event_journal_service=self.event_journal_service)
+        self.session_protocol_reducer = SessionProtocolReducer(
+            db=self.platform_db,
+            store=self.store,
+            event_journal_service=self.event_journal_service,
+            run_protocol_service=self.run_protocol_service,
+        )
         self.run_compaction_service = RunCompactionService(self.store, self.run_protocol_service)
         self.repair_case_service = RepairCaseService(self.store, event_journal_service=self.event_journal_service)
         self.rpc_event_hub = RpcEventHub()
@@ -81,6 +89,11 @@ class ServiceContainer:
         self.openai_client = OpenAIClient(self.settings, self.workspace_log_service, model_manager=self.model_manager_service)
         self.context_budget_manager = ContextBudgetManager()
         self.prompt_state_manager = PromptStateManager()
+        self.context_manager_service = ContextManagerService(
+            self.store,
+            budget_manager=self.context_budget_manager,
+            event_journal_service=self.event_journal_service,
+        )
         self.context_pack_builder = ContextPackBuilder(
             self.code_index_service,
             self.workspace_service,
@@ -100,6 +113,7 @@ class ServiceContainer:
             platform_db=self.platform_db,
             run_protocol_service=self.run_protocol_service,
             run_compaction_service=self.run_compaction_service,
+            context_manager_service=self.context_manager_service,
             event_journal_service=self.event_journal_service,
             hook_policy_service=self.hook_policy_service,
             output_artifact_service=self.output_artifact_service,
@@ -146,6 +160,7 @@ class ServiceContainer:
             run_compaction_service=self.run_compaction_service,
             background_task_service=self.background_task_service,
             repair_case_service=self.repair_case_service,
+            context_manager_service=self.context_manager_service,
             event_journal_service=self.event_journal_service,
             output_artifact_service=self.output_artifact_service,
             pr_babysitter_service=self.pr_babysitter_service,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from shlex import quote as shlex_quote
 from pathlib import PurePosixPath
 from pathlib import Path
 from typing import Any
@@ -281,17 +282,20 @@ class ExecPolicyService:
         risk = self._risk_for_decision(decision)
         command_class = self.command_class(decision)
         command_fingerprint = self.command_fingerprint(command, workspace_id=workspace_id)
+        command_prefix = self._command_prefix_payload(decision, workspace_id=workspace_id)
         approval = self._approval_for_risk(
             risk,
             decision=decision,
             preset=preset,
             workspace_id=workspace_id,
             command_fingerprint=command_fingerprint,
+            command_prefix=command_prefix,
         )
         safety = self._safety_payload(decision)
-        canonical_command = self._canonical_command_payload(decision, command_fingerprint=command_fingerprint)
+        canonical_command = self._canonical_command_payload(decision, command_fingerprint=command_fingerprint, command_prefix=command_prefix)
         dangerous = self.dangerous_command_classification(decision, command_class=command_class)
         io_policy = self.io_policy(decision, command_class=command_class, risk=risk)
+        network_decision = self._network_policy_decision(decision, risk=risk, command_class=command_class)
         approval_gate = self._approval_gate_payload(
             decision=decision,
             risk=risk,
@@ -308,6 +312,7 @@ class ExecPolicyService:
             "argv": [self.redact(item) for item in decision.argv],
             "resolved_argv": [self.redact(item) for item in decision.resolved_argv],
             "canonical_command": canonical_command,
+            "command_prefix": command_prefix,
             "resolved_executable": decision.executable_resolution,
             "matched_rules": [self._redact_rule(item) for item in decision.matched_rules],
             "matched_amendments": [self._redact_rule(item) for item in decision.matched_amendments],
@@ -315,10 +320,18 @@ class ExecPolicyService:
             "shell_parse": decision.parse_tree,
             "blocked_syntax": decision.blocked_syntax,
             "network_policy": decision.network_policy,
+            "network_policy_decision": network_decision,
             "read_write_network_policy": io_policy,
             "dangerous_command_classifier": dangerous,
             "safety": safety,
             "decision": self._decision_payload(decision, risk=risk),
+            "decision_trace": self._decision_trace(
+                decision,
+                risk=risk,
+                command_class=command_class,
+                command_prefix=command_prefix,
+                network_decision=network_decision,
+            ),
             "approval": approval,
             "approval_template": self.approval_template_for(approval, command_class=command_class, risk=risk),
             "approval_gate": approval_gate,
@@ -327,6 +340,7 @@ class ExecPolicyService:
                 "command_fingerprint": command_fingerprint,
                 "command_class": command_class,
                 "canonical_command": canonical_command,
+                "command_prefix": command_prefix,
                 "preset": preset if preset in APPROVAL_PRESETS else "safe_auto",
                 "matched_rule_ids": [str(item.get("rule_id") or "") for item in [*decision.matched_rules, *decision.matched_amendments] if isinstance(item, dict)],
                 "generated_default": "deny_unmatched",
@@ -376,6 +390,10 @@ class ExecPolicyService:
             "action": decision.get("action"),
             "approval": approval,
             "approval_gate": evaluation.get("approval_gate") if isinstance(evaluation.get("approval_gate"), dict) else {},
+            "canonical_command": evaluation.get("canonical_command") if isinstance(evaluation.get("canonical_command"), dict) else {},
+            "command_prefix": evaluation.get("command_prefix") if isinstance(evaluation.get("command_prefix"), dict) else {},
+            "network_policy_decision": evaluation.get("network_policy_decision") if isinstance(evaluation.get("network_policy_decision"), dict) else {},
+            "decision_trace": evaluation.get("decision_trace") if isinstance(evaluation.get("decision_trace"), dict) else {},
             "blocked_code": block_explanation.get("code"),
             "blocked_reason": block_explanation.get("reason"),
             "matched_rule_ids": (evaluation.get("per_command_policy") or {}).get("matched_rule_ids") if isinstance(evaluation.get("per_command_policy"), dict) else [],
@@ -502,21 +520,89 @@ class ExecPolicyService:
         scope = str(workspace_id or "global")
         return hashlib.sha256(f"{scope}\n{normalized}".encode("utf-8", errors="replace")).hexdigest()
 
-    def _canonical_command_payload(self, decision: CommandPolicyDecision, *, command_fingerprint: str) -> dict[str, Any]:
+    def _canonical_command_payload(self, decision: CommandPolicyDecision, *, command_fingerprint: str, command_prefix: dict[str, Any]) -> dict[str, Any]:
         executable = PurePosixPath(decision.argv[0]).name.lower() if decision.argv else ""
         resolved = decision.executable_resolution if isinstance(decision.executable_resolution, dict) else {}
+        canonical_argv = [self.redact(str(item)) for item in (decision.resolved_argv or decision.argv)]
         return {
             "schema": "grounded.canonical_command.v1",
             "fingerprint": command_fingerprint,
             "normalized_command": self.redact(decision.normalized_command),
             "argv": [self.redact(item) for item in decision.argv],
             "resolved_argv": [self.redact(item) for item in decision.resolved_argv],
+            "canonical_argv": canonical_argv,
+            "canonical_string": self.redact(" ".join(shlex_quote(item) for item in (decision.resolved_argv or decision.argv))),
             "executable": executable,
+            "executable_name": executable,
             "resolved_executable": self.redact(str(resolved.get("resolved_path") or "")) or None,
             "executable_resolution_status": resolved.get("status"),
+            "executable_trust": "trusted" if str(resolved.get("status") or "").startswith("trusted") else "untrusted",
             "cwd_policy": decision.cwd_policy,
             "shell_ast": decision.parse_tree,
             "matched_prefix": list(decision.matched_prefix),
+            "approved_prefix": command_prefix,
+        }
+
+    def _command_prefix_payload(self, decision: CommandPolicyDecision, *, workspace_id: str | None) -> dict[str, Any]:
+        prefix = tuple(str(item).lower() for item in (decision.matched_prefix or ()))
+        if not prefix and decision.argv:
+            executable = PurePosixPath(decision.argv[0]).name.lower()
+            prefix = (executable,)
+        scope = str(workspace_id or "global")
+        prefix_text = " ".join(prefix)
+        prefix_fingerprint = hashlib.sha256(f"{scope}\nprefix\n{prefix_text}".encode("utf-8", errors="replace")).hexdigest() if prefix else ""
+        return {
+            "schema": "grounded.approved_command_prefix.v1",
+            "prefix": list(prefix),
+            "prefix_text": prefix_text,
+            "prefix_fingerprint": prefix_fingerprint,
+            "scope": "workspace" if workspace_id else "global",
+            "workspace_id": workspace_id,
+            "match_policy": "argv_startswith",
+            "risk_ceiling": self._risk_for_decision(decision),
+        }
+
+    @staticmethod
+    def _network_policy_decision(decision: CommandPolicyDecision, *, risk: ToolRisk, command_class: str) -> dict[str, Any]:
+        network = decision.network_policy if isinstance(decision.network_policy, dict) else {}
+        blocked = bool(network.get("blocked")) or risk == "network" or command_class == "network"
+        return {
+            "schema": "grounded.network_policy_decision.v1",
+            "mode": network.get("mode") or "blocked_by_default",
+            "allowed": False,
+            "blocked": blocked,
+            "code": network.get("code") or ("network_risk_class" if blocked else "no_network_detected"),
+            "reason": network.get("reason") or ("Network risk class is blocked by generated command policy." if blocked else "No direct network behavior detected."),
+            "matched_prefix": network.get("matched_prefix") or [],
+            "enforcement": "sandbox_network_block" if blocked else "sandbox_default_block",
+        }
+
+    @staticmethod
+    def _decision_trace(
+        decision: CommandPolicyDecision,
+        *,
+        risk: ToolRisk,
+        command_class: str,
+        command_prefix: dict[str, Any],
+        network_decision: dict[str, Any],
+    ) -> dict[str, Any]:
+        steps = [
+            {"step": "parse_shell_subset", "status": "blocked" if (decision.blocked_syntax or {}).get("code") in {"control_character", "multiline_command", "shell_metacharacter", "shell_expansion", "command_chain"} else "passed", "details": decision.parse_tree},
+            {"step": "extract_executable", "status": "completed", "details": decision.executable_resolution},
+            {"step": "network_policy", "status": "blocked" if network_decision.get("blocked") else "passed", "details": network_decision},
+            {"step": "prefix_policy", "status": decision.action, "details": {"matched_prefix": list(decision.matched_prefix), "approved_prefix": command_prefix}},
+            {"step": "risk_class", "status": risk, "details": {"command_class": command_class, "safety_class": decision.safety_class}},
+        ]
+        if decision.blocked_syntax:
+            steps.append({"step": "block", "status": "forbidden", "details": decision.blocked_syntax})
+        return {
+            "schema": "grounded.exec_policy_decision_trace.v1",
+            "explainable": True,
+            "action": decision.action,
+            "risk": risk,
+            "command_class": command_class,
+            "reason": decision.reason,
+            "steps": steps,
         }
 
     def io_policy(self, decision: CommandPolicyDecision, *, command_class: str, risk: ToolRisk) -> dict[str, Any]:
@@ -692,6 +778,7 @@ class ExecPolicyService:
         preset: str,
         workspace_id: str | None,
         command_fingerprint: str,
+        command_prefix: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         resolved_preset = preset if preset in APPROVAL_PRESETS else "safe_auto"
         if decision.action == "forbidden" or risk == "forbidden":
@@ -703,6 +790,7 @@ class ExecPolicyService:
                 "scope": "workspace" if workspace_id else "global",
                 "workspace_id": workspace_id,
                 "command_fingerprint": command_fingerprint,
+                "command_prefix": command_prefix or {},
             }
         auto_approve = set(APPROVAL_PRESETS[resolved_preset]["auto_approve_risks"])
         required = decision.action == "prompt" or (risk not in {"safe", "read_only"} and risk not in auto_approve)
@@ -715,6 +803,7 @@ class ExecPolicyService:
             "scope": "workspace" if workspace_id else "global",
             "workspace_id": workspace_id,
             "command_fingerprint": command_fingerprint,
+            "command_prefix": command_prefix or {},
             "actions": ["workspace_scoped_command"] if required else [],
         }
 

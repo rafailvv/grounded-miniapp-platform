@@ -75,6 +75,7 @@ class MemorySummaryReport(MemoryApiModel):
 class RawMemoryItem(MemoryApiModel):
     memory_id: str
     kind: str
+    memory_type: str = "product_facts"
     text: str
     status: str = "candidate"
     fingerprint: str
@@ -101,6 +102,7 @@ class RunMemoryBatch(MemoryApiModel):
 class ConsolidatedMemoryItem(MemoryApiModel):
     memory_id: str
     kind: str
+    memory_type: str = "product_facts"
     text: str
     status: str = "active"
     fingerprint: str
@@ -139,6 +141,12 @@ class WorkspaceMemoryReport(MemoryApiModel):
     do_not_change: list[dict[str, Any]] = Field(default_factory=list)
     platform_constraints: list[dict[str, Any]] = Field(default_factory=list)
     repeated_fixes: list[dict[str, Any]] = Field(default_factory=list)
+    product_memory_types: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
+    preferences: list[dict[str, Any]] = Field(default_factory=list)
+    product_facts: list[dict[str, Any]] = Field(default_factory=list)
+    successful_patterns: list[dict[str, Any]] = Field(default_factory=list)
+    ui_vocabulary: list[dict[str, Any]] = Field(default_factory=list)
+    persistence_schema_decisions: list[dict[str, Any]] = Field(default_factory=list)
     memory_summary: MemorySummaryReport | None = None
 
 

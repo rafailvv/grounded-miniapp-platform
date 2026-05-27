@@ -45,6 +45,45 @@ class DynamicToolCatalog:
 
     _CAPABILITIES: tuple[DynamicToolCapability, ...] = (
         DynamicToolCapability(
+            capability_id="lsp.code_context",
+            domain="lsp",
+            title="LSP code intelligence",
+            description="Targeted diagnostics, symbol lookup, references, definitions, and route/static cross-link context for code repair.",
+            status="available_dynamic",
+            keywords=("lsp", "diagnostics", "symbol", "definition", "references", "route", "static", "code", "types", "import", "navigation"),
+            model_tools=("lsp_diagnostics", "lsp_symbol_context", "lsp_definition", "lsp_find_references", "lsp_route_graph", "lsp_route_static_context"),
+            requires=("focused_code_target",),
+            prompt_hint="Use after normal file reads/search when symbol-level context or diagnostics are needed.",
+            deferred=False,
+            metadata={"canonical_group": "lsp"},
+        ),
+        DynamicToolCapability(
+            capability_id="checks.run",
+            domain="verification",
+            title="Validation checks",
+            description="Run generated tests, static checks, and final verification only when the draft needs proof or repair evidence.",
+            status="available_dynamic",
+            keywords=("check", "checks", "test", "tests", "pytest", "validation", "verify", "failure", "proof", "gate"),
+            model_tools=("run_checks",),
+            requires=("draft_or_source_state", "serialized_execution"),
+            prompt_hint="Use after a coherent patch or when latest failure evidence is stale.",
+            deferred=False,
+            metadata={"canonical": "checks.run"},
+        ),
+        DynamicToolCapability(
+            capability_id="shell.diagnostics",
+            domain="shell",
+            title="Governed diagnostic commands",
+            description="Run tightly governed read-only commands such as rg, python import checks, or focused test commands.",
+            status="available_dynamic",
+            keywords=("shell", "command", "terminal", "pytest", "python", "rg", "npm", "diagnostic", "logs", "execute"),
+            model_tools=("run_command",),
+            requires=("exec_policy", "safe_command_prefix"),
+            prompt_hint="Use only for specific diagnostic commands; policy still blocks network/destructive shell patterns.",
+            deferred=False,
+            metadata={"canonical": "shell.exec"},
+        ),
+        DynamicToolCapability(
             capability_id="browser.verify",
             domain="browser",
             title="Browser verification",
@@ -56,6 +95,31 @@ class DynamicToolCatalog:
             prompt_hint="Use only after product code is ready or a browser-specific failure needs proof.",
             deferred=False,
             metadata={"canonical": "browser.verify"},
+        ),
+        DynamicToolCapability(
+            capability_id="image.asset",
+            domain="image",
+            title="Image asset generation",
+            description="Generate or edit bitmap assets only when the product needs concrete visual media.",
+            status="deferred_connector_required",
+            keywords=("image", "asset", "photo", "illustration", "logo", "sprite", "background", "mockup", "visual"),
+            external_tools=("imagegen",),
+            requires=("asset_brief", "human_review_for_brand_assets"),
+            prompt_hint="Prefer repo-native UI first; use image generation for real visual assets or placeholders that improve the product.",
+            metadata={"risk": "asset_generation"},
+        ),
+        DynamicToolCapability(
+            capability_id="docs.product",
+            domain="docs",
+            title="Product documentation",
+            description="Generate or update product docs, architecture notes, handoff docs, and runbooks when documentation is requested.",
+            status="available_dynamic",
+            keywords=("docs", "documentation", "readme", "runbook", "architecture", "handoff", "guide", "spec"),
+            external_tools=("magic_doc", "documents"),
+            requires=("current_routes_and_artifacts"),
+            prompt_hint="Use after code state is understood; keep docs generation separate from app runtime patches.",
+            deferred=False,
+            metadata={"workflow": "product_architecture_docs"},
         ),
         DynamicToolCapability(
             capability_id="deploy.vercel",
@@ -170,6 +234,8 @@ class DynamicToolCatalog:
             scored.append((score, reason, capability))
         scored.sort(key=lambda item: (-item[0], item[2].domain, item[2].capability_id))
         items = [capability.as_dict(score=score, reason=reason) for score, reason, capability in scored[: max(1, min(limit, 12))]]
+        available_model_tools = sorted({tool for item in items for tool in item.get("model_tools", [])})
+        external_tools = sorted({tool for item in items for tool in item.get("external_tools", [])})
         return {
             "schema": "grounded.dynamic_tool_search.v1",
             "status": "ready" if items else "empty",
@@ -179,13 +245,16 @@ class DynamicToolCatalog:
             "items": items,
             "summary": {
                 "matched_count": len(items),
-                "available_model_tools": sorted({tool for item in items for tool in item.get("model_tools", [])}),
+                "available_model_tools": available_model_tools,
+                "external_tools": external_tools,
                 "deferred_count": sum(1 for item in items if item.get("deferred")),
                 "domains": sorted({str(item.get("domain") or "") for item in items}),
             },
             "activation": {
                 "policy": "deferred",
-                "next_step": "Use a returned model_tool only when the runtime explicitly forces it into the next tool set; otherwise ask for approval or continue with local code tools.",
+                "forced_allowed_tools": available_model_tools,
+                "external_tool_candidates": external_tools,
+                "next_step": "Use forced_allowed_tools in the next model turn only for the selected capability; otherwise continue with local code tools or ask for approval.",
             },
         }
 

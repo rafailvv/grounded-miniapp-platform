@@ -65,7 +65,9 @@ class AgentWorkerTaskPlanner:
                 {
                     "worker_id": canonical_id,
                     "worker_type": str(worker.get("worker_type") or canonical_id),
-                    "alias_ids": [],
+                    "alias_ids": list(worker.get("alias_ids") or []),
+                    "lane_id": worker.get("lane_id"),
+                    "ownership_kind": worker.get("ownership_kind"),
                     "branch_role": branch_role,
                     "branch_stage": branch_stage,
                     "branch_policy": branch_policy,
@@ -73,9 +75,11 @@ class AgentWorkerTaskPlanner:
                     "owner_scope": owner_scope,
                     "path_prefixes": path_prefixes,
                     "ownership": ownership,
+                    "product_owner_contract": worker.get("product_owner_contract") or {},
                     "tool_allowlist": list(worker.get("tool_allowlist") or []),
                     "product_task_ledger_slice": ledger_slice,
                     "expected_proof": list(worker.get("expected_proof") or ownership.get("expected_proof") or []),
+                    "merge_evidence": list(worker.get("merge_evidence") or ownership.get("merge_evidence") or []),
                     "badge": str(worker.get("badge") or worker.get("status") or "planned"),
                     "mode_contract": mode_contract,
                     "prompt": cls._task_prompt(

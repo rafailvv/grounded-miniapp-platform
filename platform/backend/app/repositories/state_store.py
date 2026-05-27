@@ -60,6 +60,8 @@ class StateStore:
         "rollout_trace_evidence:",
         "exec_trace:",
         "process_outputs:",
+        "context_manager:",
+        "context_manifest:",
         "context_pressure:",
         "run_compaction:",
         "run_compaction_boundary:",

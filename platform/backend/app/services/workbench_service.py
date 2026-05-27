@@ -20,6 +20,7 @@ from uuid import uuid4
 from app.ai.model_registry import model_capabilities
 from app.models.domain import CheckExecutionRecord, CreateRunRequest, RunCheckResult, RunRecord
 from app.models.context_pressure import ContextPressureReport
+from app.models.context_manager import ContextManagerReport
 from app.models.event_journal import EventJournalPage
 from app.models.memory import MemoryConsolidationReport, MemoryRetrievalRequest
 from app.models.observability import ObservabilityReport
@@ -54,6 +55,7 @@ from app.modules.miniapp_agent_loop.product_workers import (
     PRODUCT_WORKERS,
     canonical_worker_id,
     ownership_for_worker,
+    product_owner_contract,
     worker_refs,
 )
 from app.modules.workspace_code_agent_runtime.browser_replay import BrowserProofReplay
@@ -96,6 +98,7 @@ from app.services.product_readiness import ProductReadinessContract
 from app.services.requirement_traceability import PromptArtifactCompletionAudit, RequirementTraceabilityMatrix
 from app.services.rollout_trace_evidence import RolloutTraceEvidence
 from app.services.run_compaction import RunCompactionService
+from app.services.context_manager import ContextManagerService
 from app.services.run_protocol import RunProtocolConflict, RunProtocolService, diff_sha256
 from app.services.trace_bundle import TraceBundleReducer
 from app.services.run_task_ledger import RunTaskLedger
@@ -116,6 +119,46 @@ def re_slug(value: object) -> str:
 class WorkbenchService:
     """Read-model and scaffold service for the agent workbench APIs."""
 
+    REVIEW_TARGET_DEFINITIONS: tuple[dict[str, str], ...] = (
+        {
+            "id": "current_draft",
+            "label": "Current draft",
+            "description": "Review the current draft diff for this run.",
+        },
+        {
+            "id": "against_base_template",
+            "label": "Against base template",
+            "description": "Review files that differ from the canonical starter template.",
+        },
+        {
+            "id": "since_last_successful_run",
+            "label": "Since last successful run",
+            "description": "Review changes relative to the previous applied successful run in this workspace.",
+        },
+        {
+            "id": "product_runtime_files",
+            "label": "Product runtime files",
+            "description": "Review only generated product runtime files, excluding tests and platform-only evidence.",
+        },
+        {
+            "id": "failed_repair_patch",
+            "label": "Failed repair patch",
+            "description": "Review the patch and target files from a failed or blocked repair attempt.",
+        },
+    )
+    REVIEW_TARGET_ALIASES: dict[str, str] = {
+        "draft": "current_draft",
+        "current": "current_draft",
+        "base_template": "against_base_template",
+        "template": "against_base_template",
+        "last_success": "since_last_successful_run",
+        "since_last_success": "since_last_successful_run",
+        "runtime": "product_runtime_files",
+        "product": "product_runtime_files",
+        "repair": "failed_repair_patch",
+        "failed_patch": "failed_repair_patch",
+    }
+
     @staticmethod
     def _typed_payload(model: type[WorkbenchApiModel], payload: dict[str, Any]) -> dict[str, Any]:
         return model.model_validate(payload).model_dump(mode="json", by_alias=True)
@@ -134,6 +177,7 @@ class WorkbenchService:
         run_compaction_service: RunCompactionService | None = None,
         background_task_service: BackgroundTaskService | None = None,
         repair_case_service: RepairCaseService | None = None,
+        context_manager_service: ContextManagerService | None = None,
         event_journal_service: EventJournalService | None = None,
         output_artifact_service: OutputArtifactService | None = None,
         pr_babysitter_service: PrBabysitterService | None = None,
@@ -147,6 +191,7 @@ class WorkbenchService:
         self.platform_db = platform_db
         self.run_protocol_service = run_protocol_service
         self.run_compaction_service = run_compaction_service
+        self.context_manager_service = context_manager_service
         self.background_task_service = background_task_service
         self.event_journal_service = event_journal_service
         self.output_artifact_service = output_artifact_service
@@ -1169,6 +1214,7 @@ class WorkbenchService:
                     "scope": approval.get("scope") or "workspace",
                     "workspace_id": workspace_id,
                     "command_fingerprint": approval.get("command_fingerprint") or evaluation.get("command_fingerprint"),
+                    "command_prefix": approval.get("command_prefix") or evaluation.get("command_prefix") or {},
                     "risk": decision.get("risk"),
                     "summary": self.exec_policy_service.redact(command),
                     "input": {"command": self.exec_policy_service.redact(command), "workspace_id": workspace_id},
@@ -1387,7 +1433,9 @@ class WorkbenchService:
                 {
                     "worker_id": canonical,
                     "worker_type": canonical,
-                    "alias_ids": [],
+                    "alias_ids": list(product_owner_contract(canonical).get("alias_ids") or []),
+                    "lane_id": product_owner_contract(canonical).get("lane_id"),
+                    "ownership_kind": product_owner_contract(canonical).get("ownership_kind"),
                     "branch_role": AgentWorkerManager.branch_role(canonical),
                     "branch_stage": AgentWorkerManager.branch_stage(canonical),
                     "branch_policy": AgentWorkerManager.branch_policy(canonical),
@@ -1395,6 +1443,7 @@ class WorkbenchService:
                     "badge": str(output.get("badge") or status) if isinstance(output, dict) else status,
                     "owner_scope": self._worker_scope(canonical),
                     "ownership": ownership_for_worker(canonical),
+                    "product_owner_contract": product_owner_contract(canonical),
                     "changed_files": list(output.get("changed_files") or [path for path in run.touched_files if self._path_owned_by_worker(canonical, path)]),
                     "summaries": summaries,
                     "merge_reports": merge_reports,
@@ -1404,6 +1453,7 @@ class WorkbenchService:
                     "output_ref": refs["output_ref"] if output else None,
                     "task_id": task.get("task_id") if isinstance(task, dict) else None,
                     "proof_refs": list(output.get("proof_refs") or []) if isinstance(output, dict) else [],
+                    "merge_evidence": decision.get("merge_evidence") if isinstance(decision, dict) else None,
                     "merge_decision_ref": merge_decision_ref if merge_decision else None,
                     "merge_decision": decision or None,
                 }
@@ -1414,6 +1464,19 @@ class WorkbenchService:
             "run_id": run_id,
             "workspace_id": run.workspace_id,
             "workers": lanes,
+            "ownership_contract": {
+                "schema": "grounded.product_worker_ownership_contract.v1",
+                "lanes": {
+                    "backend": ["backend_api_worker"],
+                    "role_ui": ["client_surface_worker", "specialist_surface_worker", "manager_surface_worker"],
+                    "persistence_api": ["backend_api_worker"],
+                    "tests": ["test_verifier_worker"],
+                    "verifier": ["mobile_polish_worker"],
+                    "repair": ["repair_worker"],
+                },
+                "contracts": [product_owner_contract(worker_id) for worker_id in worker_ids],
+                "merge_policy": "accept only owned diffs with merge evidence; route rejected/blocked paths to repair_worker",
+            },
             "worker_branch_refs": run.worker_branch_refs,
             "merge_decision_ref": merge_decision_ref if merge_decision else None,
             "mailbox": (mailbox or {}).get("mailbox") if isinstance(mailbox, dict) else {},
@@ -1694,9 +1757,12 @@ class WorkbenchService:
         owned_files = [path for path in run.touched_files if self._path_owned_by_worker(canonical, path)]
         return {"run_id": run_id, "worker_id": canonical, "owned_files": owned_files, "diff": self._filter_diff(diff, owned_files)}
 
-    def review(self, run_id: str) -> dict[str, Any]:
+    def review(self, run_id: str, *, target: str | None = None) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
         artifacts = self._run_artifacts_or_empty(run_id)
+        target_context = self._review_target_context(run=run, artifacts=artifacts, selected_target=target)
+        selected_target = target_context["selected_target"]
+        review_targets = target_context["targets"]
         findings: list[dict[str, Any]] = []
         for issue in run.checks_summary.issues:
             findings.append(
@@ -1712,8 +1778,8 @@ class WorkbenchService:
                     blocker=bool(issue.get("blocking") or issue.get("blocker") or run.checks_summary.gate_status in {"failed", "blocked"}),
                 )
             )
-        diff_text = str(artifacts.get("diff") or "")
-        changed_files = run.touched_files or self._paths_from_diff(diff_text)
+        diff_text = str(target_context.get("diff") or "")
+        changed_files = [str(path) for path in target_context.get("changed_files") or [] if str(path).strip()]
         check_results = [item for item in artifacts.get("check_results") or [] if isinstance(item, dict)]
         check_by_name = {str(item.get("name") or ""): item for item in check_results}
         acceptance_required = bool((run.acceptance_contract or {}).get("required")) or run.intent == "create"
@@ -1751,7 +1817,8 @@ class WorkbenchService:
             source="manual_review",
             review_context={
                 "run": run.model_dump(mode="json"),
-                "diff": str(artifacts.get("diff") or ""),
+                "diff": diff_text,
+                "review_target": selected_target,
                 "token_usage": run.token_usage,
                 "context_pressure": self.store.get("reports", run.context_pressure_ref) if run.context_pressure_ref else {},
             },
@@ -1859,7 +1926,9 @@ class WorkbenchService:
             "schema": "grounded.review_report.v2",
             "run_id": run_id,
             "workspace_id": run.workspace_id,
-            "status": "failed" if findings else "passed",
+            "status": "unavailable" if not selected_target.get("available", True) and not findings else "failed" if findings else "passed",
+            "review_target": selected_target,
+            "review_targets": review_targets,
             "summary": {
                 "finding_count": len(findings),
                 "blocker_count": blocker_count,
@@ -1868,12 +1937,16 @@ class WorkbenchService:
                 "stale_test_risks": sum(1 for item in findings if item.get("category") == "stale_test_risk"),
                 "browser_proof_gaps": sum(1 for item in findings if item.get("category") == "browser_proof"),
                 "contract_mismatches": sum(1 for item in findings if item.get("category") == "product_contract"),
+                "review_target": selected_target.get("id"),
+                "review_target_available": bool(selected_target.get("available", True)),
             },
             "findings": findings,
             "repair_cases": repair_cases,
             "evidence": {
-                "diff_available": bool(artifacts.get("diff")),
+                "diff_available": bool(diff_text),
                 "changed_files": changed_files,
+                "review_target": selected_target,
+                "review_targets": review_targets,
                 "checks": check_results,
                 "browser_proof_ref": run.browser_proof_ref,
                 "verifier_review_ref": run.verifier_review_ref,
@@ -1883,8 +1956,147 @@ class WorkbenchService:
             },
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
-        self.store.upsert("reports", f"review:{run_id}", payload)
+        review_ref = f"review:{run_id}" if selected_target.get("id") == "current_draft" else f"review:{run_id}:{selected_target.get('id')}"
+        self.store.upsert("reports", review_ref, payload)
         return payload
+
+    def _review_target_context(self, *, run: RunRecord, artifacts: dict[str, Any], selected_target: str | None) -> dict[str, Any]:
+        raw_target = str(selected_target or "current_draft").strip().lower().replace("-", "_")
+        target_id = self.REVIEW_TARGET_ALIASES.get(raw_target, raw_target)
+        allowed = {item["id"] for item in self.REVIEW_TARGET_DEFINITIONS}
+        if target_id not in allowed:
+            target_id = "current_draft"
+        raw_diff = str(artifacts.get("diff") or "")
+        if not raw_diff:
+            try:
+                raw_diff = str(self.workspace_service.diff(run.workspace_id, run_id=run.run_id) or "")
+            except KeyError:
+                raw_diff = ""
+        all_changed = self._dedupe_paths([*(run.touched_files or []), *self._paths_from_diff(raw_diff)])
+        targets = [self._review_target_descriptor(definition["id"], run=run, artifacts=artifacts, raw_diff=raw_diff, all_changed=all_changed) for definition in self.REVIEW_TARGET_DEFINITIONS]
+        selected = next((item for item in targets if item.get("id") == target_id), targets[0])
+        changed_files = [str(path) for path in selected.get("files") or [] if str(path).strip()]
+        diff_text = raw_diff if target_id == "current_draft" else self._filter_diff(raw_diff, changed_files)
+        return {
+            "selected_target": selected,
+            "targets": targets,
+            "changed_files": changed_files,
+            "diff": diff_text,
+        }
+
+    def _review_target_descriptor(self, target_id: str, *, run: RunRecord, artifacts: dict[str, Any], raw_diff: str, all_changed: list[str]) -> dict[str, Any]:
+        definition = next(item for item in self.REVIEW_TARGET_DEFINITIONS if item["id"] == target_id)
+        files = list(all_changed)
+        available = True
+        reason: str | None = None
+        metadata: dict[str, Any] = {}
+        if target_id == "against_base_template":
+            files = [path for path in all_changed if self._path_differs_from_base_template(run.workspace_id, run.run_id, path)]
+            available = bool(files)
+            reason = None if available else "No changed files differ from the canonical base template."
+            metadata["base"] = "canonical_template"
+        elif target_id == "since_last_successful_run":
+            previous = self._previous_successful_run(run)
+            if previous is None:
+                files = []
+                available = False
+                reason = "No previous completed applied run exists for this workspace."
+            else:
+                previous_files = self._dedupe_paths([*(previous.touched_files or []), *self._paths_from_diff(str(self._run_artifacts_or_empty(previous.run_id).get("diff") or ""))])
+                files = self._dedupe_paths([*all_changed, *[path for path in previous_files if path in all_changed]])
+                metadata["base_run_id"] = previous.run_id
+                metadata["base_result_revision_id"] = previous.result_revision_id
+                metadata["shared_files"] = sorted(set(previous_files) & set(all_changed))[:80]
+                metadata["new_files"] = sorted(set(all_changed) - set(previous_files))[:80]
+        elif target_id == "product_runtime_files":
+            files = [path for path in all_changed if self._is_product_runtime_file(path)]
+            available = bool(files)
+            reason = None if available else "No product runtime files changed in this draft."
+        elif target_id == "failed_repair_patch":
+            repair_failed = run.mode == "fix" and (run.status in {"failed", "blocked"} or bool(run.remaining_issues) or bool(run.failure_reason))
+            files = self._dedupe_paths([*(run.fix_targets or []), *all_changed])
+            available = bool(repair_failed and files)
+            reason = None if available else "Run is not a failed or blocked repair patch."
+            metadata["failure_class"] = run.failure_class
+            metadata["failure_signature"] = run.failure_signature
+            metadata["remaining_issue_count"] = len(run.remaining_issues or [])
+            metadata["repair_iteration_count"] = len(run.repair_iterations or [])
+        stats = self._diff_file_stats(self._filter_diff(raw_diff, files) if target_id != "current_draft" else raw_diff)
+        return {
+            **definition,
+            "available": available,
+            "reason": reason,
+            "files": files[:120],
+            "file_count": len(files),
+            "diff_available": bool(raw_diff and files),
+            "summary": {
+                "additions": sum(int(item.get("additions") or 0) for item in stats.values()),
+                "deletions": sum(int(item.get("deletions") or 0) for item in stats.values()),
+                "diff_file_count": len(stats),
+            },
+            "metadata": metadata,
+        }
+
+    def _previous_successful_run(self, run: RunRecord) -> RunRecord | None:
+        candidates: list[RunRecord] = []
+        for _, payload in self.store.items("runs"):
+            if not isinstance(payload, dict):
+                continue
+            try:
+                candidate = RunRecord.model_validate(payload)
+            except Exception:
+                continue
+            if candidate.workspace_id != run.workspace_id or candidate.run_id == run.run_id:
+                continue
+            if candidate.status == "completed" and candidate.apply_status == "applied" and candidate.created_at <= run.created_at:
+                candidates.append(candidate)
+        candidates.sort(key=lambda item: item.created_at, reverse=True)
+        return candidates[0] if candidates else None
+
+    def _path_differs_from_base_template(self, workspace_id: str, run_id: str, relative_path: str) -> bool:
+        path = str(relative_path or "").replace("\\", "/").strip()
+        if not path or path.startswith("/") or ".." in Path(path).parts:
+            return False
+        base_path = self.settings.template_dir / path
+        draft_path = self.workspace_service.draft_source_dir(workspace_id, run_id) / path
+        source_path = self.workspace_service.source_dir(workspace_id) / path
+        current_path = draft_path if draft_path.exists() else source_path
+        if not current_path.exists():
+            return base_path.exists()
+        if not base_path.exists():
+            return True
+        if current_path.is_dir() or base_path.is_dir():
+            return current_path.is_dir() != base_path.is_dir()
+        return self._file_digest(current_path) != self._file_digest(base_path)
+
+    @staticmethod
+    def _file_digest(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 256), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _is_product_runtime_file(path: str) -> bool:
+        normalized = str(path or "").replace("\\", "/")
+        if normalized.startswith(("miniapp/tests/", "tests/", "docs/", ".github/")):
+            return False
+        if normalized.startswith("miniapp/app/"):
+            return True
+        return normalized in {"miniapp/requirements.txt", "miniapp/Dockerfile", "miniapp/pyproject.toml", "miniapp/package.json", "miniapp/package-lock.json"}
+
+    @staticmethod
+    def _dedupe_paths(paths: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for path in paths:
+            item = str(path or "").strip().replace("\\", "/")
+            while item.startswith("./"):
+                item = item[2:]
+            if not item or item.startswith("/") or ".." in Path(item).parts:
+                continue
+            normalized.append(item)
+        return list(dict.fromkeys(normalized))
 
     def prompt_suggestions(self, run_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
@@ -2552,6 +2764,17 @@ class WorkbenchService:
             add_issue("preview_infra", "browser_flow_smoke", run.failure_reason or "Browser/preview infrastructure blocked product proof.", evidence=artifacts.get("preview_infra_diagnostics") or {})
         apply_ok = run.apply_status == "applied"
         browser_proof = self._normalize_browser_proof_payload(run, artifacts)
+        browser_product_proof = self._browser_product_proof_for_run(run=run, artifacts=artifacts, browser_proof=browser_proof)
+        if acceptance_required:
+            for issue in browser_product_proof.get("issues") or []:
+                if not isinstance(issue, dict) or not issue.get("blocking", True):
+                    continue
+                add_issue(
+                    str(issue.get("kind") or "browser_product_proof"),
+                    "browser_product_proof",
+                    str(issue.get("details") or "Browser product proof is incomplete."),
+                    evidence={"browser_product_proof": issue},
+                )
         traceability = self.requirement_traceability(run_id, run=run, artifacts=artifacts, browser_proof=browser_proof)
         if full_audit_required:
             issues.extend(RequirementTraceabilityMatrix.blocking_issues(traceability))
@@ -2571,6 +2794,8 @@ class WorkbenchService:
             browser_proof=browser_proof,
         )
         issues.extend(VisualRegressionGenerator.blocking_issues(visual_regression))
+        lsp_verification = self._lsp_verification_for_run(run=run, artifacts=artifacts, diff_text=diff_text)
+        issues.extend(lsp_verification.get("issues") or [])
 
         checkpoint = self.store.get("reports", run.resume_checkpoint_ref) if run.resume_checkpoint_ref else None
         checkpoint_packets = list((checkpoint or {}).get("repair_packets") or []) if isinstance(checkpoint, dict) else []
@@ -2632,6 +2857,19 @@ class WorkbenchService:
             "issue_count": len(visual_regression.get("issues") or []),
             "report_ref": f"visual_regression:{run_id}",
         }
+        readiness_evidence["browser_product_proof"] = {
+            "status": browser_product_proof.get("status"),
+            "blocking": browser_product_proof.get("blocking"),
+            "issue_count": len(browser_product_proof.get("issues") or []),
+            "report_ref": f"browser_product_proof:{run_id}",
+        }
+        readiness_evidence["lsp_verification"] = {
+            "status": lsp_verification.get("status"),
+            "blocking": lsp_verification.get("blocking"),
+            "issue_count": len(lsp_verification.get("issues") or []),
+            "diagnostics_ref": lsp_verification.get("diagnostics_ref"),
+            "route_graph_ref": lsp_verification.get("route_graph_ref"),
+        }
         readiness_payload["evidence"] = readiness_evidence
         status = "passed" if not blocking and apply_ok else "blocked" if blocking else "pending"
         payload = {
@@ -2649,6 +2887,8 @@ class WorkbenchService:
             "requirement_traceability": traceability,
             "prompt_completion_audit": completion_audit,
             "visual_regression": visual_regression,
+            "browser_product_proof": browser_product_proof,
+            "lsp_verification": lsp_verification,
             "requirements": {
                 "acceptance_required": acceptance_required,
                 "generation_sla": generation_sla.to_dict(),
@@ -2656,6 +2896,13 @@ class WorkbenchService:
                 "requirement_traceability": full_audit_required,
                 "prompt_completion_audit": full_audit_required,
                 "visual_regression": acceptance_required,
+                "browser_product_proof": acceptance_required,
+                "browser_role_screenshots": acceptance_required,
+                "browser_console_network_capture": acceptance_required,
+                "browser_reload_persistence": acceptance_required,
+                "acceptance_contract_scenarios": bool((run.acceptance_contract or {}).get("flows")),
+                "lsp_changed_files_diagnostics": acceptance_required,
+                "lsp_route_graph": acceptance_required,
                 "meaningful_diff": True,
                 "api_workflow_smoke": acceptance_required,
                 "browser_flow_smoke": acceptance_required,
@@ -2671,6 +2918,10 @@ class WorkbenchService:
                 "requirement_traceability": f"requirement_traceability:{run_id}",
                 "prompt_completion_audit": f"prompt_completion_audit:{run_id}",
                 "visual_regression": f"visual_regression:{run_id}",
+                "browser_product_proof": f"browser_product_proof:{run_id}",
+                "lsp_verification": f"lsp_verification:{run_id}",
+                "lsp_diagnostics": lsp_verification.get("diagnostics_ref"),
+                "lsp_route_graph": lsp_verification.get("route_graph_ref"),
                 "repair_recipes": run.repair_recipes_ref,
                 "final_report": f"final_report:{run_id}",
                 "resume_checkpoint": run.resume_checkpoint_ref,
@@ -2678,6 +2929,7 @@ class WorkbenchService:
                 "repair_cases": RepairCaseService.index_ref(run_id),
             },
         }
+        self.store.upsert("reports", f"browser_product_proof:{run_id}", browser_product_proof)
         state = RunStateMachine.evaluate(run=run, gate=payload, artifacts=artifacts, browser_proof=browser_proof)
         if state.get("invariant_issues"):
             payload["issues"] = [*payload["issues"], *state["invariant_issues"]]
@@ -2779,6 +3031,110 @@ class WorkbenchService:
         if normalized.endswith((".pyc", ".pyo", ".tsbuildinfo")):
             return False
         return normalized.startswith(("miniapp/app/", "miniapp/requirements.txt", "miniapp/Dockerfile"))
+
+    def _lsp_verification_for_run(self, *, run: RunRecord, artifacts: dict[str, Any], diff_text: str) -> dict[str, Any]:
+        del artifacts
+        changed_files = self._dedupe_paths([*(run.touched_files or []), *self._paths_from_diff(str(diff_text or ""))])
+        product_changed_files = [path for path in changed_files if self._is_product_runtime_source_path(path)]
+        root = self.workspace_service.draft_source_dir(run.workspace_id, run.run_id)
+        if not root.exists():
+            root = self.workspace_service.source_dir(run.workspace_id)
+        should_run = bool(product_changed_files or self._has_product_runtime_change(diff_text, run.touched_files))
+        diagnostics: dict[str, Any] = {
+            "schema": "grounded.lsp_diagnostics.v1",
+            "tool": "lsp.diagnostics",
+            "status": "skipped",
+            "items": [],
+            "error_count": 0,
+            "warning_count": 0,
+            "changed_only": True,
+            "changed_files": product_changed_files,
+            "targets": product_changed_files,
+        }
+        route_graph: dict[str, Any] = {
+            "schema": "grounded.lsp_route_graph.v1",
+            "tool": "lsp.route_graph",
+            "status": "skipped",
+            "summary": {},
+            "missing_edges": [],
+            "api_mismatches": [],
+        }
+        if should_run:
+            diagnostics = LspToolService.diagnostics(
+                root=root,
+                targets=product_changed_files or None,
+                changed_files=product_changed_files,
+                changed_only=True,
+                include_optional_tools=False,
+            )
+            route_graph = LspToolService.route_graph(root=root, targets=["miniapp/app/routes", "miniapp/app/static"])
+        diagnostics_ref = f"lsp_diagnostics:{run.workspace_id}:{run.run_id}:changed"
+        route_graph_ref = f"lsp_route_graph:{run.workspace_id}:{run.run_id}"
+        self.store.upsert("reports", diagnostics_ref, {**diagnostics, "workspace_id": run.workspace_id, "run_id": run.run_id, "gate_required": should_run})
+        self.store.upsert("reports", route_graph_ref, {**route_graph, "workspace_id": run.workspace_id, "run_id": run.run_id, "gate_required": should_run})
+        issues: list[dict[str, Any]] = []
+        for item in diagnostics.get("items") or []:
+            if not isinstance(item, dict) or item.get("severity") != "error":
+                continue
+            issues.append(
+                {
+                    "kind": "lsp_changed_files_diagnostics",
+                    "check": "lsp_diagnostics_changed_only",
+                    "details": str(item.get("message") or "Changed file diagnostics failed."),
+                    "blocking": True,
+                    "evidence": {
+                        "diagnostic": item,
+                        "changed_files": product_changed_files,
+                        "diagnostics_ref": diagnostics_ref,
+                        "required_next_tool": "lsp_diagnostics",
+                        "suggested_tool_after_read": "lsp_symbol_context",
+                    },
+                }
+            )
+        route_summary = route_graph.get("summary") if isinstance(route_graph.get("summary"), dict) else {}
+        route_issue_count = int(route_summary.get("missing_edge_count") or 0) + int(route_summary.get("api_mismatch_count") or 0)
+        if should_run and route_issue_count:
+            issues.append(
+                {
+                    "kind": "lsp_route_graph",
+                    "check": "lsp_route_graph",
+                    "details": "FastAPI/static route graph has unresolved frontend API edges.",
+                    "blocking": True,
+                    "evidence": {
+                        "summary": route_summary,
+                        "missing_edges": list(route_graph.get("missing_edges") or [])[:12],
+                        "api_mismatches": list(route_graph.get("api_mismatches") or [])[:12],
+                        "route_graph_ref": route_graph_ref,
+                        "required_next_tool": "lsp_route_graph",
+                        "suggested_tool_after_read": "lsp_find_references",
+                    },
+                }
+            )
+        status = "skipped" if not should_run else "failed" if issues else "passed"
+        report = {
+            "schema": "grounded.lsp_verification.v1",
+            "workspace_id": run.workspace_id,
+            "run_id": run.run_id,
+            "status": status,
+            "blocking": bool(issues),
+            "changed_only": True,
+            "changed_files": product_changed_files,
+            "diagnostics_ref": diagnostics_ref,
+            "route_graph_ref": route_graph_ref,
+            "diagnostics": diagnostics,
+            "route_graph": route_graph,
+            "issues": issues,
+            "policy": {
+                "diagnostics_after_each_patch": True,
+                "changed_files_only_gate": True,
+                "symbol_context_before_edit": "Use lsp_symbol_context before semantic edits when file names/symbols are uncertain.",
+                "find_references_before_rename": "Use lsp_find_references before renaming symbols, routes, ids, or API paths.",
+                "route_graph_required_for_fastapi_static": True,
+            },
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.store.upsert("reports", f"lsp_verification:{run.run_id}", report)
+        return report
 
     def repair_signatures(self, run_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
@@ -3031,10 +3387,17 @@ class WorkbenchService:
             "do_not_change": [],
             "platform_constraints": [],
             "repeated_fixes": [],
+            "product_memory_types": {},
+            "preferences": [],
+            "product_facts": [],
+            "successful_patterns": [],
+            "ui_vocabulary": [],
+            "persistence_schema_decisions": [],
         }
         stale_check = WorkspaceMemoryPipeline.stale_check(self.workspace_service.source_dir(workspace_id), current)
         current["stale_check"] = stale_check
         WorkspaceMemoryPipeline.apply_stale_status(current, stale_check)
+        WorkspaceMemoryPipeline._populate_buckets(current)
         current["pipeline"] = self.memory_pipeline(workspace_id)
         current["memory_summary"] = WorkspaceMemoryPipeline.summary(workspace_id, current)
         current["session_memory"] = self.session_memory(workspace_id, memory=current)
@@ -3071,6 +3434,7 @@ class WorkbenchService:
         superseded_count = sum(1 for item in items if item.get("status") == "superseded")
         memory_summary = WorkspaceMemoryPipeline.summary(workspace_id, workspace_memory)
         category_counts = WorkspaceMemoryPipeline._category_counts(items)
+        type_buckets = WorkspaceMemoryPipeline.type_buckets(items)
         return {
             "schema": "grounded.memory_pipeline.v1",
             "workspace_id": workspace_id,
@@ -3092,6 +3456,8 @@ class WorkbenchService:
             "stage1_count": len(stage1),
             "stage1_items": sum(len(payload.get("items") or []) for payload in stage1),
             "category_counts": category_counts,
+            "type_counts": {key: len(value) for key, value in type_buckets.items()},
+            "product_memory_types": type_buckets,
             "active_count": active_count,
             "stale_count": stale_count,
             "expired_count": expired_count,
@@ -3223,9 +3589,24 @@ class WorkbenchService:
 
     def upsert_memory(self, workspace_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         current = self.memory(workspace_id)
+        raw_kind = str(payload.get("memory_type") or payload.get("kind") or "note") if str(payload.get("kind") or "") == "note" else str(payload.get("kind") or payload.get("memory_type") or "note")
+        kind_aliases = {
+            "preferences": "preference",
+            "user_preference": "preference",
+            "product_facts": "product_fact",
+            "product_fact": "product_fact",
+            "known_failures": "failure_signature",
+            "successful_patterns": "successful_app_pattern",
+            "rejected_approaches": "rejected_approach",
+            "ui_vocabulary": "ui_vocabulary",
+            "persistence_schema_decisions": "persistence_schema_decision",
+            "persistence_schema": "persistence_schema_decision",
+        }
+        normalized_kind = kind_aliases.get(raw_kind, raw_kind)
         item = {
             "memory_id": f"mem_{uuid4().hex}",
-            "kind": str(payload.get("kind") or "note"),
+            "kind": normalized_kind,
+            "memory_type": str(payload.get("memory_type") or WorkspaceMemoryPipeline.memory_type_for_kind(normalized_kind)),
             "text": str(payload.get("text") or payload.get("content") or "").strip(),
             "citation": payload.get("citation"),
             "citations": [payload.get("citation")] if isinstance(payload.get("citation"), dict) else [],
@@ -3256,12 +3637,18 @@ class WorkbenchService:
             "rejected_approach": "rejected_approaches",
             "avoidance": "rejected_approaches",
             "reusable_workflow": "reusable_workflows",
+            "successful_app_pattern": "successful_app_patterns",
+            "ui_vocabulary": "ui_vocabulary",
+            "persistence_schema_decision": "persistence_schema_decisions",
             "do_not_change": "do_not_change",
             "repeated_fix": "repeated_fixes",
         }
         bucket = bucket_map.get(item["kind"])
         if bucket:
             current.setdefault(bucket, []).append(item)
+        memory_type = str(item.get("memory_type") or WorkspaceMemoryPipeline.memory_type_for_kind(item["kind"]))
+        current.setdefault(memory_type, []).append(item)
+        current["product_memory_types"] = WorkspaceMemoryPipeline.type_buckets(current.get("items") or [])
         current["stale_check"] = self._memory_stale_check(workspace_id, current)
         current["memory_summary"] = WorkspaceMemoryPipeline.summary(workspace_id, current)
         current["session_memory"] = self.session_memory(workspace_id, memory=current)
@@ -3380,7 +3767,7 @@ class WorkbenchService:
             return self._store_slash_execution({**base, "workspace_id": created.workspace_id, "run_id": target.run_id if target else None, "status": "started", "workflow": "add_product_flow", "run": created.model_dump(mode="json")})
         if command_id == "review":
             target = run or self._latest_run_for_slash(workspace_id, prefer_failed=False)
-            report = self.review(target.run_id)
+            report = self.review(target.run_id, target=str(payload.get("target") or (payload.get("metadata") or {}).get("target") or "") or None)
             return self._store_slash_execution({**base, "workspace_id": target.workspace_id, "run_id": target.run_id, "status": report.get("status") or "available", "workflow": "risk_review", "report": report})
         if command_id == "acceptance":
             target = run or self._latest_run_for_slash(workspace_id, prefer_failed=False)
@@ -4730,7 +5117,7 @@ class WorkbenchService:
         fingerprint = str(approval.get("command_fingerprint") or evaluation.get("command_fingerprint") or "")
         if not fingerprint:
             return evaluation
-        grant = self._workspace_approval_grant(workspace_id, fingerprint)
+        grant = self._workspace_approval_grant(workspace_id, evaluation)
         if not grant:
             return evaluation
         updated_approval = {
@@ -4739,6 +5126,7 @@ class WorkbenchService:
             "status": "approved_by_workspace_grant",
             "approval_id": grant.get("approval_id"),
             "grant_id": grant.get("grant_id"),
+            "grant_scope": grant.get("grant_scope") or grant.get("scope"),
         }
         updated = {**evaluation, "approval": updated_approval}
         decision = updated.get("decision") if isinstance(updated.get("decision"), dict) else {}
@@ -4752,10 +5140,22 @@ class WorkbenchService:
             }
         return updated
 
-    def _workspace_approval_grant(self, workspace_id: str, command_fingerprint: str) -> dict[str, Any] | None:
+    def _workspace_approval_grant(self, workspace_id: str, evaluation: dict[str, Any]) -> dict[str, Any] | None:
+        command_fingerprint = str(evaluation.get("command_fingerprint") or "")
+        command_prefix = evaluation.get("command_prefix") if isinstance(evaluation.get("command_prefix"), dict) else {}
+        prefix_fingerprint = str(command_prefix.get("prefix_fingerprint") or "")
+        decision = evaluation.get("decision") if isinstance(evaluation.get("decision"), dict) else {}
+        risk = str(decision.get("risk") or "")
         grants = self.workspace_approval_grants(workspace_id)
         for item in grants.get("items") or []:
             if isinstance(item, dict) and item.get("command_fingerprint") == command_fingerprint and item.get("status") == "approved":
+                return item
+        if not prefix_fingerprint or risk in {"network", "destructive", "forbidden"}:
+            return None
+        for item in grants.get("items") or []:
+            if not isinstance(item, dict) or item.get("status") != "approved":
+                continue
+            if item.get("prefix_fingerprint") == prefix_fingerprint and item.get("grant_scope") == "approved_command_prefix":
                 return item
         return None
 
@@ -4776,13 +5176,28 @@ class WorkbenchService:
             "approval_id": item.get("approval_id"),
             "workspace_id": workspace_id,
             "scope": "workspace",
+            "grant_scope": "exact_command",
             "kind": item.get("kind") or "command",
             "status": "approved",
             "command_fingerprint": fingerprint,
+            "command_prefix": item.get("command_prefix") if isinstance(item.get("command_prefix"), dict) else {},
+            "prefix_fingerprint": ((item.get("command_prefix") or {}).get("prefix_fingerprint") if isinstance(item.get("command_prefix"), dict) else None),
             "summary": item.get("summary") or "",
             "risk": item.get("risk") or "unknown",
             "decided_at": item.get("decided_at") or datetime.now(timezone.utc).isoformat(),
         }
+        prefix_grant = None
+        command_prefix = grant["command_prefix"] if isinstance(grant.get("command_prefix"), dict) else {}
+        prefix_fingerprint = str(command_prefix.get("prefix_fingerprint") or "")
+        if prefix_fingerprint and grant["risk"] not in {"network", "destructive", "forbidden"}:
+            prefix_grant = {
+                **grant,
+                "grant_id": f"grant_prefix_{prefix_fingerprint[:20]}",
+                "grant_scope": "approved_command_prefix",
+                "command_fingerprint": None,
+                "prefix_fingerprint": prefix_fingerprint,
+                "summary": f"Approved command prefix: {command_prefix.get('prefix_text') or grant.get('summary') or ''}".strip(),
+            }
         replaced = False
         for index, existing in enumerate(items):
             if existing.get("command_fingerprint") == fingerprint:
@@ -4791,6 +5206,15 @@ class WorkbenchService:
                 break
         if not replaced:
             items.append(grant)
+        if prefix_grant is not None:
+            replaced_prefix = False
+            for index, existing in enumerate(items):
+                if existing.get("prefix_fingerprint") == prefix_fingerprint and existing.get("grant_scope") == "approved_command_prefix":
+                    items[index] = {**existing, **prefix_grant}
+                    replaced_prefix = True
+                    break
+            if not replaced_prefix:
+                items.append(prefix_grant)
         payload["items"] = items[-250:]
         payload["updated_at"] = datetime.now(timezone.utc).isoformat()
         self.store.upsert("reports", key, payload)
@@ -4802,6 +5226,32 @@ class WorkbenchService:
         artifacts = self._run_artifacts_or_empty(run_id)
         checkpoint = self.store.get("reports", run.resume_checkpoint_ref) if run.resume_checkpoint_ref else {}
         context_pressure = self.store.get("reports", run.context_pressure_ref) if run.context_pressure_ref else {}
+        context_manager_ref = run.context_manager_ref
+        if self.context_manager_service is not None:
+            prepared = self.context_manager_service.prepare_turn_context(
+                workspace_id=run.workspace_id,
+                run_id=run.run_id,
+                session_id=run.session_id,
+                prompt=run.prompt,
+                generation_mode=run.generation_mode,
+                run_mode=run.mode,
+                prompt_payload={
+                    "task": run.prompt,
+                    "run": run.model_dump(mode="json"),
+                    "artifacts": artifacts,
+                    "checkpoint": checkpoint if isinstance(checkpoint, dict) else {},
+                    "context_pressure": context_pressure if isinstance(context_pressure, dict) else {},
+                },
+                transcript_snapshot=self.store.get("reports", run.agent_transcript_ref) if run.agent_transcript_ref else {},
+                context_pressure=context_pressure if isinstance(context_pressure, dict) else {},
+                artifacts=artifacts,
+                proofs={
+                    "browser_proof_ref": run.browser_proof_ref,
+                    "verification_report_ref": run.verification_report_ref,
+                    "trace_bundle_ref": run.trace_bundle_ref,
+                },
+            )
+            context_manager_ref = str(prepared.get("report_ref") or context_manager_ref or "")
         return self.run_compaction_service.compact_run(
             run=run,
             artifacts=artifacts,
@@ -4809,6 +5259,7 @@ class WorkbenchService:
             context_pressure=context_pressure if isinstance(context_pressure, dict) else {},
             reason="manual",
             source="manual",
+            context_manager_ref=context_manager_ref or None,
         )
 
     def compaction(self, run_id: str) -> dict[str, Any]:
@@ -4849,6 +5300,58 @@ class WorkbenchService:
             "updated_at": (latest or {}).get("created_at"),
         }
         return ContextPressureReport.model_validate(normalized).model_dump(mode="json", by_alias=True)
+
+    def context_manager(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        ref = run.context_manager_ref or f"context_manager:{run.workspace_id}:{run_id}"
+        payload = self.store.get("reports", ref)
+        if isinstance(payload, dict):
+            return ContextManagerReport.model_validate(payload).model_dump(mode="json", by_alias=True)
+        if self.context_manager_service is not None:
+            return self.context_manager_service.get_run_report(
+                workspace_id=run.workspace_id,
+                run_id=run_id,
+                session_id=run.session_id,
+            )
+        raise KeyError("Context manager report is unavailable.")
+
+    def session_context_manager(self, session_id: str) -> dict[str, Any]:
+        if self.context_manager_service is None:
+            raise KeyError("Context manager service is unavailable.")
+        if self.platform_db is None:
+            return self.context_manager_service.session_report(session_id=session_id, run_reports=[])
+        turns = self.platform_db.list_turns(session_id, limit=500)
+        run_ids = [str(turn.linked_run_id) for turn in turns if turn.linked_run_id]
+        reports: list[dict[str, Any]] = []
+        for run_id in run_ids:
+            try:
+                reports.append(self.context_manager(run_id))
+            except KeyError:
+                continue
+        return self.context_manager_service.session_report(session_id=session_id, run_reports=reports)
+
+    def compact_context_manager(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        if self.context_manager_service is None:
+            raise KeyError("Context manager service is unavailable.")
+        context_pressure = self.store.get("reports", run.context_pressure_ref) if run.context_pressure_ref else {}
+        prepared = self.context_manager_service.prepare_turn_context(
+            workspace_id=run.workspace_id,
+            run_id=run.run_id,
+            session_id=run.session_id,
+            prompt=run.prompt,
+            generation_mode=run.generation_mode,
+            run_mode=run.mode,
+            prompt_payload={
+                "task": run.prompt,
+                "run": run.model_dump(mode="json"),
+                "context_pressure": context_pressure if isinstance(context_pressure, dict) else {},
+            },
+            transcript_snapshot=self.store.get("reports", run.agent_transcript_ref) if run.agent_transcript_ref else {},
+            context_pressure=context_pressure if isinstance(context_pressure, dict) else {},
+            artifacts=self._run_artifacts_or_empty(run_id),
+        )
+        return prepared.get("report") if isinstance(prepared.get("report"), dict) else self.context_manager(run_id)
 
     def compaction_boundaries(self, run_id: str) -> dict[str, Any]:
         self.run_service.get_run(run_id)
@@ -5081,7 +5584,12 @@ class WorkbenchService:
         root = self.workspace_service.draft_source_dir(workspace_id, run_id) if run_id else self.workspace_service.source_dir(workspace_id)
         changed_files: list[str] = []
         if run_id:
-            changed_files = self._paths_from_diff(self.workspace_service.diff(workspace_id, run_id=run_id))
+            run = self.run_service.get_run(run_id)
+            try:
+                diff_paths = self._paths_from_diff(self.workspace_service.diff(workspace_id, run_id=run_id))
+            except KeyError:
+                diff_paths = []
+            changed_files = self._dedupe_paths([*(run.touched_files or []), *diff_paths])
         report = LspToolService.diagnostics(
             root=root,
             targets=files,
@@ -5201,12 +5709,36 @@ class WorkbenchService:
             base_revision_id=payload.get("base_revision_id"),
         )
         run_id = payload.get("run_id")
+        target_files = self._dedupe_paths([str(operation.file_path or "") for operation in ops])
+        root = self.workspace_service.draft_source_dir(workspace_id, str(run_id)) if run_id else self.workspace_service.source_dir(workspace_id)
+        query_terms = [Path(path).stem for path in target_files if Path(path).stem and Path(path).stem not in {"__init__", "index"}]
+        report["lsp_pre_edit_context"] = {
+            **LspToolService.symbol_context(
+                root=root,
+                query=" ".join(query_terms[:6]),
+                targets=target_files or None,
+                limit=40,
+            ),
+            "policy": {
+                "required_before_patch": True,
+                "targets": target_files,
+                "reason": "Symbol context is captured before patch application so edits can use local code structure.",
+            },
+        }
         if run_id:
             event_type = "sandbox.preflight_passed" if (report.get("sandbox_report") or {}).get("status") == "passed" else "sandbox.preflight_blocked"
             self._journal_run_event(
                 str(run_id),
                 event_type,
-                {"workspace_id": workspace_id, "report": report.get("sandbox_report") or {}},
+                {
+                    "workspace_id": workspace_id,
+                    "report": report.get("sandbox_report") or {},
+                    "lsp_pre_edit_context": {
+                        "schema": report["lsp_pre_edit_context"].get("schema"),
+                        "item_count": len(report["lsp_pre_edit_context"].get("items") or []),
+                        "targets": target_files,
+                    },
+                },
                 summary="Sandbox preflight completed.",
                 idempotency_key=f"{event_type}:{run_id}:{len(ops)}:{report.get('status')}",
             )
@@ -5218,6 +5750,199 @@ class WorkbenchService:
         except KeyError:
             self.run_service.get_run(run_id)
             return {}
+
+    def _browser_product_proof_for_run(self, *, run: RunRecord, artifacts: dict[str, Any], browser_proof: dict[str, Any]) -> dict[str, Any]:
+        contract = run.acceptance_contract if isinstance(run.acceptance_contract, dict) else {}
+        browser_check = self._check_result_by_name(artifacts, "browser_flow_smoke")
+        diagnostics = browser_check.get("diagnostics") if isinstance(browser_check.get("diagnostics"), dict) else {}
+        proof = browser_proof if isinstance(browser_proof, dict) else {}
+        raw_proof = proof.get("role_workflows") if isinstance(proof.get("role_workflows"), dict) else {}
+        roles_required = self._browser_required_roles(run=run, acceptance_contract=contract)
+        screenshots = proof.get("role_page_screenshots") if isinstance(proof.get("role_page_screenshots"), list) else []
+        screenshot_roles = {
+            str(item.get("role") or self._role_from_text(str(item.get("route") or item.get("path") or ""))).strip().lower()
+            for item in screenshots
+            if isinstance(item, dict)
+        }
+        missing_screenshot_roles = sorted(role for role in roles_required if role not in screenshot_roles)
+        console_capture_present = self._browser_capture_field_present("console_errors", proof, raw_proof, diagnostics)
+        network_capture_present = self._browser_capture_field_present("network_errors", proof, raw_proof, diagnostics)
+        console_errors = [str(item) for item in proof.get("console_errors") or [] if str(item).strip()]
+        network_errors = [str(item) for item in proof.get("network_errors") or [] if str(item).strip()]
+        reload_evidence = self._browser_reload_evidence(proof=proof, raw_proof=raw_proof, diagnostics=diagnostics)
+        persisted_marker = (
+            proof.get("persisted_state_marker")
+            or raw_proof.get("persisted_state_marker")
+            or diagnostics.get("persisted_state_marker")
+            or raw_proof.get("created_marker")
+            or diagnostics.get("created_marker")
+        )
+        mobile_layout = proof.get("mobile_layout") if isinstance(proof.get("mobile_layout"), dict) else {}
+        mobile_ok = (
+            bool(mobile_layout)
+            and str(mobile_layout.get("status") or "passed").lower() != "failed"
+            and not bool(mobile_layout.get("horizontal_overflow"))
+            and not bool(mobile_layout.get("critical_overlap") or mobile_layout.get("overlap"))
+        )
+        contract_scenarios = self._browser_contract_scenarios(acceptance_contract=contract, browser_proof=proof)
+        missing_contract_scenarios = [item for item in contract_scenarios if item.get("status") != "passed"]
+        issues: list[dict[str, Any]] = []
+
+        def issue(kind: str, details: str, evidence: dict[str, Any]) -> None:
+            issues.append({"kind": kind, "details": details, "blocking": True, "evidence": evidence})
+
+        if str(proof.get("status") or "").lower() != "passed":
+            issue("browser_product_proof_failed", "Normalized browser proof is not passing.", {"browser_status": proof.get("status"), "browser_issues": proof.get("issues") or []})
+        if missing_screenshot_roles:
+            issue("browser_product_proof_missing_role_screenshots", "Browser proof is missing screenshot evidence for required roles.", {"missing_roles": missing_screenshot_roles, "required_roles": roles_required})
+        if not console_capture_present:
+            issue("browser_product_proof_missing_console_capture", "Browser proof did not record console error capture.", {"required_field": "console_errors"})
+        if not network_capture_present:
+            issue("browser_product_proof_missing_network_capture", "Browser proof did not record network error capture.", {"required_field": "network_errors"})
+        if console_errors:
+            issue("browser_product_proof_console_errors", "Browser proof recorded console errors.", {"items": console_errors[:20]})
+        if network_errors:
+            issue("browser_product_proof_network_errors", "Browser proof recorded network errors.", {"items": network_errors[:20]})
+        if persisted_marker and not reload_evidence.get("verified"):
+            issue("browser_product_proof_missing_reload_marker", "Persisted browser workflow was not verified after reload.", {"persisted_marker": persisted_marker, "reload_evidence": reload_evidence})
+        if not mobile_ok:
+            issue("browser_product_proof_mobile_layout", "Browser proof is missing a passing mobile overflow/overlap check.", {"mobile_layout": mobile_layout})
+        if missing_contract_scenarios:
+            issue("browser_product_proof_missing_acceptance_scenarios", "Browser proof does not cover all acceptance-contract scenarios.", {"missing": missing_contract_scenarios})
+
+        status = "passed" if not issues else "failed"
+        return {
+            "schema": "grounded.browser_product_proof.v1",
+            "run_id": run.run_id,
+            "workspace_id": run.workspace_id,
+            "status": status,
+            "blocking": bool(issues),
+            "source": "acceptance_contract",
+            "required_roles": roles_required,
+            "role_screenshot_coverage": {
+                "status": "passed" if not missing_screenshot_roles else "failed",
+                "roles_with_screenshots": sorted(role for role in screenshot_roles if role),
+                "missing_roles": missing_screenshot_roles,
+                "items": screenshots,
+            },
+            "console_network_capture": {
+                "status": "passed" if console_capture_present and network_capture_present and not console_errors and not network_errors else "failed",
+                "console_capture_present": console_capture_present,
+                "network_capture_present": network_capture_present,
+                "console_errors": console_errors[:20],
+                "network_errors": network_errors[:20],
+            },
+            "reload_persistence": reload_evidence | {"persisted_marker": persisted_marker},
+            "mobile_layout": {
+                "status": "passed" if mobile_ok else "failed",
+                "report": mobile_layout,
+            },
+            "acceptance_scenario_coverage": {
+                "status": "passed" if not missing_contract_scenarios else "failed",
+                "scenarios": contract_scenarios,
+            },
+            "issues": issues,
+            "artifact_refs": {
+                "browser_proof": proof.get("artifact_refs", {}).get("browser_proof") if isinstance(proof.get("artifact_refs"), dict) else run.browser_proof_ref,
+                "run_artifacts": f"run_artifacts:{run.run_id}",
+                "browser_product_proof": f"browser_product_proof:{run.run_id}",
+            },
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    @staticmethod
+    def _browser_required_roles(*, run: RunRecord, acceptance_contract: dict[str, Any]) -> list[str]:
+        raw_roles: list[Any] = []
+        if run.target_role_scope:
+            raw_roles.extend(run.target_role_scope)
+        roles = acceptance_contract.get("roles")
+        if isinstance(roles, list):
+            raw_roles.extend(roles)
+        role_actions = acceptance_contract.get("role_actions")
+        if isinstance(role_actions, dict):
+            raw_roles.extend(role_actions.keys())
+        normalized = {str(role or "").strip().lower() for role in raw_roles}
+        known = [role for role in ("client", "specialist", "manager") if role in normalized]
+        return known or ["client"]
+
+    @staticmethod
+    def _browser_capture_field_present(field: str, proof: dict[str, Any], raw_proof: dict[str, Any], diagnostics: dict[str, Any]) -> bool:
+        del proof
+        return field in raw_proof or field in diagnostics
+
+    @classmethod
+    def _browser_reload_evidence(cls, *, proof: dict[str, Any], raw_proof: dict[str, Any], diagnostics: dict[str, Any]) -> dict[str, Any]:
+        marker_after_reload = (
+            proof.get("persisted_marker_after_reload")
+            or raw_proof.get("persisted_marker_after_reload")
+            or diagnostics.get("persisted_marker_after_reload")
+            or proof.get("reload_persisted_state_marker")
+            or raw_proof.get("reload_persisted_state_marker")
+            or diagnostics.get("reload_persisted_state_marker")
+        )
+        explicit = any(bool(value) for value in (proof.get("reload_verified"), raw_proof.get("reload_verified"), diagnostics.get("reload_verified")))
+        snapshots = proof.get("dom_snapshots") if isinstance(proof.get("dom_snapshots"), list) else []
+        reload_snapshots = [
+            item
+            for item in snapshots
+            if isinstance(item, dict)
+            and any(token in str(item.get("phase") or item.get("action") or "").lower() for token in ("reload", "after_reload", "post_reload"))
+        ]
+        return {
+            "status": "passed" if explicit or marker_after_reload or reload_snapshots else "not_recorded",
+            "verified": bool(explicit or marker_after_reload or reload_snapshots),
+            "persisted_marker_after_reload": marker_after_reload,
+            "reload_snapshots": reload_snapshots[:20],
+        }
+
+    @classmethod
+    def _browser_contract_scenarios(cls, *, acceptance_contract: dict[str, Any], browser_proof: dict[str, Any]) -> list[dict[str, Any]]:
+        flows = [item for item in acceptance_contract.get("flows") or [] if isinstance(item, dict)]
+        if not flows:
+            return []
+        proof_scenarios = [
+            item
+            for item in [
+                *(browser_proof.get("scenarios") or []),
+                *((browser_proof.get("role_workflows") or {}).get("acceptance_scenarios") or [] if isinstance(browser_proof.get("role_workflows"), dict) else []),
+            ]
+            if isinstance(item, dict)
+        ]
+        steps = [item for item in browser_proof.get("steps") or [] if isinstance(item, dict)]
+        result: list[dict[str, Any]] = []
+        for flow in flows:
+            flow_id = str(flow.get("id") or flow.get("name") or flow.get("title") or "").strip()
+            role = str(flow.get("role") or "").strip().lower()
+            if not flow_id:
+                continue
+            matched = cls._browser_contract_flow_matched(flow_id=flow_id, role=role, proof_scenarios=proof_scenarios, steps=steps)
+            result.append(
+                {
+                    "id": flow_id,
+                    "role": role or None,
+                    "status": "passed" if matched else "missing",
+                    "source": "acceptance_contract",
+                    "required": True,
+                }
+            )
+        return result
+
+    @staticmethod
+    def _browser_contract_flow_matched(*, flow_id: str, role: str, proof_scenarios: list[dict[str, Any]], steps: list[dict[str, Any]]) -> bool:
+        needles = {flow_id.lower()}
+        for item in proof_scenarios:
+            status = str(item.get("status") or "").lower()
+            item_role = str(item.get("role") or "").lower()
+            haystack = " ".join(str(item.get(key) or "") for key in ("id", "scenario_id", "flow_id", "name", "title", "action")).lower()
+            if any(needle and needle in haystack for needle in needles) and status in {"passed", "proved", "ok", "success"}:
+                return not role or item_role in {"", role}
+        for step in steps:
+            status = str(step.get("status") or "passed").lower()
+            item_role = str(step.get("role") or "").lower()
+            haystack = " ".join(str(step.get(key) or "") for key in ("flow_id", "scenario_id", "action", "step", "name")).lower()
+            if any(needle and needle in haystack for needle in needles) and status not in {"failed", "blocked"}:
+                return not role or item_role in {"", role}
+        return False
 
     def _normalize_browser_proof_payload(self, run: RunRecord, artifacts: dict[str, Any]) -> dict[str, Any]:
         stored_ref_payload = self.store.get("reports", run.browser_proof_ref) if run.browser_proof_ref else None

@@ -18,7 +18,9 @@ GuardianFindingCategory = Literal[
     "breaking_changes",
     "changed_size_risk",
     "context_bloat",
+    "destructive_action",
     "missing_tests",
+    "policy",
     "product_readiness",
     "role_workflow",
     "security_privacy",
@@ -69,10 +71,11 @@ class GuardianReviewReport(StrictModel):
     run_id: str
     workspace_id: str
     status: Literal["passed", "failed"]
-    source: Literal["pre_apply_guardian", "runtime_verifier", "manual_review"] = "runtime_verifier"
+    source: Literal["pre_apply_guardian", "pre_mutation_guardian", "runtime_verifier", "manual_review"] = "runtime_verifier"
     findings: list[GuardianFinding] = Field(default_factory=list)
     checklist: list[GuardianChecklistItem] = Field(default_factory=list)
     final_review_gate: dict[str, Any] = Field(default_factory=dict)
+    review_prompt: dict[str, Any] = Field(default_factory=dict)
     summary: dict[str, Any] = Field(default_factory=dict)
     evidence: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=utc_now)

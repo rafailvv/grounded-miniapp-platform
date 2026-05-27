@@ -1,4 +1,5 @@
 ---
+metadata_schema: grounded.skill.v2
 description: Preserve and extend an already generated mini-app without broad rewrites.
 whenToUse:
   - existing app edit
@@ -16,9 +17,17 @@ allowedTools:
   - run_checks
 model: default
 effort: medium
+triggerRules:
+  - Match prompts using this skill domain and path scope.
 validation:
   - changed_files_static
   - frontend_interaction_static_smoke
+requiredProof:
+  - Final readiness proof covers this skill.
+incompatibleSkills:
+  - ""
+outputExpectations:
+  - Produce working product changes and cite proof artifacts.
 ---
 # Existing App Edit
 
