@@ -217,6 +217,8 @@ class JobRecord(StrictModel):
     tool_batch_summaries_ref: str | None = None
     task_ledger_ref: str | None = None
     worker_mailbox_ref: str | None = None
+    worker_sessions_ref: str | None = None
+    worker_ownership_ref: str | None = None
     scratchpad_ref: str | None = None
     memory_ref: str | None = None
     worker_drafts_ref: str | None = None
@@ -613,6 +615,8 @@ class RunRecord(StrictModel):
     tool_batch_summaries_ref: str | None = None
     task_ledger_ref: str | None = None
     worker_mailbox_ref: str | None = None
+    worker_sessions_ref: str | None = None
+    worker_ownership_ref: str | None = None
     scratchpad_ref: str | None = None
     memory_ref: str | None = None
     worker_drafts_ref: str | None = None

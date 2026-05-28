@@ -103,6 +103,7 @@ from app.services.output_artifact_service import OutputArtifactService
 from app.services.repair_cases import RepairCaseService
 from app.services.run_protocol import RunProtocolService, diff_sha256
 from app.services.trace_bundle import TraceBundleWriter
+from app.services.worker_sessions import WorkerSessionService
 from app.services.generation_enhancements import SkillPackCatalog
 from app.services.workflow_acceptance import (
     build_acceptance_contract,
@@ -180,6 +181,7 @@ class WorkspaceCodeAgentRuntime:
         run_compaction_service: RunCompactionService | None = None,
         context_manager_service: ContextManagerService | None = None,
         lsp_context_service: LspContextService | None = None,
+        worker_session_service: WorkerSessionService | None = None,
         event_journal_service: EventJournalService | None = None,
         hook_policy_service: HookPolicyService | None = None,
         output_artifact_service: OutputArtifactService | None = None,
@@ -235,6 +237,7 @@ class WorkspaceCodeAgentRuntime:
         self.run_compaction_service = run_compaction_service
         self.context_manager_service = context_manager_service
         self.lsp_context_service = lsp_context_service
+        self.worker_session_service = worker_session_service
         self.event_journal_service = event_journal_service
 
     def get_job(self, job_id: str) -> JobRecord:
@@ -1872,6 +1875,39 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             job.worker_mailbox_ref,
             {"workspace_id": workspace_id, "run_id": run_id, "mailbox": worker_mailbox, "worker_tasks": worker_tasks},
         )
+        if self.worker_session_service is not None:
+            worker_sessions = self.worker_session_service.create_sessions(
+                workspace_id=workspace_id,
+                parent_run_id=run_id,
+                artifact_run_id=artifact_run_id,
+                worker_tasks=worker_tasks,
+                mailbox=worker_mailbox,
+                implementation_plan=implementation_plan,
+                acceptance_contract=acceptance_contract,
+            )
+            job.worker_sessions_ref = str(worker_sessions.get("sessions_ref") or "")
+            job.worker_ownership_ref = str(worker_sessions.get("ownership_ref") or "")
+            by_worker = {
+                canonical_worker_id(str(item.get("worker_id") or "")): item
+                for item in worker_sessions.get("items") or []
+                if isinstance(item, dict)
+            }
+            for task in worker_tasks:
+                if isinstance(task, dict):
+                    session = by_worker.get(canonical_worker_id(str(task.get("worker_id") or ""))) or {}
+                    task["worker_session_id"] = session.get("worker_session_id")
+                    task["mailbox_ref"] = worker_sessions.get("mailbox_ref")
+                    task["ownership_ref"] = worker_sessions.get("ownership_ref")
+            worker_mailbox = {
+                **worker_mailbox,
+                "worker_sessions_ref": worker_sessions.get("sessions_ref"),
+                "mailbox_ref": worker_sessions.get("mailbox_ref"),
+                "ownership_ref": worker_sessions.get("ownership_ref"),
+            }
+            self._store_report(
+                job.worker_mailbox_ref,
+                {"workspace_id": workspace_id, "run_id": run_id, "mailbox": worker_mailbox, "worker_tasks": worker_tasks},
+            )
         worker_tasks = self._prepare_product_worker_artifacts(
             workspace_id=workspace_id,
             run_id=run_id,
@@ -3588,6 +3624,15 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         }
         ref = f"worker_manager_merge_decision:{workspace_id}:{artifact_run_id}"
         self._store_report(ref, payload)
+        if self.worker_session_service is not None:
+            self.worker_session_service.mark_merge_decision(
+                workspace_id=workspace_id,
+                parent_run_id=run_id,
+                artifact_run_id=artifact_run_id,
+                decisions=decisions,
+                status=status,
+                merge_ref=ref,
+            )
 
     @staticmethod
     def _repair_packets_from_worker_decisions(decisions: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -3739,6 +3784,21 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
 
         def run_worker(worker_id: str, task: dict[str, Any], worker: dict[str, Any]) -> None:
             try:
+                if self.worker_session_service is not None:
+                    self.worker_session_service.start_turn(
+                        workspace_id=workspace_id,
+                        parent_run_id=run_id,
+                        artifact_run_id=artifact_run_id,
+                        worker_id=worker_id,
+                        input_refs={
+                            "context_ref": task.get("context_ref"),
+                            "memory_snapshot_ref": task.get("memory_snapshot_ref"),
+                            "output_ref": task.get("output_ref"),
+                            "mailbox_ref": task.get("mailbox_ref"),
+                            "ownership_ref": task.get("ownership_ref"),
+                            "worker_session_id": task.get("worker_session_id"),
+                        },
+                    )
                 result = self.worker_branch_loop.run(
                     workspace_id=workspace_id,
                     parent_run_id=artifact_run_id,
@@ -3776,6 +3836,31 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                 result=result,
                 branch_ref=ref,
             )
+            if self.worker_session_service is not None:
+                try:
+                    self.worker_session_service.complete_turn(
+                        workspace_id=workspace_id,
+                        parent_run_id=run_id,
+                        artifact_run_id=artifact_run_id,
+                        worker_id=worker_id,
+                        status="failed" if result.status == "failed" else "completed",
+                        changed_files=list(result.changed_files),
+                        output_ref=worker_refs(workspace_id, artifact_run_id, worker_id)["output_ref"],
+                        failure_packet_ref=ref if result.status == "failed" else None,
+                        metadata={
+                            "branch_ref": ref,
+                            "branch_run_id": result.branch_run_id,
+                            "result_status": result.status,
+                            "model": result.model,
+                        },
+                    )
+                except Exception as exc:
+                    self._append_event(
+                        job,
+                        "worker_failed",
+                        f"Worker {worker_id} session turn could not be finalized.",
+                        {"worker_id": worker_id, "error": str(exc), "artifact_ref": ref},
+                    )
             if result.token_usage:
                 job.token_usage = self._merge_run_token_usage(
                     job.token_usage if isinstance(job.token_usage, dict) else {},
@@ -6034,6 +6119,9 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                     "verification_report_ref": job.verification_report_ref,
                     "trace_bundle_ref": job.trace_bundle_ref,
                     "lsp_context_ref": job.lsp_context_ref,
+                    "worker_sessions_ref": job.worker_sessions_ref,
+                    "worker_mailbox_ref": job.worker_mailbox_ref,
+                    "worker_ownership_ref": job.worker_ownership_ref,
                 },
                 bookmarks=bookmarks if isinstance(bookmarks, list) else [],
             )
@@ -7561,6 +7649,8 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         job.environment_snapshot_ref = job.environment_snapshot_ref or f"environment_snapshot:{job.workspace_id}:{artifact_run_id}"
         job.tool_batch_summaries_ref = job.tool_batch_summaries_ref or f"tool_batch_summaries:{job.workspace_id}:{artifact_run_id}"
         job.worker_mailbox_ref = job.worker_mailbox_ref or f"worker_mailbox:{job.workspace_id}:{artifact_run_id}"
+        job.worker_sessions_ref = job.worker_sessions_ref or f"worker_sessions:{job.workspace_id}:{artifact_run_id}"
+        job.worker_ownership_ref = job.worker_ownership_ref or f"worker_ownership:{job.workspace_id}:{artifact_run_id}"
         job.scratchpad_ref = job.scratchpad_ref or f"scratchpad:{job.workspace_id}:{artifact_run_id}"
         job.memory_ref = job.memory_ref or f"agent_memory_store:{job.workspace_id}:{artifact_run_id}"
         job.worker_drafts_ref = job.worker_drafts_ref or f"worker_drafts:{job.workspace_id}:{artifact_run_id}"
@@ -7577,7 +7667,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             *job.worker_branch_refs,
             *[
                 ref
-                for ref in [job.worker_drafts_ref, job.worker_merge_ref, job.worker_mailbox_ref, job.worker_prefix_ref]
+                for ref in [job.worker_drafts_ref, job.worker_merge_ref, job.worker_mailbox_ref, job.worker_sessions_ref, job.worker_ownership_ref, job.worker_prefix_ref]
                 if ref
             ],
         ]
@@ -9019,6 +9109,8 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         payload["environment_snapshot_ref"] = job.environment_snapshot_ref
         payload["tool_batch_summaries_ref"] = job.tool_batch_summaries_ref
         payload["worker_mailbox_ref"] = job.worker_mailbox_ref
+        payload["worker_sessions_ref"] = job.worker_sessions_ref
+        payload["worker_ownership_ref"] = job.worker_ownership_ref
         payload["scratchpad_ref"] = job.scratchpad_ref
         payload["memory_ref"] = job.memory_ref
         payload["worker_drafts_ref"] = job.worker_drafts_ref

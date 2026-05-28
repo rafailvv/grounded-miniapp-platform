@@ -433,6 +433,8 @@ class SessionProtocolReducer:
             "failure_signature": run.failure_signature,
             "context_manager_ref": getattr(run, "context_manager_ref", None),
             "lsp_context_ref": getattr(run, "lsp_context_ref", None),
+            "worker_sessions_ref": getattr(run, "worker_sessions_ref", None),
+            "worker_ownership_ref": getattr(run, "worker_ownership_ref", None),
             "created_at": run.created_at.isoformat(),
             "updated_at": run.updated_at.isoformat(),
         }
@@ -447,6 +449,9 @@ class SessionProtocolReducer:
             "tool_trace": run.tool_trace_ref,
             "context_manager": getattr(run, "context_manager_ref", None),
             "lsp_context": getattr(run, "lsp_context_ref", None),
+            "worker_sessions": getattr(run, "worker_sessions_ref", None),
+            "worker_mailbox": getattr(run, "worker_mailbox_ref", None),
+            "worker_ownership": getattr(run, "worker_ownership_ref", None),
             "context_pressure": run.context_pressure_ref,
             "browser_proof": run.browser_proof_ref,
             "verification_report": run.verification_report_ref,

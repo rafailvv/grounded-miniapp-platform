@@ -14,6 +14,7 @@ from app.services.context_pack_builder import ContextPackBuilder
 from app.services.context_manager import ContextManagerService
 from app.services.lsp_context import LspContextService
 from app.services.lsp_server_manager import LspServerManager
+from app.services.worker_sessions import WorkerSessionService
 from app.services.document_intelligence import DocumentIntelligenceService
 from app.services.export_service import ExportService
 from app.services.engine import (
@@ -103,6 +104,7 @@ class ServiceContainer:
             budget_manager=self.context_budget_manager,
             event_journal_service=self.event_journal_service,
         )
+        self.worker_session_service = WorkerSessionService(self.store, event_journal_service=self.event_journal_service)
         self.context_pack_builder = ContextPackBuilder(
             self.code_index_service,
             self.workspace_service,
@@ -124,6 +126,7 @@ class ServiceContainer:
             run_compaction_service=self.run_compaction_service,
             context_manager_service=self.context_manager_service,
             lsp_context_service=self.lsp_context_service,
+            worker_session_service=self.worker_session_service,
             event_journal_service=self.event_journal_service,
             hook_policy_service=self.hook_policy_service,
             output_artifact_service=self.output_artifact_service,
@@ -172,6 +175,7 @@ class ServiceContainer:
             background_task_service=self.background_task_service,
             repair_case_service=self.repair_case_service,
             context_manager_service=self.context_manager_service,
+            worker_session_service=self.worker_session_service,
             lsp_context_service=self.lsp_context_service,
             event_journal_service=self.event_journal_service,
             output_artifact_service=self.output_artifact_service,

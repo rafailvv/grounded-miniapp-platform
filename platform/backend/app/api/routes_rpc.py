@@ -154,6 +154,26 @@ async def _dispatch(container: ServiceContainer, method: str, params: dict[str, 
         return container.session_protocol_reducer.run_protocol(str(params.get("run_id") or params.get("runId") or ""))
     if method == "run/context_manager":
         return container.workbench_service.context_manager(str(params.get("run_id") or params.get("runId") or ""))
+    if method == "worker/sessions":
+        return container.workbench_service.worker_sessions(str(params.get("run_id") or params.get("runId") or ""))
+    if method == "worker/mailbox":
+        return container.workbench_service.worker_mailbox(str(params.get("run_id") or params.get("runId") or ""))
+    if method == "worker/session":
+        return container.workbench_service.worker_session(
+            str(params.get("run_id") or params.get("runId") or ""),
+            str(params.get("worker_session_id") or params.get("workerSessionId") or ""),
+        )
+    if method == "worker/resume":
+        return container.workbench_service.resume_worker_session(
+            str(params.get("run_id") or params.get("runId") or ""),
+            str(params.get("worker_session_id") or params.get("workerSessionId") or ""),
+        )
+    if method == "worker/message":
+        return container.workbench_service.message_worker_session(
+            str(params.get("run_id") or params.get("runId") or ""),
+            str(params.get("worker_session_id") or params.get("workerSessionId") or ""),
+            params,
+        )
     if method == "fs/readFile":
         return service.fs_read_file(workspace_id=str(params.get("workspace_id") or params.get("workspaceId") or ""), path=str(params.get("path") or ""), run_id=params.get("run_id") or params.get("runId"))
     if method == "fs/writeFile":

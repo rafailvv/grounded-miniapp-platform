@@ -26,6 +26,8 @@ from app.models.protocol import (
     TurnIdParams,
     TurnInterruptParams,
     TurnStartParams,
+    WorkerSessionMessageParams,
+    WorkerSessionParams,
 )
 
 RPC_PROTOCOL_SCHEMA = "grounded.rpc_protocol.v2"
@@ -47,6 +49,11 @@ RPC_PARAM_MODELS: dict[str, type] = {
     "turn/interrupt": TurnInterruptParams,
     "run/protocol": RunReplayParams,
     "run/context_manager": RunReplayParams,
+    "worker/sessions": RunReplayParams,
+    "worker/mailbox": RunReplayParams,
+    "worker/session": WorkerSessionParams,
+    "worker/resume": WorkerSessionParams,
+    "worker/message": WorkerSessionMessageParams,
     "run/replay": RunReplayParams,
     "run/compare": RunCompareParams,
     "run/resume_from_bookmark": RunBookmarkParams,
@@ -124,6 +131,11 @@ def rpc_protocol_report() -> RpcProtocolReport:
             _method("turn/interrupt", TurnInterruptParams, "TurnRecord", description="Interrupt a running turn."),
             _method("run/protocol", RunReplayParams, "RunProtocolReportV2", idempotent=True, description="Read canonical run protocol state."),
             _method("run/context_manager", RunReplayParams, "ContextManagerReport", idempotent=True, description="Read run context budget manifest and decisions."),
+            _method("worker/sessions", RunReplayParams, "WorkerSessionsReport", idempotent=True, description="Read durable worker sessions for a run."),
+            _method("worker/mailbox", RunReplayParams, "WorkerMailboxReport", idempotent=True, description="Read durable worker mailbox for a run."),
+            _method("worker/session", WorkerSessionParams, "WorkerSessionRecord", idempotent=True, description="Read one durable worker session."),
+            _method("worker/resume", WorkerSessionParams, "WorkerSessionResume", description="Build a resume decision packet for a worker session."),
+            _method("worker/message", WorkerSessionMessageParams, "WorkerMailboxReport", description="Append a durable message to a worker mailbox."),
             _method(
                 "run/replay",
                 RunReplayParams,

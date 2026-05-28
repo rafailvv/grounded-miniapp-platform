@@ -1279,6 +1279,8 @@ class RunService:
                 "tool_batch_summaries_ref",
                 "task_ledger_ref",
                 "worker_mailbox_ref",
+                "worker_sessions_ref",
+                "worker_ownership_ref",
                 "scratchpad_ref",
                 "memory_ref",
                 "worker_drafts_ref",
@@ -1454,6 +1456,8 @@ class RunService:
                 "environment_snapshot_ref",
                 "tool_batch_summaries_ref",
                 "worker_mailbox_ref",
+                "worker_sessions_ref",
+                "worker_ownership_ref",
                 "scratchpad_ref",
                 "memory_ref",
                 "worker_drafts_ref",
@@ -1872,6 +1876,8 @@ class RunService:
             run.environment_snapshot_ref = getattr(job, "environment_snapshot_ref", None) or run.environment_snapshot_ref
             run.tool_batch_summaries_ref = getattr(job, "tool_batch_summaries_ref", None) or run.tool_batch_summaries_ref
             run.worker_mailbox_ref = getattr(job, "worker_mailbox_ref", None) or run.worker_mailbox_ref
+            run.worker_sessions_ref = getattr(job, "worker_sessions_ref", None) or run.worker_sessions_ref
+            run.worker_ownership_ref = getattr(job, "worker_ownership_ref", None) or run.worker_ownership_ref
             run.scratchpad_ref = getattr(job, "scratchpad_ref", None) or run.scratchpad_ref
             run.memory_ref = getattr(job, "memory_ref", None) or run.memory_ref
             run.worker_drafts_ref = getattr(job, "worker_drafts_ref", None) or run.worker_drafts_ref
@@ -2511,6 +2517,8 @@ class RunService:
             "environment_snapshot_ref": run.environment_snapshot_ref,
             "tool_batch_summaries_ref": run.tool_batch_summaries_ref,
             "worker_mailbox_ref": run.worker_mailbox_ref,
+            "worker_sessions_ref": run.worker_sessions_ref,
+            "worker_ownership_ref": run.worker_ownership_ref,
             "scratchpad_ref": run.scratchpad_ref,
             "memory_ref": run.memory_ref,
             "worker_drafts_ref": run.worker_drafts_ref,

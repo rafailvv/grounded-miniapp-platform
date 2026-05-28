@@ -103,6 +103,7 @@ from app.services.lsp_context import LspContextService
 from app.services.run_protocol import RunProtocolConflict, RunProtocolService, diff_sha256
 from app.services.trace_bundle import TraceBundleReducer
 from app.services.run_task_ledger import RunTaskLedger
+from app.services.worker_sessions import WorkerSessionService
 from app.services.skillify import SkillifyService
 from app.services.session_memory import SessionMemorySections
 from app.services.workspace.run_service import RunService
@@ -179,6 +180,7 @@ class WorkbenchService:
         background_task_service: BackgroundTaskService | None = None,
         repair_case_service: RepairCaseService | None = None,
         context_manager_service: ContextManagerService | None = None,
+        worker_session_service: WorkerSessionService | None = None,
         lsp_context_service: LspContextService | None = None,
         event_journal_service: EventJournalService | None = None,
         output_artifact_service: OutputArtifactService | None = None,
@@ -194,6 +196,7 @@ class WorkbenchService:
         self.run_protocol_service = run_protocol_service
         self.run_compaction_service = run_compaction_service
         self.context_manager_service = context_manager_service
+        self.worker_session_service = worker_session_service or WorkerSessionService(store, event_journal_service=event_journal_service)
         self.lsp_context_service = lsp_context_service
         self.background_task_service = background_task_service
         self.event_journal_service = event_journal_service
@@ -1401,6 +1404,12 @@ class WorkbenchService:
         worker_ids = [role.worker_id for role in PRODUCT_WORKERS if role.worker_id != "repair_worker"]
         if any((item.get("repair_worker") if isinstance(item, dict) else None) for item in [merge_decision]):
             worker_ids.append("repair_worker")
+        worker_sessions_report = self.worker_sessions(run_id)
+        sessions_by_worker = {
+            canonical_worker_id(str(item.get("worker_id") or "")): item
+            for item in worker_sessions_report.get("items") or []
+            if isinstance(item, dict)
+        }
         lanes = []
         for worker_id in worker_ids:
             canonical = canonical_worker_id(worker_id)
@@ -1428,13 +1437,20 @@ class WorkbenchService:
             )
             task = real_tasks.get(canonical) or {}
             status = self._worker_status(canonical, run, summaries, merge_reports, mailbox_workers)
+            worker_session = sessions_by_worker.get(canonical) or {}
             if isinstance(output, dict) and output.get("status"):
                 status = str(output.get("status"))
+            if isinstance(worker_session, dict) and worker_session.get("status") not in {None, "", "planned"}:
+                status = str(worker_session.get("status"))
             if isinstance(decision, dict) and decision.get("decision") in {"accepted", "rejected", "needs_repair"}:
                 status = {"accepted": "merged", "rejected": "rejected", "needs_repair": "blocked"}[str(decision.get("decision"))]
             lanes.append(
                 {
                     "worker_id": canonical,
+                    "worker_session_id": worker_session.get("worker_session_id") if isinstance(worker_session, dict) else None,
+                    "latest_turn_id": worker_session.get("latest_turn_id") if isinstance(worker_session, dict) else None,
+                    "mailbox_ref": worker_sessions_report.get("mailbox_ref"),
+                    "ownership_ref": worker_sessions_report.get("ownership_ref"),
                     "worker_type": canonical,
                     "alias_ids": list(product_owner_contract(canonical).get("alias_ids") or []),
                     "lane_id": product_owner_contract(canonical).get("lane_id"),
@@ -1481,10 +1497,84 @@ class WorkbenchService:
                 "merge_policy": "accept only owned diffs with merge evidence; route rejected/blocked paths to repair_worker",
             },
             "worker_branch_refs": run.worker_branch_refs,
+            "worker_sessions_ref": worker_sessions_report.get("sessions_ref"),
+            "worker_sessions": worker_sessions_report.get("items") or [],
+            "worker_mailbox_v2": worker_sessions_report.get("mailbox") or {},
+            "worker_ownership": worker_sessions_report.get("ownership") or {},
             "merge_decision_ref": merge_decision_ref if merge_decision else None,
             "mailbox": (mailbox or {}).get("mailbox") if isinstance(mailbox, dict) else {},
             "branch_plan": ((mailbox or {}).get("mailbox") or {}).get("execution_stages") if isinstance(mailbox, dict) else [],
         }
+
+    def worker_sessions(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        artifact_run_id = self._worker_artifact_run_id(run)
+        report = self.worker_session_service.list_sessions(
+            workspace_id=run.workspace_id,
+            parent_run_id=run_id,
+            artifact_run_id=artifact_run_id,
+        )
+        if not report.get("items"):
+            mailbox_payload = self.store.get("reports", run.worker_mailbox_ref) if run.worker_mailbox_ref else {}
+            mailbox = mailbox_payload.get("mailbox") if isinstance(mailbox_payload, dict) and isinstance(mailbox_payload.get("mailbox"), dict) else {}
+            worker_tasks = mailbox_payload.get("worker_tasks") if isinstance(mailbox_payload, dict) and isinstance(mailbox_payload.get("worker_tasks"), list) else []
+            if worker_tasks:
+                report = self.worker_session_service.create_sessions(
+                    workspace_id=run.workspace_id,
+                    parent_run_id=run_id,
+                    artifact_run_id=artifact_run_id,
+                    worker_tasks=worker_tasks,
+                    mailbox=mailbox,
+                    implementation_plan=run.implementation_plan or {},
+                    acceptance_contract=run.acceptance_contract or {},
+                )
+        return report
+
+    def worker_session(self, run_id: str, worker_session_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        return self.worker_session_service.get_session(
+            workspace_id=run.workspace_id,
+            parent_run_id=run_id,
+            artifact_run_id=self._worker_artifact_run_id(run),
+            worker_session_id=worker_session_id,
+        )
+
+    def worker_mailbox(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        return self.worker_session_service.mailbox(
+            workspace_id=run.workspace_id,
+            parent_run_id=run_id,
+            artifact_run_id=self._worker_artifact_run_id(run),
+        )
+
+    def resume_worker_session(self, run_id: str, worker_session_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        return self.worker_session_service.resume(
+            workspace_id=run.workspace_id,
+            parent_run_id=run_id,
+            artifact_run_id=self._worker_artifact_run_id(run),
+            worker_session_id=worker_session_id,
+        )
+
+    def message_worker_session(self, run_id: str, worker_session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        artifact_run_id = self._worker_artifact_run_id(run)
+        detail = self.worker_session_service.get_session(
+            workspace_id=run.workspace_id,
+            parent_run_id=run_id,
+            artifact_run_id=artifact_run_id,
+            worker_session_id=worker_session_id,
+        )
+        session = detail.get("session") if isinstance(detail.get("session"), dict) else {}
+        return self.worker_session_service.append_message(
+            workspace_id=run.workspace_id,
+            parent_run_id=run_id,
+            artifact_run_id=artifact_run_id,
+            from_worker=str(payload.get("from") or payload.get("from_worker") or "coordinator"),
+            to_worker=str(payload.get("to") or payload.get("to_worker") or session.get("worker_id") or ""),
+            kind=str(payload.get("kind") or "manual"),
+            payload=payload.get("payload") if isinstance(payload.get("payload"), dict) else payload,
+        )
 
     def worker_orchestration(self, run_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
@@ -1537,6 +1627,10 @@ class WorkbenchService:
             "worker_merge": merge,
             "merge_decision_ref": merge_decision_ref if merge_decision else None,
             "merge_decision": merge_decision,
+            "worker_sessions": workers.get("worker_sessions") or [],
+            "mailbox_v2": workers.get("worker_mailbox_v2") or {},
+            "ownership": workers.get("worker_ownership") or {},
+            "resume_candidates": (self.worker_sessions(run_id).get("resume_candidates") or []),
             "workers": workers.get("workers") or [],
             "worker_memory_refs": [
                 item.get("memory_snapshot_ref")

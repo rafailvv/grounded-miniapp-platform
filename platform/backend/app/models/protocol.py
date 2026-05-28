@@ -182,6 +182,18 @@ class RunReplayParams(StrictModel):
     limit: int = 500
 
 
+class WorkerSessionParams(StrictModel):
+    run_id: str = Field(validation_alias=AliasChoices("run_id", "runId"))
+    worker_session_id: str = Field(validation_alias=AliasChoices("worker_session_id", "workerSessionId"))
+
+
+class WorkerSessionMessageParams(WorkerSessionParams):
+    kind: str = "manual"
+    from_worker: str = Field(default="coordinator", validation_alias=AliasChoices("from_worker", "fromWorker", "from"))
+    to_worker: str | None = Field(default=None, validation_alias=AliasChoices("to_worker", "toWorker", "to"))
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
 class RunCompareParams(StrictModel):
     base_run_id: str = Field(validation_alias=AliasChoices("base_run_id", "baseRunId"))
     target_run_id: str = Field(validation_alias=AliasChoices("target_run_id", "targetRunId"))

@@ -159,6 +159,13 @@ class BackgroundTaskUpdateRequest(BaseModel):
     metadata: dict[str, Any] | None = None
 
 
+class WorkerSessionMessageRequest(BaseModel):
+    kind: str = "manual"
+    from_worker: str = Field(default="coordinator", alias="from")
+    to_worker: str | None = Field(default=None, alias="to")
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
 class PrBabysitterRequest(BaseModel):
     pr: str = "auto"
     repo: str | None = None
@@ -1647,6 +1654,51 @@ def get_run_workers(run_id: str, container: ServiceContainer = Depends(get_conta
 def get_run_worker_orchestration(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     try:
         return container.workbench_service.worker_orchestration(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/runs/{run_id}/worker-sessions")
+def get_run_worker_sessions(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.worker_sessions(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/runs/{run_id}/worker-sessions/{worker_session_id}")
+def get_run_worker_session(run_id: str, worker_session_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.worker_session(run_id, worker_session_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/runs/{run_id}/worker-mailbox")
+def get_run_worker_mailbox(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.worker_mailbox(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/runs/{run_id}/worker-sessions/{worker_session_id}/resume")
+def resume_run_worker_session(run_id: str, worker_session_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.resume_worker_session(run_id, worker_session_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/runs/{run_id}/worker-sessions/{worker_session_id}/message")
+def message_run_worker_session(
+    run_id: str,
+    worker_session_id: str,
+    request: WorkerSessionMessageRequest,
+    container: ServiceContainer = Depends(get_container),
+) -> dict[str, Any]:
+    try:
+        return container.workbench_service.message_worker_session(run_id, worker_session_id, request.model_dump(mode="python", by_alias=True))
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
