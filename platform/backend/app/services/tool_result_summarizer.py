@@ -274,6 +274,8 @@ class ToolResultSummarizer:
             "workflow_results": workflow_results[:12],
             "semantic_status": result.get("semantic_status"),
             "exit_code": result.get("exit_code"),
+            "command_canonical": result.get("command_canonical") if isinstance(result.get("command_canonical"), dict) else {},
+            "execution_classification": result.get("execution_classification") if isinstance(result.get("execution_classification"), dict) else {},
             "failure_signature": result.get("failure_signature"),
             "sha256": digest,
             "digest": digest,

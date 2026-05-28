@@ -1,4 +1,6 @@
 {
+  "$id": "https://grounded.local/schemas/app_protocol/turn_id_params.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "properties": {
     "turn_id": {
@@ -10,7 +12,5 @@
     "turn_id"
   ],
   "title": "TurnIdParams",
-  "type": "object",
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://grounded.local/schemas/app_protocol/turn_id_params.schema.json"
+  "type": "object"
 }

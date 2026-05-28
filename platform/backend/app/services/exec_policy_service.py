@@ -13,6 +13,7 @@ from app.modules.miniapp_agent_loop.agent_command_policy import (
     CommandPolicyDecision,
     configure_default_command_policy,
 )
+from app.services.command_canonicalizer import CommandCanonicalizer
 from app.services.sandbox_service import SandboxService
 from app.services.tool_protocol import TOOL_PROTOCOL_VERSION, ToolRisk, tool_registry_contract
 
@@ -524,6 +525,11 @@ class ExecPolicyService:
         executable = PurePosixPath(decision.argv[0]).name.lower() if decision.argv else ""
         resolved = decision.executable_resolution if isinstance(decision.executable_resolution, dict) else {}
         canonical_argv = [self.redact(str(item)) for item in (decision.resolved_argv or decision.argv)]
+        family = CommandCanonicalizer.canonicalize(
+            decision.normalized_command,
+            argv=list(decision.argv),
+            workspace_id=command_prefix.get("workspace_id") if isinstance(command_prefix, dict) else None,
+        )
         return {
             "schema": "grounded.canonical_command.v1",
             "fingerprint": command_fingerprint,
@@ -541,6 +547,16 @@ class ExecPolicyService:
             "shell_ast": decision.parse_tree,
             "matched_prefix": list(decision.matched_prefix),
             "approved_prefix": command_prefix,
+            "family_fingerprint": family.get("fingerprint"),
+            "command_family": family.get("command_family"),
+            "runner": family.get("runner"),
+            "subcommand": family.get("subcommand"),
+            "package_manager": family.get("package_manager"),
+            "target_args": family.get("target_args") if isinstance(family.get("target_args"), list) else [],
+            "normalized_family_command": self.redact(str(family.get("normalized_family_command") or "")),
+            "retry_recipe_id": family.get("retry_recipe_id"),
+            "status_taxonomy": family.get("status_taxonomy"),
+            "command_intent": family.get("command_intent"),
         }
 
     def _command_prefix_payload(self, decision: CommandPolicyDecision, *, workspace_id: str | None) -> dict[str, Any]:

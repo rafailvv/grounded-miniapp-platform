@@ -203,6 +203,31 @@ async def _dispatch(container: ServiceContainer, method: str, params: dict[str, 
             str(params.get("worker_session_id") or params.get("workerSessionId") or ""),
             params,
         )
+    if method == "doctor/global":
+        return container.workbench_service.doctor(
+            scope=str(params.get("scope") or "quick"),
+            workspace_id=params.get("workspace_id") or params.get("workspaceId"),
+            run_id=params.get("run_id") or params.get("runId"),
+        )
+    if method == "doctor/workspace":
+        return container.workbench_service.doctor_workspace(
+            str(params.get("workspace_id") or params.get("workspaceId") or ""),
+            scope=str(params.get("scope") or "quick"),
+            run_id=params.get("run_id") or params.get("runId"),
+        )
+    if method == "doctor/run":
+        run_id = str(params.get("run_id") or params.get("runId") or "")
+        workspace_id = params.get("workspace_id") or params.get("workspaceId")
+        if not workspace_id and run_id:
+            try:
+                workspace_id = container.run_service.get_run(run_id).workspace_id
+            except KeyError:
+                workspace_id = None
+        return container.workbench_service.doctor(
+            scope=str(params.get("scope") or "quick"),
+            workspace_id=workspace_id,
+            run_id=run_id or None,
+        )
     if method == "fs/readFile":
         return service.fs_read_file(workspace_id=str(params.get("workspace_id") or params.get("workspaceId") or ""), path=str(params.get("path") or ""), run_id=params.get("run_id") or params.get("runId"))
     if method == "fs/writeFile":

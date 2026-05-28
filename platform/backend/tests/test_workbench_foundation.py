@@ -203,6 +203,9 @@ def test_exec_policy_classifies_and_redacts_commands() -> None:
     assert allowed["canonical_command"]["normalized_command"] == "rg api miniapp/app"
     assert allowed["canonical_command"]["executable_name"] == "rg"
     assert allowed["canonical_command"]["canonical_string"]
+    assert allowed["canonical_command"]["command_family"] == "generic.shell"
+    assert allowed["canonical_command"]["normalized_family_command"] == "rg api miniapp/app"
+    assert allowed["canonical_command"]["retry_recipe_id"]
     assert allowed["command_prefix"]["prefix"] == ["rg"]
     assert allowed["decision_trace"]["schema"] == "grounded.exec_policy_decision_trace.v1"
     assert [step["step"] for step in allowed["decision_trace"]["steps"][:3]] == ["parse_shell_subset", "extract_executable", "network_policy"]
@@ -563,7 +566,8 @@ def test_policy_simulation_endpoint_returns_matched_rules(tmp_path: Path) -> Non
     response = client.post("/policy/evaluate", json={"command": "python3 -m pip install requests"}).json()
     doctor = client.get("/doctor").json()
 
-    assert doctor["schema"] == "grounded.doctor_health_panel.v1"
+    assert doctor["schema"] == "grounded.doctor_report.v2"
+    assert doctor["legacy_schema"] == "grounded.doctor_health_panel.v1"
     assert response["decision"]["action"] == "forbidden"
     assert response["decision"]["network_policy"]["code"] == "package_network_operation"
     assert response["shell_parse"]["kind"] == "simple_command"
@@ -579,7 +583,6 @@ def test_policy_simulation_endpoint_returns_matched_rules(tmp_path: Path) -> Non
         "db_writable",
         "browser_availability",
         "docker_daemon",
-        "playwright_browsers",
         "model_access",
         "writable_dirs",
         "disk_space",
@@ -590,10 +593,34 @@ def test_policy_simulation_endpoint_returns_matched_rules(tmp_path: Path) -> Non
     section_keys = {item["key"] for item in doctor["sections"]}
     assert {"python", "node", "browser", "backend", "preview", "storage", "templates", "policy"}.issubset(section_keys)
     assert doctor["summary"]["total"] == len(doctor["checks"])
+    assert "blocking_checks" in doctor
+    assert "warnings" in doctor
+    assert "repair_packet" in doctor
+    assert "next_sequence" in doctor
     template_hash = next(item for item in doctor["checks"] if item["name"] == "template_hash")
     disk_space = next(item for item in doctor["checks"] if item["name"] == "disk_space")
+    env_vars = next(item for item in doctor["checks"] if item["name"] == "env_vars")
     assert "sha256=" in template_hash["details"]
     assert "free=" in disk_space["details"]
+    assert "evidence" in env_vars and "present" in env_vars["evidence"]
+    assert all("duration_ms" in item and "fix_hint" in item and "repair_recipe_id" in item for item in doctor["checks"])
+
+
+def test_doctor_run_supports_full_scope_and_redacts_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-secret-value")
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+
+    doctor = client.post("/doctor/run?scope=full").json()
+    stored = app.state.container.store.get("reports", "doctor:last")
+
+    assert doctor["schema"] == "grounded.doctor_report.v2"
+    assert doctor["scope"] == "full"
+    assert stored["schema"] == "grounded.doctor_report.v2"
+    assert "sk-test-secret-value" not in json.dumps(doctor)
+    assert "playwright_browsers" in {item["name"] for item in doctor["checks"]}
+    env_vars = next(item for item in doctor["checks"] if item["name"] == "env_vars")
+    assert env_vars["evidence"]["present"]["OPENAI_API_KEY"] is True
 
 
 def test_background_tasks_crud_output_stop_retry_and_run_lane(tmp_path: Path) -> None:
@@ -1262,7 +1289,8 @@ def test_debug_stuck_and_doctor_workflows_emit_repair_packets(tmp_path: Path) ->
     assert stuck["mode"] == "stuck_run"
     assert stuck["diagnosis"]["stuck"]["kind"] == "active_not_terminal"
     assert doctor["mode"] == "doctor_workspace"
-    assert doctor["environment_health"]["schema"] == "grounded.doctor_health_panel.v1"
+    assert doctor["environment_health"]["schema"] == "grounded.doctor_report.v2"
+    assert doctor["environment_health"]["legacy_schema"] == "grounded.doctor_health_panel.v1"
     assert doctor["repair_packet"]["target_files"][0] == "miniapp/app/routes/checkout.py"
     assert debug_slash["workflow"] == "debug_run"
     assert stuck_slash["workflow"] == "stuck_run"
@@ -2284,7 +2312,7 @@ def test_typed_event_replay_reconstructs_run_resume_and_compare(tmp_path: Path) 
     last_working_compare = client.get(f"/runs/{base.run_id}/compare-last-working").json()
 
     assert protocol["schema"] == "grounded.rpc_protocol.v2"
-    assert {"run/replay", "run/compare", "run/fork_from_bookmark"}.issubset({item["method"] for item in protocol["methods"]})
+    assert {"run/replay", "run/compare", "run/fork_from_bookmark", "doctor/global", "doctor/workspace", "doctor/run"}.issubset({item["method"] for item in protocol["methods"]})
     assert replay["schema"] == "grounded.run_event_replay.v1"
     assert replay["failure_point"]["check"] == "browser_flow_smoke"
     assert replay["resume"]["latest_bookmark"]["bookmark_id"] == bookmark["bookmark_id"]

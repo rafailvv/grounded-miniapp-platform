@@ -1037,13 +1037,23 @@ def preflight_patch(workspace_id: str, payload: dict[str, Any], container: Servi
 
 
 @router.get("/doctor")
-def get_doctor(container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
-    return container.workbench_service.doctor()
+def get_doctor(
+    scope: str = "quick",
+    workspace_id: str | None = None,
+    run_id: str | None = None,
+    container: ServiceContainer = Depends(get_container),
+) -> dict[str, Any]:
+    return container.workbench_service.doctor(scope=scope, workspace_id=workspace_id, run_id=run_id)
 
 
 @router.post("/doctor/run")
-def run_doctor(container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
-    return container.workbench_service.doctor()
+def run_doctor(
+    scope: str = "quick",
+    workspace_id: str | None = None,
+    run_id: str | None = None,
+    container: ServiceContainer = Depends(get_container),
+) -> dict[str, Any]:
+    return container.workbench_service.doctor(scope=scope, workspace_id=workspace_id, run_id=run_id)
 
 
 @router.get("/runs/{run_id}/observability")
@@ -1189,9 +1199,9 @@ def get_run_stuck(run_id: str, container: ServiceContainer = Depends(get_contain
 
 
 @router.get("/workspaces/{workspace_id}/doctor-workspace")
-def get_doctor_workspace(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+def get_doctor_workspace(workspace_id: str, scope: str = "quick", container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     try:
-        return container.workbench_service.doctor_workspace(workspace_id)
+        return container.workbench_service.doctor_workspace(workspace_id, scope=scope)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 

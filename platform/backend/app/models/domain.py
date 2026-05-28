@@ -459,6 +459,7 @@ class RunCheckResult(StrictModel):
     details: str | None = None
     duration_ms: int | None = None
     command: str | None = None
+    command_canonical: dict[str, Any] = Field(default_factory=dict)
     exit_code: int | None = None
     logs: list[str] = Field(default_factory=list)
     diagnostics: dict[str, Any] = Field(default_factory=dict)

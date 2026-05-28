@@ -36,6 +36,7 @@ from app.services.workspace.service import WorkspaceService
 from app.validators.suite import ValidationSuite
 from app.ai.openai_client import OpenAIClient
 from app.services.exec_policy_service import ExecPolicyService
+from app.services.doctor_service import DoctorService
 from app.services.exec_runtime_service import ExecRuntimeService
 from app.services.sandbox_service import SandboxService
 from app.services.hook_policy_service import HookPolicyService
@@ -159,6 +160,14 @@ class ServiceContainer:
         )
         self.run_service.attach_guardian_gate_service(self.guardian_gate_service)
         self.exec_policy_service = ExecPolicyService(self.settings.runtime_dir / "policies" / "agent_exec_policy.json", sandbox_service=self.sandbox_service)
+        self.doctor_service = DoctorService(
+            settings=self.settings,
+            store=self.store,
+            openai_client=self.openai_client,
+            exec_policy_service=self.exec_policy_service,
+            event_journal_service=self.event_journal_service,
+            run_protocol_service=self.run_protocol_service,
+        )
         self.exec_runtime_service = ExecRuntimeService(
             workspace_service=self.workspace_service,
             platform_db=self.platform_db,
@@ -199,6 +208,7 @@ class ServiceContainer:
             output_artifact_service=self.output_artifact_service,
             pr_babysitter_service=self.pr_babysitter_service,
             browser_replay_proof_service=self.browser_replay_proof_service,
+            doctor_service=self.doctor_service,
         )
         self.thread_service = ThreadService(
             self.platform_db,

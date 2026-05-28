@@ -369,6 +369,17 @@ class WorkspaceMemoryPipeline:
                     check_name=check.get("name"),
                     details=check.get("details"),
                 )
+                command_canonical = check.get("command_canonical") if isinstance(check.get("command_canonical"), dict) else {}
+                if not command_canonical and isinstance(check.get("diagnostics"), dict):
+                    command_canonical = check["diagnostics"].get("command_canonical") if isinstance(check["diagnostics"].get("command_canonical"), dict) else {}
+                if command_canonical:
+                    failure_payload = {
+                        **failure_payload,
+                        "command_family": command_canonical.get("command_family"),
+                        "normalized_family_command": command_canonical.get("normalized_family_command"),
+                        "retry_recipe_id": command_canonical.get("retry_recipe_id"),
+                        "command_canonical": command_canonical,
+                    }
                 add(
                     "failure_signature",
                     f"Check `{check.get('name')}` failed: {check.get('details') or 'see check logs'}.",
@@ -964,6 +975,8 @@ class WorkspaceMemoryPipeline:
         check = payload.get("check_name") or payload.get("failure_class") or "related check"
         files = ", ".join(str(path) for path in list(payload.get("target_files") or [])[:3])
         text = f"Repeated failure candidate `{signature}` for {check}; group future occurrences by normalized failure/check/files before repairing."
+        if payload.get("command_family"):
+            text += f" Command family: {payload.get('command_family')}."
         if files:
             text += f" Likely files: {files}."
         return text
@@ -1343,7 +1356,9 @@ class WorkspaceMemoryPipeline:
             payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
             signature = str(payload.get("normalized_failure") or payload.get("failure_signature") or item.get("memory_id") or "unknown_failure")
             check = str(payload.get("check_name") or payload.get("failure_class") or "")
-            key = f"{signature}:{check}".lower()
+            command_family = str(payload.get("command_family") or "")
+            normalized_command = str(payload.get("normalized_family_command") or "")
+            key = f"{signature}:{check}:{command_family}:{normalized_command}".lower()
             entry = groups.setdefault(
                 key,
                 {
@@ -1351,6 +1366,9 @@ class WorkspaceMemoryPipeline:
                     "failure_signature": payload.get("failure_signature") or signature,
                     "failure_class": payload.get("failure_class"),
                     "check_name": payload.get("check_name"),
+                    "command_family": payload.get("command_family"),
+                    "normalized_family_command": payload.get("normalized_family_command"),
+                    "retry_recipe_id": payload.get("retry_recipe_id"),
                     "count": 0,
                     "memory_ids": [],
                     "target_files": [],

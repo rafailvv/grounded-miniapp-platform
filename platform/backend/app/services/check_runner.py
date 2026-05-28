@@ -24,6 +24,7 @@ from app.models.common import GenerationMode
 from app.models.artifacts import ValidationIssue
 from app.models.domain import CheckExecutionRecord, RunCheckResult, utc_now
 from app.modules.miniapp_validation.agent_static_validation import AgentStaticValidation
+from app.services.command_canonicalizer import CommandCanonicalizer
 from app.services.workspace.preview_service import PreviewService
 from app.validators.static_analysis import (
     extract_declared_routes,
@@ -441,6 +442,10 @@ class CheckRunner:
             )
             completed_at = utc_now()
             self._cleanup_runtime_database_artifacts(source_dir)
+            results = self._canonicalize_check_results(
+                results,
+                workspace_id=workspace_id,
+            )
             return CheckExecutionRecord(
                 workspace_id=workspace_id,
                 run_id=run_id,
@@ -645,6 +650,10 @@ class CheckRunner:
 
         completed_at = utc_now()
         self._cleanup_runtime_database_artifacts(source_dir)
+        results = self._canonicalize_check_results(
+            results,
+            workspace_id=workspace_id,
+        )
         return CheckExecutionRecord(
             workspace_id=workspace_id,
             run_id=run_id,
@@ -662,6 +671,39 @@ class CheckRunner:
             and result.status in {"failed", "blocked"}
             for result in results
         )
+
+    @staticmethod
+    def _canonicalize_check_results(
+        results: list[RunCheckResult],
+        *,
+        workspace_id: str,
+    ) -> list[RunCheckResult]:
+        canonicalized: list[RunCheckResult] = []
+        for result in results:
+            if not result.command:
+                canonicalized.append(result)
+                continue
+            logs = "\n".join(str(item) for item in (result.logs or [])[:20])
+            canonical, classification = CommandCanonicalizer.classify_execution(
+                command=result.command,
+                workspace_id=workspace_id,
+                exit_code=result.exit_code,
+                timed_out="timed out" in f"{result.details or ''}\n{logs}".lower(),
+                stdout=logs,
+                stderr=logs,
+                semantic_status=(
+                    "passed"
+                    if result.status == "passed"
+                    else "not_started"
+                    if result.status == "skipped"
+                    else None
+                ),
+            )
+            diagnostics = dict(result.diagnostics or {})
+            diagnostics.setdefault("command_canonical", canonical)
+            diagnostics.setdefault("execution_classification", classification)
+            canonicalized.append(result.model_copy(update={"command_canonical": canonical, "diagnostics": diagnostics}))
+        return canonicalized
 
     @staticmethod
     def _emit_check_progress(

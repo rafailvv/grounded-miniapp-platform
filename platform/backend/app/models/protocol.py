@@ -152,6 +152,18 @@ class SessionIdParams(StrictModel):
     session_id: str = Field(validation_alias=AliasChoices("session_id", "sessionId", "thread_id", "threadId"))
 
 
+class DoctorParams(StrictModel):
+    scope: Literal["quick", "full"] = "quick"
+    workspace_id: str | None = Field(default=None, validation_alias=AliasChoices("workspace_id", "workspaceId"))
+    run_id: str | None = Field(default=None, validation_alias=AliasChoices("run_id", "runId"))
+
+
+class DoctorWorkspaceParams(StrictModel):
+    workspace_id: str = Field(validation_alias=AliasChoices("workspace_id", "workspaceId"))
+    scope: Literal["quick", "full"] = "quick"
+    run_id: str | None = Field(default=None, validation_alias=AliasChoices("run_id", "runId"))
+
+
 class ThreadForkParams(ThreadIdParams):
     title: str | None = None
 

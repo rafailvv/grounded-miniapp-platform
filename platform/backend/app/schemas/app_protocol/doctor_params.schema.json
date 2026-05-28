@@ -1,0 +1,42 @@
+{
+  "$id": "https://grounded.local/schemas/app_protocol/doctor_params.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "run_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Run Id"
+    },
+    "scope": {
+      "default": "quick",
+      "enum": [
+        "quick",
+        "full"
+      ],
+      "title": "Scope",
+      "type": "string"
+    },
+    "workspace_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Workspace Id"
+    }
+  },
+  "title": "DoctorParams",
+  "type": "object"
+}

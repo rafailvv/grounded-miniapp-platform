@@ -1135,6 +1135,7 @@ class ToolRouter:
                 draft_source=self.context.draft_source,
                 command=command,
                 timeout_seconds=decision.timeout_seconds,
+                workspace_id=self.context.workspace_id,
                 max_output_chars=decision.output_cap_chars,
                 progress_callback=command_progress,
                 process_manager=self.context.process_manager,
@@ -1428,6 +1429,10 @@ class ToolRouter:
         if "semantic_status" in result:
             summary["semantic_status"] = result.get("semantic_status")
             summary["exit_code"] = result.get("exit_code")
+        if isinstance(result.get("command_canonical"), dict):
+            summary["command_canonical"] = result.get("command_canonical")
+        if isinstance(result.get("execution_classification"), dict):
+            summary["execution_classification"] = result.get("execution_classification")
         if "failed_checks" in result:
             summary["failed_check_count"] = len(result.get("failed_checks") or [])
         if "workflow_results" in result:

@@ -65,6 +65,7 @@ from app.services.event_journal import EventJournalService
 from app.services.export_service import ExportService
 from app.repositories.state_store import StateStore
 from app.services.exec_policy_service import ExecPolicyService
+from app.services.doctor_service import DoctorService
 from app.services.diagnostic_workflows import DiagnosticWorkflow
 from app.services.generation_enhancements import (
     AcceptanceScenarioGenerator,
@@ -191,6 +192,7 @@ class WorkbenchService:
         output_artifact_service: OutputArtifactService | None = None,
         pr_babysitter_service: PrBabysitterService | None = None,
         browser_replay_proof_service: BrowserReplayProofService | None = None,
+        doctor_service: DoctorService | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
@@ -212,6 +214,14 @@ class WorkbenchService:
         self.pr_babysitter_service = pr_babysitter_service or PrBabysitterService(store=store, workspace_service=workspace_service)
         self.browser_replay_proof_service = browser_replay_proof_service or BrowserReplayProofService(store, event_journal_service=event_journal_service)
         self.repair_case_service = repair_case_service or RepairCaseService(store, event_journal_service=event_journal_service)
+        self.doctor_service = doctor_service or DoctorService(
+            settings=settings,
+            store=store,
+            openai_client=openai_client,
+            exec_policy_service=exec_policy_service,
+            event_journal_service=event_journal_service,
+            run_protocol_service=run_protocol_service,
+        )
         self.prompt_suggestion_service = PromptSuggestionService()
 
     def list_webhooks(self, *, workspace_id: str | None = None) -> dict[str, Any]:
@@ -2682,10 +2692,10 @@ class WorkbenchService:
         )
         return payload
 
-    def doctor_workspace(self, workspace_id: str) -> dict[str, Any]:
+    def doctor_workspace(self, workspace_id: str, *, scope: str = "quick", run_id: str | None = None) -> dict[str, Any]:
         self.workspace_service.get_workspace(workspace_id)
         runs = self.run_service.list_runs(workspace_id)
-        latest = runs[0] if runs else None
+        latest = self.run_service.get_run(run_id) if run_id else runs[0] if runs else None
         reports = {
             "gate": self.store.get("reports", f"gate:{latest.run_id}") if latest else {},
             "trace_state": self.trace_bundle_state(latest.run_id) if latest else {},
@@ -2701,7 +2711,12 @@ class WorkbenchService:
             api_logs=self._workspace_log_lines(workspace_id, kind="api"),
             reports=reports,
         )
-        payload["environment_health"] = self._doctor_workspace_environment_health()
+        payload["environment_health"] = self.doctor_service.workspace_report(
+            workspace_id=workspace_id,
+            run_id=getattr(latest, "run_id", None),
+            scope=scope,
+            preview=self._preview_payload(workspace_id),
+        )
         self.store.upsert("reports", f"doctor_workspace:{workspace_id}", payload)
         return payload
 
@@ -4479,48 +4494,10 @@ class WorkbenchService:
             "input": payload,
         }
 
-    def doctor(self) -> dict[str, Any]:
-        checks = [
-            self._python_version_check(),
-            self._python_deps_check(),
-            self._node_version_check(),
-            self._npm_version_check(),
-            self._binary_check("docker"),
-            self._compose_check(),
-            self._docker_daemon_check(),
-            self._playwright_check(),
-            self._playwright_browsers_check(),
-            self._browser_availability_check(),
-            self._openai_check(),
-            self._model_access_check(),
-            self._writable_check("data_dir", self.settings.data_dir),
-            self._writable_dirs_check(),
-            self._db_writable_check(),
-            self._disk_space_check(),
-            self._template_check(),
-            self._template_hash_check(),
-            self._port_check(),
-            self._preview_port_range_check(),
-            self._preview_runtime_check(),
-            self._backend_routes_check(),
-            self._backend_imports_check(),
-            self._stale_backend_check(),
-            self._preview_container_check(),
-            self._test_command_check(),
-            self._runtime_policy_files_check(),
-            self.exec_policy_service.doctor_check(),
-        ]
-        status = "passed" if all(item["status"] == "passed" for item in checks if item["required"]) else "failed"
-        payload = {
-            "schema": "grounded.doctor_health_panel.v1",
-            "status": status,
-            "checks": checks,
-            "sections": self._doctor_sections(checks),
-            "summary": self._doctor_summary(checks),
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
+    def doctor(self, *, scope: str = "quick", workspace_id: str | None = None, run_id: str | None = None) -> dict[str, Any]:
+        preview = self._preview_payload(workspace_id) if workspace_id else None
+        payload = self.doctor_service.global_report(scope=scope, workspace_id=workspace_id, run_id=run_id, preview=preview)
         self.store.upsert("reports", "doctor:exec_policy", self.exec_policy_service.doctor_check())
-        self.store.upsert("reports", "doctor:last", payload)
         return payload
 
     def metrics_summary(self) -> dict[str, Any]:

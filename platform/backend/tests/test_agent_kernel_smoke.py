@@ -52,6 +52,7 @@ from app.modules.workspace_code_agent_runtime.process_recovery import AgentProce
 from app.modules.workspace_code_agent_runtime.prompt_contract import agent_system_prompt
 from app.modules.workspace_code_agent_runtime.runtime import WorkspaceCodeAgentRuntime
 from app.services.check_runner import CheckRunner
+from app.services.command_canonicalizer import CommandCanonicalizer
 from app.services.hook_policy_service import HookPolicyService
 from app.services.miniapp_contract import MiniAppContractCompiler
 from app.services.repair_catalog import RepairCatalog
@@ -2879,6 +2880,57 @@ def test_command_policy_returns_typed_decisions() -> None:
     assert all(item["status"] == "passed" for item in examples)
 
 
+def test_command_canonicalizer_recognizes_common_command_families() -> None:
+    cases = {
+        "npm test -- client": "node.test",
+        "pnpm run test tests/app.test.ts": "node.test",
+        "yarn test manager": "node.test",
+        "bun test": "node.test",
+        "pytest -q tests/test_app.py": "python.pytest",
+        "python -m pytest tests/test_app.py -q": "python.pytest",
+        "uv run pytest tests/test_app.py": "python.pytest",
+        "uvicorn app.main:app --port 8000": "python.uvicorn",
+        "python -m uvicorn app.main:app": "python.uvicorn",
+        "docker compose up api": "docker.compose",
+        "docker-compose ps": "docker.compose",
+        "playwright test tests/example.spec.ts": "playwright.test",
+        "npx playwright test tests/example.spec.ts": "playwright.test",
+    }
+
+    fingerprints: dict[str, set[str]] = {}
+    for command, family in cases.items():
+        canonical = CommandCanonicalizer.canonicalize(command, workspace_id="ws_cmd")
+        assert canonical["command_family"] == family
+        assert canonical["normalized_family_command"]
+        fingerprints.setdefault(family, set()).add(str(canonical["fingerprint"]))
+
+    pytest_direct = CommandCanonicalizer.canonicalize("pytest tests/test_app.py", workspace_id="ws_cmd")
+    pytest_module = CommandCanonicalizer.canonicalize("python -m pytest tests/test_app.py", workspace_id="ws_cmd")
+    assert pytest_direct["fingerprint"] == pytest_module["fingerprint"]
+
+
+def test_command_canonicalizer_classifies_failure_statuses() -> None:
+    playwright, playwright_classification = CommandCanonicalizer.classify_execution(
+        command="npx playwright test tests/example.spec.ts",
+        workspace_id="ws_cmd",
+        exit_code=1,
+        stderr="browser executable doesn't exist; please run playwright install",
+    )
+    uvicorn, uvicorn_classification = CommandCanonicalizer.classify_execution(
+        command="python -m uvicorn app.main:app",
+        workspace_id="ws_cmd",
+        exit_code=1,
+        stderr="Traceback (most recent call last): NameError: name 'app' is not defined",
+    )
+
+    assert playwright["command_family"] == "playwright.test"
+    assert playwright_classification["status_taxonomy"] == "browser_missing"
+    assert playwright_classification["retry_recipe_id"] == "command.playwright_replay_repair"
+    assert uvicorn["command_family"] == "python.uvicorn"
+    assert uvicorn_classification["status_taxonomy"] == "server_boot_failed"
+    assert uvicorn_classification["retry_recipe_id"] == "command.uvicorn_boot_repair"
+
+
 def test_process_manager_streams_head_tail_and_rg_no_match_is_success(tmp_path: Path) -> None:
     root = tmp_path
     (root / "miniapp/app").mkdir(parents=True)
@@ -2899,8 +2951,10 @@ def test_process_manager_streams_head_tail_and_rg_no_match_is_success(tmp_path: 
     assert str(result["process_id"]).startswith("proc_")
     assert result["semantic_status"] == "no_matches"
     assert result["success"] is True
+    assert result["command_canonical"]["command_family"] == "generic.shell"
+    assert result["execution_classification"]["status_taxonomy"] == "no_matches"
     assert any(event.get("status") == "started" for event in events)
-    assert any(event.get("status") == "completed" for event in events)
+    assert any(event.get("status") == "completed" and event.get("command_canonical") for event in events)
 
 
 def test_process_manager_keeps_completed_output_readable(tmp_path: Path) -> None:
@@ -2922,6 +2976,45 @@ def test_process_manager_keeps_completed_output_readable(tmp_path: Path) -> None
     assert result["success"] is True
     assert output["process_id"] == result["process_id"]
     assert manager.snapshot()["processes"][0]["status"] == "completed"  # type: ignore[index]
+
+
+def test_check_results_receive_command_canonical_metadata() -> None:
+    result = RunCheckResult(
+        name="generated_app_python_tests",
+        status="failed",
+        command="python -m unittest discover -s tests -p test_generated_app.py",
+        exit_code=1,
+        details="Generated Python app tests failed.",
+        logs=["FAILED (failures=1)"],
+    )
+
+    canonicalized = CheckRunner._canonicalize_check_results([result], workspace_id="ws_cmd")
+
+    assert canonicalized[0].command_canonical["command_family"] == "python.unittest"
+    assert canonicalized[0].diagnostics["command_canonical"]["retry_recipe_id"] == "command.python_test_repair"
+    assert canonicalized[0].diagnostics["execution_classification"]["status_taxonomy"] == "failed_tests"
+
+
+def test_repair_catalog_uses_command_canonical_retry_recipe() -> None:
+    command_canonical, _classification = CommandCanonicalizer.classify_execution(
+        command="python -m pytest miniapp/tests/test_app.py",
+        workspace_id="ws_cmd",
+        exit_code=1,
+        stderr="FAILED miniapp/tests/test_app.py::test_create - AssertionError",
+    )
+
+    packet = RepairCatalog.classify_issue(
+        {
+            "code": "custom_quality_check",
+            "severity": "high",
+            "message": "pytest failed",
+            "command_canonical": command_canonical,
+            "command": "python -m pytest miniapp/tests/test_app.py",
+        }
+    )
+
+    assert packet["known_fix_recipe"]["recipe_id"] == "command.python_test_repair"
+    assert packet["retry_strategy"]["command_family"] == "python.pytest"
 
 
 def test_process_manager_keeps_managed_process_readable_until_terminated(tmp_path: Path) -> None:
