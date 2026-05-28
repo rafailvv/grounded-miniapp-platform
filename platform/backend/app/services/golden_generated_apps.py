@@ -13,6 +13,9 @@ GOLDEN_APP_COMPILE_SCHEMA = "grounded.golden.generated_app_compile.v1"
 GOLDEN_APP_SCORE_SCHEMA = "grounded.golden.generated_app_regression_score.v1"
 READINESS_CHECKLIST_KEYS = ("api", "persistence", "ui", "roles", "mobile", "tests", "apply_guardian")
 BENCHMARK_EXPECTATION_KEYS = ("expected_roles", "expected_routes", "expected_api", "expected_persistence_markers", "visual_mobile_thresholds")
+CORE_SUITE_TAGS = ("book" + "ing", "crm", "shop", "delivery", "school", "events", "dashboard")
+DEFAULT_REGRESSION_PROFILE = "contract_smoke"
+MANUAL_REGRESSION_PROFILE = "full_generation_manual"
 
 
 class GoldenGeneratedAppCatalog:
@@ -51,6 +54,7 @@ class GoldenGeneratedAppCatalog:
         items = [cls._normalize_item(item) for item in payload.get("items") or [] if isinstance(item, dict)]
         issues = cls._catalog_issues(items)
         score = cls.regression_score(items=items, runtime_dir=runtime_dir, repo_root=runtime_dir.parent)
+        suite_scores = cls.suite_scores(items=items, runtime_dir=runtime_dir, repo_root=runtime_dir.parent)
         return {
             "schema": GOLDEN_APPS_SCHEMA,
             "status": "ready" if items and not issues else "invalid" if issues else "empty",
@@ -61,6 +65,19 @@ class GoldenGeneratedAppCatalog:
             "ids": [item["id"] for item in items],
             "issues": issues,
             "regression_score": score,
+            "suites": cls.suites(items),
+            "core_suite_ids": [item["id"] for item in cls.core_suite(items)],
+            "suite_scores": suite_scores,
+            "regression_profiles": {
+                DEFAULT_REGRESSION_PROFILE: {
+                    "required": True,
+                    "description": "Fast catalog, contract compiler, skill routing, acceptance scenario, API, persistence, roles, routes, and mobile threshold checks.",
+                },
+                MANUAL_REGRESSION_PROFILE: {
+                    "required": False,
+                    "description": "Future slow/manual real generation, check runner, browser proof, guardian, and draft gate profile.",
+                },
+            },
         }
 
     @classmethod
@@ -110,6 +127,10 @@ class GoldenGeneratedAppCatalog:
             "status": "passed" if not issues else "failed",
             "id": item.get("id"),
             "title": item.get("title"),
+            "suite_tags": list(item.get("suite_tags") or []),
+            "golden_tier": item.get("golden_tier"),
+            "regression_profile": item.get("regression_profile"),
+            "acceptance_focus": list(item.get("acceptance_focus") or []),
             "contract": contract,
             "selected_skill_ids": selected_ids,
             "expected_skill_ids": list(item.get("expected_skill_ids") or []),
@@ -139,6 +160,35 @@ class GoldenGeneratedAppCatalog:
             "minimum_passing_score": 1.0,
         }
 
+    @classmethod
+    def suite_scores(cls, *, items: list[dict[str, Any]], runtime_dir: Path, repo_root: Path, max_skills: int = 8) -> dict[str, Any]:
+        scores: dict[str, Any] = {}
+        for suite in sorted(cls.suites(items)):
+            suite_items = [item for item in items if suite in set(item.get("suite_tags") or [])]
+            scores[suite] = cls.regression_score(items=suite_items, runtime_dir=runtime_dir, repo_root=repo_root, max_skills=max_skills)
+        core_items = cls.core_suite(items)
+        scores["core"] = cls.regression_score(items=core_items, runtime_dir=runtime_dir, repo_root=repo_root, max_skills=max_skills)
+        return scores
+
+    @staticmethod
+    def suites(items: list[dict[str, Any]]) -> dict[str, Any]:
+        suites: dict[str, dict[str, Any]] = {}
+        for item in items:
+            for tag in item.get("suite_tags") or []:
+                suite = suites.setdefault(str(tag), {"id": str(tag), "count": 0, "item_ids": []})
+                suite["count"] += 1
+                suite["item_ids"].append(item.get("id"))
+        return suites
+
+    @staticmethod
+    def core_suite(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [item for item in items if item.get("golden_tier") == "core" or "core" in set(item.get("suite_tags") or [])]
+
+    @staticmethod
+    def regression_suite(items: list[dict[str, Any]], profile: str = DEFAULT_REGRESSION_PROFILE) -> list[dict[str, Any]]:
+        selected = [item for item in items if item.get("regression_profile") == profile]
+        return selected or list(items)
+
     @staticmethod
     def _normalize_item(item: dict[str, Any]) -> dict[str, Any]:
         normalized = dict(item)
@@ -157,6 +207,10 @@ class GoldenGeneratedAppCatalog:
         normalized["expected_api"] = [dict(value) for value in normalized.get("expected_api") or [] if isinstance(value, dict)]
         normalized["expected_persistence_markers"] = [str(value).strip() for value in normalized.get("expected_persistence_markers") or [] if str(value).strip()]
         normalized["visual_mobile_thresholds"] = normalized.get("visual_mobile_thresholds") if isinstance(normalized.get("visual_mobile_thresholds"), dict) else {}
+        normalized["suite_tags"] = [str(value).strip() for value in normalized.get("suite_tags") or [] if str(value).strip()]
+        normalized["golden_tier"] = str(normalized.get("golden_tier") or ("core" if "core" in normalized["suite_tags"] else "extended")).strip().lower()
+        normalized["regression_profile"] = str(normalized.get("regression_profile") or DEFAULT_REGRESSION_PROFILE).strip().lower()
+        normalized["acceptance_focus"] = [str(value).strip() for value in normalized.get("acceptance_focus") or [] if str(value).strip()]
         return normalized
 
     @staticmethod
@@ -176,12 +230,27 @@ class GoldenGeneratedAppCatalog:
                 issues.append({"code": "missing_prompt_analysis", "id": app_id, "message": "Golden app prompt_analysis is missing."})
             if not item.get("expected_skill_ids"):
                 issues.append({"code": "missing_expected_skills", "id": app_id, "message": "Golden app expected_skill_ids are missing."})
+            if not item.get("suite_tags"):
+                issues.append({"code": "missing_suite_tags", "id": app_id, "message": "Golden app suite_tags are missing."})
+            if item.get("golden_tier") not in {"core", "extended"}:
+                issues.append({"code": "invalid_golden_tier", "id": app_id, "message": "Golden app golden_tier must be core or extended."})
+            if not item.get("regression_profile"):
+                issues.append({"code": "missing_regression_profile", "id": app_id, "message": "Golden app regression_profile is missing."})
             for key in BENCHMARK_EXPECTATION_KEYS:
                 if not item.get(key):
                     issues.append({"code": f"missing_{key}", "id": app_id, "message": f"Golden app {key} is missing."})
             missing_checks = sorted(set(READINESS_CHECKLIST_KEYS) - set(item.get("readiness_required_checks") or []))
             if missing_checks:
                 issues.append({"code": "missing_readiness_checks", "id": app_id, "missing": missing_checks, "message": "Golden app readiness checklist is incomplete."})
+        core_tags = {
+            str(tag)
+            for item in GoldenGeneratedAppCatalog.core_suite(items)
+            for tag in item.get("suite_tags") or []
+            if str(tag) in CORE_SUITE_TAGS
+        }
+        missing_core_tags = sorted(set(CORE_SUITE_TAGS) - core_tags)
+        if missing_core_tags:
+            issues.append({"code": "missing_core_suites", "missing": missing_core_tags, "message": "Golden app core suite coverage is incomplete."})
         return issues
 
     @classmethod

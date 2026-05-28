@@ -49,6 +49,7 @@ from app.services.run_compaction import RunCompactionService
 from app.services.run_protocol import RunProtocolService
 from app.services.session_protocol import SessionProtocolReducer
 from app.services.repair_cases import RepairCaseService
+from app.services.prompt_contract_compiler import PromptContractCompilerService
 from app.services.workbench_service import WorkbenchService
 from app.services.starter_workspace_service import StarterWorkspaceService
 
@@ -157,6 +158,11 @@ class ServiceContainer:
             self.workspace_log_service,
             run_protocol_service=self.run_protocol_service,
             event_journal_service=self.event_journal_service,
+            prompt_contract_compiler_service=PromptContractCompilerService(
+                store=self.store,
+                openai_client=self.openai_client,
+                event_journal_service=self.event_journal_service,
+            ),
         )
         self.run_service.attach_guardian_gate_service(self.guardian_gate_service)
         self.exec_policy_service = ExecPolicyService(self.settings.runtime_dir / "policies" / "agent_exec_policy.json", sandbox_service=self.sandbox_service)

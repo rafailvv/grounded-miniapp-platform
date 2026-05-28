@@ -2312,7 +2312,17 @@ def test_typed_event_replay_reconstructs_run_resume_and_compare(tmp_path: Path) 
     last_working_compare = client.get(f"/runs/{base.run_id}/compare-last-working").json()
 
     assert protocol["schema"] == "grounded.rpc_protocol.v2"
-    assert {"run/replay", "run/compare", "run/fork_from_bookmark", "doctor/global", "doctor/workspace", "doctor/run"}.issubset({item["method"] for item in protocol["methods"]})
+    assert {
+        "run/replay",
+        "run/compare",
+        "run/fork_from_bookmark",
+        "doctor/global",
+        "doctor/workspace",
+        "doctor/run",
+        "prompt_contract/read",
+        "prompt_contract/compile",
+        "prompt_contract/list",
+    }.issubset({item["method"] for item in protocol["methods"]})
     assert replay["schema"] == "grounded.run_event_replay.v1"
     assert replay["failure_point"]["check"] == "browser_flow_smoke"
     assert replay["resume"]["latest_bookmark"]["bookmark_id"] == bookmark["bookmark_id"]
@@ -6074,6 +6084,78 @@ def test_config_security_test_matrix_prompt_contract_and_exports(tmp_path: Path)
     assert Path(manifest_export["file_path"]).exists()
     assert Path(deploy_export["file_path"]).exists()
     assert Path(docker_export["file_path"]).exists()
+
+
+def test_create_run_persists_canonical_prompt_contract_before_runtime(tmp_path: Path, monkeypatch) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Prompt Contract Workspace",
+            "description": "prompt contract test",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    run_service = app.state.container.run_service
+    monkeypatch.setattr(run_service, "_execute_run", lambda *_args, **_kwargs: None)
+
+    run = run_service.create_run(
+        workspace["workspace_id"],
+        CreateRunRequest(
+            prompt="Create a service " + "book" + "ing app where client submits a request, specialist updates status, and manager reviews workload.",
+            mode="generate",
+            intent="create",
+            generation_mode="fast",
+        ),
+    )
+    saved = run_service.get_run(run.run_id)
+    contract = client.get(f"/runs/{run.run_id}/prompt-contract").json()
+    listed = client.get(f"/workspaces/{workspace['workspace_id']}/prompt-contracts").json()
+
+    assert saved.prompt_contract_ref == f"prompt_contract:{workspace['workspace_id']}:{run.run_id}"
+    assert contract["schema"] == "grounded.prompt_contract_report.v1"
+    assert contract["status"] == "passed"
+    assert contract["contract"]["schema"] == "grounded.prompt_contract.v1"
+    assert {"roles", "entities", "fields", "workflows", "screens", "api", "persistence", "visual", "acceptance"} == {
+        item["key"] for item in contract["contract"]["sections"]
+    }
+    assert contract["contract"]["analysis_source"] == "fast_local"
+    assert contract["acceptance_contract"]["required"] is True
+    assert listed["count"] == 1
+
+
+def test_fix_run_inherits_canonical_prompt_contract_from_lineage(tmp_path: Path, monkeypatch) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Prompt Contract Lineage",
+            "description": "prompt contract inheritance test",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    run_service = app.state.container.run_service
+    monkeypatch.setattr(run_service, "_execute_run", lambda *_args, **_kwargs: None)
+    root = run_service.create_run(
+        workspace["workspace_id"],
+        CreateRunRequest(prompt="Create a project request app with client, specialist, and manager workflows.", intent="create", generation_mode="fast"),
+    )
+
+    child = run_service.create_run(
+        workspace["workspace_id"],
+        CreateRunRequest(prompt="Repair the failing project request workflow.", mode="fix", intent="edit", generation_mode="fast", resume_from_run_id=root.run_id),
+    )
+    saved = run_service.get_run(child.run_id)
+    contract = client.post(f"/runs/{child.run_id}/prompt-contract/compile").json()
+
+    assert saved.prompt_contract_ref == f"prompt_contract:{workspace['workspace_id']}:{child.run_id}"
+    assert saved.acceptance_contract["repair_continuation"] is True
+    assert contract["contract_status"] == "inherited"
+    assert contract["contract"]["source_run_id"] == root.run_id
 
 
 def test_structured_thread_compaction_contains_workbench_fields(tmp_path: Path) -> None:

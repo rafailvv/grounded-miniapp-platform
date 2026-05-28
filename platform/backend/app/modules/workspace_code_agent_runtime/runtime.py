@@ -304,6 +304,12 @@ class WorkspaceCodeAgentRuntime:
         run_payload: dict[str, Any] | None,
     ) -> list[dict[str, Any]]:
         candidates: list[dict[str, Any]] = []
+        prompt_ref = str((run_payload or {}).get("prompt_contract_ref") or f"prompt_contract:{workspace_id}:{run_id}")
+        prompt_report = self.store.get("reports", prompt_ref)
+        if isinstance(prompt_report, dict):
+            prompt_contract = prompt_report.get("contract") if isinstance(prompt_report.get("contract"), dict) else {}
+            if isinstance(prompt_contract, dict) and isinstance(prompt_contract.get("acceptance_contract"), dict):
+                candidates.append(dict(prompt_contract["acceptance_contract"]))
         report = self.store.get("reports", f"acceptance_contract:{workspace_id}:{run_id}")
         if isinstance(report, dict) and isinstance(report.get("contract"), dict):
             candidates.append(dict(report["contract"]))
@@ -1749,6 +1755,8 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         job.hook_trace_ref = f"hook_trace:{workspace_id}:{artifact_run_id}"
         job.semantic_graph_ref = f"semantic_graph:{workspace_id}:{artifact_run_id}"
         job.worker_prefix_ref = f"worker_prefix:{workspace_id}:{artifact_run_id}"
+        if isinstance(stored_run, dict) and stored_run.get("prompt_contract_ref"):
+            job.prompt_contract_ref = str(stored_run.get("prompt_contract_ref") or "")
         if miniapp_contract is not None:
             job.miniapp_contract_ref = f"miniapp_contract:{workspace_id}:{artifact_run_id}"
             job.contract_compile_ref = f"contract_compile:{workspace_id}:{artifact_run_id}"
@@ -4718,6 +4726,12 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             if isinstance(stored_run, dict) and isinstance(stored_run.get("acceptance_contract"), dict)
             else {}
         )
+        if isinstance(stored_run, dict):
+            prompt_ref = str(stored_run.get("prompt_contract_ref") or f"prompt_contract:{workspace_id}:{run_id}")
+            prompt_report = self.store.get("reports", prompt_ref)
+            prompt_contract = prompt_report.get("contract") if isinstance(prompt_report, dict) and isinstance(prompt_report.get("contract"), dict) else {}
+            if isinstance(prompt_contract, dict) and isinstance(prompt_contract.get("acceptance_contract"), dict):
+                stored_acceptance_contract = dict(prompt_contract["acceptance_contract"])
         prompt_analysis: dict[str, Any] | None = None
         requires_prompt_analysis = (
             intent_value == "create"

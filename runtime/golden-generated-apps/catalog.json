@@ -250,7 +250,22 @@
           "390x844"
         ],
         "required_role_screenshots": true
-      }
+      },
+      "suite_tags": [
+        "core",
+        "booking",
+        "beauty_salon"
+      ],
+      "golden_tier": "core",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "services",
+        "booking",
+        "today",
+        "availability",
+        "operations",
+        "schedule"
+      ]
     },
     {
       "id": "restaurant-reservations",
@@ -497,7 +512,22 @@
           "390x844"
         ],
         "required_role_screenshots": true
-      }
+      },
+      "suite_tags": [
+        "extended",
+        "booking",
+        "restaurant"
+      ],
+      "golden_tier": "extended",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "reservation",
+        "status",
+        "host-queue",
+        "waitlist",
+        "floor-load",
+        "exceptions"
+      ]
     },
     {
       "id": "shop-catalog-orders",
@@ -750,7 +780,21 @@
           "390x844"
         ],
         "required_role_screenshots": true
-      }
+      },
+      "suite_tags": [
+        "core",
+        "shop"
+      ],
+      "golden_tier": "core",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "catalog",
+        "product-detail",
+        "cart",
+        "fulfillment",
+        "stock-issues",
+        "catalog-admin"
+      ]
     },
     {
       "id": "crm-request-pipeline",
@@ -998,7 +1042,21 @@
           "390x844"
         ],
         "required_role_screenshots": true
-      }
+      },
+      "suite_tags": [
+        "core",
+        "crm"
+      ],
+      "golden_tier": "core",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "new-request",
+        "request-status",
+        "lead-queue",
+        "follow-up",
+        "pipeline",
+        "risks"
+      ]
     },
     {
       "id": "specialist-schedule",
@@ -1242,7 +1300,22 @@
           "390x844"
         ],
         "required_role_screenshots": true
-      }
+      },
+      "suite_tags": [
+        "extended",
+        "booking",
+        "schedule"
+      ],
+      "golden_tier": "extended",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "availability",
+        "booking",
+        "shift-editor",
+        "busy-time",
+        "coverage",
+        "overload"
+      ]
     },
     {
       "id": "event-registration",
@@ -1488,7 +1561,21 @@
           "390x844"
         ],
         "required_role_screenshots": true
-      }
+      },
+      "suite_tags": [
+        "core",
+        "events"
+      ],
+      "golden_tier": "core",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "events",
+        "registration",
+        "check-in",
+        "attendance",
+        "capacity",
+        "registrations"
+      ]
     },
     {
       "id": "clinic-appointment-triage",
@@ -1739,7 +1826,22 @@
           "390x844"
         ],
         "required_role_screenshots": true
-      }
+      },
+      "suite_tags": [
+        "extended",
+        "booking",
+        "clinic"
+      ],
+      "golden_tier": "extended",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "doctors",
+        "appointment",
+        "triage",
+        "visits",
+        "schedule",
+        "load"
+      ]
     },
     {
       "id": "car-service-repair-orders",
@@ -1992,7 +2094,22 @@
           "390x844"
         ],
         "required_role_screenshots": true
-      }
+      },
+      "suite_tags": [
+        "extended",
+        "booking",
+        "auto_service"
+      ],
+      "golden_tier": "extended",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "services",
+        "booking",
+        "diagnostics",
+        "repairs",
+        "queue",
+        "analytics"
+      ]
     },
     {
       "id": "fitness-class-booking",
@@ -2242,7 +2359,22 @@
           "390x844"
         ],
         "required_role_screenshots": true
-      }
+      },
+      "suite_tags": [
+        "extended",
+        "booking",
+        "fitness"
+      ],
+      "golden_tier": "extended",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "classes",
+        "booking",
+        "roster",
+        "attendance",
+        "fill",
+        "memberships"
+      ]
     },
     {
       "id": "courier-delivery-orders",
@@ -2493,7 +2625,21 @@
           "390x844"
         ],
         "required_role_screenshots": true
-      }
+      },
+      "suite_tags": [
+        "core",
+        "delivery"
+      ],
+      "golden_tier": "core",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "order",
+        "tracking",
+        "assigned",
+        "status",
+        "sla",
+        "load"
+      ]
     },
     {
       "id": "online-course-enrollment",
@@ -2744,7 +2890,22 @@
           "390x844"
         ],
         "required_role_screenshots": true
-      }
+      },
+      "suite_tags": [
+        "core",
+        "school",
+        "education"
+      ],
+      "golden_tier": "core",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "courses",
+        "enrollment",
+        "students",
+        "homework",
+        "payments",
+        "analytics"
+      ]
     },
     {
       "id": "tutoring-homework-tracker",
@@ -2989,7 +3150,22 @@
           "390x844"
         ],
         "required_role_screenshots": true
-      }
+      },
+      "suite_tags": [
+        "extended",
+        "school",
+        "education"
+      ],
+      "golden_tier": "extended",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "lessons",
+        "homework",
+        "review",
+        "grading",
+        "deadlines",
+        "progress"
+      ]
     },
     {
       "id": "property-maintenance-requests",
@@ -3242,7 +3418,22 @@
           "390x844"
         ],
         "required_role_screenshots": true
-      }
+      },
+      "suite_tags": [
+        "extended",
+        "crm",
+        "property"
+      ],
+      "golden_tier": "extended",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "request",
+        "status",
+        "queue",
+        "worklog",
+        "sla",
+        "priorities"
+      ]
     },
     {
       "id": "rental-equipment-orders",
@@ -3495,7 +3686,22 @@
           "390x844"
         ],
         "required_role_screenshots": true
-      }
+      },
+      "suite_tags": [
+        "extended",
+        "shop",
+        "rental"
+      ],
+      "golden_tier": "extended",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "catalog",
+        "rental",
+        "issue",
+        "returns",
+        "stock",
+        "overdue"
+      ]
     },
     {
       "id": "travel-tour-booking",
@@ -3746,7 +3952,22 @@
           "390x844"
         ],
         "required_role_screenshots": true
-      }
+      },
+      "suite_tags": [
+        "extended",
+        "booking",
+        "travel"
+      ],
+      "golden_tier": "extended",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "tours",
+        "booking",
+        "documents",
+        "payments",
+        "load",
+        "finance"
+      ]
     },
     {
       "id": "subscription-support-portal",
@@ -3997,7 +4218,22 @@
           "390x844"
         ],
         "required_role_screenshots": true
-      }
+      },
+      "suite_tags": [
+        "extended",
+        "crm",
+        "support"
+      ],
+      "golden_tier": "extended",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "ticket",
+        "status",
+        "inbox",
+        "reply",
+        "sla",
+        "analytics"
+      ]
     },
     {
       "id": "warehouse-stock-transfer",
@@ -4249,7 +4485,22 @@
           "390x844"
         ],
         "required_role_screenshots": true
-      }
+      },
+      "suite_tags": [
+        "extended",
+        "shop",
+        "warehouse"
+      ],
+      "golden_tier": "extended",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "request",
+        "status",
+        "picking",
+        "transit",
+        "stock",
+        "shortages"
+      ]
     },
     {
       "id": "hotel-room-service",
@@ -4500,7 +4751,22 @@
           "390x844"
         ],
         "required_role_screenshots": true
-      }
+      },
+      "suite_tags": [
+        "extended",
+        "delivery",
+        "hotel"
+      ],
+      "golden_tier": "extended",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "menu",
+        "order",
+        "kitchen",
+        "delivery",
+        "orders",
+        "analytics"
+      ]
     },
     {
       "id": "clinic-lab-results",
@@ -4750,7 +5016,22 @@
           "390x844"
         ],
         "required_role_screenshots": true
-      }
+      },
+      "suite_tags": [
+        "extended",
+        "booking",
+        "clinic"
+      ],
+      "golden_tier": "extended",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "analyses",
+        "order",
+        "samples",
+        "results",
+        "queue",
+        "urgent"
+      ]
     },
     {
       "id": "repair-home-service",
@@ -5001,7 +5282,22 @@
           "390x844"
         ],
         "required_role_screenshots": true
-      }
+      },
+      "suite_tags": [
+        "extended",
+        "booking",
+        "home_service"
+      ],
+      "golden_tier": "extended",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "services",
+        "request",
+        "visits",
+        "estimate",
+        "requests",
+        "analytics"
+      ]
     },
     {
       "id": "donation-campaigns",
@@ -5246,7 +5542,21 @@
           "390x844"
         ],
         "required_role_screenshots": true
-      }
+      },
+      "suite_tags": [
+        "extended",
+        "crm",
+        "nonprofit"
+      ],
+      "golden_tier": "extended",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "campaigns",
+        "donation",
+        "follow-up",
+        "thanks",
+        "fundraising"
+      ]
     },
     {
       "id": "admin-analytics-incident-board",
@@ -5495,7 +5805,22 @@
           "390x844"
         ],
         "required_role_screenshots": true
-      }
+      },
+      "suite_tags": [
+        "core",
+        "dashboard",
+        "admin"
+      ],
+      "golden_tier": "core",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "incident",
+        "status",
+        "owned",
+        "runbook",
+        "sla",
+        "analytics"
+      ]
     }
   ]
 }

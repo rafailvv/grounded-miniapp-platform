@@ -135,7 +135,7 @@ class GuardianGateService:
             deterministic_review_ref=deterministic_ref,
             semantic_review_ref=semantic_ref,
             draft_gate_ref=draft_gate_ref,
-            prompt_contract_ref=getattr(run, "miniapp_contract_ref", None) or "run.acceptance_contract",
+            prompt_contract_ref=getattr(run, "prompt_contract_ref", None) or getattr(run, "miniapp_contract_ref", None) or "run.acceptance_contract",
             diff_sha256=_sha256(diff_text),
             changed_files=changed,
             findings=findings,

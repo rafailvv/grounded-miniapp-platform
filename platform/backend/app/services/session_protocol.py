@@ -452,6 +452,7 @@ class SessionProtocolReducer:
             "trace_bundle": run.trace_bundle_ref,
             "trace_reducer": run.trace_reducer_ref,
             "tool_trace": run.tool_trace_ref,
+            "prompt_contract": getattr(run, "prompt_contract_ref", None),
             "context_manager": getattr(run, "context_manager_ref", None),
             "lsp_context": getattr(run, "lsp_context_ref", None),
             "worker_sessions": getattr(run, "worker_sessions_ref", None),

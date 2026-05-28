@@ -29,6 +29,7 @@ from app.models.domain import (
     RunRecord,
     ValidationSnapshot,
     WorkspaceRecord,
+    new_id,
 )
 from app.modules.miniapp_agent_loop.guardian_review import GuardianReview
 from app.modules.workspace_code_agent_runtime import WorkspaceCodeAgentRuntime
@@ -37,6 +38,7 @@ from app.services.check_runner import CheckRunner
 from app.services.guardian_gate import GuardianGateService
 from app.services.memory_pipeline import WorkspaceMemoryPipeline
 from app.services.miniapp_contract import MiniAppContractCompiler
+from app.services.prompt_contract_compiler import PromptContractCompilerService
 from app.services.repair_cases import RepairCaseService
 from app.services.event_journal import EventJournalService
 from app.services.run_protocol import RunProtocolService
@@ -125,6 +127,7 @@ class RunService:
         workspace_log_service: WorkspaceLogService,
         run_protocol_service: RunProtocolService | None = None,
         event_journal_service: EventJournalService | None = None,
+        prompt_contract_compiler_service: PromptContractCompilerService | None = None,
     ) -> None:
         self.store = store
         self.workspace_service = workspace_service
@@ -135,6 +138,11 @@ class RunService:
         self.workspace_log_service = workspace_log_service
         self.run_protocol_service = run_protocol_service
         self.event_journal_service = event_journal_service
+        self.prompt_contract_compiler_service = prompt_contract_compiler_service or PromptContractCompilerService(
+            store=store,
+            openai_client=openai_client,
+            event_journal_service=event_journal_service,
+        )
         self.guardian_gate_service = GuardianGateService(store=store, workspace_service=workspace_service, event_journal_service=event_journal_service)
         self.background_task_service: Any | None = None
         self._active_workers: dict[str, threading.Thread] = {}
@@ -216,38 +224,15 @@ class RunService:
             source_run,
             request=request,
         )
-        prompt_analysis: dict[str, Any] | None = None
-        prompt_analysis_usage: dict[str, Any] = {}
-        prompt_analysis_model: str | None = None
-        requires_prompt_analysis = (
-            resolved_intent == "create"
-            or focused_edit_kind == "behavior_workflow_edit"
-            or effective_generation_mode in {GenerationMode.BALANCED, GenerationMode.QUALITY}
-        ) and not inherited_acceptance_contract
-        if requires_prompt_analysis:
-            if effective_generation_mode in {GenerationMode.FAST, GenerationMode.BASIC}:
-                prompt_analysis = derive_prompt_contract_analysis(request.prompt)
-                prompt_analysis_model = "fast-local-contract"
-            elif not self.openai_client.enabled:
-                if effective_generation_mode not in {GenerationMode.FAST, GenerationMode.BASIC}:
-                    raise RuntimeError("LLM prompt analysis is required before creating a workflow run.")
-                prompt_analysis = derive_prompt_contract_analysis(request.prompt)
-                prompt_analysis_model = "fast-local-contract"
-            else:
-                with self.openai_client.routing_context(
-                    model_profile=effective_model_profile,
-                    generation_mode=effective_generation_mode,
-                ):
-                    prompt_analysis = self.openai_client.analyze_miniapp_prompt(
-                        prompt=request.prompt,
-                        generation_mode=effective_generation_mode,
-                        model_profile=effective_model_profile,
-                    )
-                prompt_analysis_usage = dict((prompt_analysis or {}).pop("_llm_usage", {}) or {})
-                prompt_analysis_model = str((prompt_analysis or {}).pop("_llm_model", "") or "") or None
+        prompt_contract_source_run, inherited_prompt_contract = self._resolve_inherited_prompt_contract(source_run, request=request)
         contract_prompt = contract_source_run.prompt if inherited_acceptance_contract and contract_source_run is not None else request.prompt
-        if inherited_acceptance_contract:
-            acceptance_contract = {
+        if inherited_prompt_contract and prompt_contract_source_run is not None:
+            contract_prompt = prompt_contract_source_run.prompt
+            if not inherited_acceptance_contract:
+                inherited_acceptance_contract = self._required_acceptance_contract_for_run(prompt_contract_source_run)
+                contract_source_run = prompt_contract_source_run
+        elif inherited_acceptance_contract:
+            inherited_acceptance_contract = {
                 **inherited_acceptance_contract,
                 "required": True,
                 "inherited_from_run_id": contract_source_run.run_id if contract_source_run else request.resume_from_run_id,
@@ -255,41 +240,32 @@ class RunService:
                 "contract_source_run_id": contract_source_run.run_id if contract_source_run else request.resume_from_run_id,
                 "repair_continuation": True,
             }
-        else:
-            acceptance_contract = build_acceptance_contract(
-                prompt=request.prompt,
-                intent=resolved_intent,
-                generation_mode=effective_generation_mode,
-                focused_edit_kind=focused_edit_kind,
-                prompt_analysis=prompt_analysis,
-            )
-        orchestration = orchestration_metadata_for_contract(
-            contract=acceptance_contract,
+            inherited_prompt_contract = {
+                "acceptance_contract": inherited_acceptance_contract,
+                "implementation_plan": dict((contract_source_run or source_run).implementation_plan or {}) if (contract_source_run or source_run) is not None else {},
+            }
+        run_id = new_id("run")
+        prompt_contract_result = self.prompt_contract_compiler_service.compile(
+            workspace_id=workspace_id,
+            run_id=run_id,
+            prompt=request.prompt,
+            intent=resolved_intent,
             generation_mode=effective_generation_mode,
             focused_edit_kind=focused_edit_kind,
+            model_profile=effective_model_profile,
+            inherited_prompt_contract=inherited_prompt_contract,
+            inherited_acceptance_contract=inherited_acceptance_contract,
+            source_run_id=(prompt_contract_source_run or contract_source_run).run_id if (prompt_contract_source_run or contract_source_run) else None,
+            contract_prompt=contract_prompt,
         )
-        if inherited_acceptance_contract and source_run is not None:
-            implementation_plan = {
-                **dict(source_run.implementation_plan or {}),
-                "repair_continuation": {
-                    "enabled": True,
-                    "source_run_id": source_run.run_id,
-                    "contract_source_run_id": contract_source_run.run_id if contract_source_run else source_run.run_id,
-                    "source_prompt_preserved": True,
-                    "contract_inherited": True,
-                },
-            }
-        else:
-            implementation_plan = build_implementation_plan(
-                prompt=request.prompt,
-                intent=resolved_intent,
-                generation_mode=effective_generation_mode,
-                acceptance_contract=acceptance_contract,
-                orchestration=orchestration,
-                prompt_analysis=prompt_analysis,
-            )
+        acceptance_contract = prompt_contract_result.acceptance_contract
+        implementation_plan = prompt_contract_result.implementation_plan
+        orchestration = prompt_contract_result.orchestration
+        prompt_analysis_usage = prompt_contract_result.prompt_analysis_usage
+        prompt_analysis_model = prompt_contract_result.prompt_analysis_model
         contract_blocked = bool(acceptance_contract.get("blocking")) or str(acceptance_contract.get("status") or "").startswith("blocked_")
         run = RunRecord(
+            run_id=run_id,
             workspace_id=workspace_id,
             prompt=request.prompt,
             mode=request.mode,
@@ -322,6 +298,7 @@ class RunService:
             storage_version=2,
             token_usage=self._token_usage_from_prompt_analysis(prompt_analysis_usage),
         )
+        run.prompt_contract_ref = prompt_contract_result.compile_report.prompt_contract_ref
         run.task_ledger_ref = f"task_ledger:{workspace_id}:{run.run_id}"
         run.implementation_plan = implementation_plan
         self.store.upsert(
@@ -337,16 +314,9 @@ class RunService:
             ),
         )
         if acceptance_contract.get("required"):
-            miniapp_contract = MiniAppContractCompiler.compile(
-                workspace_id=workspace_id,
-                run_id=run.run_id,
-                prompt=contract_prompt,
-                intent=resolved_intent,
-                generation_mode=effective_generation_mode,
-                acceptance_contract=acceptance_contract,
-                implementation_plan=implementation_plan,
-                prompt_analysis=prompt_analysis,
-            )
+            miniapp_contract = prompt_contract_result.miniapp_contract
+            if miniapp_contract is None:
+                raise RuntimeError("Prompt contract compiler did not return a miniapp contract for a required acceptance contract.")
             run.acceptance_contract = miniapp_contract.acceptance_summary
             run.miniapp_contract_ref = f"miniapp_contract:{workspace_id}:{run.run_id}"
             run.contract_compile_ref = f"contract_compile:{workspace_id}:{run.run_id}"
@@ -397,6 +367,7 @@ class RunService:
                 "model_profile": run.model_profile,
                 "resume_from_run_id": run.resume_from_run_id,
                 "forked_from_run_id": run.forked_from_run_id,
+                "prompt_contract_ref": run.prompt_contract_ref,
             },
             summary="Run record created.",
             idempotency_key=f"run.created:{run.run_id}",
@@ -1317,6 +1288,7 @@ class RunService:
                 "semantic_graph_ref",
                 "worker_prefix_ref",
                 "replay_trace_ref",
+                "prompt_contract_ref",
                 "miniapp_contract_ref",
                 "route_registry_ref",
                 "contract_compile_ref",
@@ -1635,6 +1607,7 @@ class RunService:
         snapshot.iteration_count = max(int(snapshot.iteration_count or 0), len(job.repair_iterations or []))
         snapshot.repair_iterations = list(job.repair_iterations or snapshot.repair_iterations)
         snapshot.repair_issue_signatures = list(job.repair_issue_signatures or snapshot.repair_issue_signatures)
+        snapshot.prompt_contract_ref = job.prompt_contract_ref or snapshot.prompt_contract_ref
         snapshot.acceptance_contract = dict(job.acceptance_contract or snapshot.acceptance_contract)
         snapshot.browser_flow_proof = dict(job.browser_flow_proof or snapshot.browser_flow_proof)
         snapshot.mobile_layout_report = dict(job.mobile_layout_report or snapshot.mobile_layout_report)
@@ -1928,6 +1901,7 @@ class RunService:
             run.semantic_graph_ref = getattr(job, "semantic_graph_ref", None) or run.semantic_graph_ref
             run.worker_prefix_ref = getattr(job, "worker_prefix_ref", None) or run.worker_prefix_ref
             run.replay_trace_ref = getattr(job, "replay_trace_ref", None) or run.replay_trace_ref
+            run.prompt_contract_ref = getattr(job, "prompt_contract_ref", None) or run.prompt_contract_ref
             run.miniapp_contract_ref = getattr(job, "miniapp_contract_ref", None) or run.miniapp_contract_ref
             run.route_registry_ref = getattr(job, "route_registry_ref", None) or run.route_registry_ref
             run.contract_compile_ref = getattr(job, "contract_compile_ref", None) or run.contract_compile_ref
@@ -2574,6 +2548,7 @@ class RunService:
             "semantic_graph_ref": run.semantic_graph_ref,
             "worker_prefix_ref": run.worker_prefix_ref,
             "replay_trace_ref": run.replay_trace_ref,
+            "prompt_contract_ref": run.prompt_contract_ref,
             "miniapp_contract_ref": run.miniapp_contract_ref,
             "route_registry_ref": run.route_registry_ref,
             "contract_compile_ref": run.contract_compile_ref,
@@ -2581,6 +2556,7 @@ class RunService:
             "miniapp_contract": self.store.get("reports", run.miniapp_contract_ref) if run.miniapp_contract_ref else None,
             "route_registry": self.store.get("reports", run.route_registry_ref) if run.route_registry_ref else None,
             "repair_recipes": self.store.get("reports", run.repair_recipes_ref) if run.repair_recipes_ref else None,
+            "prompt_contract": self.store.get("reports", run.prompt_contract_ref) if run.prompt_contract_ref else None,
             "process_outputs": process_outputs,
             "tool_result_messages": self.store.get("reports", run.tool_result_messages_ref) if run.tool_result_messages_ref else None,
             "agent_transcript": agent_transcript,
@@ -2925,8 +2901,39 @@ class RunService:
                 break
         return None, {}
 
+    def _resolve_inherited_prompt_contract(
+        self,
+        source_run: RunRecord | None,
+        *,
+        request: CreateRunRequest,
+    ) -> tuple[RunRecord | None, dict[str, Any]]:
+        if source_run is None or request.mode != "fix":
+            return None, {}
+        seen: set[str] = set()
+        current: RunRecord | None = source_run
+        while current is not None and current.run_id not in seen:
+            seen.add(current.run_id)
+            ref = current.prompt_contract_ref or f"prompt_contract:{current.workspace_id}:{current.run_id}"
+            report = self.store.get("reports", ref)
+            if isinstance(report, dict):
+                contract = report.get("contract") if isinstance(report.get("contract"), dict) else report
+                if isinstance(contract, dict) and (contract.get("acceptance_contract") or contract.get("sections")):
+                    return current, dict(report)
+            if not current.resume_from_run_id:
+                break
+            try:
+                current = self.get_run(current.resume_from_run_id)
+            except KeyError:
+                break
+        return None, {}
+
     def _required_acceptance_contract_for_run(self, run: RunRecord) -> dict[str, Any]:
         candidates: list[dict[str, Any]] = []
+        prompt_report = self.store.get("reports", run.prompt_contract_ref or f"prompt_contract:{run.workspace_id}:{run.run_id}")
+        if isinstance(prompt_report, dict):
+            prompt_contract = prompt_report.get("contract") if isinstance(prompt_report.get("contract"), dict) else {}
+            if isinstance(prompt_contract, dict) and isinstance(prompt_contract.get("acceptance_contract"), dict):
+                candidates.append(dict(prompt_contract["acceptance_contract"]))
         report = self.store.get("reports", f"acceptance_contract:{run.workspace_id}:{run.run_id}")
         if isinstance(report, dict) and isinstance(report.get("contract"), dict):
             candidates.append(dict(report["contract"]))

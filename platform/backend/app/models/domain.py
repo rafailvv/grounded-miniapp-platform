@@ -251,6 +251,7 @@ class JobRecord(StrictModel):
     worker_prefix_ref: str | None = None
     replay_trace_ref: str | None = None
     compaction_summaries: list[dict[str, Any]] = Field(default_factory=list)
+    prompt_contract_ref: str | None = None
     miniapp_contract_ref: str | None = None
     route_registry_ref: str | None = None
     contract_compile_ref: str | None = None
@@ -655,6 +656,7 @@ class RunRecord(StrictModel):
     worker_prefix_ref: str | None = None
     replay_trace_ref: str | None = None
     compaction_summaries: list[dict[str, Any]] = Field(default_factory=list)
+    prompt_contract_ref: str | None = None
     miniapp_contract_ref: str | None = None
     route_registry_ref: str | None = None
     contract_compile_ref: str | None = None

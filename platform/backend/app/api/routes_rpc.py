@@ -228,6 +228,12 @@ async def _dispatch(container: ServiceContainer, method: str, params: dict[str, 
             workspace_id=workspace_id,
             run_id=run_id or None,
         )
+    if method == "prompt_contract/read":
+        return container.workbench_service.prompt_contract(str(params.get("run_id") or params.get("runId") or ""))
+    if method == "prompt_contract/compile":
+        return container.workbench_service.compile_prompt_contract(str(params.get("run_id") or params.get("runId") or ""))
+    if method == "prompt_contract/list":
+        return container.workbench_service.workspace_prompt_contracts(str(params.get("workspace_id") or params.get("workspaceId") or ""))
     if method == "fs/readFile":
         return service.fs_read_file(workspace_id=str(params.get("workspace_id") or params.get("workspaceId") or ""), path=str(params.get("path") or ""), run_id=params.get("run_id") or params.get("runId"))
     if method == "fs/writeFile":

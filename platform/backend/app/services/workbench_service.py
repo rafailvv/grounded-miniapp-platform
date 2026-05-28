@@ -5255,22 +5255,26 @@ class WorkbenchService:
 
     def prompt_contract(self, run_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
-        contract = dict(run.acceptance_contract or {})
-        prompt_hints = contract.get("prompt_hints") if isinstance(contract.get("prompt_hints"), dict) else {}
-        analysis_status = str(prompt_hints.get("analysis_status") or "unknown")
-        status = "passed" if not contract.get("required") or analysis_status == "ok" else "needs_review"
-        payload = {
-            "run_id": run_id,
-            "status": status,
-            "analysis_source": prompt_hints.get("analysis_source"),
-            "analysis_status": analysis_status,
-            "resource_hint": prompt_hints.get("resource_hint"),
-            "field_hints": list(prompt_hints.get("field_hints") or [])[:12],
-            "role_field_hints": dict(prompt_hints.get("role_field_hints") or {}),
-            "findings": [] if status == "passed" else [{"severity": "medium", "message": "Prompt contract analysis is unavailable; generation should use LLM prompt analysis before applying product fields."}],
+        payload = self.run_service.prompt_contract_compiler_service.read(workspace_id=run.workspace_id, run_id=run_id)
+        legacy_status = "passed" if payload.get("status") in {"planned", "inherited", "not_required"} else "needs_review"
+        return {
+            **payload,
+            "status": legacy_status,
+            "contract_status": payload.get("status"),
+            "legacy_status": legacy_status,
+            "analysis_source": ((payload.get("contract") or {}).get("analysis_source") if isinstance(payload.get("contract"), dict) else None),
+            "analysis_status": ((payload.get("contract") or {}).get("analysis_status") if isinstance(payload.get("contract"), dict) else None),
+            "resource_hint": (((payload.get("acceptance_contract") or {}).get("prompt_hints") or {}).get("resource_hint") if isinstance((payload.get("acceptance_contract") or {}).get("prompt_hints"), dict) else None),
+            "field_hints": list((((payload.get("acceptance_contract") or {}).get("prompt_hints") or {}).get("field_hints") or []) if isinstance((payload.get("acceptance_contract") or {}).get("prompt_hints"), dict) else [])[:12],
+            "findings": [] if legacy_status == "passed" else [{"severity": "medium", "message": "Prompt contract analysis is unavailable or blocked."}],
         }
-        self.store.upsert("reports", f"prompt_contract:{run_id}", payload)
-        return payload
+
+    def compile_prompt_contract(self, run_id: str) -> dict[str, Any]:
+        return self.prompt_contract(run_id)
+
+    def workspace_prompt_contracts(self, workspace_id: str) -> dict[str, Any]:
+        self.workspace_service.get_workspace(workspace_id)
+        return self.run_service.prompt_contract_compiler_service.list_for_workspace(workspace_id)
 
     def miniapp_contract(self, run_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
