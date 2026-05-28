@@ -3647,6 +3647,9 @@ def test_browser_proof_final_artifact_includes_scenarios_errors_and_screenshots(
     )
 
     proof = client.get(f"/runs/{run.run_id}/browser-proof").json()
+    replay_proof = client.get(f"/runs/{run.run_id}/browser-replay-proof").json()
+    replay = client.get(f"/runs/{run.run_id}/browser-replay").json()
+    replay_scenario = client.get(f"/runs/{run.run_id}/browser-replay-proof/browser_step_1").json()
     visual = client.get(f"/runs/{run.run_id}/visual-regression").json()
     final_report = client.get(f"/runs/{run.run_id}/final-report").json()
     export = client.post(f"/workspaces/{workspace['workspace_id']}/export/browser-proof-bundle").json()
@@ -3659,12 +3662,23 @@ def test_browser_proof_final_artifact_includes_scenarios_errors_and_screenshots(
     assert proof["role_page_screenshots"][0]["role"] == "client"
     assert proof["replayable_scripts"][0]["schema"] == "grounded.browser_replay_script.v1"
     assert proof["replayable_scripts"][0]["steps"][0]["selector"] == "form#client-main"
+    assert proof["replay_proof_ref"] == f"browser_replay_proof:{workspace['workspace_id']}:{run.run_id}"
+    assert proof["playwright_spec_refs"]
     assert proof["playwright_scenario"]["steps"][0]["selector"] == "form#client-main"
     assert proof["dom_selector"] == "form#client-main"
     assert proof["screenshot_before"] == str(screenshot)
     assert proof["screenshot_after"] == str(screenshot)
     assert any(item["scenario_id"] == "browser_step_1" for item in proof["scenarios"])
     assert any(item["scenario_id"] == "mobile_viewport_layout" for item in proof["scenarios"])
+    assert replay_proof["schema"] == "grounded.browser_replay_proof.v1"
+    assert replay_proof["status"] == "ready"
+    assert replay_proof["replay_proof_ref"] == proof["replay_proof_ref"]
+    assert any(item["scenario_id"] == "browser_step_1" for item in replay_proof["scenarios"])
+    assert replay["scenario_bundles"]
+    assert replay["playwright_specs"][0]["playwright_spec"].startswith("import { test, expect }")
+    assert replay_scenario["schema"] == "grounded.browser_replay_scenario.v1"
+    assert replay_scenario["steps"][0]["selector"] == "form#client-main"
+    assert "form#client-main" in replay_scenario["playwright_spec"]
     VisualRegressionReport.model_validate(visual)
     assert visual["schema"] == "grounded.visual_regression.v1"
     assert visual["mobile_viewport_screenshots"][0]["path"] == str(screenshot)
@@ -3678,6 +3692,11 @@ def test_browser_proof_final_artifact_includes_scenarios_errors_and_screenshots(
         names = set(archive.namelist())
         assert "manifest.json" in names
         assert f"reports/browser_proof:{run.run_id}.json" in names
+        assert f"reports/browser_replay_proof:{workspace['workspace_id']}:{run.run_id}.json" in names
+        assert f"replay/{run.run_id}/browser_step_1.json" in names
+        assert f"playwright/{run.run_id}/browser_step_1.spec.ts" in names
+        assert f"dom/{run.run_id}/browser_step_1-001.json" in names
+        assert f"logs/{run.run_id}/browser_step_1-network.log" in names
         assert any(name.startswith(f"screenshots/{run.run_id}/") for name in names)
 
 
@@ -4694,11 +4713,18 @@ def test_browser_replay_endpoint_returns_latest_failed_step_plan(tmp_path: Path)
     app.state.container.store.upsert("reports", replay_ref, {"workspace_id": run.workspace_id, "run_id": run.run_id, "packet": packet})
 
     replay = client.get(f"/runs/{run.run_id}/browser-replay").json()
+    replay_proof = client.get(f"/runs/{run.run_id}/browser-replay-proof").json()
+    replay_scenario = client.get(f"/runs/{run.run_id}/browser-replay-proof/failed_step").json()
 
     assert replay["schema"] == "grounded.browser_replay.v1"
     assert replay["status"] == "ready"
     assert replay["replay_first"] is True
     assert replay["latest_packet"]["failed_step"] == "client_submit"
+    assert replay_proof["schema"] == "grounded.browser_replay_proof.v1"
+    assert replay_proof["latest_failed_step"]["failed_step"] == "client_submit"
+    assert replay_scenario["scenario_id"] == "failed_step"
+    assert replay_scenario["status"] == "failed"
+    assert "form#client-main" in replay_scenario["playwright_spec"]
 
 
 def test_repair_case_service_expands_role_directory_evidence_targets(tmp_path: Path) -> None:

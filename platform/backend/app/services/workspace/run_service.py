@@ -34,6 +34,7 @@ from app.modules.miniapp_agent_loop.guardian_review import GuardianReview
 from app.modules.workspace_code_agent_runtime import WorkspaceCodeAgentRuntime
 from app.repositories.state_store import StateStore
 from app.services.check_runner import CheckRunner
+from app.services.guardian_gate import GuardianGateService
 from app.services.memory_pipeline import WorkspaceMemoryPipeline
 from app.services.miniapp_contract import MiniAppContractCompiler
 from app.services.repair_cases import RepairCaseService
@@ -134,6 +135,7 @@ class RunService:
         self.workspace_log_service = workspace_log_service
         self.run_protocol_service = run_protocol_service
         self.event_journal_service = event_journal_service
+        self.guardian_gate_service = GuardianGateService(store=store, workspace_service=workspace_service, event_journal_service=event_journal_service)
         self.background_task_service: Any | None = None
         self._active_workers: dict[str, threading.Thread] = {}
         self._startup_started_at = datetime.now(timezone.utc)
@@ -142,6 +144,9 @@ class RunService:
 
     def attach_background_task_service(self, background_task_service: Any) -> None:
         self.background_task_service = background_task_service
+
+    def attach_guardian_gate_service(self, guardian_gate_service: GuardianGateService) -> None:
+        self.guardian_gate_service = guardian_gate_service
 
     def stop_run(self, run_id: str) -> RunRecord:
         run = self.get_run(run_id)
@@ -940,9 +945,13 @@ class RunService:
         *,
         source: str,
         changed_files: list[str] | None = None,
+        semantic_override: str | None = None,
     ) -> tuple[bool, dict[str, Any]]:
-        report = self._guardian_review_for_apply(run, source=source, changed_files=changed_files)
-        if report.get("status") == "passed":
+        gate = self.guardian_gate_service.run_gate(run=run, source=source, changed_files=changed_files, semantic_override=semantic_override)
+        report = gate.model_dump(mode="json", by_alias=True)
+        run.guardian_gate_ref = gate.guardian_gate_ref
+        if gate.apply_decision == "allow" and gate.status == "passed":
+            self._save_run(run)
             return True, report
         findings = [item for item in report.get("findings") or [] if isinstance(item, dict)]
         run.status = "blocked"
@@ -974,12 +983,12 @@ class RunService:
             run.linked_job_id,
             "validation_failed",
             "Guardian review blocked source apply.",
-            {"run_id": run.run_id, "guardian_review_ref": f"guardian_review:{run.workspace_id}:{run.run_id}", "findings": findings},
+            {"run_id": run.run_id, "guardian_gate_ref": gate.guardian_gate_ref, "guardian_review_ref": gate.deterministic_review_ref, "findings": findings, "repair_packets": report.get("repair_packets") or []},
         )
         self._journal_run(
             run,
             "guardian.apply_blocked",
-            {"run_id": run.run_id, "workspace_id": run.workspace_id, "findings": findings},
+            {"run_id": run.run_id, "workspace_id": run.workspace_id, "guardian_gate_ref": gate.guardian_gate_ref, "findings": findings, "repair_packets": report.get("repair_packets") or []},
             summary="Guardian review blocked source apply.",
             idempotency_key=f"guardian.apply_blocked:{run.run_id}:{report.get('created_at')}",
         )
@@ -1272,6 +1281,7 @@ class RunService:
                 "tool_trace_ref",
                 "file_change_history_ref",
                 "browser_proof_ref",
+                "browser_replay_proof_ref",
                 "large_tool_outputs_ref",
                 "file_state_cache_ref",
                 "turn_diff_ref",
@@ -1281,6 +1291,10 @@ class RunService:
                 "worker_mailbox_ref",
                 "worker_sessions_ref",
                 "worker_ownership_ref",
+                "draft_isolation_ref",
+                "draft_gate_ref",
+                "draft_apply_decision_ref",
+                "guardian_gate_ref",
                 "scratchpad_ref",
                 "memory_ref",
                 "worker_drafts_ref",
@@ -1450,6 +1464,7 @@ class RunService:
                 "tool_trace_ref",
                 "file_change_history_ref",
                 "browser_proof_ref",
+                "browser_replay_proof_ref",
                 "large_tool_outputs_ref",
                 "file_state_cache_ref",
                 "turn_diff_ref",
@@ -1458,6 +1473,10 @@ class RunService:
                 "worker_mailbox_ref",
                 "worker_sessions_ref",
                 "worker_ownership_ref",
+                "draft_isolation_ref",
+                "draft_gate_ref",
+                "draft_apply_decision_ref",
+                "guardian_gate_ref",
                 "scratchpad_ref",
                 "memory_ref",
                 "worker_drafts_ref",
@@ -1870,6 +1889,7 @@ class RunService:
             run.tool_trace_ref = getattr(job, "tool_trace_ref", None) or run.tool_trace_ref
             run.file_change_history_ref = getattr(job, "file_change_history_ref", None) or run.file_change_history_ref
             run.browser_proof_ref = getattr(job, "browser_proof_ref", None) or run.browser_proof_ref
+            run.browser_replay_proof_ref = getattr(job, "browser_replay_proof_ref", None) or run.browser_replay_proof_ref
             run.large_tool_outputs_ref = getattr(job, "large_tool_outputs_ref", None) or run.large_tool_outputs_ref
             run.file_state_cache_ref = getattr(job, "file_state_cache_ref", None) or run.file_state_cache_ref
             run.turn_diff_ref = getattr(job, "turn_diff_ref", None) or run.turn_diff_ref
@@ -1878,6 +1898,10 @@ class RunService:
             run.worker_mailbox_ref = getattr(job, "worker_mailbox_ref", None) or run.worker_mailbox_ref
             run.worker_sessions_ref = getattr(job, "worker_sessions_ref", None) or run.worker_sessions_ref
             run.worker_ownership_ref = getattr(job, "worker_ownership_ref", None) or run.worker_ownership_ref
+            run.draft_isolation_ref = getattr(job, "draft_isolation_ref", None) or run.draft_isolation_ref
+            run.draft_gate_ref = getattr(job, "draft_gate_ref", None) or run.draft_gate_ref
+            run.draft_apply_decision_ref = getattr(job, "draft_apply_decision_ref", None) or run.draft_apply_decision_ref
+            run.guardian_gate_ref = getattr(job, "guardian_gate_ref", None) or run.guardian_gate_ref
             run.scratchpad_ref = getattr(job, "scratchpad_ref", None) or run.scratchpad_ref
             run.memory_ref = getattr(job, "memory_ref", None) or run.memory_ref
             run.worker_drafts_ref = getattr(job, "worker_drafts_ref", None) or run.worker_drafts_ref
@@ -2511,6 +2535,7 @@ class RunService:
             "tool_trace_ref": run.tool_trace_ref,
             "file_change_history_ref": run.file_change_history_ref,
             "browser_proof_ref": run.browser_proof_ref,
+            "browser_replay_proof_ref": run.browser_replay_proof_ref,
             "large_tool_outputs_ref": run.large_tool_outputs_ref,
             "file_state_cache_ref": run.file_state_cache_ref,
             "turn_diff_ref": run.turn_diff_ref,
@@ -2519,6 +2544,10 @@ class RunService:
             "worker_mailbox_ref": run.worker_mailbox_ref,
             "worker_sessions_ref": run.worker_sessions_ref,
             "worker_ownership_ref": run.worker_ownership_ref,
+            "draft_isolation_ref": run.draft_isolation_ref,
+            "draft_gate_ref": run.draft_gate_ref,
+            "draft_apply_decision_ref": run.draft_apply_decision_ref,
+            "guardian_gate_ref": run.guardian_gate_ref,
             "scratchpad_ref": run.scratchpad_ref,
             "memory_ref": run.memory_ref,
             "worker_drafts_ref": run.worker_drafts_ref,
@@ -2559,9 +2588,14 @@ class RunService:
             "resume_checkpoint": self.store.get("reports", run.resume_checkpoint_ref) if run.resume_checkpoint_ref else None,
             "verifier_review": self.store.get("reports", run.verifier_review_ref) if run.verifier_review_ref else None,
             "browser_steps": [self.store.get("reports", ref) for ref in run.browser_step_refs if ref],
+            "browser_replay_proof": self.store.get("reports", run.browser_replay_proof_ref) if run.browser_replay_proof_ref else None,
             "lsp_context": self.store.get("reports", run.lsp_context_ref) if run.lsp_context_ref else None,
             "context_manager": self.store.get("reports", run.context_manager_ref) if run.context_manager_ref else None,
             "context_pressure": self.store.get("reports", run.context_pressure_ref) if run.context_pressure_ref else None,
+            "draft_isolation": self.store.get("reports", run.draft_isolation_ref) if run.draft_isolation_ref else None,
+            "draft_gate": self.store.get("reports", run.draft_gate_ref) if run.draft_gate_ref else None,
+            "draft_apply_decision": self.store.get("reports", run.draft_apply_decision_ref) if run.draft_apply_decision_ref else None,
+            "guardian_gate": self.store.get("reports", run.guardian_gate_ref) if run.guardian_gate_ref else None,
             "hook_trace": self.store.get("reports", run.hook_trace_ref) if run.hook_trace_ref else None,
             "semantic_graph": self.store.get("reports", run.semantic_graph_ref) if run.semantic_graph_ref else None,
             "replay_trace": self.store.get("reports", run.replay_trace_ref) if run.replay_trace_ref else None,
@@ -2653,6 +2687,20 @@ class RunService:
                     source_ref=f"memory_stage1:{run.workspace_id}:{run.run_id}",
                     idempotency_key=f"memory.raw_extracted:{run.run_id}",
                 )
+                self.event_journal_service.append_run(
+                    workspace_id=run.workspace_id,
+                    run_id=run.run_id,
+                    event_type="memory.phase1.extracted",
+                    payload={
+                        "memory_ref": f"memory_stage1:{run.workspace_id}:{run.run_id}",
+                        "raw_count": len(payload.get("items") or []),
+                        "kinds": sorted({str(item.get("kind") or "") for item in payload.get("items") or [] if isinstance(item, dict)}),
+                    },
+                    actor="system",
+                    summary="Phase 1 run memory extracted.",
+                    source_ref=f"memory_stage1:{run.workspace_id}:{run.run_id}",
+                    idempotency_key=f"memory.phase1.extracted:{run.run_id}",
+                )
             except Exception:
                 pass
 
@@ -2693,6 +2741,41 @@ class RunService:
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             },
         )
+        if self.event_journal_service is not None:
+            repeated_stats = pipeline.get("repeated_failure_stats") if isinstance(pipeline.get("repeated_failure_stats"), dict) else {}
+            for payload in stage1:
+                run_id = str(payload.get("run_id") or "")
+                if not run_id:
+                    continue
+                try:
+                    self.event_journal_service.append_run(
+                        workspace_id=workspace_id,
+                        run_id=run_id,
+                        event_type="memory.phase2.consolidated",
+                        payload={
+                            "memory_ref": f"workspace_memory:{workspace_id}",
+                            "consolidation_ref": f"memory_consolidation:{workspace_id}",
+                            "stage1_count": len(stage1),
+                            "repeated_failure_stats": repeated_stats,
+                        },
+                        actor="system",
+                        summary="Phase 2 workspace memory consolidated.",
+                        source_ref=f"workspace_memory:{workspace_id}",
+                        idempotency_key=f"memory.phase2.consolidated:{workspace_id}:{run_id}",
+                    )
+                    if int(repeated_stats.get("repeated_failure_count", 0) or 0) > 0:
+                        self.event_journal_service.append_run(
+                            workspace_id=workspace_id,
+                            run_id=run_id,
+                            event_type="memory.repeated_failure.updated",
+                            payload={"memory_ref": f"workspace_memory:{workspace_id}", "repeated_failure_stats": repeated_stats},
+                            actor="system",
+                            summary="Repeated failure memory updated.",
+                            source_ref=f"workspace_memory:{workspace_id}",
+                            idempotency_key=f"memory.repeated_failure.updated:{workspace_id}:{run_id}",
+                        )
+                except Exception:
+                    pass
 
     def _schedule_auto_repair_continuation_if_needed(self, run: RunRecord) -> None:
         try:

@@ -219,6 +219,10 @@ class JobRecord(StrictModel):
     worker_mailbox_ref: str | None = None
     worker_sessions_ref: str | None = None
     worker_ownership_ref: str | None = None
+    draft_isolation_ref: str | None = None
+    draft_gate_ref: str | None = None
+    draft_apply_decision_ref: str | None = None
+    guardian_gate_ref: str | None = None
     scratchpad_ref: str | None = None
     memory_ref: str | None = None
     worker_drafts_ref: str | None = None
@@ -238,6 +242,7 @@ class JobRecord(StrictModel):
     worker_branch_refs: list[str] = Field(default_factory=list)
     verifier_review_ref: str | None = None
     browser_step_refs: list[str] = Field(default_factory=list)
+    browser_replay_proof_ref: str | None = None
     lsp_context_ref: str | None = None
     context_manager_ref: str | None = None
     context_pressure_ref: str | None = None
@@ -617,6 +622,10 @@ class RunRecord(StrictModel):
     worker_mailbox_ref: str | None = None
     worker_sessions_ref: str | None = None
     worker_ownership_ref: str | None = None
+    draft_isolation_ref: str | None = None
+    draft_gate_ref: str | None = None
+    draft_apply_decision_ref: str | None = None
+    guardian_gate_ref: str | None = None
     scratchpad_ref: str | None = None
     memory_ref: str | None = None
     worker_drafts_ref: str | None = None
@@ -636,6 +645,7 @@ class RunRecord(StrictModel):
     worker_branch_refs: list[str] = Field(default_factory=list)
     verifier_review_ref: str | None = None
     browser_step_refs: list[str] = Field(default_factory=list)
+    browser_replay_proof_ref: str | None = None
     lsp_context_ref: str | None = None
     context_manager_ref: str | None = None
     context_pressure_ref: str | None = None

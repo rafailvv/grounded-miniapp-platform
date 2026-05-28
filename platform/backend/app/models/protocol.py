@@ -182,6 +182,27 @@ class RunReplayParams(StrictModel):
     limit: int = 500
 
 
+class DraftApplyParams(StrictModel):
+    run_id: str = Field(validation_alias=AliasChoices("run_id", "runId"))
+    files: list[str] = Field(default_factory=list)
+    apply_token: str | None = Field(default=None, validation_alias=AliasChoices("apply_token", "applyToken"))
+
+
+class DraftVariantParams(StrictModel):
+    run_id: str = Field(validation_alias=AliasChoices("run_id", "runId"))
+    variant_run_id: str | None = Field(default=None, validation_alias=AliasChoices("variant_run_id", "variantRunId"))
+
+
+class GuardianGateParams(StrictModel):
+    run_id: str = Field(validation_alias=AliasChoices("run_id", "runId"))
+    semantic_override: str | None = Field(default=None, validation_alias=AliasChoices("semantic_override", "semanticOverride"))
+
+
+class BrowserReplayScenarioParams(StrictModel):
+    run_id: str = Field(validation_alias=AliasChoices("run_id", "runId"))
+    scenario_id: str = Field(validation_alias=AliasChoices("scenario_id", "scenarioId"))
+
+
 class WorkerSessionParams(StrictModel):
     run_id: str = Field(validation_alias=AliasChoices("run_id", "runId"))
     worker_session_id: str = Field(validation_alias=AliasChoices("worker_session_id", "workerSessionId"))

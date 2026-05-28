@@ -99,6 +99,9 @@ from app.services.requirement_traceability import PromptArtifactCompletionAudit,
 from app.services.rollout_trace_evidence import RolloutTraceEvidence
 from app.services.run_compaction import RunCompactionService
 from app.services.context_manager import ContextManagerService
+from app.services.browser_replay_proof import BrowserReplayProofService
+from app.services.draft_isolation import DraftIsolationService
+from app.services.guardian_gate import GuardianGateService
 from app.services.lsp_context import LspContextService
 from app.services.run_protocol import RunProtocolConflict, RunProtocolService, diff_sha256
 from app.services.trace_bundle import TraceBundleReducer
@@ -181,10 +184,13 @@ class WorkbenchService:
         repair_case_service: RepairCaseService | None = None,
         context_manager_service: ContextManagerService | None = None,
         worker_session_service: WorkerSessionService | None = None,
+        draft_isolation_service: DraftIsolationService | None = None,
+        guardian_gate_service: GuardianGateService | None = None,
         lsp_context_service: LspContextService | None = None,
         event_journal_service: EventJournalService | None = None,
         output_artifact_service: OutputArtifactService | None = None,
         pr_babysitter_service: PrBabysitterService | None = None,
+        browser_replay_proof_service: BrowserReplayProofService | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
@@ -197,11 +203,14 @@ class WorkbenchService:
         self.run_compaction_service = run_compaction_service
         self.context_manager_service = context_manager_service
         self.worker_session_service = worker_session_service or WorkerSessionService(store, event_journal_service=event_journal_service)
+        self.draft_isolation_service = draft_isolation_service or DraftIsolationService(store=store, workspace_service=workspace_service, event_journal_service=event_journal_service)
+        self.guardian_gate_service = guardian_gate_service or GuardianGateService(store=store, workspace_service=workspace_service, event_journal_service=event_journal_service)
         self.lsp_context_service = lsp_context_service
         self.background_task_service = background_task_service
         self.event_journal_service = event_journal_service
         self.output_artifact_service = output_artifact_service
         self.pr_babysitter_service = pr_babysitter_service or PrBabysitterService(store=store, workspace_service=workspace_service)
+        self.browser_replay_proof_service = browser_replay_proof_service or BrowserReplayProofService(store, event_journal_service=event_journal_service)
         self.repair_case_service = repair_case_service or RepairCaseService(store, event_journal_service=event_journal_service)
         self.prompt_suggestion_service = PromptSuggestionService()
 
@@ -2427,10 +2436,49 @@ class WorkbenchService:
         run = self.run_service.get_run(run_id)
         artifacts = self._run_artifacts_or_empty(run_id)
         payload = self._normalize_browser_proof_payload(run, artifacts)
+        failed_packet = self._latest_browser_replay_packet(run)
+        replay = self.browser_replay_proof_service.build(workspace_id=run.workspace_id, run_id=run_id, browser_proof=payload, failed_packet=failed_packet)
+        run.browser_replay_proof_ref = replay.replay_proof_ref
+        run.browser_step_refs = list(dict.fromkeys([*list(run.browser_step_refs or []), *replay.scenario_refs]))
+        run.updated_at = datetime.now(timezone.utc)
+        self.store.upsert("runs", run_id, run.model_dump(mode="json"))
+        payload["replay_proof_ref"] = replay.replay_proof_ref
+        payload["replay_scenarios"] = [item.model_dump(mode="json", by_alias=True) for item in replay.scenarios]
+        payload["playwright_spec_refs"] = list(replay.playwright_spec_refs)
+        payload["artifact_refs"] = {**dict(payload.get("artifact_refs") or {}), "browser_replay_proof": replay.replay_proof_ref}
         self.store.upsert("reports", f"browser_proof:{run_id}", payload)
         if run.browser_proof_ref:
             self.store.upsert("reports", run.browser_proof_ref, payload)
         return payload
+
+    def browser_replay_proof(self, run_id: str, *, build: bool = False) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        existing = self.browser_replay_proof_service.get(workspace_id=run.workspace_id, run_id=run_id)
+        if existing and not build:
+            return existing
+        return self.browser_proof(run_id).get("replay_proof_ref") and self.browser_replay_proof_service.get(workspace_id=run.workspace_id, run_id=run_id) or {}
+
+    def browser_replay_scenario(self, run_id: str, scenario_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        scenario = self.browser_replay_proof_service.scenario(workspace_id=run.workspace_id, run_id=run_id, scenario_id=scenario_id)
+        if scenario is None:
+            self.browser_replay_proof(run_id, build=True)
+            scenario = self.browser_replay_proof_service.scenario(workspace_id=run.workspace_id, run_id=run_id, scenario_id=scenario_id)
+        if scenario is None:
+            raise KeyError(f"Browser replay scenario not found: {scenario_id}")
+        return scenario
+
+    def _latest_browser_replay_packet(self, run: RunRecord) -> dict[str, Any] | None:
+        refs = [ref for ref in list(getattr(run, "browser_step_refs", []) or []) if str(ref).startswith("browser_replay:")]
+        if not refs:
+            refs = [key for key, payload in self.store.items("reports") if key.startswith(f"browser_replay:{run.workspace_id}:{run.run_id}") and isinstance(payload, dict)]
+        for ref in reversed(refs):
+            payload = self.store.get("reports", ref)
+            if isinstance(payload, dict):
+                packet = payload.get("packet") if isinstance(payload.get("packet"), dict) else payload
+                if isinstance(packet, dict):
+                    return packet
+        return None
 
     def browser_replay(self, run_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
@@ -2453,6 +2501,7 @@ class WorkbenchService:
             packet = payload.get("packet") if isinstance(payload.get("packet"), dict) else payload
             items.append({"ref": ref, "packet": packet})
         latest = items[-1]["packet"] if items else {}
+        replay_proof = self.browser_replay_proof(run_id)
         return {
             "schema": "grounded.browser_replay.v1",
             "run_id": run_id,
@@ -2460,6 +2509,13 @@ class WorkbenchService:
             "status": "ready" if latest else "empty",
             "items": items,
             "latest_packet": latest,
+            "replay_proof": replay_proof,
+            "scenario_bundles": replay_proof.get("scenarios") if isinstance(replay_proof, dict) else [],
+            "playwright_specs": [
+                {"scenario_id": item.get("scenario_id"), "playwright_spec": item.get("playwright_spec")}
+                for item in (replay_proof.get("scenarios") or [])
+                if isinstance(item, dict)
+            ] if isinstance(replay_proof, dict) else [],
             "replay_first": BrowserProofReplay.should_rerun_step_first(latest if isinstance(latest, dict) else None),
             "replay_plan": latest.get("replay_plan") if isinstance(latest, dict) else {},
         }
@@ -3054,6 +3110,39 @@ class WorkbenchService:
             state = RunStateMachine.evaluate(run=run, gate=payload, artifacts=artifacts, browser_proof=browser_proof)
         payload["run_state"] = state
         payload["artifact_refs"]["run_state"] = f"run_state:{run_id}"
+        try:
+            draft_gate = self.draft_isolation_service.create_gate(
+                workspace_id=run.workspace_id,
+                run_id=run_id,
+                checks_ref=f"run_artifacts:{run_id}",
+                lsp_ref=getattr(run, "lsp_context_ref", None) or f"lsp_context:{run.workspace_id}:{run_id}",
+                readiness_ref=f"gate:{run_id}",
+            )
+            draft_manifest = self.store.get("reports", draft_gate.isolation_ref) or {}
+            payload["draft_isolation"] = draft_manifest
+            payload["draft_gate"] = draft_gate.model_dump(mode="json", by_alias=True)
+            payload["artifact_refs"]["draft_isolation"] = draft_gate.isolation_ref
+            payload["artifact_refs"]["draft_gate"] = draft_gate.gate_ref
+            self._sync_draft_refs(run, isolation_ref=draft_gate.isolation_ref, gate_ref=draft_gate.gate_ref, persist=True)
+        except Exception as exc:
+            payload["draft_isolation"] = {"status": "unavailable", "reason": str(exc)}
+        try:
+            guardian_gate = self.guardian_gate_service.latest_gate(workspace_id=run.workspace_id, run_id=run_id)
+            if guardian_gate is None:
+                guardian_gate = self.guardian_gate_service.run_gate(
+                    run=run,
+                    source="manual_review",
+                    changed_files=self.workspace_service.draft_changed_paths(run.workspace_id, run_id) if self.workspace_service.draft_exists(run.workspace_id, run_id) else run.touched_files,
+                ).model_dump(mode="json", by_alias=True)
+            payload["guardian_gate"] = guardian_gate
+            payload["guardian_gate_ref"] = guardian_gate.get("guardian_gate_ref")
+            payload["semantic_verdict"] = guardian_gate.get("semantic_verdict")
+            payload["guardian_repair_packets"] = guardian_gate.get("repair_packets") or []
+            payload["artifact_refs"]["guardian_gate"] = guardian_gate.get("guardian_gate_ref")
+            run.guardian_gate_ref = guardian_gate.get("guardian_gate_ref") or run.guardian_gate_ref
+            self.store.upsert("runs", run_id, run.model_dump(mode="json"))
+        except Exception as exc:
+            payload["guardian_gate"] = {"status": "unavailable", "reason": str(exc)}
         self.store.upsert("reports", f"gate:{run_id}", payload)
         self.store.upsert("reports", f"run_state:{run_id}", state)
         digest = hashlib.sha256(
@@ -3107,6 +3196,18 @@ class WorkbenchService:
             except Exception:
                 pass
         return self._typed_payload(GateReport, payload)
+
+    def guardian_gate(self, run_id: str, *, create: bool = False, semantic_override: str | None = None) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        existing = self.guardian_gate_service.latest_gate(workspace_id=run.workspace_id, run_id=run_id)
+        if existing and not create and semantic_override is None:
+            return existing
+        changed_files = self.workspace_service.draft_changed_paths(run.workspace_id, run_id) if self.workspace_service.draft_exists(run.workspace_id, run_id) else run.touched_files
+        report = self.guardian_gate_service.run_gate(run=run, source="manual_review", changed_files=changed_files, semantic_override=semantic_override)
+        run.guardian_gate_ref = report.guardian_gate_ref
+        run.updated_at = datetime.now(timezone.utc)
+        self.store.upsert("runs", run_id, run.model_dump(mode="json"))
+        return report.model_dump(mode="json", by_alias=True)
 
     @classmethod
     def _has_product_runtime_change(cls, diff_text: str, touched_files: list[str] | None) -> bool:
@@ -3513,6 +3614,18 @@ class WorkbenchService:
             source_ref=f"memory_stage1:{run.workspace_id}:{run_id}",
             idempotency_key=f"memory.raw_extracted:{run_id}",
         )
+        self._journal_run_event(
+            run_id,
+            "memory.phase1.extracted",
+            {
+                "memory_ref": f"memory_stage1:{run.workspace_id}:{run_id}",
+                "raw_count": len(payload.get("items") or []),
+                "kinds": sorted({str(item.get("kind") or "") for item in payload.get("items") or [] if isinstance(item, dict)}),
+            },
+            summary="Phase 1 run memory extracted.",
+            source_ref=f"memory_stage1:{run.workspace_id}:{run_id}",
+            idempotency_key=f"memory.phase1.extracted:{run_id}",
+        )
         return payload
 
     def memory_pipeline(self, workspace_id: str) -> dict[str, Any]:
@@ -3532,6 +3645,7 @@ class WorkbenchService:
         memory_summary = WorkspaceMemoryPipeline.summary(workspace_id, workspace_memory)
         category_counts = WorkspaceMemoryPipeline._category_counts(items)
         type_buckets = WorkspaceMemoryPipeline.type_buckets(items)
+        repeated_failure_stats = WorkspaceMemoryPipeline.repeated_failure_stats(items)
         return {
             "schema": "grounded.memory_pipeline.v1",
             "workspace_id": workspace_id,
@@ -3554,6 +3668,7 @@ class WorkbenchService:
             "stage1_items": sum(len(payload.get("items") or []) for payload in stage1),
             "category_counts": category_counts,
             "type_counts": {key: len(value) for key, value in type_buckets.items()},
+            "repeated_failure_stats": repeated_failure_stats,
             "product_memory_types": type_buckets,
             "active_count": active_count,
             "stale_count": stale_count,
@@ -3586,6 +3701,98 @@ class WorkbenchService:
         consolidated["session_memory"] = self.session_memory(workspace_id, memory=consolidated)
         self.store.upsert("reports", f"workspace_memory:{workspace_id}", consolidated)
         pipeline = consolidated.get("pipeline") if isinstance(consolidated.get("pipeline"), dict) else {}
+        repeated_failure_stats = pipeline.get("repeated_failure_stats") if isinstance(pipeline.get("repeated_failure_stats"), dict) else {}
+        self.store.upsert(
+            "reports",
+            f"memory_consolidation:{workspace_id}",
+            {
+                "schema": "grounded.memory_consolidation.v1",
+                "workspace_id": workspace_id,
+                "status": "auto_consolidated",
+                "stage1_count": len(stage1),
+                "raw_count": int(pipeline.get("stage1_items", 0) or 0),
+                "active_count": int(pipeline.get("active_count", 0) or 0),
+                "stale_count": int(pipeline.get("stale_count", 0) or 0),
+                "expired_count": int(pipeline.get("expired_count", 0) or 0),
+                "superseded_count": int(pipeline.get("superseded_count", 0) or 0),
+                "deduped_count": int(pipeline.get("deduped_count", 0) or 0),
+                "repeated_failure_stats": repeated_failure_stats,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        for payload in stage1:
+            run_id = str(payload.get("run_id") or "")
+            if not run_id:
+                continue
+            self._journal_run_event(
+                run_id,
+                "memory.phase2.consolidated",
+                {
+                    "memory_ref": f"workspace_memory:{workspace_id}",
+                    "consolidation_ref": f"memory_consolidation:{workspace_id}",
+                    "stage1_count": len(stage1),
+                    "repeated_failure_stats": repeated_failure_stats,
+                },
+                summary="Phase 2 workspace memory consolidated.",
+                source_ref=f"workspace_memory:{workspace_id}",
+                idempotency_key=f"memory.phase2.consolidated:{workspace_id}:{run_id}",
+            )
+            if int(repeated_failure_stats.get("repeated_failure_count", 0) or 0) > 0:
+                self._journal_run_event(
+                    run_id,
+                    "memory.repeated_failure.updated",
+                    {"memory_ref": f"workspace_memory:{workspace_id}", "repeated_failure_stats": repeated_failure_stats},
+                    summary="Repeated failure memory updated.",
+                    source_ref=f"workspace_memory:{workspace_id}",
+                    idempotency_key=f"memory.repeated_failure.updated:{workspace_id}:{run_id}",
+                )
+        pipeline = consolidated.get("pipeline") if isinstance(consolidated.get("pipeline"), dict) else {}
+        self.store.upsert(
+            "reports",
+            f"memory_consolidation:{workspace_id}",
+            {
+                "schema": "grounded.memory_consolidation.v1",
+                "workspace_id": workspace_id,
+                "status": "auto_consolidated",
+                "stage1_count": len(stage1),
+                "raw_count": int(pipeline.get("stage1_items", 0) or 0),
+                "active_count": int(pipeline.get("active_count", 0) or 0),
+                "stale_count": int(pipeline.get("stale_count", 0) or 0),
+                "expired_count": int(pipeline.get("expired_count", 0) or 0),
+                "superseded_count": int(pipeline.get("superseded_count", 0) or 0),
+                "deduped_count": int(pipeline.get("deduped_count", 0) or 0),
+                "repeated_failure_stats": pipeline.get("repeated_failure_stats") or WorkspaceMemoryPipeline.repeated_failure_stats(consolidated.get("items") or []),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        repeated_failure_stats = pipeline.get("repeated_failure_stats") if isinstance(pipeline.get("repeated_failure_stats"), dict) else {}
+        for payload in stage1:
+            run_id = str(payload.get("run_id") or "")
+            if not run_id:
+                continue
+            self._journal_run_event(
+                run_id,
+                "memory.phase2.consolidated",
+                {
+                    "memory_ref": f"workspace_memory:{workspace_id}",
+                    "consolidation_ref": f"memory_consolidation:{workspace_id}",
+                    "stage1_count": len(stage1),
+                    "repeated_failure_stats": repeated_failure_stats,
+                },
+                summary="Phase 2 workspace memory consolidated.",
+                source_ref=f"workspace_memory:{workspace_id}",
+                idempotency_key=f"memory.phase2.consolidated:{workspace_id}:{run_id}",
+            )
+            if int(repeated_failure_stats.get("repeated_failure_count", 0) or 0) > 0:
+                self._journal_run_event(
+                    run_id,
+                    "memory.repeated_failure.updated",
+                    {"memory_ref": f"workspace_memory:{workspace_id}", "repeated_failure_stats": repeated_failure_stats},
+                    summary="Repeated failure memory updated.",
+                    source_ref=f"workspace_memory:{workspace_id}",
+                    idempotency_key=f"memory.repeated_failure.updated:{workspace_id}:{run_id}",
+                )
+        pipeline = consolidated.get("pipeline") if isinstance(consolidated.get("pipeline"), dict) else {}
         summary = MemoryConsolidationReport(
             workspace_id=workspace_id,
             status="consolidated",
@@ -3599,6 +3806,7 @@ class WorkbenchService:
             updated_at=datetime.now(timezone.utc).isoformat(),
         ).model_dump(mode="json", by_alias=True)
         self.store.upsert("reports", f"memory_consolidation:{workspace_id}", summary)
+        repeated_failure_stats = (pipeline.get("repeated_failure_stats") if isinstance(pipeline.get("repeated_failure_stats"), dict) else {}) or WorkspaceMemoryPipeline.repeated_failure_stats(consolidated.get("items") or [])
         for payload in stage1:
             run_id = str(payload.get("run_id") or "")
             if not run_id:
@@ -3611,6 +3819,28 @@ class WorkbenchService:
                 source_ref=f"workspace_memory:{workspace_id}",
                 idempotency_key=f"memory.consolidated:{workspace_id}:{run_id}",
             )
+            self._journal_run_event(
+                run_id,
+                "memory.phase2.consolidated",
+                {
+                    "memory_ref": f"workspace_memory:{workspace_id}",
+                    "consolidation_ref": f"memory_consolidation:{workspace_id}",
+                    "stage1_count": len(stage1),
+                    "repeated_failure_stats": repeated_failure_stats,
+                },
+                summary="Phase 2 workspace memory consolidated.",
+                source_ref=f"workspace_memory:{workspace_id}",
+                idempotency_key=f"memory.phase2.consolidated:{workspace_id}:{run_id}",
+            )
+            if int(repeated_failure_stats.get("repeated_failure_count", 0) or 0) > 0:
+                self._journal_run_event(
+                    run_id,
+                    "memory.repeated_failure.updated",
+                    {"memory_ref": f"workspace_memory:{workspace_id}", "repeated_failure_stats": repeated_failure_stats},
+                    summary="Repeated failure memory updated.",
+                    source_ref=f"workspace_memory:{workspace_id}",
+                    idempotency_key=f"memory.repeated_failure.updated:{workspace_id}:{run_id}",
+                )
         return {**consolidated, "pipeline": self.memory_pipeline(workspace_id)}
 
     def retrieve_memory(self, workspace_id: str, payload: dict[str, Any] | MemoryRetrievalRequest) -> dict[str, Any]:
@@ -3662,6 +3892,52 @@ class WorkbenchService:
         consolidated["memory_summary"] = WorkspaceMemoryPipeline.summary(workspace_id, consolidated)
         consolidated["session_memory"] = self.session_memory(workspace_id, memory=consolidated)
         self.store.upsert("reports", f"workspace_memory:{workspace_id}", consolidated)
+        pipeline = consolidated.get("pipeline") if isinstance(consolidated.get("pipeline"), dict) else {}
+        repeated_failure_stats = pipeline.get("repeated_failure_stats") if isinstance(pipeline.get("repeated_failure_stats"), dict) else {}
+        self.store.upsert(
+            "reports",
+            f"memory_consolidation:{workspace_id}",
+            {
+                "schema": "grounded.memory_consolidation.v1",
+                "workspace_id": workspace_id,
+                "status": "auto_consolidated",
+                "stage1_count": len(stage1),
+                "raw_count": int(pipeline.get("stage1_items", 0) or 0),
+                "active_count": int(pipeline.get("active_count", 0) or 0),
+                "stale_count": int(pipeline.get("stale_count", 0) or 0),
+                "expired_count": int(pipeline.get("expired_count", 0) or 0),
+                "superseded_count": int(pipeline.get("superseded_count", 0) or 0),
+                "deduped_count": int(pipeline.get("deduped_count", 0) or 0),
+                "repeated_failure_stats": repeated_failure_stats,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        for payload in stage1:
+            run_id = str(payload.get("run_id") or "")
+            if not run_id:
+                continue
+            self._journal_run_event(
+                run_id,
+                "memory.phase2.consolidated",
+                {
+                    "memory_ref": f"workspace_memory:{workspace_id}",
+                    "consolidation_ref": f"memory_consolidation:{workspace_id}",
+                    "stage1_count": len(stage1),
+                    "repeated_failure_stats": repeated_failure_stats,
+                },
+                summary="Phase 2 workspace memory consolidated.",
+                source_ref=f"workspace_memory:{workspace_id}",
+                idempotency_key=f"memory.phase2.consolidated:{workspace_id}:{run_id}",
+            )
+            if int(repeated_failure_stats.get("repeated_failure_count", 0) or 0) > 0:
+                self._journal_run_event(
+                    run_id,
+                    "memory.repeated_failure.updated",
+                    {"memory_ref": f"workspace_memory:{workspace_id}", "repeated_failure_stats": repeated_failure_stats},
+                    summary="Repeated failure memory updated.",
+                    source_ref=f"workspace_memory:{workspace_id}",
+                    idempotency_key=f"memory.repeated_failure.updated:{workspace_id}:{run_id}",
+                )
 
     def project_instructions(self) -> dict[str, Any]:
         payload = ProjectInstructionBundle.build(repo_root=self.settings.repo_root, template_dir=self.settings.template_dir)
@@ -5480,6 +5756,87 @@ class WorkbenchService:
             raise KeyError("Run compaction service is unavailable.")
         return self.run_compaction_service.post_compact_message(run_id, boundary_id)
 
+    def draft_isolation(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        manifest = self.draft_isolation_service.ensure_manifest(workspace_id=run.workspace_id, run_id=run_id)
+        self._sync_draft_refs(run, isolation_ref=self.draft_isolation_service.manifest_ref(run.workspace_id, run_id), persist=True)
+        return manifest.model_dump(mode="json", by_alias=True)
+
+    def draft_gate(self, run_id: str, *, create: bool = False) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        report = self.draft_isolation_service.latest_gate(workspace_id=run.workspace_id, run_id=run_id)
+        if create or report is None:
+            report = self.draft_isolation_service.create_gate(
+                workspace_id=run.workspace_id,
+                run_id=run_id,
+                checks_ref=f"run_artifacts:{run_id}",
+                lsp_ref=getattr(run, "lsp_context_ref", None) or f"lsp_context:{run.workspace_id}:{run_id}",
+                readiness_ref=f"gate:{run_id}",
+            )
+        self._sync_draft_refs(run, isolation_ref=self.draft_isolation_service.manifest_ref(run.workspace_id, run_id), gate_ref=report.gate_ref, persist=True)
+        return report.model_dump(mode="json", by_alias=True)
+
+    def draft_apply(self, run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        files = self._normalize_file_list(payload.get("files") or [])
+        gate = self.draft_isolation_service.latest_gate(workspace_id=run.workspace_id, run_id=run_id)
+        if gate is None or gate.status != "passed":
+            gate = self.draft_isolation_service.create_gate(
+                workspace_id=run.workspace_id,
+                run_id=run_id,
+                checks_ref=f"run_artifacts:{run_id}",
+                lsp_ref=getattr(run, "lsp_context_ref", None) or f"lsp_context:{run.workspace_id}:{run_id}",
+                readiness_ref=f"gate:{run_id}",
+            )
+        decision = self.draft_isolation_service.validate_apply_gate(
+            workspace_id=run.workspace_id,
+            run_id=run_id,
+            apply_token=payload.get("apply_token") or gate.apply_token,
+            selected_files=files or gate.changed_files,
+        )
+        if decision.decision == "blocked":
+            self._sync_draft_refs(
+                run,
+                isolation_ref=self.draft_isolation_service.manifest_ref(run.workspace_id, run_id),
+                gate_ref=gate.gate_ref,
+                apply_decision_ref=self.draft_isolation_service.apply_decision_ref(run.workspace_id, run_id),
+                persist=True,
+            )
+            return decision.model_dump(mode="json", by_alias=True)
+        if files:
+            self.stage_files(run_id, {"files": files})
+        self.apply_staged(run_id)
+        latest = self.store.get("reports", self.draft_isolation_service.apply_decision_ref(run.workspace_id, run_id))
+        return latest if isinstance(latest, dict) else decision.model_dump(mode="json", by_alias=True)
+
+    def draft_variants(self, run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        report = self.draft_isolation_service.create_variant(
+            workspace_id=run.workspace_id,
+            source_run_id=run_id,
+            variant_run_id=payload.get("variant_run_id") or payload.get("variantRunId"),
+        )
+        return report.model_dump(mode="json", by_alias=True)
+
+    def _sync_draft_refs(
+        self,
+        run: RunRecord,
+        *,
+        isolation_ref: str | None = None,
+        gate_ref: str | None = None,
+        apply_decision_ref: str | None = None,
+        persist: bool = False,
+    ) -> None:
+        if isolation_ref:
+            run.draft_isolation_ref = isolation_ref
+        if gate_ref:
+            run.draft_gate_ref = gate_ref
+        if apply_decision_ref:
+            run.draft_apply_decision_ref = apply_decision_ref
+        if persist:
+            run.updated_at = datetime.now(timezone.utc)
+            self.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+
     def stage_files(self, run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
         files = self._normalize_file_list(payload.get("files") or [])
@@ -5520,6 +5877,33 @@ class WorkbenchService:
             if path in contract_owned or path.startswith("miniapp/app/generated/")
         )
         files = list(dict.fromkeys([*files, *blocking_required]))
+        draft_gate = self.draft_isolation_service.create_gate(
+            workspace_id=run.workspace_id,
+            run_id=run_id,
+            checks_ref=f"run_artifacts:{run_id}",
+            lsp_ref=getattr(run, "lsp_context_ref", None) or f"lsp_context:{run.workspace_id}:{run_id}",
+            readiness_ref=f"gate:{run_id}",
+        )
+        draft_decision = self.draft_isolation_service.validate_apply_gate(
+            workspace_id=run.workspace_id,
+            run_id=run_id,
+            apply_token=draft_gate.apply_token,
+            selected_files=files,
+        )
+        self._sync_draft_refs(
+            run,
+            isolation_ref=self.draft_isolation_service.manifest_ref(run.workspace_id, run_id),
+            gate_ref=draft_gate.gate_ref,
+            apply_decision_ref=self.draft_isolation_service.apply_decision_ref(run.workspace_id, run_id),
+        )
+        if draft_decision.decision == "blocked":
+            run.apply_status = "blocked"
+            run.status = "blocked"
+            run.failure_reason = "Draft apply blocked by isolation gate."
+            run.remaining_issues = [*run.remaining_issues, *draft_decision.blocked_reasons]
+            run.updated_at = datetime.now(timezone.utc)
+            self.store.upsert("runs", run_id, run.model_dump(mode="json"))
+            return run
         allowed, guardian_report = self.run_service.enforce_guardian_before_apply(
             run,
             source="pre_apply_guardian",
@@ -5531,6 +5915,12 @@ class WorkbenchService:
             artifacts["run"] = self.run_service.get_run(run_id).model_dump(mode="json")
             self.store.upsert("reports", f"run_artifacts:{run_id}", artifacts)
             return self.run_service.get_run(run_id)
+        self.draft_isolation_service.record_apply_started(
+            workspace_id=run.workspace_id,
+            run_id=run_id,
+            gate_ref=draft_gate.gate_ref,
+            selected_files=files,
+        )
         revision = self.workspace_service.apply_selected_draft_files(run.workspace_id, run_id, files, message=f"Apply staged AI draft files for run {run_id}")
         fully_applied = bool(changed_before_apply) and set(files).issuperset(changed_before_apply)
         run.result_revision_id = revision.revision_id
@@ -5545,11 +5935,31 @@ class WorkbenchService:
         run.updated_at = datetime.now(timezone.utc)
         if fully_applied:
             self.workspace_service.discard_draft(run.workspace_id, run_id)
+        apply_decision = self.draft_isolation_service.record_apply(
+            workspace_id=run.workspace_id,
+            run_id=run_id,
+            revision_id=revision.revision_id,
+            selected_files=files,
+            gate_ref=draft_gate.gate_ref,
+            apply_token=draft_gate.apply_token,
+        )
+        self._sync_draft_refs(
+            run,
+            isolation_ref=self.draft_isolation_service.manifest_ref(run.workspace_id, run_id),
+            gate_ref=draft_gate.gate_ref,
+            apply_decision_ref=self.draft_isolation_service.apply_decision_ref(run.workspace_id, run_id),
+        )
         self.store.upsert("runs", run_id, run.model_dump(mode="json"))
         artifacts = self._run_artifacts_or_empty(run_id)
         artifacts["run"] = run.model_dump(mode="json")
         artifacts["guardian_review"] = guardian_report
         artifacts["staged_apply"] = {"files": files, "revision_id": revision.revision_id, "fully_applied": fully_applied}
+        artifacts["draft_isolation"] = {
+            "isolation_ref": run.draft_isolation_ref,
+            "gate_ref": run.draft_gate_ref,
+            "apply_decision_ref": run.draft_apply_decision_ref,
+            "apply_decision": apply_decision.model_dump(mode="json", by_alias=True),
+        }
         self.store.upsert("reports", f"run_artifacts:{run_id}", artifacts)
         self.record_tool_event(run_id, tool_envelope(tool="patch.apply", input_payload={"files": files}, result=artifacts["staged_apply"], risk="mutating"))
         self._journal_run_event(

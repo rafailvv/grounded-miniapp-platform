@@ -154,6 +154,35 @@ async def _dispatch(container: ServiceContainer, method: str, params: dict[str, 
         return container.session_protocol_reducer.run_protocol(str(params.get("run_id") or params.get("runId") or ""))
     if method == "run/context_manager":
         return container.workbench_service.context_manager(str(params.get("run_id") or params.get("runId") or ""))
+    if method == "draft/isolation":
+        return container.workbench_service.draft_isolation(str(params.get("run_id") or params.get("runId") or ""))
+    if method == "draft/gate":
+        return container.workbench_service.draft_gate(str(params.get("run_id") or params.get("runId") or ""), create=True)
+    if method == "draft/apply":
+        return container.workbench_service.draft_apply(str(params.get("run_id") or params.get("runId") or ""), params)
+    if method == "draft/variant/create":
+        return container.workbench_service.draft_variants(str(params.get("run_id") or params.get("runId") or ""), params)
+    if method == "guardian/gate":
+        return container.workbench_service.guardian_gate(
+            str(params.get("run_id") or params.get("runId") or ""),
+            create=False,
+            semantic_override=params.get("semantic_override") or params.get("semanticOverride"),
+        )
+    if method == "guardian/review":
+        return container.workbench_service.guardian_gate(
+            str(params.get("run_id") or params.get("runId") or ""),
+            create=True,
+            semantic_override=params.get("semantic_override") or params.get("semanticOverride"),
+        )
+    if method == "browser/replay_proof":
+        return container.workbench_service.browser_replay_proof(str(params.get("run_id") or params.get("runId") or ""))
+    if method == "browser/replay_scenario":
+        return container.workbench_service.browser_replay_scenario(
+            str(params.get("run_id") or params.get("runId") or ""),
+            str(params.get("scenario_id") or params.get("scenarioId") or ""),
+        )
+    if method == "browser/replay_build":
+        return container.workbench_service.browser_replay_proof(str(params.get("run_id") or params.get("runId") or ""), build=True)
     if method == "worker/sessions":
         return container.workbench_service.worker_sessions(str(params.get("run_id") or params.get("runId") or ""))
     if method == "worker/mailbox":

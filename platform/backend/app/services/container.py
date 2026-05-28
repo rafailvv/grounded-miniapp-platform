@@ -15,6 +15,9 @@ from app.services.context_manager import ContextManagerService
 from app.services.lsp_context import LspContextService
 from app.services.lsp_server_manager import LspServerManager
 from app.services.worker_sessions import WorkerSessionService
+from app.services.draft_isolation import DraftIsolationService
+from app.services.guardian_gate import GuardianGateService
+from app.services.browser_replay_proof import BrowserReplayProofService
 from app.services.document_intelligence import DocumentIntelligenceService
 from app.services.export_service import ExportService
 from app.services.engine import (
@@ -72,6 +75,18 @@ class ServiceContainer:
         self.sandbox_service = SandboxService()
         self.hook_policy_service = HookPolicyService(self.store, self.settings.runtime_dir / "policies" / "agent_hooks.json")
         self.workspace_service = WorkspaceService(self.settings, self.store, self.workspace_log_service, sandbox_service=self.sandbox_service)
+        self.draft_isolation_service = DraftIsolationService(
+            store=self.store,
+            workspace_service=self.workspace_service,
+            event_journal_service=self.event_journal_service,
+        )
+        self.guardian_gate_service = GuardianGateService(
+            store=self.store,
+            workspace_service=self.workspace_service,
+            event_journal_service=self.event_journal_service,
+        )
+        self.browser_replay_proof_service = BrowserReplayProofService(self.store, event_journal_service=self.event_journal_service)
+        self.workspace_service.attach_draft_isolation_service(self.draft_isolation_service)
         self.pr_babysitter_service = PrBabysitterService(store=self.store, workspace_service=self.workspace_service)
         self.code_index_service = CodeIndexService(self.settings, self.store)
         self.workspace_service.attach_code_index_service(self.code_index_service)
@@ -142,6 +157,7 @@ class ServiceContainer:
             run_protocol_service=self.run_protocol_service,
             event_journal_service=self.event_journal_service,
         )
+        self.run_service.attach_guardian_gate_service(self.guardian_gate_service)
         self.exec_policy_service = ExecPolicyService(self.settings.runtime_dir / "policies" / "agent_exec_policy.json", sandbox_service=self.sandbox_service)
         self.exec_runtime_service = ExecRuntimeService(
             workspace_service=self.workspace_service,
@@ -176,10 +192,13 @@ class ServiceContainer:
             repair_case_service=self.repair_case_service,
             context_manager_service=self.context_manager_service,
             worker_session_service=self.worker_session_service,
+            draft_isolation_service=self.draft_isolation_service,
+            guardian_gate_service=self.guardian_gate_service,
             lsp_context_service=self.lsp_context_service,
             event_journal_service=self.event_journal_service,
             output_artifact_service=self.output_artifact_service,
             pr_babysitter_service=self.pr_babysitter_service,
+            browser_replay_proof_service=self.browser_replay_proof_service,
         )
         self.thread_service = ThreadService(
             self.platform_db,

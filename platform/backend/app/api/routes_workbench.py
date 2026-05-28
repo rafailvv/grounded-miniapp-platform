@@ -166,6 +166,19 @@ class WorkerSessionMessageRequest(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
+class DraftApplyRequest(BaseModel):
+    files: list[str] = Field(default_factory=list)
+    apply_token: str | None = None
+
+
+class DraftVariantRequest(BaseModel):
+    variant_run_id: str | None = None
+
+
+class GuardianGateRequest(BaseModel):
+    semantic_override: str | None = None
+
+
 class PrBabysitterRequest(BaseModel):
     pr: str = "auto"
     repo: str | None = None
@@ -1049,6 +1062,76 @@ def get_run_gate(run_id: str, container: ServiceContainer = Depends(get_containe
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@router.get("/runs/{run_id}/draft-isolation")
+def get_run_draft_isolation(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.draft_isolation(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/runs/{run_id}/draft-gate")
+def get_run_draft_gate(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.draft_gate(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/runs/{run_id}/draft-gate")
+def create_run_draft_gate(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.draft_gate(run_id, create=True)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/runs/{run_id}/draft-apply")
+def apply_run_draft(run_id: str, request: DraftApplyRequest, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.draft_apply(run_id, request.model_dump())
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/runs/{run_id}/draft-variants")
+def create_run_draft_variant(run_id: str, request: DraftVariantRequest, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.draft_variants(run_id, request.model_dump())
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/runs/{run_id}/guardian-gate")
+def get_run_guardian_gate(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.guardian_gate(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/runs/{run_id}/guardian-gate")
+def create_run_guardian_gate(run_id: str, request: GuardianGateRequest | None = None, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        payload = request.model_dump() if request is not None else {}
+        return container.workbench_service.guardian_gate(run_id, create=True, semantic_override=payload.get("semantic_override"))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/runs/{run_id}/guardian-gate/review")
+def review_run_guardian_gate(run_id: str, request: GuardianGateRequest | None = None, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        payload = request.model_dump() if request is not None else {}
+        return container.workbench_service.guardian_gate(run_id, create=True, semantic_override=payload.get("semantic_override"))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.get("/runs/{run_id}/state")
 def get_run_state(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     try:
@@ -1845,6 +1928,30 @@ def get_browser_proof(run_id: str, container: ServiceContainer = Depends(get_con
 def get_browser_replay(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     try:
         return container.workbench_service.browser_replay(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/runs/{run_id}/browser-replay-proof")
+def get_browser_replay_proof(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.browser_replay_proof(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/runs/{run_id}/browser-replay-proof/{scenario_id}")
+def get_browser_replay_scenario(run_id: str, scenario_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.browser_replay_scenario(run_id, scenario_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/runs/{run_id}/browser-replay-proof/build")
+def build_browser_replay_proof(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.browser_replay_proof(run_id, build=True)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 

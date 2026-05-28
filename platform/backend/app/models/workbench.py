@@ -626,6 +626,12 @@ class GateReport(WorkbenchApiModel):
     requirement_traceability: dict[str, Any] = Field(default_factory=dict)
     prompt_completion_audit: dict[str, Any] = Field(default_factory=dict)
     visual_regression: dict[str, Any] = Field(default_factory=dict)
+    draft_isolation: dict[str, Any] = Field(default_factory=dict)
+    draft_gate: dict[str, Any] = Field(default_factory=dict)
+    guardian_gate: dict[str, Any] = Field(default_factory=dict)
+    guardian_gate_ref: str | None = None
+    semantic_verdict: str | None = None
+    guardian_repair_packets: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class SchemaModelRef(WorkbenchApiModel):

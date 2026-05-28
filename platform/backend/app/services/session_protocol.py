@@ -320,6 +320,7 @@ class SessionProtocolReducer:
             for kind, ref in {
                 "latest_check": f"latest_check_execution:{run.run_id}",
                 "browser_proof": run.browser_proof_ref,
+                "browser_replay_proof": getattr(run, "browser_replay_proof_ref", None),
                 "verification_report": run.verification_report_ref,
                 "verifier_review": run.verifier_review_ref,
                 "trace_bundle": run.trace_bundle_ref,
@@ -435,6 +436,10 @@ class SessionProtocolReducer:
             "lsp_context_ref": getattr(run, "lsp_context_ref", None),
             "worker_sessions_ref": getattr(run, "worker_sessions_ref", None),
             "worker_ownership_ref": getattr(run, "worker_ownership_ref", None),
+            "draft_isolation_ref": getattr(run, "draft_isolation_ref", None),
+            "draft_gate_ref": getattr(run, "draft_gate_ref", None),
+            "draft_apply_decision_ref": getattr(run, "draft_apply_decision_ref", None),
+            "guardian_gate_ref": getattr(run, "guardian_gate_ref", None),
             "created_at": run.created_at.isoformat(),
             "updated_at": run.updated_at.isoformat(),
         }
@@ -452,8 +457,13 @@ class SessionProtocolReducer:
             "worker_sessions": getattr(run, "worker_sessions_ref", None),
             "worker_mailbox": getattr(run, "worker_mailbox_ref", None),
             "worker_ownership": getattr(run, "worker_ownership_ref", None),
+            "draft_isolation": getattr(run, "draft_isolation_ref", None),
+            "draft_gate": getattr(run, "draft_gate_ref", None),
+            "draft_apply_decision": getattr(run, "draft_apply_decision_ref", None),
+            "guardian_gate": getattr(run, "guardian_gate_ref", None),
             "context_pressure": run.context_pressure_ref,
             "browser_proof": run.browser_proof_ref,
+            "browser_replay_proof": getattr(run, "browser_replay_proof_ref", None),
             "verification_report": run.verification_report_ref,
             "memory_stage1": f"memory_stage1:{run.workspace_id}:{run.run_id}",
         }

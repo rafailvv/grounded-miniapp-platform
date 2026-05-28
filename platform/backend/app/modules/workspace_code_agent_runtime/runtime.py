@@ -1740,6 +1740,10 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         job.command_policy_ref = f"command_policy:{workspace_id}:{artifact_run_id}"
         job.lsp_context_ref = f"lsp_context:{workspace_id}:{artifact_run_id}"
         job.context_manager_ref = f"context_manager:{workspace_id}:{artifact_run_id}"
+        job.draft_isolation_ref = f"draft_isolation:{workspace_id}:{artifact_run_id}"
+        job.draft_gate_ref = f"draft_gate:{workspace_id}:{artifact_run_id}"
+        job.draft_apply_decision_ref = f"draft_apply_decision:{workspace_id}:{artifact_run_id}"
+        job.guardian_gate_ref = f"guardian_gate:{workspace_id}:{artifact_run_id}"
         job.context_pressure_ref = f"context_pressure:{workspace_id}:{artifact_run_id}"
         job.hook_trace_ref = f"hook_trace:{workspace_id}:{artifact_run_id}"
         job.semantic_graph_ref = f"semantic_graph:{workspace_id}:{artifact_run_id}"
@@ -6116,12 +6120,17 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                 artifacts=run_artifacts if isinstance(run_artifacts, dict) else {},
                 proofs={
                     "browser_proof_ref": job.browser_proof_ref,
+                    "browser_replay_proof_ref": job.browser_replay_proof_ref,
                     "verification_report_ref": job.verification_report_ref,
                     "trace_bundle_ref": job.trace_bundle_ref,
                     "lsp_context_ref": job.lsp_context_ref,
                     "worker_sessions_ref": job.worker_sessions_ref,
                     "worker_mailbox_ref": job.worker_mailbox_ref,
                     "worker_ownership_ref": job.worker_ownership_ref,
+                    "draft_isolation_ref": job.draft_isolation_ref,
+                    "draft_gate_ref": job.draft_gate_ref,
+                    "draft_apply_decision_ref": job.draft_apply_decision_ref,
+                    "guardian_gate_ref": job.guardian_gate_ref,
                 },
                 bookmarks=bookmarks if isinstance(bookmarks, list) else [],
             )
@@ -7644,6 +7653,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         job.file_change_history_ref = f"file_change_history:{job.workspace_id}:{artifact_run_id}"
         job.large_tool_outputs_ref = f"large_tool_outputs:{job.workspace_id}:{artifact_run_id}" if large_tool_output_refs else None
         job.browser_proof_ref = f"browser_proof:{job.workspace_id}:{artifact_run_id}" if job.browser_flow_proof else None
+        job.browser_replay_proof_ref = f"browser_replay_proof:{job.workspace_id}:{artifact_run_id}" if job.browser_flow_proof else None
         job.file_state_cache_ref = f"file_state_cache:{job.workspace_id}:{artifact_run_id}"
         job.turn_diff_ref = job.turn_diff_ref or f"turn_diff:{job.workspace_id}:{artifact_run_id}"
         job.environment_snapshot_ref = job.environment_snapshot_ref or f"environment_snapshot:{job.workspace_id}:{artifact_run_id}"
@@ -7651,6 +7661,10 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         job.worker_mailbox_ref = job.worker_mailbox_ref or f"worker_mailbox:{job.workspace_id}:{artifact_run_id}"
         job.worker_sessions_ref = job.worker_sessions_ref or f"worker_sessions:{job.workspace_id}:{artifact_run_id}"
         job.worker_ownership_ref = job.worker_ownership_ref or f"worker_ownership:{job.workspace_id}:{artifact_run_id}"
+        job.draft_isolation_ref = job.draft_isolation_ref or f"draft_isolation:{job.workspace_id}:{artifact_run_id}"
+        job.draft_gate_ref = job.draft_gate_ref or f"draft_gate:{job.workspace_id}:{artifact_run_id}"
+        job.draft_apply_decision_ref = job.draft_apply_decision_ref or f"draft_apply_decision:{job.workspace_id}:{artifact_run_id}"
+        job.guardian_gate_ref = job.guardian_gate_ref or f"guardian_gate:{job.workspace_id}:{artifact_run_id}"
         job.scratchpad_ref = job.scratchpad_ref or f"scratchpad:{job.workspace_id}:{artifact_run_id}"
         job.memory_ref = job.memory_ref or f"agent_memory_store:{job.workspace_id}:{artifact_run_id}"
         job.worker_drafts_ref = job.worker_drafts_ref or f"worker_drafts:{job.workspace_id}:{artifact_run_id}"
@@ -9103,6 +9117,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         payload["tool_trace_ref"] = job.tool_trace_ref
         payload["file_change_history_ref"] = job.file_change_history_ref
         payload["browser_proof_ref"] = job.browser_proof_ref
+        payload["browser_replay_proof_ref"] = job.browser_replay_proof_ref
         payload["large_tool_outputs_ref"] = job.large_tool_outputs_ref
         payload["file_state_cache_ref"] = job.file_state_cache_ref
         payload["turn_diff_ref"] = job.turn_diff_ref
@@ -9111,6 +9126,10 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         payload["worker_mailbox_ref"] = job.worker_mailbox_ref
         payload["worker_sessions_ref"] = job.worker_sessions_ref
         payload["worker_ownership_ref"] = job.worker_ownership_ref
+        payload["draft_isolation_ref"] = job.draft_isolation_ref
+        payload["draft_gate_ref"] = job.draft_gate_ref
+        payload["draft_apply_decision_ref"] = job.draft_apply_decision_ref
+        payload["guardian_gate_ref"] = job.guardian_gate_ref
         payload["scratchpad_ref"] = job.scratchpad_ref
         payload["memory_ref"] = job.memory_ref
         payload["worker_drafts_ref"] = job.worker_drafts_ref

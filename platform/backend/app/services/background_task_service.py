@@ -453,6 +453,7 @@ class BackgroundTaskService:
             "expired_count": int(pipeline.get("expired_count", 0) or 0),
             "superseded_count": int(pipeline.get("superseded_count", 0) or 0),
             "deduped_count": int(pipeline.get("deduped_count", 0) or 0),
+            "repeated_failure_stats": pipeline.get("repeated_failure_stats") or WorkspaceMemoryPipeline.repeated_failure_stats(consolidated.get("items") or []),
             "updated_at": _now_iso(),
         }
         self.store.upsert("reports", summary_ref, summary)

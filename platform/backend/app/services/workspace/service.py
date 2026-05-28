@@ -45,6 +45,7 @@ class WorkspaceService:
         self.workspace_log_service = workspace_log_service
         self.sandbox_service = sandbox_service or SandboxService()
         self.code_index_service = None
+        self.draft_isolation_service = None
 
     @staticmethod
     def _strip_leading_dot_slash(raw_path: object) -> str:
@@ -55,6 +56,9 @@ class WorkspaceService:
 
     def attach_code_index_service(self, code_index_service) -> None:
         self.code_index_service = code_index_service
+
+    def attach_draft_isolation_service(self, draft_isolation_service) -> None:
+        self.draft_isolation_service = draft_isolation_service
 
     def create_workspace(self, workspace: WorkspaceRecord) -> WorkspaceRecord:
         workspace_dir = self.settings.workspaces_dir / workspace.workspace_id
@@ -407,11 +411,15 @@ class WorkspaceService:
             shutil.rmtree(draft_source)
         draft_source.parent.mkdir(parents=True, exist_ok=True)
         self._copy_tree(self.source_dir(workspace_id), draft_source, allow_generated=True)
+        if self.draft_isolation_service is not None:
+            self.draft_isolation_service.ensure_manifest(workspace_id=workspace_id, run_id=run_id, status="ready")
         return draft_source
 
     def ensure_draft(self, workspace_id: str, run_id: str) -> Path:
         draft_source = self.draft_source_dir(workspace_id, run_id)
         if draft_source.exists():
+            if self.draft_isolation_service is not None:
+                self.draft_isolation_service.ensure_manifest(workspace_id=workspace_id, run_id=run_id)
             return draft_source
         return self.prepare_draft(workspace_id, run_id)
 
@@ -430,6 +438,13 @@ class WorkspaceService:
             message="Draft cloned for run resume.",
             payload={"source_run_id": source_run_id, "target_run_id": target_run_id},
         )
+        if self.draft_isolation_service is not None:
+            self.draft_isolation_service.ensure_manifest(
+                workspace_id=workspace_id,
+                run_id=target_run_id,
+                parent_run_id=source_run_id,
+                parent_isolation_ref=self.draft_isolation_service.manifest_ref(workspace_id, source_run_id),
+            )
         return target_draft
 
     def apply_file_changes(self, workspace_id: str, run_id: str, file_changes: list[DraftAction]) -> Path:
