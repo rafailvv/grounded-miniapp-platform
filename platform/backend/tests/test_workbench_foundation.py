@@ -2519,6 +2519,28 @@ def test_agent_transcript_microcompacts_large_tool_results(tmp_path: Path) -> No
     assert stored["original_chars"] > 6000
 
 
+def test_agent_transcript_redacts_secret_like_tool_results_from_pending_context() -> None:
+    transcript = AgentTranscriptStore()
+    run_key = "run_secret_tool_result"
+    transcript.append_tool_results(
+        run_key,
+        [
+            {
+                "tool_use_id": "tool_secret",
+                "tool": "run_command",
+                "status": "completed",
+                "stdout": "api_key=secret-value\n" + ("x" * 7000),
+            }
+        ],
+    )
+    pending = transcript.snapshot(run_key)["tool_result_messages"][0]
+
+    assert pending["tool_result_summarized"] is True
+    assert pending["result_summary"]["secret_redacted"] is True
+    assert "api_key=secret-value" not in pending["output"]
+    assert "tool result was omitted" in pending["output"].lower()
+
+
 def test_agent_transcript_queues_and_consumes_post_compact_message() -> None:
     transcript = AgentTranscriptStore()
     run_key = "run_post_compact"

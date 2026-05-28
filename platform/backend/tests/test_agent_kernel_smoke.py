@@ -1543,8 +1543,14 @@ def test_tool_router_spills_large_result_to_output_artifact_writer(tmp_path: Pat
 
     assert envelope["truncation"]["truncated"] is True  # type: ignore[index]
     assert envelope["truncation"]["spilled"] is True  # type: ignore[index]
+    assert envelope["truncation"]["summarized"] is True  # type: ignore[index]
+    assert envelope["result_summary"]["original_chars"] > envelope["result_summary"]["inline_chars"]  # type: ignore[index]
+    assert envelope["result_summary"]["artifact_ref"] == "exec_output:ws_router:run_router:tool:list_1:tool:abc"  # type: ignore[index]
     assert envelope["artifacts"][0]["kind"] == "tool_result"  # type: ignore[index]
     assert payload["artifact_ref"] == "exec_output:ws_router:run_router:tool:list_1:tool:abc"
+    assert payload["schema"] == "grounded.tool_result_compact.v1"
+    assert "files" not in payload
+    assert payload["original_chars"] > len(str(payload["excerpt"]))
     assert written[0]["stream"] == "tool"
     assert written[0]["metadata"]["tool"] == "file.list"  # type: ignore[index]
     assert "very-long-component-name" in str(written[0]["content"])

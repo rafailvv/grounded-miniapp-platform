@@ -3,12 +3,19 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import hashlib
 import json
+import re
 from typing import Any, Callable
+
+from app.services.tool_result_summarizer import ToolResultSummarizer
 
 
 MICROCOMPACT_THRESHOLD_CHARS = 6000
 DEFAULT_CONTEXT_WINDOW_TOKENS = 128_000
 DEFAULT_TOOL_OUTPUT_COMPACT_CHARS = 2400
+SECRET_PATTERNS = (
+    re.compile(r"(api[_-]?key|token|secret|password)\s*=", re.I),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"),
+)
 
 
 def _now() -> str:
@@ -39,6 +46,10 @@ def _estimate_tokens(value: Any) -> int:
 
 def _sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _secret_like(text: str) -> bool:
+    return any(pattern.search(text) for pattern in SECRET_PATTERNS)
 
 
 class AgentTranscriptStore:
@@ -406,8 +417,28 @@ class AgentTranscriptStore:
                 continue
             tool_use_id = str(result.get("tool_use_id") or result.get("call_id") or result.get("id") or "").strip()
             serialized = _payload_text(result)
-            microcompact = self._microcompact(run_key, result, serialized)
-            output = str(microcompact.get("output") or "") if microcompact else _compact_payload(result)
+            secret_like = _secret_like(serialized)
+            microcompact = {} if secret_like else self._microcompact(run_key, result, serialized)
+            compact_context = ToolResultSummarizer.compact_for_context(tool_result=result, max_inline_chars=DEFAULT_TOOL_OUTPUT_COMPACT_CHARS)
+            if secret_like:
+                output = _payload_text(
+                    {
+                        "schema": "grounded.tool_result_compact.v1",
+                        "tool": result.get("tool"),
+                        "tool_use_id": tool_use_id,
+                        "status": result.get("status") or "completed",
+                        "secret_redacted": True,
+                        "original_chars": len(serialized),
+                        "sha256": _sha256_text(serialized),
+                        "instruction": "Tool result was omitted from model context because it contains secret-like material.",
+                    }
+                )
+            elif microcompact:
+                output = str(microcompact.get("output") or "")
+            elif len(serialized) > DEFAULT_TOOL_OUTPUT_COMPACT_CHARS:
+                output = _payload_text(compact_context)
+            else:
+                output = _compact_payload(result, max_chars=DEFAULT_TOOL_OUTPUT_COMPACT_CHARS)
             if not tool_use_id:
                 self.append(
                     run_key,
@@ -416,6 +447,8 @@ class AgentTranscriptStore:
                         "tool": str(result.get("tool") or ""),
                         "output": output,
                         "pending": False,
+                        "tool_result_summarized": bool(secret_like or microcompact or len(serialized) > DEFAULT_TOOL_OUTPUT_COMPACT_CHARS),
+                        "result_summary": compact_context.get("result_summary") if isinstance(compact_context.get("result_summary"), dict) else result.get("result_summary"),
                         **({key: value for key, value in microcompact.items() if key != "output"} if microcompact else {}),
                     },
                 )
@@ -424,6 +457,10 @@ class AgentTranscriptStore:
                 "tool_use_id": tool_use_id,
                 "tool": str(result.get("tool") or ""),
                 "output": output,
+                "tool_result_summarized": bool(secret_like or microcompact or len(serialized) > DEFAULT_TOOL_OUTPUT_COMPACT_CHARS),
+                "result_summary": compact_context.get("result_summary") if isinstance(compact_context.get("result_summary"), dict) else result.get("result_summary"),
+                "original_chars": len(serialized),
+                "sha256": _sha256_text(serialized),
                 **({key: value for key, value in microcompact.items() if key != "output"} if microcompact else {}),
             }
             pending.append(message)
@@ -559,10 +596,11 @@ class AgentTranscriptStore:
             if len(output_text) <= max_output_chars or payload.get("compacted_by_policy"):
                 continue
             digest = _sha256_text(output_text)
+            original_chars = max(len(output_text), int(payload.get("original_chars") or 0))
             payload["output"] = _compact_payload(output_text, max_chars=max_output_chars)
             payload["compacted_by_policy"] = {
                 "reason": reason,
-                "original_chars": len(output_text),
+                "original_chars": original_chars,
                 "sha256": digest,
                 "max_output_chars": max_output_chars,
                 "compacted_at": _now(),
@@ -572,7 +610,7 @@ class AgentTranscriptStore:
                     "sequence": events[index].get("sequence"),
                     "tool_use_id": payload.get("tool_use_id"),
                     "tool": payload.get("tool"),
-                    "original_chars": len(output_text),
+                    "original_chars": original_chars,
                     "sha256": digest,
                 }
             )

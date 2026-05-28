@@ -38,6 +38,7 @@ from app.services.tool_protocol import (
     tool_definition,
     tool_protocol_spec,
 )
+from app.services.tool_result_summarizer import ToolResultSummarizer
 from app.services.lsp_context import LspContextService
 from app.services.workspace.service import WorkspaceService
 
@@ -1234,9 +1235,7 @@ class ToolRouter:
         loaded_context: dict[str, str] | None = None,
         duration_ms: int | None = None,
     ) -> ToolRouterResult:
-        result_summary = self._result_summary(request, decision, result, status="completed")
-        compacted, truncation, artifacts = self._compact_result(request, decision, result)
-        compacted = {**compacted, "result_summary": result_summary}
+        compacted, truncation, artifacts, result_summary = self._compact_result(request, decision, result)
         envelope = self._make_envelope(
             request,
             decision,
@@ -1456,76 +1455,27 @@ class ToolRouter:
         request: ToolCallRequest,
         decision: ToolRouteDecision,
         result: dict[str, Any],
-    ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
-        encoded = json.dumps(result, ensure_ascii=True, sort_keys=True, default=str)
-        should_truncate = len(encoded) > decision.output_cap_chars
-        should_spill = decision.artifact_spill_policy == "always" or (
-            decision.artifact_spill_policy == "on_truncation" and should_truncate
+    ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+        summarized = ToolResultSummarizer.summarize(
+            workspace_id=self.context.workspace_id,
+            run_id=self.context.run_id,
+            canonical_tool=request.canonical_tool,
+            model_tool=request.tool,
+            tool_call_id=request.tool_call_id,
+            result=result,
+            output_cap_chars=decision.output_cap_chars,
+            artifact_spill_policy=decision.artifact_spill_policy,
+            result_summarization=decision.result_summarization,
+            output_spill_writer=self.context.output_spill_writer,
+            output_artifact_writer=self.context.output_artifact_writer,
         )
-        if decision.artifact_spill_policy == "never" or not should_spill:
-            return result, {"truncated": False}, []
-        digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-        excerpt = encoded[: max(200, decision.output_cap_chars)]
-        artifacts: list[dict[str, Any]] = []
-        if self.context.output_spill_writer is not None:
-            artifact = self.context.output_spill_writer(
-                f"tool-output:{self.context.run_id}:{request.tool_call_id}:{digest[:12]}",
-                {"tool": request.canonical_tool, "sha256": digest, "result": result},
-            )
-            if artifact:
-                artifacts.append(self._tool_result_artifact_ref(artifact))
-        elif self.context.output_artifact_writer is not None:
-            artifact = self.context.output_artifact_writer(
-                {
-                    "process_id": f"tool:{request.tool_call_id}",
-                    "stream": "tool",
-                    "command": f"tool:{request.canonical_tool}",
-                    "content": encoded,
-                    "head_tail": _head_tail_payload(encoded, max_chars=decision.output_cap_chars),
-                    "semantic_status": "completed",
-                    "metadata": {
-                        "source": "tool_result_spill",
-                        "tool": request.canonical_tool,
-                        "model_tool": request.tool,
-                        "tool_call_id": request.tool_call_id,
-                        "sha256": digest,
-                    },
-                }
-            )
-            if artifact:
-                artifacts.append(self._tool_result_artifact_ref(artifact))
-        artifact_ref = str(artifacts[0].get("ref") or "") if artifacts else ""
-        if not should_truncate:
-            enriched = dict(result)
-            enriched["artifact_ref"] = artifact_ref
-            enriched["artifacts"] = artifacts
-            return enriched, {
-                "truncated": False,
-                "sha256": digest,
-                "original_chars": len(encoded),
-                "artifact_ref": artifact_ref,
-                "spilled": bool(artifacts),
-                "spill_policy": decision.artifact_spill_policy,
-            }, artifacts
-        compacted = {
-            "tool": str(result.get("tool") or request.tool),
-            "tool_use_id": request.tool_call_id,
-            "status": str(result.get("status") or "completed"),
-            "excerpt": excerpt,
-            "sha256": digest,
-            "original_chars": len(encoded),
-            "artifact_ref": artifact_ref,
-            "artifacts": artifacts,
-        }
-        return compacted, {
-            "truncated": True,
-            "sha256": digest,
-            "excerpt_chars": len(excerpt),
-            "original_chars": len(encoded),
-            "artifact_ref": artifact_ref,
-            "spilled": bool(artifacts),
-            "spill_policy": decision.artifact_spill_policy,
-        }, artifacts
+        compacted = summarized["result"]
+        summary = dict(summarized["summary"])
+        legacy_summary = self._result_summary(request, decision, result, status=str(summary.get("status") or "completed"))
+        summary = {**legacy_summary, **summary}
+        if isinstance(compacted, dict):
+            compacted["result_summary"] = summary
+        return compacted, summarized["truncation"], summarized["artifacts"], summary
 
     @staticmethod
     def _tool_result_artifact_ref(artifact: dict[str, Any]) -> dict[str, Any]:

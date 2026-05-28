@@ -102,6 +102,7 @@ from app.services.lsp_context import LspContextService
 from app.services.output_artifact_service import OutputArtifactService
 from app.services.repair_cases import RepairCaseService
 from app.services.run_protocol import RunProtocolService, diff_sha256
+from app.services.tool_result_summarizer import ToolResultSummarizer
 from app.services.trace_bundle import TraceBundleWriter
 from app.services.worker_sessions import WorkerSessionService
 from app.services.generation_enhancements import SkillPackCatalog
@@ -5868,7 +5869,10 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             and len(serialized) > TOOL_RESULT_SPILL_THRESHOLD_CHARS
         )
         if not should_spill:
-            return WorkspaceCodeAgentRuntime._compact_jsonish(item, max_chars=900, max_items=7)
+            compact = ToolResultSummarizer.compact_for_context(tool_result=dict(item), max_inline_chars=900)
+            if len(serialized) > 900:
+                return compact
+            return {**WorkspaceCodeAgentRuntime._compact_jsonish(item, max_chars=900, max_items=7), "result_summary": compact.get("result_summary")}
         if self.run_compaction_service is not None:
             compact = self.run_compaction_service.microcompact_tool_result(
                 workspace_id=str(workspace_id),
@@ -5884,6 +5888,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                 "digest": compact.get("digest"),
                 "original_chars": compact.get("original_chars"),
                 "preview": compact.get("output"),
+                "result_summary": ToolResultSummarizer.compact_for_context(tool_result=dict(item), max_inline_chars=900).get("result_summary"),
                 "has_more": True,
             }
         report_key = self._store_large_tool_result(
@@ -5900,6 +5905,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             "persisted_output_ref": report_key,
             "original_chars": len(serialized),
             "preview": truncate_tool_text(serialized, max_chars=1800),
+            "result_summary": ToolResultSummarizer.compact_for_context(tool_result=dict(item), max_inline_chars=900).get("result_summary"),
             "has_more": True,
         }
 
