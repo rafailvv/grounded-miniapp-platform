@@ -99,6 +99,7 @@ from app.services.requirement_traceability import PromptArtifactCompletionAudit,
 from app.services.rollout_trace_evidence import RolloutTraceEvidence
 from app.services.run_compaction import RunCompactionService
 from app.services.context_manager import ContextManagerService
+from app.services.lsp_context import LspContextService
 from app.services.run_protocol import RunProtocolConflict, RunProtocolService, diff_sha256
 from app.services.trace_bundle import TraceBundleReducer
 from app.services.run_task_ledger import RunTaskLedger
@@ -178,6 +179,7 @@ class WorkbenchService:
         background_task_service: BackgroundTaskService | None = None,
         repair_case_service: RepairCaseService | None = None,
         context_manager_service: ContextManagerService | None = None,
+        lsp_context_service: LspContextService | None = None,
         event_journal_service: EventJournalService | None = None,
         output_artifact_service: OutputArtifactService | None = None,
         pr_babysitter_service: PrBabysitterService | None = None,
@@ -192,6 +194,7 @@ class WorkbenchService:
         self.run_protocol_service = run_protocol_service
         self.run_compaction_service = run_compaction_service
         self.context_manager_service = context_manager_service
+        self.lsp_context_service = lsp_context_service
         self.background_task_service = background_task_service
         self.event_journal_service = event_journal_service
         self.output_artifact_service = output_artifact_service
@@ -5580,6 +5583,13 @@ class WorkbenchService:
         }
 
     def lsp_diagnostics(self, workspace_id: str, *, run_id: str | None = None, changed_only: bool = False, files: list[str] | None = None) -> dict[str, Any]:
+        if self.lsp_context_service is not None:
+            return self.lsp_context_service.diagnostics(
+                workspace_id=workspace_id,
+                run_id=run_id,
+                changed_only=changed_only,
+                files=files,
+            )
         self.workspace_service.get_workspace(workspace_id)
         root = self.workspace_service.draft_source_dir(workspace_id, run_id) if run_id else self.workspace_service.source_dir(workspace_id)
         changed_files: list[str] = []
@@ -5669,29 +5679,78 @@ class WorkbenchService:
         }
 
     def lsp_symbol_context(self, workspace_id: str, *, run_id: str | None = None, query: str = "", targets: list[str] | None = None) -> dict[str, Any]:
+        if self.lsp_context_service is not None:
+            return self.lsp_context_service.symbol_context(workspace_id=workspace_id, run_id=run_id, query=query, targets=targets, persist=True)
         self.workspace_service.get_workspace(workspace_id)
         root = self.workspace_service.draft_source_dir(workspace_id, run_id) if run_id else self.workspace_service.source_dir(workspace_id)
         return {**LspToolService.symbol_context(root=root, query=query, targets=targets), "workspace_id": workspace_id, "run_id": run_id}
 
     def lsp_definition(self, workspace_id: str, *, run_id: str | None = None, symbol: str = "", targets: list[str] | None = None) -> dict[str, Any]:
+        if self.lsp_context_service is not None:
+            return self.lsp_context_service.definition(workspace_id=workspace_id, run_id=run_id, symbol=symbol, targets=targets)
         self.workspace_service.get_workspace(workspace_id)
         root = self.workspace_service.draft_source_dir(workspace_id, run_id) if run_id else self.workspace_service.source_dir(workspace_id)
         return {**LspToolService.definition(root=root, symbol=symbol, targets=targets), "workspace_id": workspace_id, "run_id": run_id}
 
     def lsp_find_references(self, workspace_id: str, *, run_id: str | None = None, symbol: str = "", targets: list[str] | None = None) -> dict[str, Any]:
+        if self.lsp_context_service is not None:
+            return self.lsp_context_service.find_references(workspace_id=workspace_id, run_id=run_id, symbol=symbol, targets=targets)
         self.workspace_service.get_workspace(workspace_id)
         root = self.workspace_service.draft_source_dir(workspace_id, run_id) if run_id else self.workspace_service.source_dir(workspace_id)
         return {**LspToolService.find_references(root=root, symbol=symbol, targets=targets), "workspace_id": workspace_id, "run_id": run_id}
 
     def lsp_route_static_context(self, workspace_id: str, *, run_id: str | None = None, targets: list[str] | None = None) -> dict[str, Any]:
+        if self.lsp_context_service is not None:
+            return self.lsp_context_service.route_static_context(workspace_id=workspace_id, run_id=run_id, targets=targets)
         self.workspace_service.get_workspace(workspace_id)
         root = self.workspace_service.draft_source_dir(workspace_id, run_id) if run_id else self.workspace_service.source_dir(workspace_id)
         return {**LspToolService.route_static_context(root=root, targets=targets), "workspace_id": workspace_id, "run_id": run_id}
 
     def lsp_route_graph(self, workspace_id: str, *, run_id: str | None = None, targets: list[str] | None = None) -> dict[str, Any]:
+        if self.lsp_context_service is not None:
+            return self.lsp_context_service.route_graph(workspace_id=workspace_id, run_id=run_id, targets=targets, persist=True)
         self.workspace_service.get_workspace(workspace_id)
         root = self.workspace_service.draft_source_dir(workspace_id, run_id) if run_id else self.workspace_service.source_dir(workspace_id)
         return {**LspToolService.route_graph(root=root, targets=targets), "workspace_id": workspace_id, "run_id": run_id}
+
+    def lsp_context(self, workspace_id: str, *, run_id: str | None = None, files: list[str] | None = None) -> dict[str, Any]:
+        if self.lsp_context_service is None:
+            self.workspace_service.get_workspace(workspace_id)
+            diagnostics = self.lsp_diagnostics(workspace_id, run_id=run_id, files=files)
+            return {
+                "schema": "grounded.lsp_context.v1",
+                "workspace_id": workspace_id,
+                "run_id": run_id,
+                "status": diagnostics.get("status") or "ready",
+                "engine": diagnostics.get("engine") or "static",
+                "fallback_used": True,
+                "lsp_context_ref": f"lsp_context:{workspace_id}:{run_id or 'source'}",
+                "diagnostics": diagnostics,
+                "items": diagnostics.get("items") or [],
+                "jumps": diagnostics.get("jumps") or [],
+                "next_sequence": 1,
+            }
+        return self.lsp_context_service.context(workspace_id=workspace_id, run_id=run_id, files=files)
+
+    def lsp_servers(self, workspace_id: str) -> dict[str, Any]:
+        self.workspace_service.get_workspace(workspace_id)
+        if self.lsp_context_service is None:
+            return {"schema": "grounded.lsp_servers.v1", "status": "unavailable", "items": []}
+        return self.lsp_context_service.servers(workspace_id=workspace_id)
+
+    def restart_lsp(self, workspace_id: str, *, run_id: str | None = None) -> dict[str, Any]:
+        self.workspace_service.get_workspace(workspace_id)
+        if self.lsp_context_service is None:
+            return {"schema": "grounded.lsp_restart.v1", "status": "unavailable", "items": []}
+        return self.lsp_context_service.restart(workspace_id=workspace_id, run_id=run_id)
+
+    def run_lsp_context(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        ref = getattr(run, "lsp_context_ref", None) or f"lsp_context:{run.workspace_id}:{run.run_id}"
+        payload = self.store.get("reports", ref)
+        if isinstance(payload, dict):
+            return payload
+        return self.lsp_context(run.workspace_id, run_id=run.run_id)
 
     def patch_preflight(self, workspace_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         raw_ops = payload.get("ops") or payload.get("patch_actions") or []

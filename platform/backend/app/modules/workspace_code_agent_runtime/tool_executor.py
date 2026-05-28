@@ -8,6 +8,7 @@ from app.modules.miniapp_agent_loop.agent_file_state import AgentFileStateCache
 from app.modules.miniapp_agent_loop.agent_hooks import AgentHookManager
 from app.modules.miniapp_agent_loop.agent_process_manager import AgentProcessManager
 from app.modules.miniapp_agent_loop.tool_router import ToolRouter, ToolRouterContext
+from app.services.lsp_context import LspContextService
 from app.services.workspace.service import WorkspaceService
 
 
@@ -28,6 +29,7 @@ class AgentToolExecutor:
         read_artifact: Callable[[str], dict[str, Any] | None] | None = None,
         output_artifact_writer: Callable[[str, str, dict[str, Any]], dict[str, Any] | None] | None = None,
         denied_action_writer: Callable[[str, str, dict[str, Any]], dict[str, Any] | None] | None = None,
+        lsp_context_service: LspContextService | None = None,
     ) -> None:
         self.workspace_service = workspace_service
         self.file_state_cache = file_state_cache or AgentFileStateCache()
@@ -35,6 +37,7 @@ class AgentToolExecutor:
         self.read_artifact = read_artifact
         self.output_artifact_writer = output_artifact_writer
         self.denied_action_writer = denied_action_writer
+        self.lsp_context_service = lsp_context_service
 
     def execute(
         self,
@@ -65,6 +68,7 @@ class AgentToolExecutor:
                 hook_manager=hook_manager,
                 mode=mode,
                 forced_allowed_tools=forced_allowed_tools,
+                lsp_context_service=self.lsp_context_service,
                 output_artifact_writer=(
                     (lambda payload: self.output_artifact_writer(workspace_id, run_id, payload))
                     if self.output_artifact_writer is not None

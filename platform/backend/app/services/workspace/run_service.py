@@ -1294,6 +1294,7 @@ class RunService:
                 "artifact_read_trace_ref",
                 "resume_checkpoint_ref",
                 "verifier_review_ref",
+                "lsp_context_ref",
                 "context_manager_ref",
                 "context_pressure_ref",
                 "hook_trace_ref",
@@ -1468,6 +1469,7 @@ class RunService:
                 "artifact_read_trace_ref",
                 "resume_checkpoint_ref",
                 "verifier_review_ref",
+                "lsp_context_ref",
                 "context_manager_ref",
                 "context_pressure_ref",
                 "hook_trace_ref",
@@ -1889,6 +1891,7 @@ class RunService:
             run.worker_branch_refs = list(getattr(job, "worker_branch_refs", []) or run.worker_branch_refs)
             run.verifier_review_ref = getattr(job, "verifier_review_ref", None) or run.verifier_review_ref
             run.browser_step_refs = list(getattr(job, "browser_step_refs", []) or run.browser_step_refs)
+            run.lsp_context_ref = getattr(job, "lsp_context_ref", None) or run.lsp_context_ref
             run.context_manager_ref = getattr(job, "context_manager_ref", None) or run.context_manager_ref
             run.context_pressure_ref = getattr(job, "context_pressure_ref", None) or run.context_pressure_ref
             run.hook_trace_ref = getattr(job, "hook_trace_ref", None) or run.hook_trace_ref
@@ -2527,6 +2530,7 @@ class RunService:
             "verifier_review_ref": run.verifier_review_ref,
             "browser_step_refs": run.browser_step_refs,
             "active_tool_uses": run.active_tool_uses,
+            "lsp_context_ref": run.lsp_context_ref,
             "context_manager_ref": run.context_manager_ref,
             "context_pressure_ref": run.context_pressure_ref,
             "hook_trace_ref": run.hook_trace_ref,
@@ -2547,6 +2551,7 @@ class RunService:
             "resume_checkpoint": self.store.get("reports", run.resume_checkpoint_ref) if run.resume_checkpoint_ref else None,
             "verifier_review": self.store.get("reports", run.verifier_review_ref) if run.verifier_review_ref else None,
             "browser_steps": [self.store.get("reports", ref) for ref in run.browser_step_refs if ref],
+            "lsp_context": self.store.get("reports", run.lsp_context_ref) if run.lsp_context_ref else None,
             "context_manager": self.store.get("reports", run.context_manager_ref) if run.context_manager_ref else None,
             "context_pressure": self.store.get("reports", run.context_pressure_ref) if run.context_pressure_ref else None,
             "hook_trace": self.store.get("reports", run.hook_trace_ref) if run.hook_trace_ref else None,

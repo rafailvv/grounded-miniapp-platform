@@ -98,6 +98,7 @@ from app.services.context_manager import ContextManagerService
 from app.services.event_journal import EventJournalService
 from app.services.hook_policy_service import HookPolicyService
 from app.services.memory_pipeline import WorkspaceMemoryPipeline
+from app.services.lsp_context import LspContextService
 from app.services.output_artifact_service import OutputArtifactService
 from app.services.repair_cases import RepairCaseService
 from app.services.run_protocol import RunProtocolService, diff_sha256
@@ -178,6 +179,7 @@ class WorkspaceCodeAgentRuntime:
         run_protocol_service: RunProtocolService | None = None,
         run_compaction_service: RunCompactionService | None = None,
         context_manager_service: ContextManagerService | None = None,
+        lsp_context_service: LspContextService | None = None,
         event_journal_service: EventJournalService | None = None,
         hook_policy_service: HookPolicyService | None = None,
         output_artifact_service: OutputArtifactService | None = None,
@@ -225,12 +227,14 @@ class WorkspaceCodeAgentRuntime:
             read_artifact=lambda ref: self.store.get("reports", ref),
             output_artifact_writer=self._store_command_output_artifact,
             denied_action_writer=self._store_denied_action,
+            lsp_context_service=lsp_context_service,
         )
         self.context_pack_builder = context_pack_builder
         self.platform_db = platform_db
         self.run_protocol_service = run_protocol_service
         self.run_compaction_service = run_compaction_service
         self.context_manager_service = context_manager_service
+        self.lsp_context_service = lsp_context_service
         self.event_journal_service = event_journal_service
 
     def get_job(self, job_id: str) -> JobRecord:
@@ -1731,6 +1735,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         job.tool_result_messages_ref = f"tool_result_messages:{workspace_id}:{artifact_run_id}"
         job.resume_checkpoint_ref = f"resume_checkpoint:{workspace_id}:{artifact_run_id}"
         job.command_policy_ref = f"command_policy:{workspace_id}:{artifact_run_id}"
+        job.lsp_context_ref = f"lsp_context:{workspace_id}:{artifact_run_id}"
         job.context_manager_ref = f"context_manager:{workspace_id}:{artifact_run_id}"
         job.context_pressure_ref = f"context_pressure:{workspace_id}:{artifact_run_id}"
         job.hook_trace_ref = f"hook_trace:{workspace_id}:{artifact_run_id}"
@@ -6028,6 +6033,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                     "browser_proof_ref": job.browser_proof_ref,
                     "verification_report_ref": job.verification_report_ref,
                     "trace_bundle_ref": job.trace_bundle_ref,
+                    "lsp_context_ref": job.lsp_context_ref,
                 },
                 bookmarks=bookmarks if isinstance(bookmarks, list) else [],
             )
@@ -7582,6 +7588,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         )
         job.verifier_review_ref = job.verifier_review_ref or job.verification_report_ref
         job.context_pressure_ref = job.context_pressure_ref or f"context_pressure:{job.workspace_id}:{artifact_run_id}"
+        job.lsp_context_ref = job.lsp_context_ref or f"lsp_context:{job.workspace_id}:{artifact_run_id}"
         job.hook_trace_ref = job.hook_trace_ref or f"hook_trace:{job.workspace_id}:{artifact_run_id}"
         job.semantic_graph_ref = job.semantic_graph_ref or f"semantic_graph:{job.workspace_id}:{artifact_run_id}"
         job.worker_prefix_ref = job.worker_prefix_ref or f"worker_prefix:{job.workspace_id}:{artifact_run_id}"
@@ -9031,6 +9038,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         payload["verifier_review_ref"] = job.verifier_review_ref
         payload["browser_step_refs"] = list(job.browser_step_refs)
         payload["hook_trace_ref"] = job.hook_trace_ref
+        payload["lsp_context_ref"] = job.lsp_context_ref
         payload["semantic_graph_ref"] = job.semantic_graph_ref
         payload["worker_prefix_ref"] = job.worker_prefix_ref
         payload["replay_trace_ref"] = job.replay_trace_ref

@@ -12,6 +12,8 @@ from app.services.check_runner import CheckRunner
 from app.services.code_index_service import CodeIndexService
 from app.services.context_pack_builder import ContextPackBuilder
 from app.services.context_manager import ContextManagerService
+from app.services.lsp_context import LspContextService
+from app.services.lsp_server_manager import LspServerManager
 from app.services.document_intelligence import DocumentIntelligenceService
 from app.services.export_service import ExportService
 from app.services.engine import (
@@ -82,8 +84,15 @@ class ServiceContainer:
             self.runtime_manager,
             self.workspace_log_service,
         )
+        self.lsp_server_manager = LspServerManager()
+        self.lsp_context_service = LspContextService(
+            store=self.store,
+            workspace_service=self.workspace_service,
+            server_manager=self.lsp_server_manager,
+            event_journal_service=self.event_journal_service,
+        )
         self.agent_context_builder = AgentContextBuilder(store=self.store, workspace_service=self.workspace_service)
-        self.agent_tool_call_loop = AgentToolCallLoop(context_builder=self.agent_context_builder)
+        self.agent_tool_call_loop = AgentToolCallLoop(context_builder=self.agent_context_builder, lsp_context_service=self.lsp_context_service)
         self.validation_suite = ValidationSuite()
         self.check_runner = CheckRunner(self.validation_suite, self.preview_service)
         self.openai_client = OpenAIClient(self.settings, self.workspace_log_service, model_manager=self.model_manager_service)
@@ -114,6 +123,7 @@ class ServiceContainer:
             run_protocol_service=self.run_protocol_service,
             run_compaction_service=self.run_compaction_service,
             context_manager_service=self.context_manager_service,
+            lsp_context_service=self.lsp_context_service,
             event_journal_service=self.event_journal_service,
             hook_policy_service=self.hook_policy_service,
             output_artifact_service=self.output_artifact_service,
@@ -146,6 +156,7 @@ class ServiceContainer:
             preview_service=self.preview_service,
             check_runner=self.check_runner,
             pr_babysitter_service=self.pr_babysitter_service,
+            lsp_context_service=self.lsp_context_service,
         )
         self.run_service.attach_background_task_service(self.background_task_service)
         self.workbench_service = WorkbenchService(
@@ -161,6 +172,7 @@ class ServiceContainer:
             background_task_service=self.background_task_service,
             repair_case_service=self.repair_case_service,
             context_manager_service=self.context_manager_service,
+            lsp_context_service=self.lsp_context_service,
             event_journal_service=self.event_journal_service,
             output_artifact_service=self.output_artifact_service,
             pr_babysitter_service=self.pr_babysitter_service,

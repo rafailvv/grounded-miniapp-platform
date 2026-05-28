@@ -16,6 +16,7 @@ from app.services.repair_cases import RepairCaseService
 from app.services.workspace.preview_service import PreviewService
 from app.services.workspace.run_service import RunService
 from app.services.workspace.service import WorkspaceService
+from app.services.lsp_context import LspContextService
 
 
 TERMINAL_STATUSES = {"completed", "failed", "blocked", "cancelled"}
@@ -47,6 +48,7 @@ class BackgroundTaskService:
         preview_service: PreviewService,
         check_runner: CheckRunner,
         pr_babysitter_service: PrBabysitterService | None = None,
+        lsp_context_service: LspContextService | None = None,
     ) -> None:
         self.store = store
         self.workspace_service = workspace_service
@@ -54,6 +56,7 @@ class BackgroundTaskService:
         self.preview_service = preview_service
         self.check_runner = check_runner
         self.pr_babysitter_service = pr_babysitter_service
+        self.lsp_context_service = lsp_context_service
         self._workers: dict[str, threading.Thread] = {}
 
     def create_task(
@@ -363,6 +366,35 @@ class BackgroundTaskService:
             except KeyError:
                 changed_files = []
         self._append_output(task.task_id, "progress", "LSP diagnostics started.", {"run_id": run_id, "changed_only": changed_only, "files": files})
+        if self.lsp_context_service is not None:
+            payload = self.lsp_context_service.diagnostics(
+                workspace_id=task.workspace_id,
+                run_id=run_id,
+                changed_only=changed_only,
+                files=files or None,
+            )
+            self._append_output(
+                task.task_id,
+                "diagnostic_stream",
+                f"LSP diagnostics completed: {payload.get('status')}",
+                {
+                    "status": payload.get("status"),
+                    "engine": payload.get("engine"),
+                    "diagnostics_ref": payload.get("diagnostics_ref"),
+                    "error_count": payload.get("error_count", 0),
+                    "warning_count": payload.get("warning_count", 0),
+                },
+            )
+            task_ref = f"lsp_diagnostics_task:{task.task_id}"
+            self.store.upsert("reports", task_ref, payload)
+            return {
+                "summary": f"LSP diagnostics {payload.get('status')}.",
+                "diagnostics_ref": payload.get("diagnostics_ref") or f"lsp_diagnostics:{task.workspace_id}:{run_id or 'source'}",
+                "task_diagnostics_ref": task_ref,
+                "diagnostics_status": payload.get("status"),
+                "error_count": payload.get("error_count", 0),
+                "warning_count": payload.get("warning_count", 0),
+            }
         report = LspToolService.diagnostics(
             root=source_dir,
             targets=files or None,

@@ -968,6 +968,44 @@ def get_lsp_route_graph(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@router.get("/workspaces/{workspace_id}/lsp/context")
+def get_lsp_context(
+    workspace_id: str,
+    run_id: str | None = None,
+    files: str | None = None,
+    container: ServiceContainer = Depends(get_container),
+) -> dict[str, Any]:
+    try:
+        file_list = [item.strip() for item in str(files or "").split(",") if item.strip()]
+        return container.workbench_service.lsp_context(workspace_id, run_id=run_id, files=file_list or None)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/workspaces/{workspace_id}/lsp/servers")
+def get_lsp_servers(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.lsp_servers(workspace_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/workspaces/{workspace_id}/lsp/restart")
+def restart_lsp(workspace_id: str, run_id: str | None = None, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.restart_lsp(workspace_id, run_id=run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/runs/{run_id}/lsp-context")
+def get_run_lsp_context(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.run_lsp_context(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.post("/workspaces/{workspace_id}/patch/preflight")
 def preflight_patch(workspace_id: str, payload: dict[str, Any], container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     try:

@@ -1950,7 +1950,7 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
     assert any(item["rule_id"] == "block_destructive" for item in permissions["items"])
     assert lsp["status"] in {"passed", "failed"}
     assert lsp["schema"] == "grounded.lsp_diagnostics.v1"
-    assert lsp["engine"] == "grounded.lsp.v2"
+    assert lsp["engine"] in {"static", "real_lsp+static"}
     assert lsp["diagnostic_stream"]
     assert lsp["route_graph"]["schema"] == "grounded.lsp_route_graph.v1"
     assert "jump" in lsp["items"][0] if lsp["items"] else True

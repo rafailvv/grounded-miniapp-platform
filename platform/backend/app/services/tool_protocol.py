@@ -425,7 +425,7 @@ TOOL_MODEL_METADATA: dict[str, dict[str, Any]] = {
     "lsp.diagnostics": {
         "kind": "read_only",
         "model_name": "lsp_diagnostics",
-        "model_visible": False,
+        "model_visible": True,
         "mode_visibility": DEFAULT_MODE_VISIBILITY,
         "activity": "checking",
         "progress_label": "Running targeted file diagnostics",
@@ -434,7 +434,7 @@ TOOL_MODEL_METADATA: dict[str, dict[str, Any]] = {
     "lsp.symbol_context": {
         "kind": "read_only",
         "model_name": "lsp_symbol_context",
-        "model_visible": False,
+        "model_visible": True,
         "mode_visibility": DEFAULT_MODE_VISIBILITY,
         "activity": "searching",
         "progress_label": "Reading symbol context",
@@ -443,7 +443,7 @@ TOOL_MODEL_METADATA: dict[str, dict[str, Any]] = {
     "lsp.definition": {
         "kind": "read_only",
         "model_name": "lsp_definition",
-        "model_visible": False,
+        "model_visible": True,
         "mode_visibility": DEFAULT_MODE_VISIBILITY,
         "activity": "searching",
         "progress_label": "Finding symbol definition",
@@ -452,7 +452,7 @@ TOOL_MODEL_METADATA: dict[str, dict[str, Any]] = {
     "lsp.find_references": {
         "kind": "read_only",
         "model_name": "lsp_find_references",
-        "model_visible": False,
+        "model_visible": True,
         "mode_visibility": DEFAULT_MODE_VISIBILITY,
         "activity": "searching",
         "progress_label": "Finding symbol references",
@@ -461,7 +461,7 @@ TOOL_MODEL_METADATA: dict[str, dict[str, Any]] = {
     "lsp.route_graph": {
         "kind": "read_only",
         "model_name": "lsp_route_graph",
-        "model_visible": False,
+        "model_visible": True,
         "mode_visibility": DEFAULT_MODE_VISIBILITY,
         "activity": "searching",
         "progress_label": "Building route graph",
@@ -470,7 +470,7 @@ TOOL_MODEL_METADATA: dict[str, dict[str, Any]] = {
     "lsp.route_static_context": {
         "kind": "read_only",
         "model_name": "lsp_route_static_context",
-        "model_visible": False,
+        "model_visible": True,
         "mode_visibility": DEFAULT_MODE_VISIBILITY,
         "activity": "searching",
         "progress_label": "Reading route and static UI context",

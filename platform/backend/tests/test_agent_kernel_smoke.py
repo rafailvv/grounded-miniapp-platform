@@ -605,12 +605,12 @@ def test_lsp_agent_tools_are_dynamic_aliases_with_canonical_protocol() -> None:
     tool_names = {tool["name"] for tool in AgentToolRegistry.openai_tools()}
     forced_tool_names = {tool["name"] for tool in AgentToolRegistry.openai_tools({"lsp_diagnostics", "lsp_symbol_context", "lsp_definition", "lsp_find_references", "lsp_route_graph", "lsp_route_static_context"}, include_dynamic=True)}
 
-    assert "lsp_diagnostics" not in tool_names
-    assert "lsp_symbol_context" not in tool_names
-    assert "lsp_definition" not in tool_names
-    assert "lsp_find_references" not in tool_names
-    assert "lsp_route_graph" not in tool_names
-    assert "lsp_route_static_context" not in tool_names
+    assert "lsp_diagnostics" in tool_names
+    assert "lsp_symbol_context" in tool_names
+    assert "lsp_definition" in tool_names
+    assert "lsp_find_references" in tool_names
+    assert "lsp_route_graph" in tool_names
+    assert "lsp_route_static_context" in tool_names
     assert {"lsp_diagnostics", "lsp_symbol_context", "lsp_definition", "lsp_find_references", "lsp_route_graph", "lsp_route_static_context"} == forced_tool_names
     assert AgentToolRegistry.kind("lsp.diagnostics") == "read_only"
 
@@ -1577,7 +1577,7 @@ def test_tool_router_mode_filtering_and_forced_tools() -> None:
     assert "tool_search" in default_names
     assert "run_command" not in default_names
     assert "run_checks" not in default_names
-    assert "lsp_diagnostics" not in default_names
+    assert "lsp_diagnostics" in default_names
     assert "write_file" not in default_names
     assert "apply_patch_to_draft" not in default_names
     assert "ask_user" not in default_names

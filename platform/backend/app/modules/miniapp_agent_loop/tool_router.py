@@ -38,6 +38,7 @@ from app.services.tool_protocol import (
     tool_definition,
     tool_protocol_spec,
 )
+from app.services.lsp_context import LspContextService
 from app.services.workspace.service import WorkspaceService
 
 
@@ -98,6 +99,7 @@ class ToolRouterContext:
     output_spill_writer: Callable[[str, dict[str, Any]], dict[str, Any] | None] | None = None
     output_artifact_writer: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None
     denied_action_writer: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None
+    lsp_context_service: LspContextService | None = None
     max_parallel_read_tools: int = 6
 
 
@@ -856,55 +858,60 @@ class ToolRouter:
                 if str(item or "").strip() and _is_model_visible_path(_strip_leading_dot_slash(item))
             ]
             effective_targets = files or request_targets
-            result = {
-                **LspToolService.diagnostics(
+            lsp_result = (
+                self.context.lsp_context_service.diagnostics(
+                    workspace_id=self.context.workspace_id,
+                    run_id=self.context.run_id,
+                    files=effective_targets,
+                    changed_only=bool(request.input.get("changed_only")),
+                )
+                if self.context.lsp_context_service is not None
+                else LspToolService.diagnostics(
                     root=self.context.draft_source,
                     targets=effective_targets,
                     changed_files=changed_files,
                     changed_only=bool(request.input.get("changed_only")),
-                ),
-                "reason": request.reason,
-                "tool_use_id": request.tool_call_id,
-                "blocked_targets": blocked_targets,
-            }
+                )
+            )
+            result = {**lsp_result, "reason": request.reason, "tool_use_id": request.tool_call_id, "blocked_targets": blocked_targets}
         elif tool_name in {"lsp.symbol_context", "lsp_symbol_context"}:
             query = str(request.input.get("query") or request.input.get("pattern") or "").strip()
-            result = {
-                **LspToolService.symbol_context(root=self.context.draft_source, query=query, targets=request_targets),
-                "reason": request.reason,
-                "tool_use_id": request.tool_call_id,
-                "blocked_targets": blocked_targets,
-            }
+            lsp_result = (
+                self.context.lsp_context_service.symbol_context(workspace_id=self.context.workspace_id, run_id=self.context.run_id, query=query, targets=request_targets, persist=True)
+                if self.context.lsp_context_service is not None
+                else LspToolService.symbol_context(root=self.context.draft_source, query=query, targets=request_targets)
+            )
+            result = {**lsp_result, "reason": request.reason, "tool_use_id": request.tool_call_id, "blocked_targets": blocked_targets}
         elif tool_name in {"lsp.find_references", "lsp_find_references"}:
             symbol = str(request.input.get("symbol") or request.input.get("query") or request.input.get("pattern") or "").strip()
-            result = {
-                **LspToolService.find_references(root=self.context.draft_source, symbol=symbol, targets=request_targets),
-                "reason": request.reason,
-                "tool_use_id": request.tool_call_id,
-                "blocked_targets": blocked_targets,
-            }
+            lsp_result = (
+                self.context.lsp_context_service.find_references(workspace_id=self.context.workspace_id, run_id=self.context.run_id, symbol=symbol, targets=request_targets)
+                if self.context.lsp_context_service is not None
+                else LspToolService.find_references(root=self.context.draft_source, symbol=symbol, targets=request_targets)
+            )
+            result = {**lsp_result, "reason": request.reason, "tool_use_id": request.tool_call_id, "blocked_targets": blocked_targets}
         elif tool_name in {"lsp.definition", "lsp_definition"}:
             symbol = str(request.input.get("symbol") or request.input.get("query") or request.input.get("pattern") or "").strip()
-            result = {
-                **LspToolService.definition(root=self.context.draft_source, symbol=symbol, targets=request_targets),
-                "reason": request.reason,
-                "tool_use_id": request.tool_call_id,
-                "blocked_targets": blocked_targets,
-            }
+            lsp_result = (
+                self.context.lsp_context_service.definition(workspace_id=self.context.workspace_id, run_id=self.context.run_id, symbol=symbol, targets=request_targets)
+                if self.context.lsp_context_service is not None
+                else LspToolService.definition(root=self.context.draft_source, symbol=symbol, targets=request_targets)
+            )
+            result = {**lsp_result, "reason": request.reason, "tool_use_id": request.tool_call_id, "blocked_targets": blocked_targets}
         elif tool_name in {"lsp.route_graph", "lsp_route_graph"}:
-            result = {
-                **LspToolService.route_graph(root=self.context.draft_source, targets=request_targets),
-                "reason": request.reason,
-                "tool_use_id": request.tool_call_id,
-                "blocked_targets": blocked_targets,
-            }
+            lsp_result = (
+                self.context.lsp_context_service.route_graph(workspace_id=self.context.workspace_id, run_id=self.context.run_id, targets=request_targets, persist=True)
+                if self.context.lsp_context_service is not None
+                else LspToolService.route_graph(root=self.context.draft_source, targets=request_targets)
+            )
+            result = {**lsp_result, "reason": request.reason, "tool_use_id": request.tool_call_id, "blocked_targets": blocked_targets}
         elif tool_name in {"lsp.route_static_context", "lsp_route_static_context"}:
-            result = {
-                **LspToolService.route_static_context(root=self.context.draft_source, targets=request_targets),
-                "reason": request.reason,
-                "tool_use_id": request.tool_call_id,
-                "blocked_targets": blocked_targets,
-            }
+            lsp_result = (
+                self.context.lsp_context_service.route_static_context(workspace_id=self.context.workspace_id, run_id=self.context.run_id, targets=request_targets)
+                if self.context.lsp_context_service is not None
+                else LspToolService.route_static_context(root=self.context.draft_source, targets=request_targets)
+            )
+            result = {**lsp_result, "reason": request.reason, "tool_use_id": request.tool_call_id, "blocked_targets": blocked_targets}
         elif tool_name == "inspect_diff":
             result = {**self._inspect_diff(targets=request_targets), "reason": request.reason, "tool_use_id": request.tool_call_id}
         elif tool_name == "read_artifact_ref":
