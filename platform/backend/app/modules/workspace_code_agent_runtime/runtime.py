@@ -358,6 +358,7 @@ class WorkspaceCodeAgentRuntime:
         request = GenerateRequest(
             prompt=job.prompt,
             mode=job.mode,
+            edit_mode=job.edit_mode,
             target_platform=job.target_platform,
             preview_profile=job.preview_profile,
             generation_mode=job.generation_mode,
@@ -392,6 +393,7 @@ class WorkspaceCodeAgentRuntime:
             workspace_id=workspace_id,
             prompt=request.prompt,
             mode=request.mode,
+            edit_mode=request.edit_mode,
             status="running",
             generation_mode=generation_mode,
             target_platform=request.target_platform,
@@ -4878,10 +4880,12 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             "run_id": run_id,
             "prompt_payload_mode": "compact_generated_test_repair" if generated_tests_repair else "compact_browser_repair" if browser_step_repair else "compact_repair" if compact_repair_prompt else "focused_visual" if focused_visual_edit else "standard",
             "mode": request.mode,
+            "edit_mode": request.edit_mode,
             "intent": request.intent,
             "generation_mode": str(getattr(request.generation_mode, "value", request.generation_mode) or ""),
             "focused_edit_kind": focused_edit_kind,
             "focused_edit_files": focused_edit_files,
+            "improve_mode": self._improve_mode_context(workspace_id=workspace_id, run_id=run_id) if request.edit_mode == "improve" else {},
             "acceptance_contract": (
                 self._compact_acceptance_contract(acceptance_contract)
                 if compact_repair_prompt
@@ -5240,6 +5244,11 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         if is_initial_fast_create:
             return {}
         target_files = self._target_files_from_execution(latest_execution)
+        if request.edit_mode == "improve":
+            improve_slice = self._improve_slice_report(workspace_id=workspace_id, run_id=run_id)
+            improve_targets = [str(item) for item in improve_slice.get("connected_files") or [] if str(item).strip()]
+            if improve_targets:
+                target_files = improve_targets[:16]
         if not target_files and latest_diff_summary:
             target_files = self._paths_from_diff(str(latest_diff_summary or ""))[:8]
         try:
@@ -5277,6 +5286,32 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                 "target_file_sample": (pack.retrieval_stats.get("anchor_report") or {}).get("target_file_sample", []),
                 "budget": pack.retrieval_stats.get("budget") or {},
             },
+        }
+
+    def _improve_slice_report(self, *, workspace_id: str, run_id: str) -> dict[str, Any]:
+        payload = self.store.get("reports", f"improve_slice:{workspace_id}:{run_id}")
+        return payload if isinstance(payload, dict) else {}
+
+    def _improve_mode_context(self, *, workspace_id: str, run_id: str) -> dict[str, Any]:
+        slice_payload = self._improve_slice_report(workspace_id=workspace_id, run_id=run_id)
+        map_payload = self.store.get("reports", f"existing_app_map:{workspace_id}:{run_id}")
+        if not isinstance(map_payload, dict) and not slice_payload:
+            return {}
+        return {
+            "schema": "grounded.improve_mode_context.v1",
+            "instruction": (
+                "Improve mode: inspect the existing architecture/product map first, then patch only the minimum connected slice. "
+                "Preserve existing selectors, routes, API paths, persistence semantics, and tests unless the requested improvement explicitly requires changing them."
+            ),
+            "existing_app_map_ref": (map_payload or {}).get("existing_app_map_ref") if isinstance(map_payload, dict) else f"existing_app_map:{workspace_id}:{run_id}",
+            "improve_slice_ref": slice_payload.get("improve_slice_ref") or f"improve_slice:{workspace_id}:{run_id}",
+            "connected_files": list(slice_payload.get("connected_files") or [])[:24],
+            "protected_files": list(slice_payload.get("protected_files") or [])[:40],
+            "required_proof": list(slice_payload.get("required_proof") or []),
+            "risk_level": slice_payload.get("risk_level"),
+            "role_pages": list((map_payload or {}).get("role_pages") or [])[:18] if isinstance(map_payload, dict) else [],
+            "api_endpoints": list((map_payload or {}).get("api_endpoints") or [])[:18] if isinstance(map_payload, dict) else [],
+            "frontend_api_calls": list((map_payload or {}).get("frontend_api_calls") or [])[:18] if isinstance(map_payload, dict) else [],
         }
 
     @staticmethod

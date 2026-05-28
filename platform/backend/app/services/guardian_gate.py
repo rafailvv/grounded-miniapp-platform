@@ -162,6 +162,7 @@ class GuardianGateService:
             verdict = "allow" if override == "allow" else override
         diff_summary = packet.get("diff_summary") if isinstance(packet.get("diff_summary"), dict) else {}
         changed_files = [str(path) for path in packet.get("changed_files") or []]
+        improve_slice = packet.get("improve_slice") if isinstance(packet.get("improve_slice"), dict) else {}
         prompt = str(packet.get("prompt") or "").lower()
         acceptance = packet.get("acceptance_contract") if isinstance(packet.get("acceptance_contract"), dict) else {}
         deleted_routes = diff_summary.get("deleted_routes") or []
@@ -177,6 +178,23 @@ class GuardianGateService:
             findings.append(self._finding("guardian.semantic_contract_mismatch", "Acceptance requires product changes, but the draft has no changed files.", {"acceptance_contract": acceptance}, category="product_readiness"))
         if re.search(r"\b(api|backend|route|endpoint)\b", prompt) and changed_files and not any(path.startswith(("miniapp/app/routes", "miniapp/app/schemas.py", "miniapp/app/db.py")) for path in changed_files):
             findings.append(self._finding("guardian.semantic_contract_mismatch", "Prompt asks for API/backend work but changed files do not touch backend contract surfaces.", {"prompt_terms": ["api", "backend"], "changed_files": changed_files[:20]}, category="product_readiness"))
+        allowed = {str(path) for path in improve_slice.get("connected_files") or [] if str(path).strip()}
+        protected = {str(path) for path in improve_slice.get("protected_files") or [] if str(path).strip()}
+        if allowed:
+            outside = [
+                path
+                for path in changed_files
+                if path not in allowed and path in protected and not path.startswith("docs/")
+            ]
+            if outside:
+                findings.append(
+                    self._finding(
+                        "guardian.improve_slice_broad_rewrite",
+                        "Improve mode changed protected files outside the planned connected slice.",
+                        {"outside_slice": outside[:20], "improve_slice_ref": improve_slice.get("improve_slice_ref")},
+                        category="scope_control",
+                    )
+                )
         if override == "uncertain":
             findings.append(self._finding("guardian.semantic_uncertain", "Semantic reviewer could not confidently approve the source apply.", {"review_packet_ref": packet_ref}, category="policy", severity="high"))
         elif override == "block":
@@ -201,6 +219,7 @@ class GuardianGateService:
     def _review_packet(self, *, run: RunRecord, artifacts: dict[str, Any], changed_files: list[str], diff_text: str, draft_gate_ref: str | None) -> dict[str, Any]:
         check_results = [item for item in artifacts.get("check_results") or [] if isinstance(item, dict)]
         check_by_name = {str(item.get("name") or ""): str(item.get("status") or "") for item in check_results}
+        improve_slice = self.store.get("reports", getattr(run, "improve_slice_ref", None) or f"improve_slice:{run.workspace_id}:{run.run_id}")
         return {
             "schema": "grounded.guardian_review_packet.v1",
             "workspace_id": run.workspace_id,
@@ -211,6 +230,7 @@ class GuardianGateService:
             "changed_files": changed_files[:100],
             "diff_sha256": _sha256(diff_text),
             "diff_summary": self._diff_summary(diff_text),
+            "improve_slice": improve_slice if isinstance(improve_slice, dict) else {},
             "proof_refs": {
                 "draft_gate_ref": draft_gate_ref,
                 "lsp_context_ref": getattr(run, "lsp_context_ref", None),

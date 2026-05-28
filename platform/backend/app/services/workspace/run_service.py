@@ -41,6 +41,7 @@ from app.services.miniapp_contract import MiniAppContractCompiler
 from app.services.prompt_contract_compiler import PromptContractCompilerService
 from app.services.repair_cases import RepairCaseService
 from app.services.event_journal import EventJournalService
+from app.services.existing_app_map import ExistingAppMapService
 from app.services.run_protocol import RunProtocolService
 from app.services.run_state_machine import RunStateMachine
 from app.services.run_task_ledger import RunTaskLedger
@@ -128,6 +129,7 @@ class RunService:
         run_protocol_service: RunProtocolService | None = None,
         event_journal_service: EventJournalService | None = None,
         prompt_contract_compiler_service: PromptContractCompilerService | None = None,
+        existing_app_map_service: ExistingAppMapService | None = None,
     ) -> None:
         self.store = store
         self.workspace_service = workspace_service
@@ -143,6 +145,7 @@ class RunService:
             openai_client=openai_client,
             event_journal_service=event_journal_service,
         )
+        self.existing_app_map_service = existing_app_map_service
         self.guardian_gate_service = GuardianGateService(store=store, workspace_service=workspace_service, event_journal_service=event_journal_service)
         self.background_task_service: Any | None = None
         self._active_workers: dict[str, threading.Thread] = {}
@@ -189,6 +192,8 @@ class RunService:
 
     def _start_run(self, workspace_id: str, request: CreateRunRequest, *, wait: bool) -> RunRecord:
         workspace = self.workspace_service.get_workspace(workspace_id)
+        if request.edit_mode == "improve":
+            request = request.model_copy(update={"mode": "fix", "intent": "refine"})
         source_run: RunRecord | None = None
         if request.resume_from_run_id:
             source_run = self.get_run(request.resume_from_run_id)
@@ -206,6 +211,7 @@ class RunService:
         contract_probe = GenerateRequest(
             prompt=request.prompt,
             mode=request.mode,
+            edit_mode=request.edit_mode,
             target_platform=request.target_platform,
             preview_profile=request.preview_profile,
             generation_mode=effective_generation_mode,
@@ -269,6 +275,7 @@ class RunService:
             workspace_id=workspace_id,
             prompt=request.prompt,
             mode=request.mode,
+            edit_mode=request.edit_mode,
             intent=resolved_intent,
             apply_strategy="staged_auto_apply",
             approval_required=False,
@@ -299,6 +306,52 @@ class RunService:
             token_usage=self._token_usage_from_prompt_analysis(prompt_analysis_usage),
         )
         run.prompt_contract_ref = prompt_contract_result.compile_report.prompt_contract_ref
+        improve_blocked = False
+        if request.edit_mode == "improve":
+            if not (self._workspace_has_existing_build(workspace) or self._workspace_has_existing_app_surface(workspace)):
+                improve_blocked = True
+                run.status = "blocked"
+                run.apply_status = "blocked"
+                run.current_stage = "blocked: improve mode requires existing app"
+                run.progress_percent = 100
+                run.failure_class = "improve_no_existing_app"
+                run.failure_reason = "Improve mode requires an existing generated app before patching."
+                run.implementation_plan = {
+                    **dict(run.implementation_plan or {}),
+                    "edit_mode": "improve",
+                    "improve_mode": {"status": "blocked", "reason": "existing_app_required"},
+                }
+            elif self.existing_app_map_service is not None:
+                improve = self.existing_app_map_service.prepare_improve_run(
+                    workspace_id=workspace_id,
+                    run_id=run.run_id,
+                    prompt=request.prompt,
+                )
+                map_payload = improve.get("map") if isinstance(improve.get("map"), dict) else {}
+                slice_payload = improve.get("slice") if isinstance(improve.get("slice"), dict) else {}
+                run.existing_app_map_ref = str(map_payload.get("existing_app_map_ref") or f"existing_app_map:{workspace_id}:{run.run_id}")
+                run.improve_slice_ref = str(slice_payload.get("improve_slice_ref") or f"improve_slice:{workspace_id}:{run.run_id}")
+                if slice_payload.get("blocked_reasons"):
+                    improve_blocked = True
+                    run.status = "blocked"
+                    run.apply_status = "blocked"
+                    run.current_stage = "blocked: improve slice unavailable"
+                    run.progress_percent = 100
+                    run.failure_class = "improve_slice_blocked"
+                    run.failure_reason = "Improve mode could not derive a connected slice from the existing app."
+                run.implementation_plan = {
+                    **dict(run.implementation_plan or {}),
+                    "edit_mode": "improve",
+                    "existing_app_map_ref": run.existing_app_map_ref,
+                    "improve_slice_ref": run.improve_slice_ref,
+                    "improve_mode": {
+                        "status": "blocked" if improve_blocked else "ready",
+                        "connected_files": list(slice_payload.get("connected_files") or []),
+                        "protected_files": list(slice_payload.get("protected_files") or [])[:80],
+                        "required_proof": list(slice_payload.get("required_proof") or []),
+                    },
+                }
+        implementation_plan = dict(run.implementation_plan or implementation_plan)
         run.task_ledger_ref = f"task_ledger:{workspace_id}:{run.run_id}"
         run.implementation_plan = implementation_plan
         self.store.upsert(
@@ -364,10 +417,13 @@ class RunService:
                 "mode": run.mode,
                 "intent": run.intent,
                 "generation_mode": str(getattr(run.generation_mode, "value", run.generation_mode)),
+                "edit_mode": run.edit_mode,
                 "model_profile": run.model_profile,
                 "resume_from_run_id": run.resume_from_run_id,
                 "forked_from_run_id": run.forked_from_run_id,
                 "prompt_contract_ref": run.prompt_contract_ref,
+                "existing_app_map_ref": run.existing_app_map_ref,
+                "improve_slice_ref": run.improve_slice_ref,
             },
             summary="Run record created.",
             idempotency_key=f"run.created:{run.run_id}",
@@ -396,6 +452,7 @@ class RunService:
                 "apply_status": run.apply_status,
                 "current_stage": run.current_stage,
                 "mode": run.mode,
+                "edit_mode": run.edit_mode,
                 "intent": run.intent,
             },
             summary="Run started.",
@@ -433,7 +490,9 @@ class RunService:
                 },
             )
         self.store.delete("reports", f"run_stop_request:{run.run_id}")
-        if contract_blocked:
+        if contract_blocked or improve_blocked:
+            reason = acceptance_contract.get("reason") if contract_blocked else run.failure_reason
+            issues = acceptance_contract.get("issues") or ([] if not improve_blocked else [{"code": run.failure_class, "message": run.failure_reason}])
             if self.run_protocol_service is not None:
                 self.run_protocol_service.append_event(
                     run_id=run.run_id,
@@ -441,11 +500,11 @@ class RunService:
                     session_id=run.session_id,
                     event_type="run_completed",
                     status="blocked",
-                    message="Run blocked because prompt-derived acceptance contract is missing.",
+                    message="Run blocked before runtime.",
                     payload={
                         "status": run.status,
-                        "reason": acceptance_contract.get("reason"),
-                        "issues": acceptance_contract.get("issues") or [],
+                        "reason": reason,
+                        "issues": issues,
                     },
                 )
             self._journal_run(
@@ -456,11 +515,11 @@ class RunService:
                     "status": run.status,
                     "apply_status": run.apply_status,
                     "current_stage": run.current_stage,
-                    "reason": acceptance_contract.get("reason"),
-                    "issues": acceptance_contract.get("issues") or [],
+                    "reason": reason,
+                    "issues": issues,
                 },
-                summary="Run blocked because prompt-derived acceptance contract is missing.",
-                idempotency_key=f"run.blocked:{run.run_id}:contract",
+                summary="Run blocked before runtime.",
+                idempotency_key=f"run.blocked:{run.run_id}:{'contract' if contract_blocked else 'improve'}",
             )
             return self.get_run(run.run_id)
         if wait:
@@ -1789,6 +1848,7 @@ class RunService:
             generate_request = GenerateRequest(
                 prompt=request.prompt,
                 mode=request.mode,
+                edit_mode=request.edit_mode,
                 target_platform=request.target_platform,
                 preview_profile=request.preview_profile,
                 generation_mode=effective_generation_mode,
@@ -3074,6 +3134,22 @@ class RunService:
                 paths.append(candidate)
         return any(self._is_meaningful_source_path(path) for path in paths)
 
+    def _workspace_has_existing_app_surface(self, workspace: WorkspaceRecord) -> bool:
+        source_dir = self.workspace_service.source_dir(workspace.workspace_id)
+        routes_dir = source_dir / "miniapp" / "app" / "routes"
+        route_files = {
+            path.name
+            for path in routes_dir.glob("*.py")
+            if path.name not in {"__init__.py", "health.py", "role_pages.py", "role_routes.py"}
+        } if routes_dir.exists() else set()
+        static_root = source_dir / "miniapp" / "app" / "static"
+        role_pages = [
+            path
+            for role in ROLE_ORDER
+            for path in (static_root / role).rglob("index.html")
+        ] if static_root.exists() else []
+        return bool(route_files and role_pages)
+
     @staticmethod
     def _resolve_model_profile(model_profile: str | None, generation_mode: GenerationMode) -> str:
         return resolve_model_profile(model_profile, generation_mode)
@@ -3240,6 +3316,7 @@ class RunService:
         probe = GenerateRequest(
             prompt=request.prompt,
             mode=request.mode,
+            edit_mode=request.edit_mode,
             target_platform=request.target_platform,
             preview_profile=request.preview_profile,
             generation_mode=run.generation_mode,

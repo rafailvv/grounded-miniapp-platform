@@ -36,6 +36,7 @@ export type Run = {
   workspace_id: string;
   prompt: string;
   mode?: "generate" | "fix";
+  edit_mode?: "default" | "improve";
   generation_mode?: "fast" | "balanced" | "quality" | "production" | "basic";
   intent: "create" | "edit" | "refine" | "role_only_change";
   apply_strategy: "staged_auto_apply" | "manual_approve";
@@ -149,6 +150,8 @@ export type Run = {
   browser_step_refs?: Array<string>;
   active_tool_uses?: Array<Record<string, unknown>>;
   context_pressure_ref?: string | null;
+  existing_app_map_ref?: string | null;
+  improve_slice_ref?: string | null;
   hook_trace_ref?: string | null;
   semantic_graph_ref?: string | null;
   worker_prefix_ref?: string | null;
@@ -1273,6 +1276,7 @@ export async function createRun(
   payload: {
     prompt: string;
     mode?: "generate" | "fix";
+    edit_mode?: "default" | "improve";
     intent?: "auto" | "create" | "edit" | "refine" | "role_only_change";
     apply_strategy?: "staged_auto_apply" | "manual_approve";
     target_role_scope?: Array<"client" | "specialist" | "manager">;
@@ -1290,6 +1294,7 @@ export async function createRun(
 ): Promise<Run> {
   const runPayload = {
     mode: "generate",
+    edit_mode: "default",
     intent: "auto",
     apply_strategy: "staged_auto_apply",
     target_role_scope: [],

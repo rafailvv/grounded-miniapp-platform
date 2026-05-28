@@ -174,6 +174,7 @@ class TurnStartParams(StrictModel):
     thread_id: str = Field(validation_alias=AliasChoices("thread_id", "threadId"))
     prompt: str = ""
     mode: str = "generate"
+    edit_mode: str = Field(default="default", validation_alias=AliasChoices("edit_mode", "editMode"))
     generation_mode: str = Field(default="balanced", validation_alias=AliasChoices("generation_mode", "generationMode"))
     intent: str = "auto"
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -192,6 +193,16 @@ class RunReplayParams(StrictModel):
     run_id: str = Field(validation_alias=AliasChoices("run_id", "runId"))
     after_sequence: int = Field(default=0, validation_alias=AliasChoices("after_sequence", "afterSequence"))
     limit: int = 500
+
+
+class ImproveRunParams(StrictModel):
+    workspace_id: str = Field(validation_alias=AliasChoices("workspace_id", "workspaceId"))
+    prompt: str
+    run_id: str | None = Field(default=None, validation_alias=AliasChoices("run_id", "runId"))
+    resume_from_run_id: str | None = Field(default=None, validation_alias=AliasChoices("resume_from_run_id", "resumeFromRunId"))
+    target_role_scope: list[str] = Field(default_factory=list, validation_alias=AliasChoices("target_role_scope", "targetRoleScope"))
+    model_profile: str | None = Field(default=None, validation_alias=AliasChoices("model_profile", "modelProfile"))
+    generation_mode: str | None = Field(default=None, validation_alias=AliasChoices("generation_mode", "generationMode"))
 
 
 class DraftApplyParams(StrictModel):

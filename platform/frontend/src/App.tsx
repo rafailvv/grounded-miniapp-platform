@@ -153,7 +153,7 @@ const ROLE_LABELS: Record<RoleKey, string> = {
 
 const DEFAULT_PROMPT = "";
 const ROOT_PREVIEW_PATH = "/";
-const PRODUCT_SLASH_COMMANDS = new Set(["generate", "fix", "polish", "add-flow", "review", "acceptance", "deploy", "babysit-pr", "docs"]);
+const PRODUCT_SLASH_COMMANDS = new Set(["generate", "fix", "polish", "add-flow", "improve", "review", "acceptance", "deploy", "babysit-pr", "docs"]);
 
 function parseProductSlashCommand(value: string): { commandId: string; detail: string } | null {
   const match = value.trim().match(/^\/([a-z-]+)(?:\s+([\s\S]*))?$/i);
@@ -2397,11 +2397,11 @@ export default function App() {
     setLoading(true);
     setError("");
     setStatusMessage("");
-    if (["generate", "fix", "polish", "add-flow"].includes(commandId)) {
+    if (["generate", "fix", "polish", "add-flow", "improve"].includes(commandId)) {
       setPreviewBooting(true);
     }
     try {
-      const commandPrompt = detail || (["generate", "add-flow"].includes(commandId) ? prompt.trim() : "");
+      const commandPrompt = detail || (["generate", "add-flow", "improve"].includes(commandId) ? prompt.trim() : "");
       const execution = await executeSlashCommand(commandId, {
         workspace_id: workspace.workspace_id,
         run_id: selectedRun?.run_id,
@@ -2608,7 +2608,7 @@ export default function App() {
     setCommandPaletteOpen(false);
     if (actionId.startsWith("slash:")) {
       const commandId = actionId.slice("slash:".length);
-      await handleExecuteSlashCommand(commandId, ["generate", "add-flow"].includes(commandId) ? prompt.trim() : "");
+      await handleExecuteSlashCommand(commandId, ["generate", "add-flow", "improve"].includes(commandId) ? prompt.trim() : "");
       return;
     }
     if (actionId === "generate") {

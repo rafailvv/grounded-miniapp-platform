@@ -13,6 +13,7 @@ from app.services.code_index_service import CodeIndexService
 from app.services.context_pack_builder import ContextPackBuilder
 from app.services.context_manager import ContextManagerService
 from app.services.lsp_context import LspContextService
+from app.services.existing_app_map import ExistingAppMapService
 from app.services.lsp_server_manager import LspServerManager
 from app.services.worker_sessions import WorkerSessionService
 from app.services.draft_isolation import DraftIsolationService
@@ -109,6 +110,12 @@ class ServiceContainer:
             server_manager=self.lsp_server_manager,
             event_journal_service=self.event_journal_service,
         )
+        self.existing_app_map_service = ExistingAppMapService(
+            store=self.store,
+            workspace_service=self.workspace_service,
+            lsp_context_service=self.lsp_context_service,
+            event_journal_service=self.event_journal_service,
+        )
         self.agent_context_builder = AgentContextBuilder(store=self.store, workspace_service=self.workspace_service)
         self.agent_tool_call_loop = AgentToolCallLoop(context_builder=self.agent_context_builder, lsp_context_service=self.lsp_context_service)
         self.validation_suite = ValidationSuite()
@@ -163,6 +170,7 @@ class ServiceContainer:
                 openai_client=self.openai_client,
                 event_journal_service=self.event_journal_service,
             ),
+            existing_app_map_service=self.existing_app_map_service,
         )
         self.run_service.attach_guardian_gate_service(self.guardian_gate_service)
         self.exec_policy_service = ExecPolicyService(self.settings.runtime_dir / "policies" / "agent_exec_policy.json", sandbox_service=self.sandbox_service)
@@ -215,6 +223,7 @@ class ServiceContainer:
             pr_babysitter_service=self.pr_babysitter_service,
             browser_replay_proof_service=self.browser_replay_proof_service,
             doctor_service=self.doctor_service,
+            existing_app_map_service=self.existing_app_map_service,
         )
         self.thread_service = ThreadService(
             self.platform_db,

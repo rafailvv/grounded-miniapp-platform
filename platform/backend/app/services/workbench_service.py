@@ -82,6 +82,7 @@ from app.services.generation_enhancements import (
 )
 from app.services.generation_sla import GenerationSla
 from app.services.golden_generated_apps import GoldenGeneratedAppCatalog
+from app.services.existing_app_map import ExistingAppMapService
 from app.services.skill_registry import SkillRegistryService
 from app.services.simplify_pass import SimplifyPass
 from app.services.miniapp_contract import MiniAppContractMaterializer, MiniAppRouteRegistry
@@ -193,6 +194,7 @@ class WorkbenchService:
         pr_babysitter_service: PrBabysitterService | None = None,
         browser_replay_proof_service: BrowserReplayProofService | None = None,
         doctor_service: DoctorService | None = None,
+        existing_app_map_service: ExistingAppMapService | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
@@ -221,6 +223,12 @@ class WorkbenchService:
             exec_policy_service=exec_policy_service,
             event_journal_service=event_journal_service,
             run_protocol_service=run_protocol_service,
+        )
+        self.existing_app_map_service = existing_app_map_service or ExistingAppMapService(
+            store=store,
+            workspace_service=workspace_service,
+            lsp_context_service=lsp_context_service,
+            event_journal_service=event_journal_service,
         )
         self.prompt_suggestion_service = PromptSuggestionService()
 
@@ -3975,6 +3983,36 @@ class WorkbenchService:
         self.store.upsert("reports", f"golden_generated_app:{app_id}", payload)
         return payload
 
+    def existing_app_map(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        return self.existing_app_map_service.read_map(workspace_id=run.workspace_id, run_id=run.run_id)
+
+    def improve_mode(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        return self.existing_app_map_service.report(workspace_id=run.workspace_id, run_id=run.run_id)
+
+    def improve_workspace(self, workspace_id: str, payload: dict[str, Any] | None = None) -> RunRecord:
+        payload = payload or {}
+        self.workspace_service.get_workspace(workspace_id)
+        prompt = str(payload.get("prompt") or payload.get("detail") or "").strip()
+        if not prompt:
+            raise ValueError("Improve mode requires prompt.")
+        base_run_id = str(payload.get("resume_from_run_id") or payload.get("run_id") or "").strip()
+        base_run = self.run_service.get_run(base_run_id) if base_run_id else self._latest_run_for_slash(workspace_id, prefer_failed=False, required=False)
+        return self.run_service.create_run(
+            workspace_id,
+            CreateRunRequest(
+                prompt=prompt,
+                mode="fix",
+                edit_mode="improve",
+                intent="refine",
+                generation_mode=str(payload.get("generation_mode") or (base_run.generation_mode if base_run else "balanced")),  # type: ignore[arg-type]
+                target_role_scope=[role for role in payload.get("target_role_scope") or (base_run.target_role_scope if base_run else []) if role in {"client", "specialist", "manager"}],  # type: ignore[arg-type]
+                model_profile=str(payload.get("model_profile") or (base_run.model_profile if base_run else "")),
+                resume_from_run_id=base_run.run_id if base_run else None,
+            ),
+        )
+
     def upsert_memory(self, workspace_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         current = self.memory(workspace_id)
         raw_kind = str(payload.get("memory_type") or payload.get("kind") or "note") if str(payload.get("kind") or "") == "note" else str(payload.get("kind") or payload.get("memory_type") or "note")
@@ -4153,6 +4191,9 @@ class WorkbenchService:
             target = run or self._latest_run_for_slash(workspace_id, prefer_failed=False, required=False)
             created = self._execute_add_flow_slash(workspace_id or (target.workspace_id if target else ""), target, payload)
             return self._store_slash_execution({**base, "workspace_id": created.workspace_id, "run_id": target.run_id if target else None, "status": "started", "workflow": "add_product_flow", "run": created.model_dump(mode="json")})
+        if command_id == "improve":
+            created = self._execute_improve_slash(workspace_id, run, payload)
+            return self._store_slash_execution({**base, "workspace_id": created.workspace_id, "run_id": run.run_id if run else None, "status": "started", "workflow": "improve_existing_app", "run": created.model_dump(mode="json")})
         if command_id == "review":
             target = run or self._latest_run_for_slash(workspace_id, prefer_failed=False)
             report = self.review(target.run_id, target=str(payload.get("target") or (payload.get("metadata") or {}).get("target") or "") or None)
@@ -4326,6 +4367,22 @@ class WorkbenchService:
         return self.run_service.create_run(
             workspace_id,
             self._slash_run_request(prompt=prompt, mode="fix" if run else "generate", intent="refine", payload=payload, base_run=run, generation_mode=str(payload.get("generation_mode") or "balanced")),
+        )
+
+    def _execute_improve_slash(self, workspace_id: str, run: RunRecord | None, payload: dict[str, Any]) -> RunRecord:
+        if not workspace_id:
+            raise ValueError("/improve requires workspace_id.")
+        detail = self._slash_prompt(payload)
+        if not detail:
+            raise ValueError("/improve requires an improvement description.")
+        return self.improve_workspace(
+            workspace_id,
+            {
+                **dict(payload or {}),
+                "prompt": detail,
+                "run_id": run.run_id if run else payload.get("run_id"),
+                "generation_mode": payload.get("generation_mode") or "balanced",
+            },
         )
 
     def _execute_acceptance_slash(self, run: RunRecord) -> dict[str, Any]:

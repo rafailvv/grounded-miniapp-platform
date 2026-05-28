@@ -96,6 +96,15 @@ class FilesRequest(BaseModel):
     files: list[str] = []
 
 
+class ImproveRunRequest(BaseModel):
+    prompt: str
+    run_id: str | None = None
+    resume_from_run_id: str | None = None
+    target_role_scope: list[str] = Field(default_factory=list)
+    model_profile: str | None = None
+    generation_mode: str | None = None
+
+
 class ThreadStartRequest(BaseModel):
     workspace_id: str
     title: str | None = None
@@ -105,6 +114,7 @@ class ThreadStartRequest(BaseModel):
 class TurnStartRequest(BaseModel):
     prompt: str
     mode: str = "generate"
+    edit_mode: str = "default"
     generation_mode: str = "balanced"
     intent: str = "auto"
     metadata: dict[str, Any] = {}
@@ -362,6 +372,16 @@ def create_webhook(
 ) -> dict[str, Any]:
     try:
         return container.workbench_service.create_webhook(request, idempotency_key=idempotency_key)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/workspaces/{workspace_id}/improve", response_model=RunRecord)
+def improve_workspace(workspace_id: str, request: ImproveRunRequest, container: ServiceContainer = Depends(get_container)) -> RunRecord:
+    try:
+        return container.workbench_service.improve_workspace(workspace_id, request.model_dump())
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
@@ -1022,6 +1042,22 @@ def restart_lsp(workspace_id: str, run_id: str | None = None, container: Service
 def get_run_lsp_context(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     try:
         return container.workbench_service.run_lsp_context(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/runs/{run_id}/existing-app-map")
+def get_existing_app_map(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.existing_app_map(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/runs/{run_id}/improve-mode")
+def get_improve_mode(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.improve_mode(run_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 

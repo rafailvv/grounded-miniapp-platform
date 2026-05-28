@@ -55,6 +55,7 @@ from app.services.event_journal import EventJournalSecretError, EventJournalServ
 from app.services.exec_policy_service import ExecPolicyService
 from app.services.sandbox_service import SandboxService, SandboxViolationError
 from app.services.pr_babysitter import PrBabysitterService
+from app.services.starter_workspace_service import BLOOM_STARTER_WORKSPACE_ID
 from app.services.tool_protocol import TOOL_PROTOCOL_VERSION, canonical_tool_name, tool_envelope
 from app.services.workspace.runtime_manager import PreviewRuntimeManager
 
@@ -182,6 +183,92 @@ def test_create_run_writes_journal_v2_lifecycle_events(tmp_path: Path) -> None:
     events = client.get(f"/runs/{run.run_id}/events-v2").json()
 
     assert {"run.created", "run.session_configured", "run.started"}.issubset({item["event_type"] for item in events["items"]})
+
+
+def test_existing_app_map_service_builds_map_and_improve_slice(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("PLATFORM_BOOTSTRAP_STARTER_WORKSPACE", "1")
+    monkeypatch.setenv("PREVIEW_RUNTIME_MODE", "local")
+    app = create_app(data_dir=tmp_path)
+    service = app.state.container.existing_app_map_service
+
+    report = service.prepare_improve_run(
+        workspace_id=BLOOM_STARTER_WORKSPACE_ID,
+        run_id="run_improve_map_test",
+        prompt="Improve the manager analytics view with order status data without changing checkout.",
+    )
+    app_map = service.read_map(workspace_id=BLOOM_STARTER_WORKSPACE_ID, run_id="run_improve_map_test")
+    slice_plan = service.read_slice(workspace_id=BLOOM_STARTER_WORKSPACE_ID, run_id="run_improve_map_test")
+
+    assert report["report"]["schema"] == "grounded.improve_mode_report.v1"
+    assert report["report"]["status"] in {"ready", "blocked"}
+    assert app_map["schema"] == "grounded.existing_app_map.v1"
+    assert any(page["role"] == "manager" for page in app_map["role_pages"])
+    assert any(endpoint["path"].startswith("/api") for endpoint in app_map["api_endpoints"])
+    assert any(ref["path"].startswith("/api") for ref in app_map["frontend_api_calls"])
+    assert app_map["tests"]
+    assert slice_plan["schema"] == "grounded.improve_slice_plan.v1"
+    assert "miniapp/app/routes/flower_shop.py" in slice_plan["connected_files"]
+    assert any(path.startswith("miniapp/tests/") for path in slice_plan["connected_files"])
+    events = [event.event_type for event in app.state.container.event_journal_service.list_run("run_improve_map_test")]
+    assert {"improve.map.started", "improve.map.created", "improve.slice.planned"}.issubset(events)
+
+
+def test_improve_run_blocks_without_existing_app_surface(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Empty Improve Workspace",
+            "description": "No product source yet",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    app.state.container.run_service._execute_run = lambda run_id, payload: None
+
+    run = app.state.container.run_service.create_run_sync(
+        workspace["workspace_id"],
+        CreateRunRequest(
+            prompt="Improve the existing manager dashboard.",
+            mode="fix",
+            intent="refine",
+            edit_mode="improve",
+            generation_mode="fast",
+        ),
+    )
+
+    assert run.edit_mode == "improve"
+    assert run.status == "blocked"
+    assert run.failure_class == "improve_no_existing_app"
+    assert run.existing_app_map_ref is None
+    assert run.improve_slice_ref is None
+
+
+def test_improve_workspace_endpoint_creates_focused_run_with_refs(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("PLATFORM_BOOTSTRAP_STARTER_WORKSPACE", "1")
+    monkeypatch.setenv("PREVIEW_RUNTIME_MODE", "local")
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    app.state.container.run_service._execute_run = lambda run_id, payload: None
+
+    created = client.post(
+        f"/workspaces/{BLOOM_STARTER_WORKSPACE_ID}/improve",
+        json={"prompt": "Improve the manager analytics screen but preserve checkout APIs.", "generation_mode": "fast"},
+    ).json()
+    mode_report = client.get(f"/runs/{created['run_id']}/improve-mode").json()
+    app_map = client.get(f"/runs/{created['run_id']}/existing-app-map").json()
+
+    assert created["edit_mode"] == "improve"
+    assert created["mode"] == "fix"
+    assert created["intent"] == "refine"
+    assert created["existing_app_map_ref"] == f"existing_app_map:{BLOOM_STARTER_WORKSPACE_ID}:{created['run_id']}"
+    assert created["improve_slice_ref"] == f"improve_slice:{BLOOM_STARTER_WORKSPACE_ID}:{created['run_id']}"
+    assert created["implementation_plan"]["edit_mode"] == "improve"
+    assert created["implementation_plan"]["improve_slice_ref"] == created["improve_slice_ref"]
+    assert mode_report["schema"] == "grounded.improve_mode_report.v1"
+    assert mode_report["improve_slice_ref"] == created["improve_slice_ref"]
+    assert app_map["schema"] == "grounded.existing_app_map.v1"
 
 
 def test_exec_policy_classifies_and_redacts_commands() -> None:

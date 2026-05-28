@@ -164,6 +164,7 @@ class JobRecord(StrictModel):
     prompt: str
     status: Literal["pending", "running", "blocked", "completed", "failed"] = "pending"
     mode: RunMode = "generate"
+    edit_mode: Literal["default", "improve"] = "default"
     generation_mode: GenerationMode = GenerationMode.BALANCED
     target_platform: TargetPlatform
     preview_profile: PreviewProfile
@@ -222,6 +223,8 @@ class JobRecord(StrictModel):
     draft_isolation_ref: str | None = None
     draft_gate_ref: str | None = None
     draft_apply_decision_ref: str | None = None
+    existing_app_map_ref: str | None = None
+    improve_slice_ref: str | None = None
     guardian_gate_ref: str | None = None
     scratchpad_ref: str | None = None
     memory_ref: str | None = None
@@ -374,6 +377,7 @@ class CreateChatTurnRequest(StrictModel):
 class GenerateRequest(StrictModel):
     prompt: str
     mode: RunMode = "generate"
+    edit_mode: Literal["default", "improve"] = "default"
     target_platform: TargetPlatform = TargetPlatform.TELEGRAM
     preview_profile: PreviewProfile = PreviewProfile.TELEGRAM_MOCK
     generation_mode: GenerationMode = GenerationMode.BALANCED
@@ -559,6 +563,7 @@ class RunRecord(StrictModel):
     workspace_id: str
     prompt: str
     mode: RunMode = "generate"
+    edit_mode: Literal["default", "improve"] = "default"
     intent: Literal["create", "edit", "refine", "role_only_change"]
     apply_strategy: Literal["staged_auto_apply", "manual_approve"] = "staged_auto_apply"
     target_role_scope: list[Literal["client", "specialist", "manager"]] = Field(default_factory=list)
@@ -627,6 +632,8 @@ class RunRecord(StrictModel):
     draft_isolation_ref: str | None = None
     draft_gate_ref: str | None = None
     draft_apply_decision_ref: str | None = None
+    existing_app_map_ref: str | None = None
+    improve_slice_ref: str | None = None
     guardian_gate_ref: str | None = None
     scratchpad_ref: str | None = None
     memory_ref: str | None = None
@@ -683,6 +690,7 @@ class RunRecord(StrictModel):
 class CreateRunRequest(StrictModel):
     prompt: str
     mode: RunMode = "generate"
+    edit_mode: Literal["default", "improve"] = "default"
     intent: Literal["auto", "create", "edit", "refine", "role_only_change"] = "auto"
     apply_strategy: Literal["staged_auto_apply", "manual_approve"] = "staged_auto_apply"
     target_role_scope: list[Literal["client", "specialist", "manager"]] = Field(default_factory=list)

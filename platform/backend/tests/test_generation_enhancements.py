@@ -68,6 +68,7 @@ def test_project_instructions_skills_slash_commands_and_worker_roles(tmp_path: P
         "/fix",
         "/polish",
         "/add-flow",
+        "/improve",
         "/review",
         "/acceptance",
         "/deploy",

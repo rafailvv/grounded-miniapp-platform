@@ -490,6 +490,7 @@ class SlashCommandCatalog:
         {"id": "fix", "name": "/fix", "kind": "workflow", "description": "Repair the latest blocked or failed run from its active repair packet.", "requires": ["workspace", "run"], "workflow": "repair_latest_failure"},
         {"id": "polish", "name": "/polish", "kind": "workflow", "description": "Improve UI polish while preserving product semantics and acceptance proof.", "requires": ["workspace"], "workflow": "ui_polish_run"},
         {"id": "add-flow", "name": "/add-flow", "kind": "workflow", "description": "Add a new end-to-end scenario across API, persistence, UI, roles, mobile, and tests.", "requires": ["workspace", "prompt"], "workflow": "add_product_flow"},
+        {"id": "improve", "name": "/improve", "kind": "workflow", "description": "Improve an existing app by mapping current architecture and patching the smallest connected slice.", "requires": ["workspace", "prompt"], "workflow": "improve_existing_app"},
         {"id": "review", "name": "/review", "kind": "workflow", "description": "Find product risks, proof gaps, stale tests, and apply blockers for a run.", "requires": ["run"], "workflow": "risk_review"},
         {"id": "acceptance", "name": "/acceptance", "kind": "workflow", "description": "Run the acceptance proof loop and refresh readiness evidence.", "requires": ["run"], "workflow": "acceptance_proof"},
         {"id": "deploy", "name": "/deploy", "kind": "workflow", "description": "Prepare deploy artifacts only after the production gate is green.", "requires": ["workspace"], "workflow": "deploy_bundle"},
@@ -552,6 +553,7 @@ class SlashCommandCatalog:
             "fix": {"type": "execute_workflow", "workflow": "repair_latest_failure"},
             "polish": {"type": "execute_workflow", "workflow": "ui_polish_run"},
             "add-flow": {"type": "execute_workflow", "workflow": "add_product_flow"},
+            "improve": {"type": "execute_workflow", "workflow": "improve_existing_app"},
             "review": {"type": "execute_workflow", "workflow": "risk_review", "tab": "review"},
             "acceptance": {"type": "execute_workflow", "workflow": "acceptance_proof", "tab": "checks"},
             "deploy": {"type": "execute_workflow", "workflow": "deploy_bundle"},
@@ -570,6 +572,7 @@ class SlashCommandCatalog:
         templates = {
             "polish": "Polish the current app visually. Preserve existing behavior and tests.",
             "add-flow": f"Add a connected product flow: {detail}".strip(),
+            "improve": f"Improve the existing app with the smallest connected slice: {detail}".strip(),
             "fix": "Analyze the selected run failure and apply the smallest safe fix.",
             "acceptance": "Run the full production acceptance proof loop and report exact blockers.",
             "deploy": "Prepare deploy artifacts after the production readiness gate is green.",

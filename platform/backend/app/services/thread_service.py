@@ -221,6 +221,7 @@ class ThreadService:
         run_request = CreateRunRequest(
             prompt=prompt,
             mode=params.get("mode") or "generate",
+            edit_mode=params.get("edit_mode") or "default",
             intent=params.get("intent") or "auto",
             apply_strategy=params.get("apply_strategy") or "staged_auto_apply",
             target_role_scope=list(params.get("target_role_scope") or []),
