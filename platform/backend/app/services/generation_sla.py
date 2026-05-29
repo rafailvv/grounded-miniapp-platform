@@ -4,6 +4,8 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from app.models.common import GenerationMode
+from app.models.platform_config import GenerationModeConfig
+from app.services.platform_config import platform_config
 
 
 @dataclass(frozen=True)
@@ -28,94 +30,31 @@ class GenerationSlaProfile:
         return payload
 
 
-SECOND_QUEUE_CAPABILITIES: tuple[dict[str, Any], ...] = (
-    {"id": "doctor", "title": "/doctor platform + workspace diagnostics", "priority": 1, "status": "partially_available", "endpoint": "/doctor"},
-    {"id": "cost", "title": "/cost generation cost accounting", "priority": 1, "status": "partially_available", "endpoint": "/system/observability"},
-    {"id": "structured_diff", "title": "/diff structured patch review", "priority": 1, "status": "tool_available", "tool": "inspect_diff"},
-    {"id": "review", "title": "/review code and product review for generated apps", "priority": 1, "status": "available", "endpoint": "/runs/{run_id}/review"},
-    {"id": "context_view", "title": "Context view: what the agent actually saw", "priority": 2, "status": "partially_available", "endpoint": "/runs/{run_id}/context-pressure"},
-    {"id": "resume_thread_lifecycle", "title": "/resume and thread lifecycle", "priority": 2, "status": "available", "endpoint": "/runs/{run_id}/resume"},
-    {"id": "rewind_rollback", "title": "/rewind and rollback applied draft", "priority": 2, "status": "available", "endpoint": "/runs/{run_id}/rollback"},
-    {"id": "prompt_suggestions", "title": "Prompt suggestions and speculation", "priority": 2, "status": "available", "endpoint": "/runs/{run_id}/prompt-suggestions"},
-    {"id": "output_styles", "title": "Output styles for final responses", "priority": 3, "status": "planned"},
-    {"id": "command_palette", "title": "Workbench keybinding and command palette improvements", "priority": 3, "status": "planned"},
-    {"id": "ide_bridge", "title": "PyCharm/WebStorm IDE bridge", "priority": 4, "status": "conditional"},
-    {"id": "remote_sessions", "title": "Remote sessions for remote generation runtime", "priority": 4, "status": "conditional"},
-)
+def _profile_from_config(mode: str, config: GenerationModeConfig) -> GenerationSlaProfile:
+    return GenerationSlaProfile(
+        mode=mode,
+        label=config.label,
+        objective=config.objective,
+        required_checks=tuple(config.required_checks),
+        optional_checks=tuple(config.optional_checks),
+        proof_requirements=tuple(config.proof_requirements),
+        final_gate=tuple(config.final_gate),
+        context_policy=config.context_policy,
+        worker_policy=config.worker_policy,
+        max_repair_attempts=config.max_repair_attempts,
+        audit_level=config.audit_level,
+        output_style=config.output_style,
+    )
 
 
-SLA_PROFILES: dict[GenerationMode, GenerationSlaProfile] = {
-    GenerationMode.BASIC: GenerationSlaProfile(
-        mode="basic",
-        label="Basic scaffold",
-        objective="Small low-risk scaffold or exploratory edit with only static sanity checks.",
-        required_checks=("changed_files_static",),
-        optional_checks=("api_workflow_smoke",),
-        proof_requirements=("static import/build sanity",),
-        final_gate=("meaningful diff",),
-        context_policy="tiny",
-        worker_policy="serial",
-        max_repair_attempts=1,
-        audit_level="none",
-        output_style="short",
-    ),
-    GenerationMode.FAST: GenerationSlaProfile(
-        mode="fast",
-        label="Fast happy path",
-        objective="Ship one working happy path quickly with minimal but real product proof.",
-        required_checks=("api_workflow_smoke", "browser_flow_smoke"),
-        optional_checks=("changed_files_static", "generated_app_python_tests", "generated_app_js_tests"),
-        proof_requirements=("one prompt-derived happy path", "persisted state marker", "single role/browser route proof"),
-        final_gate=("meaningful product diff", "happy path browser proof"),
-        context_policy="focused",
-        worker_policy="serial",
-        max_repair_attempts=2,
-        audit_level="light",
-        output_style="concise",
-    ),
-    GenerationMode.BALANCED: GenerationSlaProfile(
-        mode="balanced",
-        label="Balanced product proof",
-        objective="Cover role flows, persistence, generated tests, and mobile usability.",
-        required_checks=("api_workflow_smoke", "browser_flow_smoke", "generated_app_python_tests", "generated_app_js_tests"),
-        optional_checks=("visual_regression", "prompt_completion_audit"),
-        proof_requirements=("role coverage", "shared persistence", "mobile layout", "generated app tests"),
-        final_gate=("requirement traceability", "prompt completion audit", "repair case sync"),
-        context_policy="standard",
-        worker_policy="serial with repair cases",
-        max_repair_attempts=5,
-        audit_level="standard",
-        output_style="implementation_summary",
-    ),
-    GenerationMode.QUALITY: GenerationSlaProfile(
-        mode="quality",
-        label="Quality browser + visual proof",
-        objective="Deep generated-app proof with browser scenarios, analytics, edge states, and visual snapshots.",
-        required_checks=("api_workflow_smoke", "browser_flow_smoke", "generated_app_python_tests", "generated_app_js_tests"),
-        optional_checks=("visual_regression", "observability", "guardian_review"),
-        proof_requirements=("browser proof", "analytics/observability signals", "edge states", "visual snapshots", "mobile overflow/overlap scan"),
-        final_gate=("requirement traceability", "prompt completion audit", "visual regression report", "final review gate"),
-        context_policy="broad",
-        worker_policy="parallel owned branches when contract is ready",
-        max_repair_attempts=6,
-        audit_level="deep",
-        output_style="proof_first",
-    ),
-    GenerationMode.PRODUCTION: GenerationSlaProfile(
-        mode="production",
-        label="Production release gate",
-        objective="Release-grade proof with security, export, docs, regression, and full audit evidence.",
-        required_checks=("api_workflow_smoke", "browser_flow_smoke", "generated_app_python_tests", "generated_app_js_tests"),
-        optional_checks=("visual_regression", "security_summary", "export_bundle", "documentation", "regression_suite", "observability"),
-        proof_requirements=("full role regression", "security/privacy review", "exportable artifact", "operator docs", "visual regression", "full prompt audit"),
-        final_gate=("security summary", "export proof", "docs proof", "regression proof", "prompt-to-artifact completion audit"),
-        context_policy="release",
-        worker_policy="parallel workers plus final release review",
-        max_repair_attempts=8,
-        audit_level="release",
-        output_style="release_report",
-    ),
-}
+def sla_profiles() -> dict[GenerationMode, GenerationSlaProfile]:
+    config = platform_config()
+    profiles: dict[GenerationMode, GenerationSlaProfile] = {}
+    for mode in GenerationMode:
+        mode_config = config.generation_modes.get(mode.value)
+        if mode_config is not None and mode_config.enabled:
+            profiles[mode] = _profile_from_config(mode.value, mode_config)
+    return profiles
 
 
 def normalize_generation_mode(value: GenerationMode | str | None) -> GenerationMode:
@@ -133,7 +72,9 @@ def normalize_generation_mode(value: GenerationMode | str | None) -> GenerationM
 class GenerationSla:
     @staticmethod
     def profile(mode: GenerationMode | str | None) -> GenerationSlaProfile:
-        return SLA_PROFILES[normalize_generation_mode(mode)]
+        profiles = sla_profiles()
+        normalized = normalize_generation_mode(mode)
+        return profiles.get(normalized) or profiles[normalize_generation_mode(platform_config().sla.default_mode)]
 
     @staticmethod
     def required_checks(mode: GenerationMode | str | None) -> tuple[str, ...]:
@@ -141,25 +82,26 @@ class GenerationSla:
 
     @staticmethod
     def requires_full_audit(mode: GenerationMode | str | None) -> bool:
-        return normalize_generation_mode(mode) in {GenerationMode.BALANCED, GenerationMode.QUALITY, GenerationMode.PRODUCTION}
+        return normalize_generation_mode(mode).value in set(platform_config().sla.full_audit_modes)
 
     @staticmethod
     def requires_visual_snapshots(mode: GenerationMode | str | None) -> bool:
-        return normalize_generation_mode(mode) in {GenerationMode.QUALITY, GenerationMode.PRODUCTION}
+        return normalize_generation_mode(mode).value in set(platform_config().sla.visual_snapshot_modes)
 
     @staticmethod
     def treats_as_quality(mode: GenerationMode | str | None) -> bool:
-        return normalize_generation_mode(mode) in {GenerationMode.QUALITY, GenerationMode.PRODUCTION}
+        return normalize_generation_mode(mode).value in set(platform_config().sla.quality_like_modes)
 
     @staticmethod
     def manifest() -> dict[str, Any]:
+        config = platform_config()
+        profiles = sla_profiles()
         return {
             "schema": "grounded.generation_sla.v1",
-            "default_mode": GenerationMode.BALANCED.value,
-            "modes": [SLA_PROFILES[mode].to_dict() for mode in (GenerationMode.FAST, GenerationMode.BALANCED, GenerationMode.QUALITY, GenerationMode.PRODUCTION, GenerationMode.BASIC)],
-            "second_queue": list(SECOND_QUEUE_CAPABILITIES),
-            "compatibility": {
-                "basic": "kept for legacy low-proof scaffolds",
-                "production": "additive mode; quality remains accepted and maps to deep proof",
-            },
+            "default_mode": config.sla.default_mode,
+            "modes": [profiles[mode].to_dict() for mode in (GenerationMode.FAST, GenerationMode.BALANCED, GenerationMode.QUALITY, GenerationMode.PRODUCTION, GenerationMode.BASIC) if mode in profiles],
+            "second_queue": list(config.sla.second_queue),
+            "compatibility": dict(config.sla.compatibility),
+            "platform_config_ref": "runtime/platform.config.json",
+            "platform_config_schema": "platform/backend/app/schemas/platform.config.schema.json",
         }

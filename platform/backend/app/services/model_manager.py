@@ -212,8 +212,8 @@ class ModelManagerService:
         registry = PROVIDER_REGISTRY.get(provider, {})
         env_name = str(registry.get("base_url_env") or "OPENAI_BASE_URL")
         if provider == "openai":
-            return os.getenv(env_name, "https://api.openai.com/v1")
-        return os.getenv(env_name, "")
+            return os.getenv(env_name, str(registry.get("default_base_url") or "https://api.openai.com/v1"))
+        return os.getenv(env_name, str(registry.get("default_base_url") or ""))
 
     def provider_api_key(self, provider: str) -> str | None:
         registry = PROVIDER_REGISTRY.get(provider, {})

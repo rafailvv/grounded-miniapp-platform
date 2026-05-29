@@ -14,6 +14,7 @@ from app.models.hooks import HookContext
 from app.models.memory import MemoryRetrievalRequest, MemoryRetrievalResult, MemorySummaryReport
 from app.models.observability import ObservabilityReport
 from app.models.output_artifacts import CommandOutputArtifact, OutputArtifactIndex
+from app.models.platform_config import PlatformConfig
 from app.models.prompt_suggestions import PromptSuggestionsReport
 from app.models.sandbox import SandboxRuntimeManifest
 from app.models.threads import ThreadSnapshot
@@ -57,6 +58,7 @@ from app.models.workbench import (
 from app.services.container import ServiceContainer
 from app.services.app_protocol import app_protocol_manifest, app_protocol_schema_catalog
 from app.services.generation_sla import GenerationSla
+from app.services.platform_config import platform_config, platform_config_manifest, platform_config_schema
 from app.services.run_protocol import RunProtocolConflict
 from app.services.tool_protocol import tool_registry_contract
 from app.modules.miniapp_agent_loop.tool_router import ToolRouter
@@ -249,6 +251,21 @@ def get_project_instructions(container: ServiceContainer = Depends(get_container
 @router.get("/system/generation-modes", response_model=GenerationModeSlaManifest)
 def get_generation_modes() -> GenerationModeSlaManifest:
     return GenerationModeSlaManifest.model_validate(GenerationSla.manifest())
+
+
+@router.get("/system/platform-config", response_model=PlatformConfig)
+def get_platform_config() -> PlatformConfig:
+    return platform_config()
+
+
+@router.get("/system/platform-config/manifest")
+def get_platform_config_manifest() -> dict[str, Any]:
+    return platform_config_manifest()
+
+
+@router.get("/system/platform-config/schema")
+def get_platform_config_schema() -> dict[str, Any]:
+    return platform_config_schema()
 
 
 @router.get("/system/rpc-protocol", response_model=RpcProtocolReport)

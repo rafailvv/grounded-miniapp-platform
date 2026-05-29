@@ -995,6 +995,57 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/system/platform-config": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Platform Config */
+        get: operations["get_platform_config_system_platform_config_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/system/platform-config/manifest": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Platform Config Manifest */
+        get: operations["get_platform_config_manifest_system_platform_config_manifest_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/system/platform-config/schema": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Platform Config Schema */
+        get: operations["get_platform_config_schema_system_platform_config_schema_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/system/rpc-protocol": {
         parameters: {
             query?: never;
@@ -4234,6 +4285,41 @@ export interface components {
             /** Prompt */
             prompt?: string | null;
         };
+        /** BrowserProofConfig */
+        BrowserProofConfig: {
+            /**
+             * Enabled
+             * @default true
+             */
+            enabled: boolean;
+            /** Required Modes */
+            required_modes?: string[];
+            /** Screenshot Modes */
+            screenshot_modes?: string[];
+            /** Require Ui Steps Modes */
+            require_ui_steps_modes?: string[];
+            /** Require Persisted Marker Modes */
+            require_persisted_marker_modes?: string[];
+            /**
+             * Replay Artifacts
+             * @default true
+             */
+            replay_artifacts: boolean;
+            default_mobile_viewport?: components["schemas"]["BrowserViewportConfig"];
+        };
+        /** BrowserViewportConfig */
+        BrowserViewportConfig: {
+            /**
+             * Width
+             * @default 390
+             */
+            width: number;
+            /**
+             * Height
+             * @default 844
+             */
+            height: number;
+        };
         /** ChatTurnRecord */
         ChatTurnRecord: {
             /** Turn Id */
@@ -4258,6 +4344,35 @@ export interface components {
              * Format: date-time
              */
             created_at?: string;
+        };
+        /** CheckConfig */
+        CheckConfig: {
+            /** Label */
+            label: string;
+            /**
+             * Category
+             * @enum {string}
+             */
+            category: "static" | "api" | "browser" | "tests" | "visual" | "security" | "docs" | "export" | "observability" | "audit";
+            /**
+             * Blocking
+             * @default true
+             */
+            blocking: boolean;
+            /**
+             * Proof Kind
+             * @default
+             */
+            proof_kind: string;
+            /** Required For Modes */
+            required_for_modes?: string[];
+            /** Diagnostic Contract */
+            diagnostic_contract?: string[];
+            /**
+             * Repair Hint
+             * @default
+             */
+            repair_hint: string;
         };
         /** CheckResult */
         CheckResult: {
@@ -4399,6 +4514,15 @@ export interface components {
              * @enum {string}
              */
             enforcement: "documented" | "tested" | "enforced";
+        };
+        /** CompletionBudgetConfig */
+        CompletionBudgetConfig: {
+            /** Time Limit Ms */
+            time_limit_ms: number;
+            /** Token Limit */
+            token_limit: number;
+            /** Turn Budget Cap */
+            turn_budget_cap: number;
         };
         /** ContextBudgetPolicy */
         ContextBudgetPolicy: {
@@ -5356,6 +5480,53 @@ export interface components {
          * @enum {string}
          */
         GenerationMode: "fast" | "balanced" | "quality" | "production" | "basic";
+        /** GenerationModeConfig */
+        GenerationModeConfig: {
+            /**
+             * Enabled
+             * @default true
+             */
+            enabled: boolean;
+            /** Label */
+            label: string;
+            /** Objective */
+            objective: string;
+            /** Required Checks */
+            required_checks?: string[];
+            /** Optional Checks */
+            optional_checks?: string[];
+            /** Proof Requirements */
+            proof_requirements?: string[];
+            /** Final Gate */
+            final_gate?: string[];
+            /**
+             * Context Policy
+             * @default standard
+             */
+            context_policy: string;
+            /**
+             * Worker Policy
+             * @default serial
+             */
+            worker_policy: string;
+            /**
+             * Max Repair Attempts
+             * @default 1
+             */
+            max_repair_attempts: number;
+            /**
+             * Audit Level
+             * @default light
+             * @enum {string}
+             */
+            audit_level: "none" | "light" | "standard" | "deep" | "release";
+            /**
+             * Output Style
+             * @default concise
+             */
+            output_style: string;
+            completion_budget: components["schemas"]["CompletionBudgetConfig"];
+        };
         /** GenerationModeQuality */
         GenerationModeQuality: {
             /** Generation Mode */
@@ -5805,6 +5976,41 @@ export interface components {
              */
             reason: string;
         };
+        /** ModelCapabilityConfig */
+        ModelCapabilityConfig: {
+            /**
+             * Provider
+             * @default openai
+             */
+            provider: string;
+            /**
+             * Context Window
+             * @default 128000
+             */
+            context_window: number;
+            /**
+             * Supports Tools
+             * @default true
+             */
+            supports_tools: boolean;
+            /**
+             * Supports Structured Output
+             * @default true
+             */
+            supports_structured_output: boolean;
+            /**
+             * Supports Reasoning
+             * @default false
+             */
+            supports_reasoning: boolean;
+            /**
+             * Cost Tier
+             * @default unknown
+             */
+            cost_tier: string;
+            /** Roles */
+            roles?: string[];
+        };
         /** ModelManagerStatus */
         ModelManagerStatus: {
             /**
@@ -5850,6 +6056,56 @@ export interface components {
             };
             /** Updated At */
             updated_at: string;
+        };
+        /** ModelProfileConfig */
+        ModelProfileConfig: {
+            /** Label */
+            label: string;
+            /**
+             * Provider
+             * @default openai
+             */
+            provider: string;
+            /**
+             * Description
+             * @default
+             */
+            description: string;
+            /** Routing */
+            routing?: {
+                [key: string]: string;
+            };
+            /**
+             * Default
+             * @default false
+             */
+            default: boolean;
+            /** Fallbacks */
+            fallbacks?: {
+                [key: string]: string[];
+            };
+        };
+        /** ModelProviderConfig */
+        ModelProviderConfig: {
+            /**
+             * Label
+             * @default
+             */
+            label: string;
+            /** Enabled Env */
+            enabled_env: string;
+            /**
+             * Base Url Env
+             * @default
+             */
+            base_url_env: string;
+            /**
+             * Default Base Url
+             * @default
+             */
+            default_base_url: string;
+            /** Models */
+            models?: string[];
         };
         /** ModelProviderStatus */
         ModelProviderStatus: {
@@ -6065,6 +6321,46 @@ export interface components {
              * @default
              */
             pattern: string;
+        };
+        /** PlatformConfig */
+        PlatformConfig: {
+            /**
+             * Schema
+             * @default grounded.platform_config.v1
+             */
+            schema: string;
+            /**
+             * Version
+             * @default 1
+             */
+            version: number;
+            /** Generation Modes */
+            generation_modes: {
+                [key: string]: components["schemas"]["GenerationModeConfig"];
+            };
+            /** Checks */
+            checks: {
+                [key: string]: components["schemas"]["CheckConfig"];
+            };
+            /** Providers */
+            providers: {
+                [key: string]: components["schemas"]["ModelProviderConfig"];
+            };
+            /** Model Capabilities */
+            model_capabilities: {
+                [key: string]: components["schemas"]["ModelCapabilityConfig"];
+            };
+            /** Model Profiles */
+            model_profiles: {
+                [key: string]: components["schemas"]["ModelProfileConfig"];
+            };
+            /** Default Profile By Mode */
+            default_profile_by_mode: {
+                [key: string]: string;
+            };
+            skill_activation: components["schemas"]["SkillActivationConfig"];
+            browser_proof: components["schemas"]["BrowserProofConfig"];
+            sla: components["schemas"]["SlaConfig"];
         };
         /** PrBabysitterRequest */
         PrBabysitterRequest: {
@@ -8558,6 +8854,29 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /** SkillActivationConfig */
+        SkillActivationConfig: {
+            /**
+             * Enabled
+             * @default true
+             */
+            enabled: boolean;
+            roots?: components["schemas"]["SkillRootConfig"];
+            /** Max Selected By Mode */
+            max_selected_by_mode?: {
+                [key: string]: number;
+            };
+            /** Required Skills By Mode */
+            required_skills_by_mode?: {
+                [key: string]: string[];
+            };
+            /** Activation Budget By Mode */
+            activation_budget_by_mode?: {
+                [key: string]: {
+                    [key: string]: number;
+                };
+            };
+        };
         /** SkillEvaluateRequest */
         SkillEvaluateRequest: {
             /**
@@ -8576,6 +8895,29 @@ export interface components {
             /** Max Skills */
             max_skills?: number | null;
         };
+        /** SkillRootConfig */
+        SkillRootConfig: {
+            /**
+             * System
+             * @default true
+             */
+            system: boolean;
+            /**
+             * Repo
+             * @default true
+             */
+            repo: boolean;
+            /**
+             * Plugin
+             * @default true
+             */
+            plugin: boolean;
+            /**
+             * User
+             * @default true
+             */
+            user: boolean;
+        };
         /** SkillifyRequest */
         SkillifyRequest: {
             /** Skill Id */
@@ -8592,6 +8934,28 @@ export interface components {
              * @default user
              */
             scope: string;
+        };
+        /** SlaConfig */
+        SlaConfig: {
+            /**
+             * Default Mode
+             * @default balanced
+             */
+            default_mode: string;
+            /** Full Audit Modes */
+            full_audit_modes?: string[];
+            /** Visual Snapshot Modes */
+            visual_snapshot_modes?: string[];
+            /** Quality Like Modes */
+            quality_like_modes?: string[];
+            /** Second Queue */
+            second_queue?: {
+                [key: string]: unknown;
+            }[];
+            /** Compatibility */
+            compatibility?: {
+                [key: string]: unknown;
+            };
         };
         /** SlashCommandResolveRequest */
         SlashCommandResolveRequest: {
@@ -8724,6 +9088,7 @@ export interface components {
             product_readiness_result?: components["schemas"]["ProductReadinessResult"] | null;
             prompt_completion_audit_report?: components["schemas"]["PromptCompletionAuditReport"] | null;
             generation_mode_sla_manifest?: components["schemas"]["GenerationModeSlaManifest"] | null;
+            platform_config?: components["schemas"]["PlatformConfig"] | null;
             visual_regression_report?: components["schemas"]["VisualRegressionReport"] | null;
             repair_case?: components["schemas"]["RepairCase"] | null;
             trace_state?: components["schemas"]["TraceState"] | null;
@@ -11492,6 +11857,70 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["GenerationModeSlaManifest"];
+                };
+            };
+        };
+    };
+    get_platform_config_system_platform_config_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlatformConfig"];
+                };
+            };
+        };
+    };
+    get_platform_config_manifest_system_platform_config_manifest_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    get_platform_config_schema_system_platform_config_schema_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
                 };
             };
         };

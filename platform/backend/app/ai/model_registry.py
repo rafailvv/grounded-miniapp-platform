@@ -3,129 +3,117 @@ from __future__ import annotations
 import os
 
 from app.models.common import GenerationMode
+from app.services.platform_config import platform_config
 
 
-CODEX_MINI_MODEL = os.getenv("OPENAI_CODE_MINI_MODEL", "gpt-5.4-mini")
-CODEX_MAX_MODEL = os.getenv("OPENAI_CODE_MAX_MODEL", "gpt-5.4-mini")
-FAST_CODE_MODEL = os.getenv("OPENAI_CODE_FAST_MODEL", CODEX_MINI_MODEL)
-BALANCED_CODE_MODEL = os.getenv("OPENAI_CODE_BALANCED_MODEL", CODEX_MINI_MODEL)
-QUALITY_CODE_MODEL = os.getenv("OPENAI_CODE_QUALITY_MODEL", CODEX_MINI_MODEL)
-SUMMARY_MODEL = os.getenv("OPENAI_CODE_SUMMARY_MODEL", CODEX_MINI_MODEL)
-REPAIR_MODEL = os.getenv("OPENAI_CODE_REPAIR_MODEL", CODEX_MINI_MODEL)
+def _configured_model_for_role(profile_name: str, role: str) -> str:
+    profile = platform_config().model_profiles.get(profile_name)
+    return str((profile.routing if profile else {}).get(role) or "gpt-5.4-mini")
 
-TASK_PROFILES = {
-    "openai_code_fast": {
-        "label": "OpenAI Code Fast",
-        "provider": "openai",
-        "description": "Default iterative coding profile tuned for lower cost while keeping solid general coding quality.",
-        "routing": {
-            "agent_turn": FAST_CODE_MODEL,
-            "code_edit": FAST_CODE_MODEL,
-            "repair": REPAIR_MODEL,
-            "summarize": SUMMARY_MODEL,
-            "cheap_task": SUMMARY_MODEL,
-        },
-        "default": True,
-    },
-    "research_balanced": {
-        "label": "Research Balanced",
-        "provider": "openai",
-        "description": "Balanced profile for iterative code-agent generation and repair.",
-        "routing": {
-            "agent_turn": BALANCED_CODE_MODEL,
-            "code_edit": BALANCED_CODE_MODEL,
-            "repair": REPAIR_MODEL,
-            "summarize": SUMMARY_MODEL,
-            "cheap_task": SUMMARY_MODEL,
-        },
-        "default": False,
-    },
-    "openai_code_quality": {
-        "label": "OpenAI Code Quality",
-        "provider": "openai",
-        "description": "Highest-confidence profile for iterative code-agent generation and repair.",
-        "routing": {
-            "agent_turn": QUALITY_CODE_MODEL,
-            "code_edit": QUALITY_CODE_MODEL,
-            "repair": REPAIR_MODEL,
-            "summarize": SUMMARY_MODEL,
-            "cheap_task": SUMMARY_MODEL,
-        },
-        "default": False,
-    },
-}
 
-MODEL_CAPABILITIES = {
-    CODEX_MINI_MODEL: {
-        "provider": "openai",
-        "context_window": int(os.getenv("OPENAI_CODE_MINI_CONTEXT_WINDOW", "1000000")),
-        "supports_tools": True,
-        "supports_structured_output": True,
-        "supports_reasoning": True,
-        "cost_tier": "low",
-        "roles": ["agent_turn", "code_edit", "repair", "summarize", "cheap_task"],
-    },
-    CODEX_MAX_MODEL: {
-        "provider": "openai",
-        "context_window": int(os.getenv("OPENAI_CODE_MAX_CONTEXT_WINDOW", "1000000")),
-        "supports_tools": True,
-        "supports_structured_output": True,
-        "supports_reasoning": True,
-        "cost_tier": "high",
-        "roles": ["agent_turn", "code_edit", "repair"],
-    },
-    "text-embedding-3-large": {
-        "provider": "openai",
-        "context_window": 8191,
-        "supports_tools": False,
-        "supports_structured_output": False,
-        "supports_reasoning": False,
-        "cost_tier": "embedding",
-        "roles": ["embedding"],
-    },
-}
+CODEX_MINI_MODEL = os.getenv("OPENAI_CODE_MINI_MODEL", _configured_model_for_role("openai_code_fast", "agent_turn"))
+CODEX_MAX_MODEL = os.getenv("OPENAI_CODE_MAX_MODEL", _configured_model_for_role("openai_code_quality", "agent_turn"))
 
-PROVIDER_REGISTRY = {
-    "openai": {
-        "enabled_env": "OPENAI_API_KEY",
-        "base_url_env": "OPENAI_BASE_URL",
-        "models": sorted(MODEL_CAPABILITIES),
-    },
-}
-
-MODEL_REGISTRY = {
+ROLE_MODEL_ENV = {
     "agent_turn": {
-        "primary": TASK_PROFILES["research_balanced"]["routing"]["agent_turn"],
+        "openai_code_fast": "OPENAI_CODE_FAST_MODEL",
+        "research_balanced": "OPENAI_CODE_BALANCED_MODEL",
+        "openai_code_quality": "OPENAI_CODE_QUALITY_MODEL",
     },
     "code_edit": {
-        "primary": TASK_PROFILES["research_balanced"]["routing"]["code_edit"],
+        "openai_code_fast": "OPENAI_CODE_FAST_MODEL",
+        "research_balanced": "OPENAI_CODE_BALANCED_MODEL",
+        "openai_code_quality": "OPENAI_CODE_QUALITY_MODEL",
     },
-    "repair": {
-        "primary": TASK_PROFILES["research_balanced"]["routing"]["repair"],
-    },
-    "summarize": {
-        "primary": TASK_PROFILES["research_balanced"]["routing"]["summarize"],
-    },
-    "cheap_task": {
-        "primary": TASK_PROFILES["research_balanced"]["routing"]["cheap_task"],
-    },
-    "embedding": {
-        "primary": "text-embedding-3-large",
-    },
+    "repair": {"*": "OPENAI_CODE_REPAIR_MODEL"},
+    "summarize": {"*": "OPENAI_CODE_SUMMARY_MODEL"},
+    "cheap_task": {"*": "OPENAI_CODE_SUMMARY_MODEL"},
 }
 
+
+def _task_profiles() -> dict[str, dict[str, object]]:
+    config = platform_config()
+    profiles: dict[str, dict[str, object]] = {}
+    for name, profile in config.model_profiles.items():
+        routing = dict(profile.routing)
+        for role, model in list(routing.items()):
+            env_name = ROLE_MODEL_ENV.get(role, {}).get(name) or ROLE_MODEL_ENV.get(role, {}).get("*")
+            routing[role] = os.getenv(env_name, model) if env_name else model
+        profiles[name] = {
+            "label": profile.label,
+            "provider": profile.provider,
+            "description": profile.description,
+            "routing": routing,
+            "default": profile.default,
+            "fallbacks": {role: list(items) for role, items in profile.fallbacks.items()},
+        }
+    return profiles
+
+
+def _model_capabilities() -> dict[str, dict[str, object]]:
+    capabilities = {
+        name: item.model_dump(mode="json")
+        for name, item in platform_config().model_capabilities.items()
+    }
+    mini_model = os.getenv("OPENAI_CODE_MINI_MODEL")
+    if mini_model:
+        source = dict(next(iter(capabilities.values()), {}))
+        source.update({"provider": "openai", "context_window": int(os.getenv("OPENAI_CODE_MINI_CONTEXT_WINDOW", "1000000")), "supports_tools": True, "supports_structured_output": True, "supports_reasoning": True, "cost_tier": "low"})
+        capabilities[mini_model] = source
+    max_model = os.getenv("OPENAI_CODE_MAX_MODEL")
+    if max_model:
+        capabilities[max_model] = {
+            "provider": "openai",
+            "context_window": int(os.getenv("OPENAI_CODE_MAX_CONTEXT_WINDOW", "1000000")),
+            "supports_tools": True,
+            "supports_structured_output": True,
+            "supports_reasoning": True,
+            "cost_tier": "high",
+            "roles": ["agent_turn", "code_edit", "repair"],
+        }
+    for profile in _task_profiles().values():
+        for model in dict(profile.get("routing") or {}).values():
+            capabilities.setdefault(
+                str(model),
+                {
+                    "provider": "openai",
+                    "context_window": 128000,
+                    "supports_tools": str(model).startswith("gpt-"),
+                    "supports_structured_output": str(model).startswith("gpt-"),
+                    "supports_reasoning": str(model).startswith("gpt-5"),
+                    "cost_tier": "unknown",
+                    "roles": [],
+                },
+            )
+    return capabilities
+
+
+TASK_PROFILES = _task_profiles()
+MODEL_CAPABILITIES = _model_capabilities()
+PROVIDER_REGISTRY = {
+    name: {
+        "label": provider.label,
+        "enabled_env": provider.enabled_env,
+        "base_url_env": provider.base_url_env,
+        "default_base_url": provider.default_base_url,
+        "models": sorted(set([*provider.models, *MODEL_CAPABILITIES])),
+    }
+    for name, provider in platform_config().providers.items()
+}
+MODEL_REGISTRY = {
+    role: {"primary": TASK_PROFILES["research_balanced"]["routing"][role]}
+    for role in ("agent_turn", "code_edit", "repair", "summarize", "cheap_task")
+}
+MODEL_REGISTRY["embedding"] = {"primary": "text-embedding-3-large"}
 DEFAULT_PROFILE_BY_MODE = {
-    GenerationMode.FAST: "openai_code_fast",
-    GenerationMode.BALANCED: "research_balanced",
-    GenerationMode.QUALITY: "openai_code_quality",
-    GenerationMode.PRODUCTION: "openai_code_quality",
-    GenerationMode.BASIC: "openai_code_fast",
+    GenerationMode(mode): profile
+    for mode, profile in platform_config().default_profile_by_mode.items()
 }
 
 
 def default_profile_for_generation_mode(generation_mode: GenerationMode | str | None) -> str:
     if generation_mode is None:
-        return DEFAULT_PROFILE_BY_MODE[GenerationMode.BALANCED]
+        return DEFAULT_PROFILE_BY_MODE.get(GenerationMode(platform_config().sla.default_mode), DEFAULT_PROFILE_BY_MODE[GenerationMode.BALANCED])
     mode = generation_mode if isinstance(generation_mode, GenerationMode) else GenerationMode(str(generation_mode))
     return DEFAULT_PROFILE_BY_MODE.get(mode, DEFAULT_PROFILE_BY_MODE[GenerationMode.BALANCED])
 
@@ -155,7 +143,7 @@ def routing_for_profile(*, model_profile: str | None, generation_mode: Generatio
 
 def model_capabilities(model: str) -> dict[str, object]:
     name = str(model or "").strip()
-    capabilities = dict(MODEL_CAPABILITIES.get(name) or {})
+    capabilities = dict(MODEL_CAPABILITIES.get(name) or _model_capabilities().get(name) or {})
     if not capabilities:
         capabilities = {
             "provider": "openai",

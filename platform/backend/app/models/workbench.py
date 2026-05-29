@@ -7,6 +7,7 @@ from pydantic import ConfigDict, Field
 from app.models.common import StrictModel
 from app.models.event_journal import EventJournalPage, EventJournalPayload, RunEventV2, RunJournalState, ThreadEventV2, ThreadJournalState
 from app.models.observability import ObservabilityReport
+from app.models.platform_config import PlatformConfig
 from app.models.protocol import (
     AppProtocolManifest,
     ProtocolApprovalState,
@@ -673,6 +674,7 @@ class SystemSchemaShapes(WorkbenchApiModel):
     product_readiness_result: ProductReadinessResult | None = None
     prompt_completion_audit_report: PromptCompletionAuditReport | None = None
     generation_mode_sla_manifest: GenerationModeSlaManifest | None = None
+    platform_config: PlatformConfig | None = None
     visual_regression_report: VisualRegressionReport | None = None
     repair_case: RepairCase | None = None
     trace_state: TraceState | None = None
@@ -731,6 +733,7 @@ SYSTEM_SCHEMA_MODEL_REFS: tuple[SchemaModelRef, ...] = (
     SchemaModelRef(name="ArtifactRef", purpose="Stable reference to persisted run artifacts."),
     SchemaModelRef(name="GateReport", purpose="Generation acceptance gate report."),
     SchemaModelRef(name="GenerationModeSlaManifest", purpose="Product SLA profiles for generation modes and second-priority platform capabilities."),
+    SchemaModelRef(name="PlatformConfig", purpose="Product configuration contract for generation modes, checks, model routing, skill activation, browser proof, and SLA policy."),
     SchemaModelRef(name="PromptCompletionAuditReport", purpose="Prompt-to-artifact completion audit for final readiness gates."),
     SchemaModelRef(name="VisualRegressionReport", purpose="Generated-app snapshot and visual regression proof report."),
     SchemaModelRef(name="RepairCase", purpose="Evidence-driven repair case."),

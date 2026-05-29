@@ -17,6 +17,7 @@ from app.models.skills import (
     SkillSelection,
     SkillValidationIssue,
 )
+from app.services.platform_config import platform_config
 
 
 ROLE_ORDER = ("client", "specialist", "manager")
@@ -415,11 +416,12 @@ class SkillRegistryService:
     @staticmethod
     def activation_budget(*, generation_mode: str | None, max_skills: int | None, max_body_chars: int | None, max_total_body_chars: int | None) -> dict[str, int]:
         mode = str(generation_mode or "").lower()
-        defaults = {
-            "fast": {"max_skills": 2, "max_body_chars": 350, "max_total_body_chars": 900},
-            "balanced": {"max_skills": 4, "max_body_chars": 550, "max_total_body_chars": 2600},
-            "quality": {"max_skills": 5, "max_body_chars": 800, "max_total_body_chars": 5200},
-        }.get(mode, {"max_skills": 4, "max_body_chars": 550, "max_total_body_chars": 2600})
+        config = platform_config()
+        defaults = config.skill_activation.activation_budget_by_mode.get(mode) or config.skill_activation.activation_budget_by_mode.get(config.sla.default_mode) or {
+            "max_skills": 4,
+            "max_body_chars": 550,
+            "max_total_body_chars": 2600,
+        }
         return {
             "max_skills": max(1, int(max_skills or defaults["max_skills"])),
             "max_body_chars": max(120, int(max_body_chars or defaults["max_body_chars"])),

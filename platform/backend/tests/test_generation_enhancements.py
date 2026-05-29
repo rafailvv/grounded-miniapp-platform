@@ -7,9 +7,12 @@ from fastapi.testclient import TestClient
 from app.main import create_app
 from app.models.domain import CheckExecutionRecord, CreateRunRequest, RunCheckResult, RunRecord
 from app.services.generation_enhancements import ProjectInstructionBundle, SkillPackCatalog
+from app.services.generation_sla import GenerationSla
 from app.services.skill_registry import SkillRegistryService
 from app.services.memory_pipeline import WorkspaceMemoryPipeline
 from app.services.trace_bundle import TraceBundleWriter
+from app.services.platform_config import platform_config
+from app.ai.model_registry import provider_routing_table
 
 
 def _workspace(client: TestClient) -> dict:
@@ -83,8 +86,8 @@ def test_project_instructions_skills_slash_commands_and_worker_roles(tmp_path: P
     assert resolved["ui_action"]["type"] == "execute_workflow"
     assert resolved["ui_action"]["workflow"] == "ui_polish_run"
     assert "Polish the current app visually" in resolved["prompt_template"]
-    assert any(item["worker_id"] == "backend_api_worker" and item["alias_ids"] == [] for item in workers["items"])
-    assert any(item["worker_id"] == "mobile_polish_worker" and item["alias_ids"] == [] for item in workers["items"])
+    assert any(item["worker_id"] == "backend_api_worker" and "backend_worker" in item["alias_ids"] for item in workers["items"])
+    assert any(item["worker_id"] == "mobile_polish_worker" and "visual_verifier_worker" in item["alias_ids"] for item in workers["items"])
     assert subagents["schema"] == "grounded.subagent_fork_contract.v1"
     assert [lane["lane_id"] for lane in subagents["lanes"]] == ["planner", "backend", "frontend-role-ui", "tests", "verifier", "polish", "repair"]
     assert "patch_files" not in next(lane for lane in subagents["lanes"] if lane["lane_id"] == "verifier")["tool_allowlist"]
@@ -157,6 +160,26 @@ def test_domain_product_skills_select_relevant_packs(tmp_path: Path) -> None:
         ).json()
         selected_ids = {item["id"] for item in result["selected"]}
         assert expected_ids.issubset(selected_ids), (prompt, selected_ids)
+
+
+def test_platform_config_drives_sla_skills_and_model_profiles() -> None:
+    config = platform_config()
+    manifest = GenerationSla.manifest()
+    routing = provider_routing_table()
+    skill_budget = SkillRegistryService.activation_budget(
+        generation_mode="quality",
+        max_skills=None,
+        max_body_chars=None,
+        max_total_body_chars=None,
+    )
+
+    assert manifest["platform_config_ref"] == "runtime/platform.config.json"
+    assert manifest["default_mode"] == config.sla.default_mode
+    assert manifest["modes"][0]["required_checks"] == config.generation_modes["fast"].required_checks
+    assert GenerationSla.requires_visual_snapshots("quality") is True
+    assert GenerationSla.requires_visual_snapshots("balanced") is False
+    assert skill_budget == config.skill_activation.activation_budget_by_mode["quality"]
+    assert routing["profiles"]["openai_code_quality"]["routing"] == config.model_profiles["openai_code_quality"].routing
 
 
 def test_slash_generate_execute_starts_real_run_workflow(tmp_path: Path, monkeypatch) -> None:
