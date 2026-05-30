@@ -171,13 +171,26 @@ def test_app_protocol_manifest_covers_core_subjects_and_legacy_endpoints(tmp_pat
     assert protocol["endpoint_refs"]["openapi"] == "/openapi.json"
 
     subjects = {item["subject"]: item for item in protocol["subjects"]}
-    assert set(subjects) == {"run", "turn", "tool_call", "approval", "event", "worker_update"}
+    assert set(subjects) == {"workbench", "run", "turn", "tool_call", "approval", "event", "worker_update", "browser_proof"}
+    assert subjects["workbench"]["v2_payload_model"] == "ProtocolWorkbenchState"
+    assert subjects["browser_proof"]["v2_payload_model"] == "ProtocolBrowserProofState"
+    assert "/runs/{run_id}/browser-proof" in subjects["browser_proof"]["legacy_endpoints"]
     assert "/runs/{run_id}/protocol" in subjects["run"]["legacy_endpoints"]
     assert "/threads/{thread_id}" in subjects["turn"]["legacy_endpoints"]
     assert "/runs/{run_id}/tool-events" in subjects["tool_call"]["legacy_endpoints"]
     assert "/runs/{run_id}/approvals" in subjects["approval"]["legacy_endpoints"]
     assert "/runs/{run_id}/events-v2" in subjects["event"]["legacy_endpoints"]
     assert "/runs/{run_id}/workers" in subjects["worker_update"]["legacy_endpoints"]
+    assert {
+        "WorkbenchEventResponse",
+        "RunEventsResponse",
+        "WorkerUpdateResponse",
+        "BrowserProofResponse",
+        "WorkbenchNotification",
+        "RunNotification",
+        "WorkerUpdateNotification",
+        "BrowserProofNotification",
+    }.issubset(set(protocol["rpc_method_models"]))
 
 
 def test_app_protocol_schema_fixtures_match_generated_models() -> None:
@@ -220,6 +233,10 @@ def test_typed_rpc_protocol_declares_models_idempotency_and_cursors(tmp_path: Pa
     assert set(RPC_PARAM_MODELS) <= set(methods)
     assert methods["thread/list"]["cursor"]["cursor_kind"] == "opaque_cursor"
     assert methods["run/replay"]["cursor"]["cursor_kind"] == "sequence_cursor"
+    assert methods["run/events"]["result_model"] == "RunEventsResponse"
+    assert methods["worker/updates"]["result_model"] == "WorkerUpdateResponse"
+    assert methods["browser/proof"]["result_model"] == "BrowserProofResponse"
+    assert methods["workbench/events"]["result_model"] == "WorkbenchEventResponse"
     assert methods["thread/list"]["idempotent"] is True
     assert methods["thread/start"]["idempotency"]["mode"] == "recommended"
     assert methods["command/exec"]["stability"] == "experimental"

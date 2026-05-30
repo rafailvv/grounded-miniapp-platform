@@ -6682,7 +6682,7 @@ export interface components {
              * Subject
              * @enum {string}
              */
-            subject: "run" | "turn" | "tool_call" | "approval" | "event" | "worker_update";
+            subject: "workbench" | "run" | "turn" | "tool_call" | "approval" | "event" | "worker_update" | "browser_proof";
             /** Type */
             type: string;
             /**
@@ -6722,7 +6722,7 @@ export interface components {
              * Subject
              * @enum {string}
              */
-            subject: "run" | "turn" | "tool_call" | "approval" | "event" | "worker_update";
+            subject: "workbench" | "run" | "turn" | "tool_call" | "approval" | "event" | "worker_update" | "browser_proof";
             /** Type */
             type: string;
             /**
@@ -6937,7 +6937,7 @@ export interface components {
              * Subject
              * @enum {string}
              */
-            subject: "run" | "turn" | "tool_call" | "approval" | "event" | "worker_update";
+            subject: "workbench" | "run" | "turn" | "tool_call" | "approval" | "event" | "worker_update" | "browser_proof";
             /** Purpose */
             purpose: string;
             /** V1 Payload Model */

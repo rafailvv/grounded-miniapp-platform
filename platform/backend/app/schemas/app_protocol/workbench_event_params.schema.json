@@ -1,0 +1,77 @@
+{
+  "$id": "https://grounded.local/schemas/app_protocol/workbench_event_params.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "after_sequence": {
+      "default": 0,
+      "title": "After Sequence",
+      "type": "integer"
+    },
+    "limit": {
+      "default": 500,
+      "title": "Limit",
+      "type": "integer"
+    },
+    "run_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Run Id"
+    },
+    "subject": {
+      "anyOf": [
+        {
+          "enum": [
+            "workbench",
+            "run",
+            "turn",
+            "tool_call",
+            "approval",
+            "event",
+            "worker_update",
+            "browser_proof"
+          ],
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Subject"
+    },
+    "thread_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Thread Id"
+    },
+    "workspace_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Workspace Id"
+    }
+  },
+  "title": "WorkbenchEventParams",
+  "type": "object"
+}

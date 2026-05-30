@@ -53,12 +53,14 @@
     },
     "subject": {
       "enum": [
+        "workbench",
         "run",
         "turn",
         "tool_call",
         "approval",
         "event",
-        "worker_update"
+        "worker_update",
+        "browser_proof"
       ],
       "title": "Subject",
       "type": "string"

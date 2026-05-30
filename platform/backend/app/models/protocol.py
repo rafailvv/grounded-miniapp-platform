@@ -8,7 +8,7 @@ from app.models.common import StrictModel
 
 
 ProtocolVersion = Literal["v1", "v2"]
-ProtocolSubject = Literal["run", "turn", "tool_call", "approval", "event", "worker_update"]
+ProtocolSubject = Literal["workbench", "run", "turn", "tool_call", "approval", "event", "worker_update", "browser_proof"]
 ProtocolStatus = Literal["queued", "started", "running", "waiting", "completed", "failed", "blocked", "cancelled", "skipped"]
 RpcStability = Literal["stable", "experimental", "deprecated"]
 RpcCursorKind = Literal["none", "opaque_cursor", "sequence_cursor", "offset_cursor"]
@@ -195,6 +195,27 @@ class RunReplayParams(StrictModel):
     limit: int = 500
 
 
+class WorkbenchEventParams(StrictModel):
+    workspace_id: str | None = Field(default=None, validation_alias=AliasChoices("workspace_id", "workspaceId"))
+    run_id: str | None = Field(default=None, validation_alias=AliasChoices("run_id", "runId"))
+    thread_id: str | None = Field(default=None, validation_alias=AliasChoices("thread_id", "threadId"))
+    subject: ProtocolSubject | None = None
+    after_sequence: int = Field(default=0, validation_alias=AliasChoices("after_sequence", "afterSequence"))
+    limit: int = 500
+
+
+class RunEventsParams(RunReplayParams):
+    include_payloads: bool = Field(default=False, validation_alias=AliasChoices("include_payloads", "includePayloads"))
+
+
+class WorkerUpdateParams(RunReplayParams):
+    worker_id: str | None = Field(default=None, validation_alias=AliasChoices("worker_id", "workerId"))
+
+
+class BrowserProofParams(RunReplayParams):
+    build: bool = False
+
+
 class ImproveRunParams(StrictModel):
     workspace_id: str = Field(validation_alias=AliasChoices("workspace_id", "workspaceId"))
     prompt: str
@@ -364,6 +385,19 @@ class ProtocolEventState(StrictModel):
     created_at: str
 
 
+class ProtocolWorkbenchState(StrictModel):
+    schema_: str = Field(default="grounded.app_protocol.workbench_state.v2", alias="schema")
+    workspace_id: str | None = None
+    thread_id: str | None = None
+    run_id: str | None = None
+    status: str = "ok"
+    active_view: str | None = None
+    command: str | None = None
+    refs: dict[str, Any] = Field(default_factory=dict)
+    summary: str = ""
+    updated_at: str | None = None
+
+
 class ProtocolWorkerUpdate(StrictModel):
     schema_: str = Field(default="grounded.app_protocol.worker_update.v2", alias="schema")
     worker_id: str
@@ -385,6 +419,104 @@ class ProtocolWorkerUpdate(StrictModel):
     refs: dict[str, Any] = Field(default_factory=dict)
     created_at: str | None = None
     updated_at: str | None = None
+
+
+class ProtocolBrowserProofState(StrictModel):
+    schema_: str = Field(default="grounded.app_protocol.browser_proof_state.v2", alias="schema")
+    run_id: str
+    workspace_id: str
+    status: Literal["pending", "running", "passed", "failed", "partial", "ready", "empty", "not_recorded", "unknown"] = "unknown"
+    replay_proof_ref: str | None = None
+    scenario_refs: list[str] = Field(default_factory=list)
+    scenarios: list[dict[str, Any]] = Field(default_factory=list)
+    playwright_spec_refs: list[str] = Field(default_factory=list)
+    screenshot_refs: list[str] = Field(default_factory=list)
+    console_errors: list[str] = Field(default_factory=list)
+    network_errors: list[str] = Field(default_factory=list)
+    mobile_viewport: dict[str, Any] = Field(default_factory=dict)
+    artifact_refs: dict[str, Any] = Field(default_factory=dict)
+    refs: dict[str, Any] = Field(default_factory=dict)
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+class WorkbenchEventResponse(StrictModel):
+    schema_: str = Field(default="grounded.app_protocol.workbench_event_response.v2", alias="schema")
+    protocol_version: Literal["v2"] = "v2"
+    status: str = "ok"
+    items: list[ProtocolEventState] = Field(default_factory=list)
+    next_sequence: int = 0
+    compatibility: dict[str, Any] = Field(default_factory=dict)
+
+
+class RunEventsResponse(StrictModel):
+    schema_: str = Field(default="grounded.app_protocol.run_events_response.v2", alias="schema")
+    protocol_version: Literal["v2"] = "v2"
+    run_id: str
+    workspace_id: str | None = None
+    items: list[ProtocolEventState] = Field(default_factory=list)
+    next_sequence: int = 0
+    legacy_event_page_ref: str | None = None
+    compatibility: dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkerUpdateResponse(StrictModel):
+    schema_: str = Field(default="grounded.app_protocol.worker_update_response.v2", alias="schema")
+    protocol_version: Literal["v2"] = "v2"
+    run_id: str
+    workspace_id: str | None = None
+    workers: list[ProtocolWorkerUpdate] = Field(default_factory=list)
+    next_sequence: int = 0
+    compatibility: dict[str, Any] = Field(default_factory=dict)
+
+
+class BrowserProofResponse(StrictModel):
+    schema_: str = Field(default="grounded.app_protocol.browser_proof_response.v2", alias="schema")
+    protocol_version: Literal["v2"] = "v2"
+    run_id: str
+    workspace_id: str | None = None
+    proof: ProtocolBrowserProofState
+    compatibility: dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkbenchNotification(StrictModel):
+    schema_: str = Field(default="grounded.app_protocol.workbench_notification.v2", alias="schema")
+    protocol_version: Literal["v2"] = "v2"
+    subject: Literal["workbench"] = "workbench"
+    type: str
+    status: ProtocolStatus = "running"
+    payload: ProtocolWorkbenchState
+    sequence: int | None = None
+
+
+class RunNotification(StrictModel):
+    schema_: str = Field(default="grounded.app_protocol.run_notification.v2", alias="schema")
+    protocol_version: Literal["v2"] = "v2"
+    subject: Literal["run"] = "run"
+    type: str
+    status: ProtocolStatus = "running"
+    payload: ProtocolRunState
+    sequence: int | None = None
+
+
+class WorkerUpdateNotification(StrictModel):
+    schema_: str = Field(default="grounded.app_protocol.worker_update_notification.v2", alias="schema")
+    protocol_version: Literal["v2"] = "v2"
+    subject: Literal["worker_update"] = "worker_update"
+    type: str
+    status: ProtocolStatus = "running"
+    payload: ProtocolWorkerUpdate
+    sequence: int | None = None
+
+
+class BrowserProofNotification(StrictModel):
+    schema_: str = Field(default="grounded.app_protocol.browser_proof_notification.v2", alias="schema")
+    protocol_version: Literal["v2"] = "v2"
+    subject: Literal["browser_proof"] = "browser_proof"
+    type: str
+    status: ProtocolStatus = "running"
+    payload: ProtocolBrowserProofState
+    sequence: int | None = None
 
 
 class ProtocolEnvelopeV1(StrictModel):

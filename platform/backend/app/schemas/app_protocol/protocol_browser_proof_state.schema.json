@@ -1,0 +1,136 @@
+{
+  "$id": "https://grounded.local/schemas/app_protocol/protocol_browser_proof_state.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "artifact_refs": {
+      "additionalProperties": true,
+      "title": "Artifact Refs",
+      "type": "object"
+    },
+    "console_errors": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Console Errors",
+      "type": "array"
+    },
+    "created_at": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Created At"
+    },
+    "mobile_viewport": {
+      "additionalProperties": true,
+      "title": "Mobile Viewport",
+      "type": "object"
+    },
+    "network_errors": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Network Errors",
+      "type": "array"
+    },
+    "playwright_spec_refs": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Playwright Spec Refs",
+      "type": "array"
+    },
+    "refs": {
+      "additionalProperties": true,
+      "title": "Refs",
+      "type": "object"
+    },
+    "replay_proof_ref": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Replay Proof Ref"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "scenario_refs": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Scenario Refs",
+      "type": "array"
+    },
+    "scenarios": {
+      "items": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "title": "Scenarios",
+      "type": "array"
+    },
+    "schema": {
+      "default": "grounded.app_protocol.browser_proof_state.v2",
+      "title": "Schema",
+      "type": "string"
+    },
+    "screenshot_refs": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Screenshot Refs",
+      "type": "array"
+    },
+    "status": {
+      "default": "unknown",
+      "enum": [
+        "pending",
+        "running",
+        "passed",
+        "failed",
+        "partial",
+        "ready",
+        "empty",
+        "not_recorded",
+        "unknown"
+      ],
+      "title": "Status",
+      "type": "string"
+    },
+    "updated_at": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Updated At"
+    },
+    "workspace_id": {
+      "title": "Workspace Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "run_id",
+    "workspace_id"
+  ],
+  "title": "ProtocolBrowserProofState",
+  "type": "object"
+}

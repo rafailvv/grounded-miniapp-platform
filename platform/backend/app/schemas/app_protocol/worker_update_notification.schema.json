@@ -1,0 +1,237 @@
+{
+  "$defs": {
+    "ProtocolWorkerUpdate": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact_refs": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Artifact Refs",
+          "type": "array"
+        },
+        "branch_policy": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Branch Policy"
+        },
+        "branch_run_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Branch Run Id"
+        },
+        "changed_files": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Changed Files",
+          "type": "array"
+        },
+        "conflict_report": {
+          "additionalProperties": true,
+          "title": "Conflict Report",
+          "type": "object"
+        },
+        "created_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Created At"
+        },
+        "merge_decision": {
+          "additionalProperties": true,
+          "title": "Merge Decision",
+          "type": "object"
+        },
+        "owner_scope": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Owner Scope"
+        },
+        "path_prefixes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Path Prefixes",
+          "type": "array"
+        },
+        "phase": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Phase"
+        },
+        "post_merge_verifier": {
+          "additionalProperties": true,
+          "title": "Post Merge Verifier",
+          "type": "object"
+        },
+        "proof_refs": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Proof Refs",
+          "type": "array"
+        },
+        "refs": {
+          "additionalProperties": true,
+          "title": "Refs",
+          "type": "object"
+        },
+        "run_id": {
+          "title": "Run Id",
+          "type": "string"
+        },
+        "schema": {
+          "default": "grounded.app_protocol.worker_update.v2",
+          "title": "Schema",
+          "type": "string"
+        },
+        "status": {
+          "default": "planned",
+          "enum": [
+            "planned",
+            "running",
+            "completed",
+            "failed",
+            "blocked",
+            "merged",
+            "rejected"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "updated_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Updated At"
+        },
+        "worker_id": {
+          "title": "Worker Id",
+          "type": "string"
+        },
+        "workspace_id": {
+          "title": "Workspace Id",
+          "type": "string"
+        },
+        "write_scope": {
+          "additionalProperties": true,
+          "title": "Write Scope",
+          "type": "object"
+        }
+      },
+      "required": [
+        "worker_id",
+        "run_id",
+        "workspace_id"
+      ],
+      "title": "ProtocolWorkerUpdate",
+      "type": "object"
+    }
+  },
+  "$id": "https://grounded.local/schemas/app_protocol/worker_update_notification.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "payload": {
+      "$ref": "#/$defs/ProtocolWorkerUpdate"
+    },
+    "protocol_version": {
+      "const": "v2",
+      "default": "v2",
+      "title": "Protocol Version",
+      "type": "string"
+    },
+    "schema": {
+      "default": "grounded.app_protocol.worker_update_notification.v2",
+      "title": "Schema",
+      "type": "string"
+    },
+    "sequence": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Sequence"
+    },
+    "status": {
+      "default": "running",
+      "enum": [
+        "queued",
+        "started",
+        "running",
+        "waiting",
+        "completed",
+        "failed",
+        "blocked",
+        "cancelled",
+        "skipped"
+      ],
+      "title": "Status",
+      "type": "string"
+    },
+    "subject": {
+      "const": "worker_update",
+      "default": "worker_update",
+      "title": "Subject",
+      "type": "string"
+    },
+    "type": {
+      "title": "Type",
+      "type": "string"
+    }
+  },
+  "required": [
+    "type",
+    "payload"
+  ],
+  "title": "WorkerUpdateNotification",
+  "type": "object"
+}
