@@ -9,6 +9,7 @@ from app.models.common import StrictModel
 
 PROMPT_CONTRACT_SCHEMA = "grounded.prompt_contract.v1"
 PROMPT_CONTRACT_COMPILE_SCHEMA = "grounded.prompt_contract_compile.v1"
+PRODUCT_BLUEPRINT_SCHEMA = "grounded.product_blueprint.v1"
 
 
 class PromptContractRequirement(StrictModel):
@@ -60,6 +61,25 @@ class PromptContract(StrictModel):
     sections: list[PromptContractSection] = Field(default_factory=list)
     acceptance_contract: dict[str, Any] = Field(default_factory=dict)
     implementation_plan: dict[str, Any] = Field(default_factory=dict)
+    product_blueprint: dict[str, Any] = Field(default_factory=dict)
+    refs: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProductBlueprint(StrictModel):
+    schema_: str = Field(default=PRODUCT_BLUEPRINT_SCHEMA, alias="schema")
+    blueprint_id: str
+    status: Literal["planned", "blocked", "not_required", "inherited"] = "planned"
+    workspace_id: str
+    run_id: str
+    source_run_id: str | None = None
+    prompt_summary: str = ""
+    roles: list[str] = Field(default_factory=list)
+    entities: list[dict[str, Any]] = Field(default_factory=list)
+    workflows: list[dict[str, Any]] = Field(default_factory=list)
+    api: dict[str, Any] = Field(default_factory=dict)
+    persistence: dict[str, Any] = Field(default_factory=dict)
+    screens: list[dict[str, Any]] = Field(default_factory=list)
+    acceptance_proof: dict[str, Any] = Field(default_factory=dict)
     refs: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -70,6 +90,7 @@ class PromptContractCompileReport(StrictModel):
     run_id: str
     prompt_contract_ref: str
     acceptance_contract_ref: str | None = None
+    product_blueprint_ref: str | None = None
     miniapp_contract_ref: str | None = None
     contract_compile_ref: str | None = None
     analysis_source: str | None = None
@@ -77,4 +98,3 @@ class PromptContractCompileReport(StrictModel):
     blocking: bool = False
     issues: list[str] = Field(default_factory=list)
     next_sequence: int = 0
-

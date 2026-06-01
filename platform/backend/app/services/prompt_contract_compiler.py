@@ -12,6 +12,7 @@ from app.models.prompt_contract import (
     PromptContractRequirement,
     PromptContractScenario,
     PromptContractSection,
+    ProductBlueprint,
 )
 from app.repositories.state_store import StateStore
 from app.services.event_journal import EventJournalService
@@ -32,6 +33,7 @@ ROLE_ORDER = ("client", "specialist", "manager")
 class PromptContractCompileResult:
     contract: PromptContract
     compile_report: PromptContractCompileReport
+    product_blueprint: ProductBlueprint
     acceptance_contract: dict[str, Any]
     implementation_plan: dict[str, Any]
     orchestration: dict[str, Any]
@@ -161,10 +163,15 @@ class PromptContractCompilerService:
             miniapp_contract=miniapp_contract,
             source_run_id=None,
         )
+        product_blueprint = self._build_product_blueprint(contract)
+        contract.product_blueprint = product_blueprint.model_dump(mode="json", by_alias=True)
         if not requires_contract and not acceptance_contract.get("required"):
             contract.status = "not_required"
+            product_blueprint.status = "not_required"
         if acceptance_contract.get("blocking") or str(acceptance_contract.get("status") or "").startswith("blocked_"):
             contract.status = "blocked"
+            product_blueprint.status = "blocked"
+        contract.product_blueprint = product_blueprint.model_dump(mode="json", by_alias=True)
         compile_ref = f"prompt_contract_compile:{workspace_id}:{run_id}"
         report = PromptContractCompileReport(
             status="blocked" if contract.status == "blocked" else "not_required" if contract.status == "not_required" else "compiled",
@@ -172,6 +179,7 @@ class PromptContractCompilerService:
             run_id=run_id,
             prompt_contract_ref=f"prompt_contract:{workspace_id}:{run_id}",
             acceptance_contract_ref=f"acceptance_contract:{workspace_id}:{run_id}" if acceptance_contract.get("required") or intent_value == "create" else None,
+            product_blueprint_ref=f"product_blueprint:{workspace_id}:{run_id}",
             miniapp_contract_ref=f"miniapp_contract:{workspace_id}:{run_id}" if miniapp_contract is not None else None,
             contract_compile_ref=compile_ref,
             analysis_source=contract.analysis_source,
@@ -183,6 +191,7 @@ class PromptContractCompilerService:
         result = PromptContractCompileResult(
             contract=contract,
             compile_report=report,
+            product_blueprint=product_blueprint,
             acceptance_contract=acceptance_contract,
             implementation_plan=implementation_plan,
             orchestration=orchestration,
@@ -249,17 +258,21 @@ class PromptContractCompilerService:
             miniapp_contract=None,
             source_run_id=None,
         )
+        product_blueprint = self._build_product_blueprint(contract)
+        contract.product_blueprint = product_blueprint.model_dump(mode="json", by_alias=True)
         report = PromptContractCompileReport(
             status="compiled" if acceptance_contract else "not_required",
             workspace_id=workspace_id,
             run_id=run_id,
             prompt_contract_ref=f"prompt_contract:{workspace_id}:{run_id}",
             acceptance_contract_ref=f"acceptance_contract:{workspace_id}:{run_id}" if acceptance_contract else None,
+            product_blueprint_ref=f"product_blueprint:{workspace_id}:{run_id}",
             analysis_source=(acceptance_contract.get("prompt_hints") or {}).get("analysis_source") if isinstance(acceptance_contract.get("prompt_hints"), dict) else None,
             next_sequence=self._next_sequence("prompt_contract_compile"),
         )
         payload = self._response_payload(contract=contract, report=report, miniapp_contract=None)
         self.store.upsert("reports", report.prompt_contract_ref, payload)
+        self.store.upsert("reports", report.product_blueprint_ref, product_blueprint.model_dump(mode="json", by_alias=True))
         return payload
 
     def _compile_inherited(
@@ -292,6 +305,7 @@ class PromptContractCompilerService:
                 }
             )
         implementation_plan = dict(inherited_contract.get("implementation_plan") or inherited_prompt_contract.get("implementation_plan") or {})
+        inherited_blueprint = dict(inherited_contract.get("product_blueprint") or inherited_prompt_contract.get("product_blueprint") or {})
         implementation_plan["repair_continuation"] = {
             **dict(implementation_plan.get("repair_continuation") or {}),
             "enabled": True,
@@ -325,12 +339,18 @@ class PromptContractCompilerService:
             source_run_id=source_run_id,
         )
         contract.status = "inherited"
+        product_blueprint = self._build_product_blueprint(contract)
+        if inherited_blueprint:
+            product_blueprint.refs = {**dict(product_blueprint.refs or {}), "inherited_product_blueprint": inherited_blueprint.get("blueprint_id") or inherited_blueprint.get("refs")}
+        product_blueprint.status = "inherited"
+        contract.product_blueprint = product_blueprint.model_dump(mode="json", by_alias=True)
         report = PromptContractCompileReport(
             status="inherited",
             workspace_id=workspace_id,
             run_id=run_id,
             prompt_contract_ref=f"prompt_contract:{workspace_id}:{run_id}",
             acceptance_contract_ref=f"acceptance_contract:{workspace_id}:{run_id}",
+            product_blueprint_ref=f"product_blueprint:{workspace_id}:{run_id}",
             miniapp_contract_ref=f"miniapp_contract:{workspace_id}:{run_id}" if miniapp_contract is not None else None,
             analysis_source=contract.analysis_source,
             blocking=False,
@@ -339,6 +359,7 @@ class PromptContractCompilerService:
         return PromptContractCompileResult(
             contract=contract,
             compile_report=report,
+            product_blueprint=product_blueprint,
             acceptance_contract=acceptance_contract,
             implementation_plan=implementation_plan,
             orchestration=orchestration_metadata_for_contract(contract=acceptance_contract, generation_mode=generation_mode, focused_edit_kind="repair_continuation"),
@@ -508,6 +529,47 @@ class PromptContractCompilerService:
         return scenarios
 
     @staticmethod
+    def _build_product_blueprint(contract: PromptContract) -> ProductBlueprint:
+        required_checks = sorted(
+            {
+                check
+                for scenario in contract.acceptance_scenarios
+                for check in scenario.required_checks
+                if str(check or "").strip()
+            }
+        )
+        acceptance_proof = {
+            "status": "planned" if contract.status in {"planned", "inherited"} else contract.status,
+            "scenarios": [scenario.model_dump(mode="json") for scenario in contract.acceptance_scenarios],
+            "required_checks": required_checks,
+            "browser_proof_required": contract.status != "not_required",
+            "acceptance_contract_required": bool((contract.acceptance_contract or {}).get("required")),
+            "proof_refs": {
+                "acceptance_contract": f"acceptance_contract:{contract.workspace_id}:{contract.run_id}",
+                "prompt_contract": f"prompt_contract:{contract.workspace_id}:{contract.run_id}",
+            },
+        }
+        return ProductBlueprint(
+            blueprint_id=new_id("blueprint"),
+            status=contract.status,
+            workspace_id=contract.workspace_id,
+            run_id=contract.run_id,
+            source_run_id=contract.source_run_id,
+            prompt_summary=contract.prompt_summary,
+            roles=list(contract.roles),
+            entities=list(contract.entities),
+            workflows=list(contract.workflows),
+            api=dict(contract.api),
+            persistence=dict(contract.persistence),
+            screens=list(contract.screens),
+            acceptance_proof=acceptance_proof,
+            refs={
+                "prompt_contract_ref": f"prompt_contract:{contract.workspace_id}:{contract.run_id}",
+                "acceptance_contract_ref": f"acceptance_contract:{contract.workspace_id}:{contract.run_id}",
+            },
+        )
+
+    @staticmethod
     def _sections(contract: PromptContract) -> list[PromptContractSection]:
         section_payloads = {
             "roles": [{"role": role} for role in contract.roles],
@@ -543,6 +605,8 @@ class PromptContractCompilerService:
     def _persist_result(self, result: PromptContractCompileResult) -> None:
         payload = self._response_payload(contract=result.contract, report=result.compile_report, miniapp_contract=result.miniapp_contract)
         self.store.upsert("reports", result.compile_report.prompt_contract_ref, payload)
+        if result.compile_report.product_blueprint_ref:
+            self.store.upsert("reports", result.compile_report.product_blueprint_ref, result.product_blueprint.model_dump(mode="json", by_alias=True))
         self.store.upsert("reports", f"prompt_contract_compile:{result.contract.workspace_id}:{result.contract.run_id}", result.compile_report.model_dump(mode="json", by_alias=True))
         self.store.upsert("reports", f"prompt_contract_compile:{result.compile_report.next_sequence}", result.compile_report.model_dump(mode="json", by_alias=True))
 
@@ -555,6 +619,8 @@ class PromptContractCompilerService:
             "run_id": contract.run_id,
             "contract": contract.model_dump(mode="json", by_alias=True),
             "compile_report": report.model_dump(mode="json", by_alias=True),
+            "product_blueprint": contract.product_blueprint,
+            "product_blueprint_ref": report.product_blueprint_ref,
             "acceptance_contract": contract.acceptance_contract,
             "acceptance_contract_ref": report.acceptance_contract_ref,
             "miniapp_contract_ref": report.miniapp_contract_ref,

@@ -53,6 +53,7 @@ from app.modules.workspace_code_agent_runtime.process_recovery import AgentProce
 from app.modules.workspace_code_agent_runtime.prompt_contract import agent_system_prompt
 from app.modules.workspace_code_agent_runtime.runtime import WorkspaceCodeAgentRuntime
 from app.services.check_runner import CheckRunner
+from app.services.acceptance_test_materializer import AcceptanceTestMaterializer
 from app.services.command_canonicalizer import CommandCanonicalizer
 from app.services.hook_policy_service import HookPolicyService
 from app.services.miniapp_contract import MiniAppContractCompiler
@@ -917,6 +918,122 @@ def test_implementation_plan_embeds_generated_tests_synthesis() -> None:
     assert any(item["kind"] == "browser_workflow" for item in synthesis["test_specs"])
 
 
+def test_acceptance_test_materializer_builds_deterministic_project_artifacts() -> None:
+    replay_proof = {
+        "scenarios": [
+            {
+                "scenario_id": "Client Create Request!",
+                "status": "passed",
+                "role": "client",
+                "route": "/client",
+                "viewport": {"width": 390, "height": 844},
+                "steps": [{"route": "/client", "selector": "form#client-main", "action": "submit"}],
+                "playwright_spec": "import { test, expect } from '@playwright/test';\n\ntest('client', async ({ page }) => {\n  await page.goto('/client');\n});\n",
+            }
+        ]
+    }
+
+    materialized = AcceptanceTestMaterializer.materialize(
+        workspace_id="ws_1",
+        run_id="run_1",
+        replay_proof=replay_proof,
+        replay_source_ref="browser_replay_proof:ws_1:run_1",
+    )
+
+    assert materialized["status"] == "ready"
+    assert materialized["acceptance_tests_ref"] == "acceptance_tests:ws_1:run_1"
+    assert materialized["acceptance_test_files"] == [
+        "miniapp/tests/test_acceptance.py",
+        "miniapp/tests/acceptance/client_create_request.spec.ts",
+    ]
+    changes = materialized["file_changes"]
+    assert changes[0].file_path == "miniapp/tests/test_acceptance.py"
+    assert "ReplayableAcceptanceTests" in str(changes[0].content)
+    assert changes[1].file_path == "miniapp/tests/acceptance/client_create_request.spec.ts"
+    assert "// acceptance-scenario:" in str(changes[1].content)
+    assert "browser_replay_proof:ws_1:run_1" == materialized["acceptance_replay_source_ref"]
+
+
+def test_acceptance_replay_check_passes_materialized_static_contract(tmp_path: Path) -> None:
+    backend_dir = tmp_path / "miniapp"
+    replay_proof = {
+        "scenarios": [
+            {
+                "scenario_id": "browser_step_1",
+                "status": "passed",
+                "route": "/client",
+                "viewport": {"width": 390, "height": 844},
+                "steps": [{"route": "/client", "selector": "form#client-main", "action": "submit"}],
+                "playwright_spec": "import { test, expect } from '@playwright/test';\n\ntest('replay', async ({ page }) => {\n  await page.goto('/client');\n});\n",
+            }
+        ]
+    }
+    materialized = AcceptanceTestMaterializer.materialize(workspace_id="ws", run_id="run", replay_proof=replay_proof)
+    for change in materialized["file_changes"]:
+        target = backend_dir / str(change.file_path).removeprefix("miniapp/")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(str(change.content), encoding="utf-8")
+
+    runner = CheckRunner.__new__(CheckRunner)
+    runner._python_requirements_cache = set()
+    import threading
+
+    runner._python_requirements_cache_lock = threading.Lock()
+    result = CheckRunner._run_acceptance_replay_tests(runner, backend_dir, require_present=True)
+
+    assert result.status == "passed"
+    assert result.name == "acceptance_replay_tests"
+    assert result.diagnostics["acceptance_spec_count"] == 1
+
+
+def test_runtime_materializes_acceptance_tests_from_browser_replay_proof(tmp_path: Path, monkeypatch) -> None:
+    draft = tmp_path / "draft"
+
+    class FakeWorkspaceService:
+        def apply_file_changes(self, workspace_id: str, run_id: str, file_changes: list[DraftAction]) -> Path:
+            assert workspace_id == "ws"
+            assert run_id == "run"
+            for change in file_changes:
+                target = draft / change.file_path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(str(change.content), encoding="utf-8")
+            return draft
+
+    runtime = WorkspaceCodeAgentRuntime.__new__(WorkspaceCodeAgentRuntime)
+    runtime.store = StateStore(tmp_path / "state.json")
+    runtime.workspace_service = FakeWorkspaceService()
+    runtime.event_journal_service = None
+    monkeypatch.setattr(runtime, "_append_trace_bundle_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runtime, "_store_report", lambda key, payload: runtime.store.upsert("reports", key, payload))
+    job = JobRecord(
+        workspace_id="ws",
+        linked_run_id="run",
+        prompt="Build client request flow",
+        target_platform="telegram_mini_app",
+        preview_profile="telegram_mock",
+        browser_flow_proof={
+            "status": "passed",
+            "playwright_scenario": {
+                "steps": [{"route": "/client", "selector": "form#client-main", "action": "submit"}],
+                "mobile_viewport": {"width": 390, "height": 844},
+            },
+        },
+        browser_replay_proof_ref="browser_replay_proof:ws:run",
+    )
+
+    changes = WorkspaceCodeAgentRuntime._materialize_acceptance_tests(runtime, job=job, artifact_run_id="run")
+
+    assert [change.file_path for change in changes] == [
+        "miniapp/tests/test_acceptance.py",
+        "miniapp/tests/acceptance/browser_step_1.spec.ts",
+    ]
+    assert job.acceptance_tests_ref == "acceptance_tests:ws:run"
+    assert (draft / "miniapp/tests/test_acceptance.py").exists()
+    assert (draft / "miniapp/tests/acceptance/browser_step_1.spec.ts").exists()
+    report = runtime.store.get("reports", "acceptance_tests:ws:run")
+    assert report["acceptance_test_files"] == job.acceptance_test_files
+
+
 def test_acceptance_contract_carries_prompt_field_hints() -> None:
     prompt = "Клиент указывает компанию, адрес, дату, бюджет и комментарий. Менеджер видит выручку."
 
@@ -1647,6 +1764,36 @@ def test_runtime_activity_promotes_tool_summary_label_to_top_level(monkeypatch) 
     assert event["message"] == "Updated inventory API"
     assert event["status"] == "completed"
     assert stored_reports["agent_activity:ws_activity:run_activity"]["items"][0]["label"] == "Updated inventory API"  # type: ignore[index]
+
+
+def test_product_blueprint_gate_requires_all_pre_code_sections() -> None:
+    incomplete = {
+        "schema": "grounded.product_blueprint.v1",
+        "roles": ["client", "specialist", "manager"],
+        "entities": [],
+        "workflows": [],
+        "api": {},
+        "persistence": {"must_persist": True},
+        "screens": [],
+        "acceptance_proof": {},
+    }
+    complete = {
+        **incomplete,
+        "entities": [{"name": "inventory request"}],
+        "workflows": [{"id": "client_create_specialist_update_manager_review"}],
+        "api": {"required_endpoints": [{"method": "POST", "path": "/api/inventory"}]},
+        "screens": [{"role": "client", "intent": "create_or_configure"}],
+        "acceptance_proof": {"required_checks": ["api_workflow_smoke"], "browser_proof_required": True},
+    }
+
+    assert set(WorkspaceCodeAgentRuntime._product_blueprint_missing_sections(incomplete)) == {
+        "entities",
+        "workflows",
+        "api",
+        "screens",
+        "acceptance_proof",
+    }
+    assert WorkspaceCodeAgentRuntime._product_blueprint_ready(complete)
 
 
 def test_tool_router_spills_large_result_to_output_artifact_writer(tmp_path: Path, monkeypatch) -> None:

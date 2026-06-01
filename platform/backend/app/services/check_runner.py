@@ -438,6 +438,17 @@ class CheckRunner:
                         command="browser/preview flow deferred during focused edit" if focused_details else "browser/preview flow deferred during fast gate",
                         logs=[],
                     ),
+                    RunCheckResult(
+                        name="acceptance_replay_tests",
+                        status="skipped",
+                        details=(
+                            "Replayable acceptance tests were skipped for a focused CSS-only visual edit."
+                            if focused_details
+                            else "Replayable acceptance tests were deferred until acceptance artifacts exist."
+                        ),
+                        command=f"{sys.executable} -m unittest discover -s tests -p test_acceptance.py",
+                        logs=[],
+                    ),
                 ]
             )
             completed_at = utc_now()
@@ -647,6 +658,22 @@ class CheckRunner:
                 duration_ms=result.duration_ms,
                 check_profile=check_profile,
             )
+
+        self._emit_check_progress(progress_callback, "acceptance_replay_tests", "started", check_profile=check_profile)
+        acceptance_started = time.perf_counter()
+        acceptance_result = self._run_acceptance_replay_tests(
+            backend_dir,
+            require_present=self._acceptance_replay_files_present(backend_dir),
+        )
+        acceptance_result.duration_ms = int((time.perf_counter() - acceptance_started) * 1000)
+        results.append(acceptance_result)
+        self._emit_check_progress(
+            progress_callback,
+            "acceptance_replay_tests",
+            acceptance_result.status,
+            duration_ms=acceptance_result.duration_ms,
+            check_profile=check_profile,
+        )
 
         completed_at = utc_now()
         self._cleanup_runtime_database_artifacts(source_dir)
@@ -4143,6 +4170,10 @@ except Exception as exc:
                 location = "miniapp/app/static"
                 code = "platform.frontend_interaction_static"
                 message = next((line for line in result.logs if line.strip()), message)
+            if result.name == "acceptance_replay_tests":
+                location = "tests/acceptance"
+                code = "tests.acceptance_replay"
+                message = next((line for line in reversed(result.logs) if line.strip()), message)
             if result.name in {"generated_app_python_tests", "generated_app_js_tests"}:
                 location = "tests"
                 code = "tests.python_generated_app" if result.name == "generated_app_python_tests" else "tests.js_generated_app"
@@ -4287,7 +4318,7 @@ except Exception as exc:
             return "syntax/build"
         if "platform_invariants" in failed_names or "frontend_interaction_static_smoke" in failed_names:
             return "validator/contract"
-        if "generated_app_python_tests" in failed_names or "generated_app_js_tests" in failed_names:
+        if "generated_app_python_tests" in failed_names or "generated_app_js_tests" in failed_names or "acceptance_replay_tests" in failed_names:
             return "app/runtime_test"
         for result in results:
             if result.name == "browser_flow_smoke" and result.status == "failed":
@@ -6893,6 +6924,91 @@ except Exception as exc:
             if all(left == right or "{param}" in {left, right} or (left.startswith("{") and right.startswith("{")) for left, right in zip(ref_parts, declared_parts)):
                 return True
         return False
+
+    @staticmethod
+    def _acceptance_replay_files_present(backend_dir: Path) -> bool:
+        test_file = backend_dir / "tests" / "test_acceptance.py"
+        acceptance_dir = backend_dir / "tests" / "acceptance"
+        return test_file.exists() or (acceptance_dir.exists() and any(acceptance_dir.glob("*.spec.ts")))
+
+    def _run_acceptance_replay_tests(self, backend_dir: Path, *, require_present: bool = False) -> RunCheckResult:
+        test_file = backend_dir / "tests" / "test_acceptance.py"
+        acceptance_dir = backend_dir / "tests" / "acceptance"
+        specs = sorted(acceptance_dir.glob("*.spec.ts")) if acceptance_dir.exists() else []
+        command_text = f"{sys.executable} -m unittest discover -s tests -p test_acceptance.py"
+        if not test_file.exists() or not specs:
+            return RunCheckResult(
+                name="acceptance_replay_tests",
+                status="failed" if require_present else "skipped",
+                details=(
+                    "Replayable acceptance tests are required because acceptance artifacts exist, but the runner/spec files are incomplete."
+                    if require_present
+                    else "Replayable acceptance tests were not present in the draft workspace."
+                ),
+                command=command_text,
+                logs=[],
+                diagnostics={
+                    "missing_test_file": "tests/test_acceptance.py" if not test_file.exists() else None,
+                    "missing_acceptance_specs": not bool(specs),
+                    "target_files": ["miniapp/tests/test_acceptance.py", "miniapp/tests/acceptance/*.spec.ts", "miniapp/app/static/**", "miniapp/app/routes/**"],
+                }
+                if require_present
+                else {},
+            )
+        install_result = self._install_python_requirements(
+            backend_dir,
+            result_name="acceptance_replay_tests",
+            purpose="Acceptance replay Python dependency",
+        )
+        if install_result is not None:
+            return install_result
+        env = {**os.environ}
+        python_path_parts = [str(backend_dir)]
+        existing_python_path = env.get("PYTHONPATH")
+        if existing_python_path:
+            python_path_parts.append(existing_python_path)
+        env["PYTHONPATH"] = os.pathsep.join(python_path_parts)
+        command = [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test_acceptance.py"]
+        try:
+            result = subprocess.run(
+                command,
+                cwd=backend_dir,
+                capture_output=True,
+                text=True,
+                timeout=int(os.getenv("ACCEPTANCE_REPLAY_TEST_TIMEOUT_SEC", "240")),
+                env=env,
+            )
+        except subprocess.TimeoutExpired as exc:
+            return RunCheckResult(
+                name="acceptance_replay_tests",
+                status="failed",
+                details="Replayable acceptance tests timed out.",
+                command=" ".join(command),
+                logs=self._command_logs("Replayable acceptance tests timed out.", exc.stdout or "", exc.stderr or ""),
+                diagnostics={"target_files": ["miniapp/tests/test_acceptance.py", "miniapp/tests/acceptance/*.spec.ts"]},
+            )
+        if result.returncode != 0:
+            return RunCheckResult(
+                name="acceptance_replay_tests",
+                status="failed",
+                details="Replayable acceptance tests failed for the draft miniapp.",
+                command=" ".join(command),
+                exit_code=result.returncode,
+                logs=self._command_logs("Replayable acceptance tests failed.", result.stdout, result.stderr),
+                diagnostics={
+                    "target_files": ["miniapp/tests/test_acceptance.py", "miniapp/tests/acceptance/*.spec.ts", "miniapp/app/static/**", "miniapp/app/routes/**"],
+                    "acceptance_spec_count": len(specs),
+                },
+            )
+        return RunCheckResult(
+            name="acceptance_replay_tests",
+            status="passed",
+            details="Replayable acceptance tests passed.",
+            command=" ".join(command),
+            exit_code=result.returncode,
+            logs=["Replayable acceptance tests passed."],
+            diagnostics={"acceptance_spec_count": len(specs)},
+        )
 
     def _run_python_app_tests(self, backend_dir: Path, *, require_present: bool = False) -> RunCheckResult:
         test_file = backend_dir / "tests" / "test_generated_app.py"

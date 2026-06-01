@@ -8306,6 +8306,10 @@ export interface components {
             implementation_plan?: {
                 [key: string]: unknown;
             };
+            /** Product Blueprint */
+            product_blueprint?: {
+                [key: string]: unknown;
+            };
             /** Agent Turns */
             agent_turns?: {
                 [key: string]: unknown;
@@ -8400,6 +8404,12 @@ export interface components {
             browser_step_refs?: string[];
             /** Browser Replay Proof Ref */
             browser_replay_proof_ref?: string | null;
+            /** Acceptance Tests Ref */
+            acceptance_tests_ref?: string | null;
+            /** Acceptance Test Files */
+            acceptance_test_files?: string[];
+            /** Acceptance Replay Source Ref */
+            acceptance_replay_source_ref?: string | null;
             /** Lsp Context Ref */
             lsp_context_ref?: string | null;
             /** Context Manager Ref */
@@ -8420,6 +8430,8 @@ export interface components {
             }[];
             /** Prompt Contract Ref */
             prompt_contract_ref?: string | null;
+            /** Product Blueprint Ref */
+            product_blueprint_ref?: string | null;
             /** Miniapp Contract Ref */
             miniapp_contract_ref?: string | null;
             /** Route Registry Ref */

@@ -26,11 +26,13 @@ from app.models.domain import (
     GenerateRequest,
     JobEvent,
     JobRecord,
+    new_id,
     RepairIterationRecord,
     RunCheckResult,
     RunRecord,
     ValidationSnapshot,
 )
+from app.models.prompt_contract import ProductBlueprint
 from app.modules.miniapp_agent_loop.agent_file_state import AgentFileStateCache
 from app.modules.miniapp_agent_loop.agent_command_policy import command_policy_snapshot
 from app.modules.miniapp_agent_loop.agent_coordinator import AgentCoordinator
@@ -90,6 +92,8 @@ from app.modules.workspace_code_agent_runtime.process_recovery import AgentProce
 from app.modules.workspace_code_agent_runtime.tool_executor import AgentToolExecutor
 from app.repositories.platform_db import PlatformDb
 from app.repositories.state_store import StateStore
+from app.services.acceptance_test_materializer import AcceptanceTestMaterializer
+from app.services.browser_replay_proof import BrowserReplayProofService
 from app.services.check_runner import CheckRunner
 from app.services.miniapp_contract import MiniAppContractCompiler, MiniAppContractMaterializer, MiniAppRouteRegistry
 from app.services.platform_shell import BASE_STYLESHEET_HREF, BASE_STYLESHEET_PATH, PAGE_SHELL_INLINE_STYLE
@@ -533,6 +537,33 @@ class WorkspaceCodeAgentRuntime:
             request=request,
             stored_run=self.store.get("runs", run_id),
         )
+        stored_run = self.store.get("runs", run_id)
+        implementation_plan = dict(stored_run.get("implementation_plan") or {}) if isinstance(stored_run, dict) else {}
+        product_blueprint = self._product_blueprint_for_runtime(
+            workspace_id=workspace_id,
+            run_id=run_id,
+            request=request,
+            acceptance_contract=acceptance_contract,
+            implementation_plan=implementation_plan,
+            stored_run=stored_run if isinstance(stored_run, dict) else None,
+            status="planned",
+        )
+        if not self._product_blueprint_ready(product_blueprint):
+            job.status = "blocked"
+            job.outcome_kind = "blocked_generation"
+            job.summary = "Generation blocked before code because product blueprint is incomplete."
+            job.failure_reason = "Product blueprint must define roles, entities, workflows, API, persistence, screens, and acceptance proof before code generation."
+            job.failure_class = "product_blueprint_missing"
+            job.current_fix_phase = "planning"
+            job.product_blueprint = product_blueprint
+            job.product_blueprint_ref = f"product_blueprint:{workspace_id}:{run_id}"
+            self._store_report(job.product_blueprint_ref, product_blueprint)
+            self._append_event(job, "job_failed", job.summary, {"failure_class": job.failure_class, "product_blueprint_ref": job.product_blueprint_ref})
+            return job
+        job.product_blueprint = product_blueprint
+        job.product_blueprint_ref = f"product_blueprint:{workspace_id}:{run_id}"
+        self._store_report(job.product_blueprint_ref, product_blueprint)
+        self._append_activity(job, "planning", "Product blueprint prepared.", {"product_blueprint_ref": job.product_blueprint_ref, "status": product_blueprint.get("status")}, save=False)
         file_changes = self._fast_local_scaffold_file_changes(
             prompt=request.prompt,
             resource_label=resource_label,
@@ -625,6 +656,7 @@ class WorkspaceCodeAgentRuntime:
             },
         ]
         job.acceptance_contract = acceptance_contract
+        job.implementation_plan = implementation_plan
         job.flow_coverage = {"status": "scaffolded", "required_flows": ["client_create_specialist_update_manager_review"]}
         job.latency_breakdown["agent_total_ms"] = int((time.perf_counter() - started_at) * 1000)
         job.token_usage = {"total_tokens": 0, "mode": "fast_local_scaffold"}
@@ -1601,6 +1633,110 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             return text[: body_close.start()] + script + text[body_close.start() :]
         return text.rstrip() + "\n" + script
 
+    def _product_blueprint_for_runtime(
+        self,
+        *,
+        workspace_id: str,
+        run_id: str,
+        request: GenerateRequest,
+        acceptance_contract: dict[str, Any],
+        implementation_plan: dict[str, Any],
+        stored_run: dict[str, Any] | None,
+        status: str = "planned",
+    ) -> dict[str, Any]:
+        stored_ref = str((stored_run or {}).get("product_blueprint_ref") or f"product_blueprint:{workspace_id}:{run_id}")
+        stored_blueprint = self.store.get("reports", stored_ref)
+        if isinstance(stored_blueprint, dict) and self._product_blueprint_ready(stored_blueprint):
+            return dict(stored_blueprint)
+        embedded = (stored_run or {}).get("product_blueprint")
+        if isinstance(embedded, dict) and self._product_blueprint_ready(embedded):
+            return dict(embedded)
+        hints = acceptance_contract.get("prompt_hints") if isinstance(acceptance_contract.get("prompt_hints"), dict) else {}
+        workflows = [dict(flow) for flow in acceptance_contract.get("flows") or [] if isinstance(flow, dict)]
+        api = dict(implementation_plan.get("api_contract") or acceptance_contract.get("api_contract") or {})
+        if not api.get("required_endpoints") and acceptance_contract.get("required_endpoints"):
+            api["required_endpoints"] = list(acceptance_contract.get("required_endpoints") or [])
+        blueprint = ProductBlueprint(
+            blueprint_id=new_id("blueprint"),
+            status=status if status in {"planned", "blocked", "not_required", "inherited"} else "planned",  # type: ignore[arg-type]
+            workspace_id=workspace_id,
+            run_id=run_id,
+            source_run_id=str((stored_run or {}).get("resume_from_run_id") or "") or None,
+            prompt_summary=str(hints.get("prompt_summary") or request.prompt or "")[:1200],
+            roles=list(acceptance_contract.get("roles") or ROLE_ORDER),
+            entities=self._blueprint_entities(acceptance_contract=acceptance_contract, implementation_plan=implementation_plan, hints=hints),
+            workflows=workflows,
+            api=api,
+            persistence={
+                "must_persist": bool(api.get("must_persist", acceptance_contract.get("required") or request.mode == "generate")),
+                "must_support_update": bool(api.get("must_support_update") or (acceptance_contract.get("features") or {}).get("workflow_update")),
+                "refresh_persistence": bool((acceptance_contract.get("features") or {}).get("refresh_persistence")),
+                "no_seed_or_mock_records": True,
+            },
+            screens=self._blueprint_screens(acceptance_contract=acceptance_contract, implementation_plan=implementation_plan),
+            acceptance_proof={
+                "status": "planned",
+                "scenarios": workflows,
+                "required_checks": sorted({str(check) for flow in workflows for check in (flow.get("required_tests") or []) if str(check or "").strip()}),
+                "browser_proof_required": request.mode == "generate" or bool(acceptance_contract.get("required")),
+                "acceptance_contract_required": bool(acceptance_contract.get("required")),
+            },
+            refs={
+                "prompt_contract_ref": (stored_run or {}).get("prompt_contract_ref") or f"prompt_contract:{workspace_id}:{run_id}",
+                "acceptance_contract_ref": f"acceptance_contract:{workspace_id}:{run_id}",
+            },
+        ).model_dump(mode="json", by_alias=True)
+        missing = self._product_blueprint_missing_sections(blueprint)
+        if missing:
+            blueprint["status"] = "blocked"
+            blueprint["missing_sections"] = missing
+        return blueprint
+
+    @staticmethod
+    def _blueprint_entities(*, acceptance_contract: dict[str, Any], implementation_plan: dict[str, Any], hints: dict[str, Any]) -> list[dict[str, Any]]:
+        prompt_contract = implementation_plan.get("prompt_contract_v1") if isinstance(implementation_plan.get("prompt_contract_v1"), dict) else {}
+        entities = [
+            {"name": str(item), "source": "implementation_plan"}
+            for item in implementation_plan.get("primary_entities") or prompt_contract.get("entities") or []
+            if str(item or "").strip()
+        ]
+        for item in hints.get("resource_hints") or ([hints.get("resource_hint")] if hints.get("resource_hint") else []):
+            if str(item or "").strip() and not any(entity.get("name") == str(item) for entity in entities):
+                entities.append({"name": str(item), "source": "prompt_hints"})
+        fields = [str(item) for item in hints.get("field_hints") or [] if str(item or "").strip()]
+        if fields:
+            if not entities:
+                entities.append({"name": str(hints.get("resource_hint") or "request"), "source": "prompt_hints"})
+            for entity in entities:
+                entity.setdefault("fields", fields[:12])
+        return entities
+
+    @staticmethod
+    def _blueprint_screens(*, acceptance_contract: dict[str, Any], implementation_plan: dict[str, Any]) -> list[dict[str, Any]]:
+        screen_plan = implementation_plan.get("routeable_screen_plan") or (implementation_plan.get("ui_contract") or {}).get("routeable_screen_plan") or (acceptance_contract.get("page_contract") or {}).get("routeable_screen_plan") or {}
+        roles = screen_plan.get("roles") if isinstance(screen_plan.get("roles"), dict) else {}
+        screens: list[dict[str, Any]] = []
+        for role, items in roles.items():
+            for index, item in enumerate(items or []):
+                if isinstance(item, dict):
+                    screens.append({"screen_id": f"{role}_{index + 1}", "role": role, **item})
+        return screens or [{"screen_id": role, "role": role, "intent": "role_workflow", "purpose": f"{role} workflow screen"} for role in ROLE_ORDER]
+
+    @classmethod
+    def _product_blueprint_ready(cls, blueprint: dict[str, Any]) -> bool:
+        return not cls._product_blueprint_missing_sections(blueprint)
+
+    @staticmethod
+    def _product_blueprint_missing_sections(blueprint: dict[str, Any]) -> list[str]:
+        missing: list[str] = []
+        for key in ("roles", "entities", "workflows", "screens"):
+            if not isinstance(blueprint.get(key), list) or not blueprint.get(key):
+                missing.append(key)
+        for key in ("api", "persistence", "acceptance_proof"):
+            if not isinstance(blueprint.get(key), dict) or not blueprint.get(key):
+                missing.append(key)
+        return missing
+
     def _run_loop(
         self,
         *,
@@ -1721,6 +1857,48 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                         "turn": 0,
                         "result": "blocked_contract_missing",
                         "issues": list(acceptance_contract.get("issues") or []),
+                    }
+                ],
+            )
+        product_blueprint = self._product_blueprint_for_runtime(
+            workspace_id=workspace_id,
+            run_id=run_id,
+            request=request,
+            acceptance_contract=acceptance_contract,
+            implementation_plan=implementation_plan,
+            stored_run=stored_run if isinstance(stored_run, dict) else None,
+            status="planned",
+        )
+        job.product_blueprint = product_blueprint
+        job.product_blueprint_ref = f"product_blueprint:{workspace_id}:{run_id}"
+        self._store_report(job.product_blueprint_ref, product_blueprint)
+        self._append_activity(
+            job,
+            "planning",
+            "Product blueprint prepared.",
+            {"product_blueprint_ref": job.product_blueprint_ref, "status": product_blueprint.get("status")},
+            save=False,
+        )
+        if not self._product_blueprint_ready(product_blueprint):
+            return self.results.blocked(
+                summary="Run blocked before code because product blueprint is incomplete.",
+                failure_reason="Product blueprint must define roles, entities, workflows, API, persistence, screens, and acceptance proof before code generation.",
+                failure_class="product_blueprint_missing",
+                failure_signature="product_blueprint.missing_sections",
+                root_cause_summary="Generation stopped before edits to avoid coding without stable product semantics.",
+                current_phase="planning",
+                latest_execution=None,
+                latest_preview_details={},
+                latest_apply_result=None,
+                iterations=[],
+                repair_iterations=[],
+                all_file_changes=[],
+                last_assistant_message="",
+                turn_history=[
+                    {
+                        "turn": 0,
+                        "result": "product_blueprint_missing",
+                        "issues": list(product_blueprint.get("missing_sections") or []),
                     }
                 ],
             )
@@ -7488,7 +7666,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                 role_coverage = dict(diagnostics.get("role_coverage") or role_coverage)
                 generated_tests = dict(diagnostics.get("generated_tests") or generated_tests)
                 neutral_template_findings = list(diagnostics.get("neutral_template_findings") or neutral_template_findings)
-            if result.name in {"generated_app_python_tests", "generated_app_js_tests"}:
+            if result.name in {"generated_app_python_tests", "generated_app_js_tests", "acceptance_replay_tests"}:
                 generated_tests[result.name] = {
                     "status": result.status,
                     "details": result.details,
@@ -7514,6 +7692,44 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                 "neutral_template_findings": neutral_template_findings,
             },
         )
+
+    def _materialize_acceptance_tests(self, *, job: JobRecord, artifact_run_id: str) -> list[DraftAction]:
+        if not job.browser_flow_proof or not job.browser_replay_proof_ref:
+            return []
+        replay_report = BrowserReplayProofService(self.store, event_journal_service=self.event_journal_service).build(
+            workspace_id=job.workspace_id,
+            run_id=artifact_run_id,
+            browser_proof=job.browser_flow_proof,
+            failed_packet=None,
+        )
+        replay_payload = replay_report.model_dump(mode="json", by_alias=True)
+        materialized = AcceptanceTestMaterializer.materialize(
+            workspace_id=job.workspace_id,
+            run_id=artifact_run_id,
+            replay_proof=replay_payload,
+            replay_source_ref=job.browser_replay_proof_ref,
+        )
+        file_changes = [item for item in materialized.pop("file_changes", []) if isinstance(item, DraftAction)]
+        if not file_changes:
+            return []
+        self.workspace_service.apply_file_changes(job.workspace_id, artifact_run_id, file_changes)
+        job.acceptance_tests_ref = str(materialized.get("acceptance_tests_ref") or AcceptanceTestMaterializer.ref(job.workspace_id, artifact_run_id))
+        job.acceptance_test_files = list(materialized.get("acceptance_test_files") or [])
+        job.acceptance_replay_source_ref = str(materialized.get("acceptance_replay_source_ref") or job.browser_replay_proof_ref)
+        self._store_report(job.browser_replay_proof_ref, replay_payload)
+        self._store_report(job.acceptance_tests_ref, materialized)
+        self._append_activity(
+            job,
+            "verification",
+            "Acceptance tests materialized.",
+            {
+                "acceptance_tests_ref": job.acceptance_tests_ref,
+                "acceptance_test_files": job.acceptance_test_files,
+                "acceptance_replay_source_ref": job.acceptance_replay_source_ref,
+            },
+            save=False,
+        )
+        return file_changes
 
     def _combined_changed_content(self, *, workspace_id: str, run_id: str, changed_paths: list[str], path_prefix: str) -> str:
         combined: list[str] = []
@@ -7641,6 +7857,8 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         semantic_graph_items: list[dict[str, Any]] = []
         artifact_read_items: list[dict[str, Any]] = []
         artifact_run_id = job.linked_run_id or job.job_id
+        job.browser_proof_ref = f"browser_proof:{job.workspace_id}:{artifact_run_id}" if job.browser_flow_proof else None
+        job.browser_replay_proof_ref = f"browser_replay_proof:{job.workspace_id}:{artifact_run_id}" if job.browser_flow_proof else None
         for turn in loop_result.turn_history:
             metadata = turn.get("metadata") if isinstance(turn, dict) else {}
             for item in (metadata.get("tool_results") if isinstance(metadata, dict) else []) or []:
@@ -7684,6 +7902,9 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                     if ref:
                         large_tool_output_refs.append(str(ref))
                     tool_trace_items.append(compact_item)
+        acceptance_artifact_changes = self._materialize_acceptance_tests(job=job, artifact_run_id=artifact_run_id)
+        if acceptance_artifact_changes:
+            loop_result.all_file_changes.extend(acceptance_artifact_changes)
         patch_history = [
             {
                 "file_path": operation.file_path,
@@ -9165,6 +9386,8 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         payload["current_fix_phase"] = job.current_fix_phase
         payload["orchestration_phases"] = list(job.orchestration_phases)
         payload["implementation_plan"] = dict(job.implementation_plan)
+        payload["product_blueprint"] = dict(job.product_blueprint)
+        payload["product_blueprint_ref"] = job.product_blueprint_ref
         payload["agent_turns"] = list(job.agent_turns)
         payload["agent_activity_events"] = list(job.agent_activity_events)
         payload["agent_memory"] = dict(job.agent_memory)
@@ -9203,6 +9426,9 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         payload["worker_branch_refs"] = list(job.worker_branch_refs)
         payload["verifier_review_ref"] = job.verifier_review_ref
         payload["browser_step_refs"] = list(job.browser_step_refs)
+        payload["acceptance_tests_ref"] = job.acceptance_tests_ref
+        payload["acceptance_test_files"] = list(job.acceptance_test_files)
+        payload["acceptance_replay_source_ref"] = job.acceptance_replay_source_ref
         payload["hook_trace_ref"] = job.hook_trace_ref
         payload["lsp_context_ref"] = job.lsp_context_ref
         payload["semantic_graph_ref"] = job.semantic_graph_ref

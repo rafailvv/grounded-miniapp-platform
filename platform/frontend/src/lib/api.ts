@@ -96,6 +96,7 @@ export type Run = {
   neutral_template_findings?: Array<Record<string, unknown>>;
   orchestration_phases?: Array<Record<string, unknown>>;
   implementation_plan?: Record<string, unknown>;
+  product_blueprint?: Record<string, unknown> | null;
   agent_activity_events?: Array<{
     type?: string;
     message?: string;
@@ -125,6 +126,10 @@ export type Run = {
   tool_trace_ref?: string | null;
   file_change_history_ref?: string | null;
   browser_proof_ref?: string | null;
+  browser_replay_proof_ref?: string | null;
+  acceptance_tests_ref?: string | null;
+  acceptance_test_files?: string[];
+  acceptance_replay_source_ref?: string | null;
   large_tool_outputs_ref?: string | null;
   file_state_cache_ref?: string | null;
   turn_diff_ref?: string | null;
@@ -157,6 +162,7 @@ export type Run = {
   semantic_graph_ref?: string | null;
   worker_prefix_ref?: string | null;
   replay_trace_ref?: string | null;
+  product_blueprint_ref?: string | null;
   miniapp_contract_ref?: string | null;
   route_registry_ref?: string | null;
   contract_compile_ref?: string | null;
@@ -214,6 +220,7 @@ export type RunArtifacts = {
   neutral_template_findings?: Array<Record<string, unknown>>;
   orchestration_phases?: Array<Record<string, unknown>>;
   implementation_plan?: Record<string, unknown>;
+  product_blueprint?: Record<string, unknown> | null;
   agent_activity_events?: Array<{
     type?: string;
     message?: string;
@@ -243,6 +250,10 @@ export type RunArtifacts = {
   tool_trace_ref?: string | null;
   file_change_history_ref?: string | null;
   browser_proof_ref?: string | null;
+  browser_replay_proof_ref?: string | null;
+  acceptance_tests_ref?: string | null;
+  acceptance_test_files?: string[];
+  acceptance_replay_source_ref?: string | null;
   large_tool_outputs_ref?: string | null;
   file_state_cache_ref?: string | null;
   turn_diff_ref?: string | null;
@@ -273,6 +284,7 @@ export type RunArtifacts = {
   semantic_graph_ref?: string | null;
   worker_prefix_ref?: string | null;
   replay_trace_ref?: string | null;
+  product_blueprint_ref?: string | null;
   repair_issue_signatures?: Array<Record<string, unknown>>;
   mobile_layout_report?: Record<string, unknown>;
   draft_preview?: {
@@ -298,6 +310,7 @@ export type RunArtifacts = {
   } | null;
   fix_case?: Record<string, unknown> | null;
   fix_runtime?: Record<string, unknown> | null;
+  acceptance_tests?: Record<string, unknown> | null;
   preview?: {
     status: string;
     runtime_mode: string;

@@ -204,6 +204,7 @@ class JobRecord(StrictModel):
     budget_status: dict[str, Any] = Field(default_factory=dict)
     orchestration_phases: list[dict[str, Any]] = Field(default_factory=list)
     implementation_plan: dict[str, Any] = Field(default_factory=dict)
+    product_blueprint: dict[str, Any] = Field(default_factory=dict)
     agent_turns: list[dict[str, Any]] = Field(default_factory=list)
     agent_activity_events: list[dict[str, Any]] = Field(default_factory=list)
     agent_memory: dict[str, Any] = Field(default_factory=dict)
@@ -246,6 +247,9 @@ class JobRecord(StrictModel):
     verifier_review_ref: str | None = None
     browser_step_refs: list[str] = Field(default_factory=list)
     browser_replay_proof_ref: str | None = None
+    acceptance_tests_ref: str | None = None
+    acceptance_test_files: list[str] = Field(default_factory=list)
+    acceptance_replay_source_ref: str | None = None
     lsp_context_ref: str | None = None
     context_manager_ref: str | None = None
     context_pressure_ref: str | None = None
@@ -255,6 +259,7 @@ class JobRecord(StrictModel):
     replay_trace_ref: str | None = None
     compaction_summaries: list[dict[str, Any]] = Field(default_factory=list)
     prompt_contract_ref: str | None = None
+    product_blueprint_ref: str | None = None
     miniapp_contract_ref: str | None = None
     route_registry_ref: str | None = None
     contract_compile_ref: str | None = None
@@ -613,6 +618,7 @@ class RunRecord(StrictModel):
     budget_status: dict[str, Any] = Field(default_factory=dict)
     orchestration_phases: list[dict[str, Any]] = Field(default_factory=list)
     implementation_plan: dict[str, Any] = Field(default_factory=dict)
+    product_blueprint: dict[str, Any] = Field(default_factory=dict)
     agent_turns: list[dict[str, Any]] = Field(default_factory=list)
     agent_activity_events: list[dict[str, Any]] = Field(default_factory=list)
     agent_memory: dict[str, Any] = Field(default_factory=dict)
@@ -655,6 +661,9 @@ class RunRecord(StrictModel):
     verifier_review_ref: str | None = None
     browser_step_refs: list[str] = Field(default_factory=list)
     browser_replay_proof_ref: str | None = None
+    acceptance_tests_ref: str | None = None
+    acceptance_test_files: list[str] = Field(default_factory=list)
+    acceptance_replay_source_ref: str | None = None
     lsp_context_ref: str | None = None
     context_manager_ref: str | None = None
     context_pressure_ref: str | None = None
@@ -664,6 +673,7 @@ class RunRecord(StrictModel):
     replay_trace_ref: str | None = None
     compaction_summaries: list[dict[str, Any]] = Field(default_factory=list)
     prompt_contract_ref: str | None = None
+    product_blueprint_ref: str | None = None
     miniapp_contract_ref: str | None = None
     route_registry_ref: str | None = None
     contract_compile_ref: str | None = None

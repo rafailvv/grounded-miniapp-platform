@@ -1910,6 +1910,7 @@ export default function App() {
   const displayActivityEvents = normalizeAgentActivityEvents(
     runArtifacts?.agent_activity_events?.length ? runArtifacts.agent_activity_events : selectedRun?.agent_activity_events,
   ).slice(-12);
+  const productBlueprint = (runArtifacts?.product_blueprint || selectedRun?.product_blueprint || null) as Record<string, unknown> | null;
   const filesSectionTitle =
     completedGenerateRun && selectedRun?.intent === "create"
       ? "Created files"
@@ -3191,6 +3192,36 @@ export default function App() {
                 </div>
               ) : (
                 <p className="muted">No agent activity recorded yet.</p>
+              )}
+            </section>
+
+            <section className="run-detail-section">
+              <h4>Product blueprint</h4>
+              {productBlueprint ? (
+                <div className="run-details-grid">
+                  <div className="run-detail-card">
+                    <span>Status</span>
+                    <strong>{String(productBlueprint.status || "planned")}</strong>
+                  </div>
+                  <div className="run-detail-card">
+                    <span>Roles</span>
+                    <strong>{asStringArray(productBlueprint.roles).length}</strong>
+                  </div>
+                  <div className="run-detail-card">
+                    <span>Entities</span>
+                    <strong>{asRecordArray(productBlueprint.entities).length}</strong>
+                  </div>
+                  <div className="run-detail-card">
+                    <span>Workflows</span>
+                    <strong>{asRecordArray(productBlueprint.workflows).length}</strong>
+                  </div>
+                  <div className="run-detail-card">
+                    <span>Screens</span>
+                    <strong>{asRecordArray(productBlueprint.screens).length}</strong>
+                  </div>
+                </div>
+              ) : (
+                <p className="muted">No product blueprint recorded yet.</p>
               )}
             </section>
 

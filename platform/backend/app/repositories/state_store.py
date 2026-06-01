@@ -34,6 +34,7 @@ class StateStore:
         "browser_proof:",
         "browser_replay_proof:",
         "browser_replay_scenario:",
+        "acceptance_tests:",
         "compaction_summaries:",
         "acceptance_contract:",
         "implementation_plan:",

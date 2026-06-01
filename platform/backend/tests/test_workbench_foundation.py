@@ -245,6 +245,53 @@ def test_improve_run_blocks_without_existing_app_surface(tmp_path: Path) -> None
     assert run.improve_slice_ref is None
 
 
+def test_create_run_prepares_product_blueprint_before_runtime_executes(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Blueprint Workspace",
+            "description": "Verify product blueprint gate",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    observed: dict[str, object] = {}
+
+    def assert_blueprint_ready_before_execute(run_id: str, payload: dict[str, object]) -> None:
+        del payload
+        run = app.state.container.run_service.get_run(run_id)
+        blueprint = app.state.container.store.get("reports", run.product_blueprint_ref or "")
+        observed["run_id"] = run_id
+        observed["product_blueprint_ref"] = run.product_blueprint_ref
+        observed["blueprint"] = blueprint
+        assert run.product_blueprint_ref == f"product_blueprint:{workspace['workspace_id']}:{run_id}"
+        assert isinstance(blueprint, dict)
+        assert blueprint["schema"] == "grounded.product_blueprint.v1"
+        assert blueprint["roles"]
+        assert blueprint["entities"]
+        assert blueprint["workflows"]
+        assert blueprint["api"]
+        assert blueprint["persistence"]
+        assert blueprint["screens"]
+        assert blueprint["acceptance_proof"]
+
+    app.state.container.run_service._execute_run = assert_blueprint_ready_before_execute
+    run = app.state.container.run_service.create_run_sync(
+        workspace["workspace_id"],
+        CreateRunRequest(
+            prompt="Create an inventory request workflow with client submission, specialist updates, and manager review.",
+            mode="generate",
+            intent="create",
+            generation_mode="fast",
+        ),
+    )
+
+    assert observed["run_id"] == run.run_id
+    assert run.product_blueprint_ref == observed["product_blueprint_ref"]
+
+
 def test_improve_workspace_endpoint_creates_focused_run_with_refs(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("PLATFORM_BOOTSTRAP_STARTER_WORKSPACE", "1")
     monkeypatch.setenv("PREVIEW_RUNTIME_MODE", "local")
@@ -3721,7 +3768,20 @@ def test_browser_proof_final_artifact_includes_scenarios_errors_and_screenshots(
         touched_files=["miniapp/app/static/client/app.js"],
         acceptance_contract={"required": True},
     )
+    run.acceptance_tests_ref = f"acceptance_tests:{workspace['workspace_id']}:{run.run_id}"
+    run.acceptance_test_files = ["miniapp/tests/test_acceptance.py", "miniapp/tests/acceptance/browser_step_1.spec.ts"]
+    run.acceptance_replay_source_ref = f"browser_replay_proof:{workspace['workspace_id']}:{run.run_id}"
     app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+    app.state.container.store.upsert(
+        "reports",
+        run.acceptance_tests_ref,
+        {
+            "schema": "grounded.acceptance_tests.v1",
+            "status": "ready",
+            "acceptance_test_files": run.acceptance_test_files,
+            "acceptance_replay_source_ref": run.acceptance_replay_source_ref,
+        },
+    )
     app.state.container.store.upsert(
         "reports",
         f"run_artifacts:{run.run_id}",
@@ -3835,6 +3895,8 @@ def test_browser_proof_final_artifact_includes_scenarios_errors_and_screenshots(
     assert any(item["kind"] == "js_error" for item in visual["issues"])
     assert final_report["visual_regression"]["schema"] == "grounded.visual_regression.v1"
     assert final_report["browser_proof"]["artifact_refs"]["export_browser_proof_bundle"].endswith("/export/browser-proof-bundle")
+    assert final_report["acceptance_tests"]["status"] == "ready"
+    assert final_report["artifact_refs"]["acceptance_tests"] == run.acceptance_tests_ref
     with zipfile.ZipFile(export["file_path"]) as archive:
         names = set(archive.namelist())
         assert "manifest.json" in names

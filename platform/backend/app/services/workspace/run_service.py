@@ -266,6 +266,7 @@ class RunService:
         )
         acceptance_contract = prompt_contract_result.acceptance_contract
         implementation_plan = prompt_contract_result.implementation_plan
+        product_blueprint = prompt_contract_result.product_blueprint.model_dump(mode="json", by_alias=True)
         orchestration = prompt_contract_result.orchestration
         prompt_analysis_usage = prompt_contract_result.prompt_analysis_usage
         prompt_analysis_model = prompt_contract_result.prompt_analysis_model
@@ -291,6 +292,7 @@ class RunService:
             source_revision_id=workspace.current_revision_id,
             error_context=request.error_context,
             implementation_plan=implementation_plan,
+            product_blueprint=product_blueprint,
             acceptance_contract=acceptance_contract,
             orchestration_phases=list(orchestration.get("phases") or []),
             worker_summaries=list(orchestration.get("worker_summaries") or []),
@@ -306,6 +308,7 @@ class RunService:
             token_usage=self._token_usage_from_prompt_analysis(prompt_analysis_usage),
         )
         run.prompt_contract_ref = prompt_contract_result.compile_report.prompt_contract_ref
+        run.product_blueprint_ref = prompt_contract_result.compile_report.product_blueprint_ref
         improve_blocked = False
         if request.edit_mode == "improve":
             if not (self._workspace_has_existing_build(workspace) or self._workspace_has_existing_app_surface(workspace)):
@@ -321,6 +324,7 @@ class RunService:
                     "edit_mode": "improve",
                     "improve_mode": {"status": "blocked", "reason": "existing_app_required"},
                 }
+                run.product_blueprint = {**dict(run.product_blueprint or {}), "improve_mode": {"status": "blocked", "reason": "existing_app_required"}}
             elif self.existing_app_map_service is not None:
                 improve = self.existing_app_map_service.prepare_improve_run(
                     workspace_id=workspace_id,
@@ -351,9 +355,20 @@ class RunService:
                         "required_proof": list(slice_payload.get("required_proof") or []),
                     },
                 }
+                run.product_blueprint = {
+                    **dict(run.product_blueprint or {}),
+                    "improve_mode": dict(run.implementation_plan.get("improve_mode") or {}),
+                    "refs": {
+                        **dict((run.product_blueprint or {}).get("refs") or {}),
+                        "existing_app_map_ref": run.existing_app_map_ref,
+                        "improve_slice_ref": run.improve_slice_ref,
+                    },
+                }
         implementation_plan = dict(run.implementation_plan or implementation_plan)
         run.task_ledger_ref = f"task_ledger:{workspace_id}:{run.run_id}"
         run.implementation_plan = implementation_plan
+        if run.product_blueprint_ref:
+            self.store.upsert("reports", run.product_blueprint_ref, run.product_blueprint)
         self.store.upsert(
             "reports",
             run.task_ledger_ref,
@@ -400,6 +415,8 @@ class RunService:
                     "run_id": run.run_id,
                     "contract": run.acceptance_contract,
                     "implementation_plan": implementation_plan,
+                    "product_blueprint": run.product_blueprint,
+                    "product_blueprint_ref": run.product_blueprint_ref,
                     "orchestration": orchestration,
                 },
             )
@@ -422,6 +439,7 @@ class RunService:
                 "resume_from_run_id": run.resume_from_run_id,
                 "forked_from_run_id": run.forked_from_run_id,
                 "prompt_contract_ref": run.prompt_contract_ref,
+                "product_blueprint_ref": run.product_blueprint_ref,
                 "existing_app_map_ref": run.existing_app_map_ref,
                 "improve_slice_ref": run.improve_slice_ref,
             },
@@ -1312,6 +1330,8 @@ class RunService:
                 "file_change_history_ref",
                 "browser_proof_ref",
                 "browser_replay_proof_ref",
+                "acceptance_tests_ref",
+                "acceptance_replay_source_ref",
                 "large_tool_outputs_ref",
                 "file_state_cache_ref",
                 "turn_diff_ref",
@@ -1355,7 +1375,7 @@ class RunService:
             ):
                 if not getattr(run, attr, None) and existing.get(attr):
                     setattr(run, attr, str(existing.get(attr) or ""))
-            for attr in ("active_processes", "worker_branch_refs", "browser_step_refs"):
+            for attr in ("active_processes", "worker_branch_refs", "browser_step_refs", "acceptance_test_files"):
                 if not getattr(run, attr, None) and isinstance(existing.get(attr), list):
                     setattr(run, attr, list(existing.get(attr) or []))
             for attr in (
@@ -1496,6 +1516,8 @@ class RunService:
                 "file_change_history_ref",
                 "browser_proof_ref",
                 "browser_replay_proof_ref",
+                "acceptance_tests_ref",
+                "acceptance_replay_source_ref",
                 "large_tool_outputs_ref",
                 "file_state_cache_ref",
                 "turn_diff_ref",
@@ -1538,7 +1560,7 @@ class RunService:
                 if not getattr(run, attr, None) and getattr(job, attr, None):
                     setattr(run, attr, str(getattr(job, attr) or ""))
                     changed = True
-            for attr in ("active_processes", "worker_branch_refs", "browser_step_refs"):
+            for attr in ("active_processes", "worker_branch_refs", "browser_step_refs", "acceptance_test_files"):
                 if not getattr(run, attr, None) and getattr(job, attr, None):
                     setattr(run, attr, list(getattr(job, attr) or []))
                     changed = True
@@ -1667,8 +1689,13 @@ class RunService:
         snapshot.repair_iterations = list(job.repair_iterations or snapshot.repair_iterations)
         snapshot.repair_issue_signatures = list(job.repair_issue_signatures or snapshot.repair_issue_signatures)
         snapshot.prompt_contract_ref = job.prompt_contract_ref or snapshot.prompt_contract_ref
+        snapshot.product_blueprint_ref = job.product_blueprint_ref or snapshot.product_blueprint_ref
+        snapshot.product_blueprint = dict(job.product_blueprint or snapshot.product_blueprint)
         snapshot.acceptance_contract = dict(job.acceptance_contract or snapshot.acceptance_contract)
         snapshot.browser_flow_proof = dict(job.browser_flow_proof or snapshot.browser_flow_proof)
+        snapshot.acceptance_tests_ref = job.acceptance_tests_ref or snapshot.acceptance_tests_ref
+        snapshot.acceptance_test_files = list(job.acceptance_test_files or snapshot.acceptance_test_files)
+        snapshot.acceptance_replay_source_ref = job.acceptance_replay_source_ref or snapshot.acceptance_replay_source_ref
         snapshot.mobile_layout_report = dict(job.mobile_layout_report or snapshot.mobile_layout_report)
         snapshot.flow_coverage = dict(job.flow_coverage or snapshot.flow_coverage)
         if job.status == "completed":
@@ -1916,6 +1943,7 @@ class RunService:
             )
             run.orchestration_phases = list(getattr(job, "orchestration_phases", []) or run.orchestration_phases)
             run.implementation_plan = dict(getattr(job, "implementation_plan", {}) or run.implementation_plan)
+            run.product_blueprint = dict(getattr(job, "product_blueprint", {}) or run.product_blueprint)
             run.agent_activity_events = list(getattr(job, "agent_activity_events", []) or run.agent_activity_events)
             run.agent_memory = dict(getattr(job, "agent_memory", {}) or run.agent_memory)
             run.agent_transcript_ref = getattr(job, "agent_transcript_ref", None) or run.agent_transcript_ref
@@ -1923,6 +1951,9 @@ class RunService:
             run.file_change_history_ref = getattr(job, "file_change_history_ref", None) or run.file_change_history_ref
             run.browser_proof_ref = getattr(job, "browser_proof_ref", None) or run.browser_proof_ref
             run.browser_replay_proof_ref = getattr(job, "browser_replay_proof_ref", None) or run.browser_replay_proof_ref
+            run.acceptance_tests_ref = getattr(job, "acceptance_tests_ref", None) or run.acceptance_tests_ref
+            run.acceptance_test_files = list(getattr(job, "acceptance_test_files", []) or run.acceptance_test_files)
+            run.acceptance_replay_source_ref = getattr(job, "acceptance_replay_source_ref", None) or run.acceptance_replay_source_ref
             run.large_tool_outputs_ref = getattr(job, "large_tool_outputs_ref", None) or run.large_tool_outputs_ref
             run.file_state_cache_ref = getattr(job, "file_state_cache_ref", None) or run.file_state_cache_ref
             run.turn_diff_ref = getattr(job, "turn_diff_ref", None) or run.turn_diff_ref
@@ -1962,6 +1993,7 @@ class RunService:
             run.worker_prefix_ref = getattr(job, "worker_prefix_ref", None) or run.worker_prefix_ref
             run.replay_trace_ref = getattr(job, "replay_trace_ref", None) or run.replay_trace_ref
             run.prompt_contract_ref = getattr(job, "prompt_contract_ref", None) or run.prompt_contract_ref
+            run.product_blueprint_ref = getattr(job, "product_blueprint_ref", None) or run.product_blueprint_ref
             run.miniapp_contract_ref = getattr(job, "miniapp_contract_ref", None) or run.miniapp_contract_ref
             run.route_registry_ref = getattr(job, "route_registry_ref", None) or run.route_registry_ref
             run.contract_compile_ref = getattr(job, "contract_compile_ref", None) or run.contract_compile_ref
@@ -2570,6 +2602,9 @@ class RunService:
             "file_change_history_ref": run.file_change_history_ref,
             "browser_proof_ref": run.browser_proof_ref,
             "browser_replay_proof_ref": run.browser_replay_proof_ref,
+            "acceptance_tests_ref": run.acceptance_tests_ref,
+            "acceptance_test_files": run.acceptance_test_files,
+            "acceptance_replay_source_ref": run.acceptance_replay_source_ref,
             "large_tool_outputs_ref": run.large_tool_outputs_ref,
             "file_state_cache_ref": run.file_state_cache_ref,
             "turn_diff_ref": run.turn_diff_ref,
@@ -2609,6 +2644,7 @@ class RunService:
             "worker_prefix_ref": run.worker_prefix_ref,
             "replay_trace_ref": run.replay_trace_ref,
             "prompt_contract_ref": run.prompt_contract_ref,
+            "product_blueprint_ref": run.product_blueprint_ref,
             "miniapp_contract_ref": run.miniapp_contract_ref,
             "route_registry_ref": run.route_registry_ref,
             "contract_compile_ref": run.contract_compile_ref,
@@ -2617,6 +2653,7 @@ class RunService:
             "route_registry": self.store.get("reports", run.route_registry_ref) if run.route_registry_ref else None,
             "repair_recipes": self.store.get("reports", run.repair_recipes_ref) if run.repair_recipes_ref else None,
             "prompt_contract": self.store.get("reports", run.prompt_contract_ref) if run.prompt_contract_ref else None,
+            "product_blueprint": self.store.get("reports", run.product_blueprint_ref) if run.product_blueprint_ref else None,
             "process_outputs": process_outputs,
             "tool_result_messages": self.store.get("reports", run.tool_result_messages_ref) if run.tool_result_messages_ref else None,
             "agent_transcript": agent_transcript,
@@ -2625,6 +2662,7 @@ class RunService:
             "verifier_review": self.store.get("reports", run.verifier_review_ref) if run.verifier_review_ref else None,
             "browser_steps": [self.store.get("reports", ref) for ref in run.browser_step_refs if ref],
             "browser_replay_proof": self.store.get("reports", run.browser_replay_proof_ref) if run.browser_replay_proof_ref else None,
+            "acceptance_tests": self.store.get("reports", run.acceptance_tests_ref) if run.acceptance_tests_ref else None,
             "lsp_context": self.store.get("reports", run.lsp_context_ref) if run.lsp_context_ref else None,
             "context_manager": self.store.get("reports", run.context_manager_ref) if run.context_manager_ref else None,
             "context_pressure": self.store.get("reports", run.context_pressure_ref) if run.context_pressure_ref else None,
@@ -3059,7 +3097,7 @@ class RunService:
                         for item in diagnostics_neutral_findings
                         if isinstance(item, dict)
                     ]
-            if result.name in {"generated_app_python_tests", "generated_app_js_tests"}:
+            if result.name in {"generated_app_python_tests", "generated_app_js_tests", "acceptance_replay_tests"}:
                 generated_tests[result.name] = {
                     "status": result.status,
                     "details": result.details,
