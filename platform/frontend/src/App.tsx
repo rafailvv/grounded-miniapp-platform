@@ -434,6 +434,7 @@ type AgentActivityView = {
   phase?: string;
   elapsed_ms?: number;
   artifact_ref?: string;
+  label?: string;
   summary?: string;
   duration_ms?: number;
   status?: string;
@@ -465,6 +466,7 @@ function normalizeAgentActivityEvents(events: unknown): AgentActivityView[] {
         phase: typeof record.phase === "string" ? record.phase : undefined,
         elapsed_ms: typeof record.elapsed_ms === "number" ? record.elapsed_ms : undefined,
         artifact_ref: typeof record.artifact_ref === "string" ? record.artifact_ref : undefined,
+        label: typeof record.label === "string" ? record.label : undefined,
         summary: typeof record.summary === "string" ? record.summary : undefined,
         duration_ms: typeof record.duration_ms === "number" ? record.duration_ms : undefined,
         status: typeof record.status === "string" ? record.status : undefined,
@@ -3173,13 +3175,13 @@ export default function App() {
                   {displayActivityEvents.map((event, index) => (
                     <div key={`${event.type}-${event.created_at ?? index}`} className="run-detail-item">
                       <div className="run-detail-item-top">
-                        <strong>{event.type.replace(/_/g, " ")}</strong>
+                        <strong>{event.label || event.summary || event.message}</strong>
                         <span>{event.created_at ? formatTimestamp(event.created_at) : ""}</span>
                       </div>
-                      <p>{event.message}</p>
-                      {(event.summary || event.status || event.worker || event.duration_ms !== undefined) && (
+                      <p>{event.message === (event.label || event.summary) ? event.type.replace(/_/g, " ") : event.message}</p>
+                      {(event.type || event.status || event.worker || event.duration_ms !== undefined) && (
                         <small className="muted">
-                          {[event.summary, event.status, event.worker, event.owner_scope, event.duration_ms !== undefined ? `${event.duration_ms} ms` : ""]
+                          {[event.type.replace(/_/g, " "), event.status, event.worker, event.owner_scope, event.duration_ms !== undefined ? `${event.duration_ms} ms` : ""]
                             .filter(Boolean)
                             .join(" · ")}
                         </small>

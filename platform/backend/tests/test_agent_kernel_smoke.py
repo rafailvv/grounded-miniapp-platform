@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from app.ai.openai_client import OpenAIClient
 from app.ai.model_registry import CODEX_MINI_MODEL, models_for_role
 from app.models.common import GenerationMode
-from app.models.domain import CheckExecutionRecord, CreateRunRequest, DraftAction, RunCheckResult, WorkspaceRecord, utc_now
+from app.models.domain import CheckExecutionRecord, CreateRunRequest, DraftAction, JobRecord, RunCheckResult, WorkspaceRecord, utc_now
 from app.models.hooks import HookContext
 from app.modules.miniapp_agent_loop.agent_file_state import AgentFileStateCache
 from app.modules.miniapp_agent_loop.agent_command_policy import DEFAULT_COMMAND_POLICY, AgentCommandPolicy, decide_workspace_command
@@ -25,6 +25,7 @@ from app.modules.miniapp_agent_loop.agent_tool_call_loop import AgentToolCallLoo
 from app.modules.miniapp_agent_loop.agent_transcript import AgentTranscriptStore
 from app.modules.miniapp_agent_loop.agent_tool_registry import AgentToolRegistry
 from app.modules.miniapp_agent_loop.agent_tool_changes import file_changes_from_mutating_tool_calls
+from app.modules.miniapp_agent_loop.tool_batch_summary import summarize_tool_batch
 from app.modules.miniapp_agent_loop.tool_router import ToolRouter, ToolRouterContext
 from app.modules.miniapp_agent_loop.tool_orchestrator import ToolOrchestrationRequest, ToolOrchestrator
 from app.modules.miniapp_agent_loop.diagnostics_delta import AgentDiagnosticsDelta
@@ -1380,6 +1381,76 @@ def test_agent_tools_batch_reads_and_serialize_mutations() -> None:
     ]
 
 
+def test_tool_batch_summary_generates_user_visible_action_labels() -> None:
+    cases = [
+        (
+            [{"tool": "read_files", "targets": ["miniapp/app/main.py"]}],
+            [{"status": "completed"}],
+            "completed",
+            "Read app context",
+        ),
+        (
+            [{"tool": "search_files", "targets": ["miniapp/app/routes"]}],
+            [{"status": "completed"}],
+            "completed",
+            "Searched routes",
+        ),
+        (
+            [{"tool": "semantic_scan", "targets": ["miniapp/app"]}],
+            [{"status": "completed"}],
+            "completed",
+            "Scanned source semantics",
+        ),
+        (
+            [{"tool": "run_command", "command": "npm run build"}],
+            [{"status": "completed"}],
+            "completed",
+            "Ran build",
+        ),
+        (
+            [{"tool": "run_checks", "targets": ["pytest"]}],
+            [{"status": "completed"}],
+            "completed",
+            "Ran tests",
+        ),
+        (
+            [{"tool": "browser_verify", "targets": ["/client"]}],
+            [{"status": "completed"}],
+            "completed",
+            "Ran browser smoke",
+        ),
+        (
+            [{"tool": "write_file", "file_path": "miniapp/app/routes/inventory_api.py"}],
+            [{"status": "deferred", "deferred_changes": [{"file_path": "miniapp/app/routes/inventory_api.py", "operation": "replace"}]}],
+            "completed",
+            "Updated inventory API",
+        ),
+        (
+            [{"tool": "apply_patch_to_draft", "file_path": "miniapp/app/static/client/mobile-overflow.css"}],
+            [{"status": "deferred", "deferred_changes": [{"file_path": "miniapp/app/static/client/mobile-overflow.css", "operation": "patch"}]}],
+            "completed",
+            "Patched mobile overflow",
+        ),
+        (
+            [{"tool": "browser_verify", "targets": ["/client"]}],
+            [{"status": "failed"}],
+            "completed",
+            "Failed browser smoke",
+        ),
+        (
+            [{"tool": "run_checks", "targets": ["pytest"]}],
+            [{"status": "completed", "failed_checks": [{"name": "pytest"}]}],
+            "completed",
+            "Checks need repair",
+        ),
+    ]
+
+    for requests, results, status, expected_label in cases:
+        summary = summarize_tool_batch(batch_id="batch_1", requests=requests, results=results, duration_ms=7, status=status)
+        assert summary["label"] == expected_label
+        assert summary["summary"] == expected_label
+
+
 def test_agent_registry_exposes_real_openai_tool_contract() -> None:
     tools = AgentToolRegistry.openai_tools()
     encoded = json.dumps(tools)
@@ -1486,6 +1557,41 @@ def test_tool_registry_contract_exposes_governed_canonical_specs() -> None:
 
 
 def test_tool_router_normalizes_alias_and_returns_typed_envelope(tmp_path: Path) -> None:
+    activities: list[dict[str, object]] = []
+    context = _router_context(tmp_path)
+    context = replace(context, append_activity=lambda kind, label, details: activities.append({"kind": kind, "label": label, "details": details}))
+    router = ToolRouter(context)
+
+    result = router.route_batch(
+        [
+            {
+                "tool": "read_files",
+                "tool_use_id": "read_1",
+                "targets": ["miniapp/app/static/client/app.js"],
+                "reason": "inspect",
+            }
+        ]
+    )
+
+    read_result = result.model_results[1]
+    envelope = read_result["envelope"]
+    summary_event = next(item for item in activities if item["kind"] == "tool_use_summary")
+    assert summary_event["label"] == "Read app context"
+    assert summary_event["details"]["label"] == "Read app context"  # type: ignore[index]
+    assert summary_event["details"]["summary"] == "Read app context"  # type: ignore[index]
+    assert result.loaded_context["miniapp/app/static/client/app.js"] == "console.log('ok');\n"
+    assert read_result["tool_use_id"] == "read_1"
+    assert envelope["tool_call_id"] == "read_1"  # type: ignore[index]
+    assert envelope["tool"] == "file.read"  # type: ignore[index]
+    assert envelope["status"] == "completed"  # type: ignore[index]
+    assert envelope["approval"]["class"] == "none"  # type: ignore[index]
+    assert envelope["capabilities"]  # type: ignore[index]
+    assert envelope["parallel_safe"] is True  # type: ignore[index]
+    assert envelope["side_effect_class"] == "read_workspace"  # type: ignore[index]
+    assert envelope["result_summary"]["counts"]["files_count"] == 1  # type: ignore[index]
+
+
+def test_tool_router_batch_summary_activity_includes_label(tmp_path: Path) -> None:
     router = ToolRouter(_router_context(tmp_path))
 
     result = router.route_batch(
@@ -1511,6 +1617,36 @@ def test_tool_router_normalizes_alias_and_returns_typed_envelope(tmp_path: Path)
     assert envelope["parallel_safe"] is True  # type: ignore[index]
     assert envelope["side_effect_class"] == "read_workspace"  # type: ignore[index]
     assert envelope["result_summary"]["counts"]["files_count"] == 1  # type: ignore[index]
+
+
+def test_runtime_activity_promotes_tool_summary_label_to_top_level(monkeypatch) -> None:
+    runtime = WorkspaceCodeAgentRuntime.__new__(WorkspaceCodeAgentRuntime)
+    runtime.store = SimpleNamespace(get=lambda *args, **kwargs: None)
+    stored_reports: dict[str, dict[str, object]] = {}
+    monkeypatch.setattr(runtime, "_store_report", lambda key, payload: stored_reports.setdefault(key, payload))
+    monkeypatch.setattr(runtime, "_append_trace_bundle_event", lambda *args, **kwargs: None)
+    job = JobRecord(
+        workspace_id="ws_activity",
+        linked_run_id="run_activity",
+        prompt="Build inventory flow",
+        target_platform="telegram_mini_app",
+        preview_profile="telegram_mock",
+    )
+
+    runtime._append_activity(
+        job,
+        "tool_use_summary",
+        "Updated inventory API",
+        {"label": "Updated inventory API", "summary": "Updated inventory API", "status": "completed", "duration_ms": 12},
+        save=False,
+    )
+
+    event = job.agent_activity_events[0]
+    assert event["label"] == "Updated inventory API"
+    assert event["summary"] == "Updated inventory API"
+    assert event["message"] == "Updated inventory API"
+    assert event["status"] == "completed"
+    assert stored_reports["agent_activity:ws_activity:run_activity"]["items"][0]["label"] == "Updated inventory API"  # type: ignore[index]
 
 
 def test_tool_router_spills_large_result_to_output_artifact_writer(tmp_path: Path, monkeypatch) -> None:

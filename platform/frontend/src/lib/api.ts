@@ -109,6 +109,7 @@ export type Run = {
     phase?: string;
     elapsed_ms?: number;
     artifact_ref?: string | null;
+    label?: string;
     summary?: string;
     duration_ms?: number;
     status?: string;
@@ -226,6 +227,7 @@ export type RunArtifacts = {
     phase?: string;
     elapsed_ms?: number;
     artifact_ref?: string | null;
+    label?: string;
     summary?: string;
     duration_ms?: number;
     status?: string;

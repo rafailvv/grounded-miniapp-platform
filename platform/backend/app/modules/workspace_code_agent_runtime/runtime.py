@@ -8376,7 +8376,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             "sequence": len(job.agent_activity_events) + 1,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
-        for key in ("batch_id", "worker", "owner_scope", "summary", "duration_ms", "status"):
+        for key in ("batch_id", "worker", "owner_scope", "label", "summary", "duration_ms", "status"):
             if key in payload:
                 event[key] = payload.get(key)
         for key in ("tool_use_id", "worker_id", "phase", "elapsed_ms", "artifact_ref", "hook", "semantic_status"):
