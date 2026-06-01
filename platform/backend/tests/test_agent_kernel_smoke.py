@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from app.ai.openai_client import OpenAIClient
 from app.ai.model_registry import CODEX_MINI_MODEL, models_for_role
 from app.models.common import GenerationMode
-from app.models.domain import CheckExecutionRecord, CreateRunRequest, DraftAction, JobRecord, RunCheckResult, WorkspaceRecord, utc_now
+from app.models.domain import CheckExecutionRecord, CreateRunRequest, DraftAction, JobRecord, RunCheckResult, RunRecord, WorkspaceRecord, utc_now
 from app.models.hooks import HookContext
 from app.modules.miniapp_agent_loop.agent_file_state import AgentFileStateCache
 from app.modules.miniapp_agent_loop.agent_command_policy import DEFAULT_COMMAND_POLICY, AgentCommandPolicy, decide_workspace_command
@@ -442,6 +442,44 @@ document.getElementById("client-form")?.addEventListener("submit", async (event)
     issues = CheckRunner._frontend_role_wiring_issues(source_dir / "miniapp/app/static")
 
     assert "platform.workflow_form_field_value_not_used" not in [issue.code for issue in issues]
+
+
+def test_fast_scaffold_client_form_keeps_form_reference_across_await() -> None:
+    ui_copy = WorkspaceCodeAgentRuntime._fast_ui_copy("Client books a rental request.", "rental request")
+    source = WorkspaceCodeAgentRuntime._fast_role_js(
+        "client",
+        "Client books a rental request.",
+        "rental request",
+        ["contact details", "date"],
+        ["new", "completed"],
+        ui_copy,
+    )
+
+    assert "const form = event.currentTarget;" in source
+    assert "window.MiniApp.formData(form)" in source
+    assert "form.reset();" in source
+    assert "event.currentTarget.reset()" not in source
+
+
+def test_fast_scaffold_ui_copy_uses_prompt_domain_not_internal_labels() -> None:
+    prompt = "I run a small consulting practice and need a mini-application for booking consultations."
+
+    resource = WorkspaceCodeAgentRuntime._fast_prompt_resource_label(prompt, prompt_analysis={"resource_hint": "request"})
+    ui_copy = WorkspaceCodeAgentRuntime._fast_ui_copy(prompt, resource)
+    source = WorkspaceCodeAgentRuntime._fast_role_js(
+        "client",
+        prompt,
+        resource,
+        ["consultation topic", "preferred time", "contact details"],
+        ["new", "reviewed"],
+        ui_copy,
+    )
+
+    assert resource == "consultation"
+    assert "FAST scaffold" not in source
+    assert "Book consultation" in source
+    assert "Submitted consultations" in source
+    assert "Request submitted" not in source
 
 
 def test_lsp_tool_service_reports_jumpable_changed_file_diagnostics(tmp_path: Path) -> None:
@@ -1794,6 +1832,134 @@ def test_product_blueprint_gate_requires_all_pre_code_sections() -> None:
         "acceptance_proof",
     }
     assert WorkspaceCodeAgentRuntime._product_blueprint_ready(complete)
+
+
+def test_fast_scaffold_blueprint_fills_sparse_contract_without_blocking() -> None:
+    sparse = {
+        "schema": "grounded.product_blueprint.v1",
+        "roles": ["client", "specialist", "manager"],
+        "entities": [],
+        "workflows": [],
+        "api": {},
+        "persistence": {"must_persist": True},
+        "screens": [],
+        "acceptance_proof": {},
+        "missing_sections": ["entities", "workflows", "api", "screens", "acceptance_proof"],
+    }
+
+    blueprint = WorkspaceCodeAgentRuntime._fast_local_scaffold_blueprint(sparse, resource_label="onboarding request")
+
+    assert WorkspaceCodeAgentRuntime._product_blueprint_ready(blueprint)
+    assert blueprint["entities"][0]["name"] == "onboarding request"
+    assert blueprint["api"]["required_endpoints"][0]["path"] == "/api/fast-requests"
+    assert "missing_sections" not in blueprint
+
+
+def test_terminal_job_snapshot_preserves_fast_scaffold_changed_files() -> None:
+    service = RunService.__new__(RunService)
+    run = RunRecord(
+        run_id="run_fast",
+        workspace_id="ws_fast",
+        prompt="Build onboarding flow",
+        intent="edit",
+        generation_mode=GenerationMode.FAST,
+        apply_status="pending",
+        status="running",
+    )
+    job = JobRecord(
+        job_id="job_fast",
+        workspace_id="ws_fast",
+        linked_run_id="run_fast",
+        prompt="Build onboarding flow",
+        target_platform="telegram_mini_app",
+        preview_profile="telegram_mock",
+        status="completed",
+        outcome_kind="applied",
+        fix_targets=[
+            "miniapp/app/routes/fast_requests.py",
+            "miniapp/app/static/client/app.js",
+            "miniapp/app/generated/route_manifest.json",
+        ],
+        apply_result={"revision_id": "rev_applied"},
+    )
+
+    snapshot = RunService._terminal_run_snapshot_from_job(service, run, job)
+
+    assert snapshot is not None
+    assert snapshot.status == "completed"
+    assert snapshot.apply_status == "applied"
+    assert snapshot.touched_files == [
+        "miniapp/app/routes/fast_requests.py",
+        "miniapp/app/static/client/app.js",
+    ]
+    assert snapshot.fix_targets == job.fix_targets
+
+
+def test_apply_completed_draft_keeps_product_touched_files_when_revision_only_has_preview_logs() -> None:
+    service = RunService.__new__(RunService)
+    service.workspace_service = SimpleNamespace(
+        approve_draft=lambda workspace_id, run_id, message: SimpleNamespace(revision_id="rev_result"),
+        discard_draft=lambda workspace_id, run_id: None,
+    )
+    service.enforce_guardian_before_apply = lambda run, source: (True, {})
+    service._save_run = lambda run: None
+    service._append_job_event = lambda *args, **kwargs: None
+    service._record_before_apply_checkpoint = lambda *args, **kwargs: None
+    service._meaningful_paths_between_revisions = lambda **kwargs: [
+        ".sandbox/preview/stdout.log",
+        ".sandbox/preview/stderr.log",
+    ]
+    run = RunRecord(
+        run_id="run_fast",
+        workspace_id="ws_fast",
+        prompt="Build onboarding flow",
+        intent="edit",
+        generation_mode=GenerationMode.FAST,
+        source_revision_id="rev_source",
+        linked_job_id="job_fast",
+        status="running",
+        touched_files=["miniapp/app/routes/fast_requests.py", "miniapp/app/static/client/app.js"],
+    )
+
+    applied = RunService._apply_completed_draft(service, run, message="Apply generated draft.")
+
+    assert applied is True
+    assert run.status == "completed"
+    assert run.apply_status == "applied"
+    assert run.touched_files == ["miniapp/app/routes/fast_requests.py", "miniapp/app/static/client/app.js"]
+
+
+def test_apply_completed_draft_falls_back_to_fix_targets_for_idempotent_fast_apply() -> None:
+    service = RunService.__new__(RunService)
+    service.workspace_service = SimpleNamespace(
+        approve_draft=lambda workspace_id, run_id, message: SimpleNamespace(revision_id="rev_result"),
+        discard_draft=lambda workspace_id, run_id: None,
+    )
+    service.enforce_guardian_before_apply = lambda run, source: (True, {})
+    service._save_run = lambda run: None
+    service._append_job_event = lambda *args, **kwargs: None
+    service._record_before_apply_checkpoint = lambda *args, **kwargs: None
+    service._meaningful_paths_between_revisions = lambda **kwargs: [".sandbox/preview/stdout.log"]
+    run = RunRecord(
+        run_id="run_fast",
+        workspace_id="ws_fast",
+        prompt="Build onboarding flow",
+        intent="edit",
+        generation_mode=GenerationMode.FAST,
+        source_revision_id="rev_source",
+        linked_job_id="job_fast",
+        status="running",
+        fix_targets=[
+            "miniapp/app/routes/fast_requests.py",
+            "miniapp/app/static/client/app.js",
+            "miniapp/app/generated/route_manifest.json",
+        ],
+    )
+
+    applied = RunService._apply_completed_draft(service, run, message="Apply generated draft.")
+
+    assert applied is True
+    assert run.touched_files == ["miniapp/app/routes/fast_requests.py", "miniapp/app/static/client/app.js"]
 
 
 def test_tool_router_spills_large_result_to_output_artifact_writer(tmp_path: Path, monkeypatch) -> None:

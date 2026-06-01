@@ -3536,30 +3536,6 @@ export default function App() {
               <h3>Run Timeline</h3>
               <span>{runs.length} total</span>
             </div>
-            {observabilityReport ? (
-              <div className="observability-strip" aria-label="Workspace observability summary">
-                <div>
-                  <span>Cost</span>
-                  <strong>{formatUsd(observabilityReport.cost.estimated_cost_usd)}</strong>
-                </div>
-                <div>
-                  <span>Green</span>
-                  <strong>{formatRate(observabilityGreenRate(observabilityReport))}</strong>
-                </div>
-                <div>
-                  <span>Repair</span>
-                  <strong>{formatRate(repairRate)}</strong>
-                </div>
-                <div>
-                  <span>p95</span>
-                  <strong>{formatDurationMs(observabilityReport.latency.p95_ms)}</strong>
-                </div>
-                <div className="observability-strip-wide">
-                  <span>Failure</span>
-                  <strong>{dominantFailureClass}</strong>
-                </div>
-              </div>
-            ) : null}
             <div className="run-list">
               {runs.length ? (
                 runs.map((run) => {

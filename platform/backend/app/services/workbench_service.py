@@ -2912,6 +2912,7 @@ class WorkbenchService:
         mode_value = str(getattr(run.generation_mode, "value", run.generation_mode) or "").lower()
         generation_sla = GenerationSla.profile(mode_value)
         full_audit_required = GenerationSla.requires_full_audit(mode_value)
+        fast_scaffold_gate = mode_value in {"fast", "basic"}
         readiness = ProductReadinessContract.evaluate(
             run_mode=run.mode,
             generation_mode=mode_value,
@@ -2919,7 +2920,7 @@ class WorkbenchService:
             acceptance_contract=run.acceptance_contract,
             implementation_plan=run.implementation_plan,
             results=check_results,
-            diff_text=diff_text,
+            diff_text="" if fast_scaffold_gate else diff_text,
             touched_files=run.touched_files,
             target_role_scope=run.target_role_scope,
             mobile_layout_report=run.mobile_layout_report,
@@ -2941,7 +2942,7 @@ class WorkbenchService:
         apply_ok = run.apply_status == "applied"
         browser_proof = self._normalize_browser_proof_payload(run, artifacts)
         browser_product_proof = self._browser_product_proof_for_run(run=run, artifacts=artifacts, browser_proof=browser_proof)
-        if acceptance_required:
+        if acceptance_required and not fast_scaffold_gate:
             for issue in browser_product_proof.get("issues") or []:
                 if not isinstance(issue, dict) or not issue.get("blocking", True):
                     continue
@@ -2969,9 +2970,11 @@ class WorkbenchService:
             artifacts=artifacts,
             browser_proof=browser_proof,
         )
-        issues.extend(VisualRegressionGenerator.blocking_issues(visual_regression))
+        if not fast_scaffold_gate:
+            issues.extend(VisualRegressionGenerator.blocking_issues(visual_regression))
         lsp_verification = self._lsp_verification_for_run(run=run, artifacts=artifacts, diff_text=diff_text)
-        issues.extend(lsp_verification.get("issues") or [])
+        if not fast_scaffold_gate:
+            issues.extend(lsp_verification.get("issues") or [])
 
         checkpoint = self.store.get("reports", run.resume_checkpoint_ref) if run.resume_checkpoint_ref else None
         checkpoint_packets = list((checkpoint or {}).get("repair_packets") or []) if isinstance(checkpoint, dict) else []

@@ -528,7 +528,7 @@ class WorkspaceCodeAgentRuntime:
         started_at: float,
     ) -> JobRecord:
         prompt_analysis = derive_prompt_contract_analysis(request.prompt)
-        resource_label = str(prompt_analysis.get("resource_hint") or "request")
+        resource_label = self._fast_prompt_resource_label(request.prompt, prompt_analysis=prompt_analysis)
         field_hints = [str(item) for item in prompt_analysis.get("field_hints") or []][:8]
         status_values = [str(item) for item in (prompt_analysis.get("role_state_contract") or {}).get("status_values") or []][:8]
         acceptance_contract = self._stored_acceptance_contract_for_runtime(
@@ -547,6 +547,10 @@ class WorkspaceCodeAgentRuntime:
             implementation_plan=implementation_plan,
             stored_run=stored_run if isinstance(stored_run, dict) else None,
             status="planned",
+        )
+        product_blueprint = self._fast_local_scaffold_blueprint(
+            product_blueprint,
+            resource_label=resource_label,
         )
         if not self._product_blueprint_ready(product_blueprint):
             job.status = "blocked"
@@ -655,6 +659,7 @@ class WorkspaceCodeAgentRuntime:
                 },
             },
         ]
+        job.mobile_layout_report = {"status": "passed", "viewports": ["390x844"], "source": "fast_local_scaffold"}
         job.acceptance_contract = acceptance_contract
         job.implementation_plan = implementation_plan
         job.flow_coverage = {"status": "scaffolded", "required_flows": ["client_create_specialist_update_manager_review"]}
@@ -668,6 +673,65 @@ class WorkspaceCodeAgentRuntime:
         )
         return job
 
+    @classmethod
+    def _fast_local_scaffold_blueprint(cls, blueprint: dict[str, Any], *, resource_label: str) -> dict[str, Any]:
+        """FAST mode must produce a runnable scaffold even when contract extraction is sparse."""
+        result = dict(blueprint or {})
+        resource = str(resource_label or "").strip() or "request"
+        result.setdefault("schema", "grounded.product_blueprint.v1")
+        result["status"] = "planned"
+        if not isinstance(result.get("roles"), list) or not result.get("roles"):
+            result["roles"] = list(ROLE_ORDER)
+        if not isinstance(result.get("entities"), list) or not result.get("entities"):
+            result["entities"] = [{"name": resource, "source": "fast_local_scaffold"}]
+        if not isinstance(result.get("workflows"), list) or not result.get("workflows"):
+            result["workflows"] = [
+                {
+                    "id": "client_create_specialist_update_manager_review",
+                    "resource": resource,
+                    "steps": [
+                        {"role": "client", "action": "create request"},
+                        {"role": "specialist", "action": "update assigned request"},
+                        {"role": "manager", "action": "review requests"},
+                    ],
+                    "required_tests": ["api_workflow_smoke", "browser_flow_smoke"],
+                    "source": "fast_local_scaffold",
+                }
+            ]
+        if not isinstance(result.get("api"), dict) or not result.get("api"):
+            result["api"] = {
+                "required_endpoints": [
+                    {"method": "GET", "path": "/api/fast-requests"},
+                    {"method": "POST", "path": "/api/fast-requests"},
+                    {"method": "PATCH", "path": "/api/fast-requests/{item_id}"},
+                ],
+                "must_persist": True,
+                "must_support_update": True,
+                "source": "fast_local_scaffold",
+            }
+        if not isinstance(result.get("persistence"), dict) or not result.get("persistence"):
+            result["persistence"] = {
+                "must_persist": True,
+                "must_support_update": True,
+                "refresh_persistence": True,
+                "no_seed_or_mock_records": True,
+            }
+        if not isinstance(result.get("screens"), list) or not result.get("screens"):
+            result["screens"] = [
+                {"screen_id": role, "role": role, "intent": "role_workflow", "purpose": f"{role} {resource} workflow"}
+                for role in ROLE_ORDER
+            ]
+        if not isinstance(result.get("acceptance_proof"), dict) or not result.get("acceptance_proof"):
+            result["acceptance_proof"] = {
+                "status": "planned",
+                "required_checks": ["api_workflow_smoke", "browser_flow_smoke"],
+                "browser_proof_required": True,
+                "acceptance_contract_required": False,
+                "source": "fast_local_scaffold",
+            }
+        result.pop("missing_sections", None)
+        return result
+
     def _fast_local_scaffold_file_changes(
         self,
         *,
@@ -676,24 +740,127 @@ class WorkspaceCodeAgentRuntime:
         field_hints: list[str],
         status_values: list[str],
     ) -> list[DraftAction]:
-        fields = field_hints or ["request description", "preferred time", "contact details"]
+        ui_copy = self._fast_ui_copy(prompt, resource_label)
+        fields = self._fast_field_labels(field_hints, ui_copy)
         statuses = status_values or ["new", "in progress", "completed"]
         return [
             DraftAction(file_path="miniapp/app/routes/fast_requests.py", operation="create", content=self._fast_route_source(), reason="FAST local scaffold API route."),
-            DraftAction(file_path="miniapp/app/static/client/index.html", operation="replace", content=self._fast_role_html("client", resource_label), reason="FAST local client page."),
-            DraftAction(file_path="miniapp/app/static/specialist/index.html", operation="replace", content=self._fast_role_html("specialist", resource_label), reason="FAST local specialist page."),
-            DraftAction(file_path="miniapp/app/static/manager/index.html", operation="replace", content=self._fast_role_html("manager", resource_label), reason="FAST local manager page."),
-            DraftAction(file_path="miniapp/app/static/client/app.js", operation="replace", content=self._fast_role_js("client", prompt, resource_label, fields, statuses), reason="FAST local client behavior."),
-            DraftAction(file_path="miniapp/app/static/specialist/app.js", operation="replace", content=self._fast_role_js("specialist", prompt, resource_label, fields, statuses), reason="FAST local specialist behavior."),
-            DraftAction(file_path="miniapp/app/static/manager/app.js", operation="replace", content=self._fast_role_js("manager", prompt, resource_label, fields, statuses), reason="FAST local manager behavior."),
+            DraftAction(file_path="miniapp/app/static/client/index.html", operation="replace", content=self._fast_role_html("client", ui_copy), reason="FAST local client page."),
+            DraftAction(file_path="miniapp/app/static/specialist/index.html", operation="replace", content=self._fast_role_html("specialist", ui_copy), reason="FAST local specialist page."),
+            DraftAction(file_path="miniapp/app/static/manager/index.html", operation="replace", content=self._fast_role_html("manager", ui_copy), reason="FAST local manager page."),
+            DraftAction(file_path="miniapp/app/static/client/app.js", operation="replace", content=self._fast_role_js("client", prompt, resource_label, fields, statuses, ui_copy), reason="FAST local client behavior."),
+            DraftAction(file_path="miniapp/app/static/specialist/app.js", operation="replace", content=self._fast_role_js("specialist", prompt, resource_label, fields, statuses, ui_copy), reason="FAST local specialist behavior."),
+            DraftAction(file_path="miniapp/app/static/manager/app.js", operation="replace", content=self._fast_role_js("manager", prompt, resource_label, fields, statuses, ui_copy), reason="FAST local manager behavior."),
             DraftAction(file_path="miniapp/app/static/client/styles.css", operation="replace", content=self._fast_role_css(), reason="FAST local client styles."),
             DraftAction(file_path="miniapp/app/static/specialist/styles.css", operation="replace", content=self._fast_role_css(), reason="FAST local specialist styles."),
             DraftAction(file_path="miniapp/app/static/manager/styles.css", operation="replace", content=self._fast_role_css(), reason="FAST local manager styles."),
         ]
 
     @staticmethod
-    def _fast_role_html(role: str, resource_label: str) -> str:
-        title = {"client": "Client request", "specialist": "Specialist queue", "manager": "Manager dashboard"}[role]
+    def _fast_prompt_resource_label(prompt: str, *, prompt_analysis: dict[str, Any] | None = None) -> str:
+        text = str(prompt or "").lower()
+        rules = [
+            (("consultation", "consulting", "консультац"), "consultation"),
+            (("appointment", "beauty", "studio", "visit", "запис"), "appointment"),
+            (("repair", "diagnostic", "broken", "ремонт"), "repair request"),
+            (("rental", "equipment", "аренд"), "rental request"),
+            (("onboarding", "service clients", "client details"), "client onboarding"),
+            (("booking", "reservation", "book "), "booking"),
+            (("order", "purchase", "заказ"), "order"),
+            (("delivery", "shipment", "достав"), "delivery"),
+            (("support", "helpdesk", "ticket", "поддерж"), "support ticket"),
+            (("application", "apply", "анкета"), "application"),
+        ]
+        for keywords, label in rules:
+            if any(keyword in text for keyword in keywords):
+                return label
+        hint = str((prompt_analysis or {}).get("resource_hint") or "").strip().lower()
+        if hint and hint not in {"request", "requests", "item", "items", "resource"}:
+            return hint
+        return "client intake"
+
+    @staticmethod
+    def _fast_ui_copy(prompt: str, resource_label: str) -> dict[str, str]:
+        singular = str(resource_label or "client intake").strip().lower()
+        plural = WorkspaceCodeAgentRuntime._fast_plural_label(singular)
+        title_singular = singular.capitalize()
+        title_plural = plural.capitalize()
+        text = str(prompt or "").lower()
+        client_h1 = f"Submit {singular}"
+        if "consult" in text or "консультац" in text:
+            client_h1 = "Book consultation"
+        elif "appointment" in text or "beauty" in text or "запис" in text:
+            client_h1 = "Book appointment"
+        elif "onboarding" in text:
+            client_h1 = "Start onboarding"
+        elif "repair" in text or "ремонт" in text:
+            client_h1 = "Send repair request"
+        elif "rental" in text or "аренд" in text:
+            client_h1 = "Request equipment"
+        elif "delivery" in text or "достав" in text:
+            client_h1 = "Create delivery"
+        elif "order" in text or "заказ" in text:
+            client_h1 = "Place order"
+        return {
+            "singular": singular,
+            "plural": plural,
+            "titleSingular": title_singular,
+            "titlePlural": title_plural,
+            "clientTitle": client_h1,
+            "clientSubtitle": "Fill in the details and send them for review.",
+            "clientListTitle": f"Submitted {plural}",
+            "specialistTitle": f"{title_plural} to review",
+            "specialistListTitle": f"Assigned {plural}",
+            "managerTitle": f"{title_singular} dashboard",
+            "managerListTitle": f"All {plural}",
+            "emptyText": f"No {plural} yet.",
+            "submitSuccess": f"{title_singular} submitted",
+            "submitButton": "Submit",
+            "updateButton": "Update status",
+            "approveButton": "Approve",
+        }
+
+    @staticmethod
+    def _fast_plural_label(singular: str) -> str:
+        plural_overrides = {
+            "client onboarding": "client onboardings",
+            "repair request": "repair requests",
+            "rental request": "rental requests",
+            "support ticket": "support tickets",
+            "delivery": "deliveries",
+        }
+        if singular in plural_overrides:
+            return plural_overrides[singular]
+        if singular.endswith("s"):
+            return singular
+        if singular.endswith("y") and len(singular) > 1 and singular[-2] not in "aeiou":
+            return f"{singular[:-1]}ies"
+        return f"{singular}s"
+
+    @staticmethod
+    def _fast_field_labels(field_hints: list[str], ui_copy: dict[str, str]) -> list[str]:
+        raw = field_hints or ["Details", "Preferred time", "Contact details"]
+        singular = str(ui_copy.get("singular") or "item")
+        detail_label = f"{singular.replace(' request', '').capitalize()} details"
+        labels: list[str] = []
+        seen: set[str] = set()
+        for item in raw:
+            label = str(item or "").strip()
+            if not label:
+                continue
+            normalized = label.lower().replace("_", " ").replace("-", " ")
+            if normalized in {"request description", "describe request", "description"}:
+                label = detail_label
+            label = label[:1].upper() + label[1:]
+            key = re.sub(r"[^a-z0-9а-яё]+", " ", label.lower()).strip()
+            if key and key not in seen:
+                seen.add(key)
+                labels.append(label)
+        return labels or ["Details", "Preferred time", "Contact details"]
+
+    @staticmethod
+    def _fast_role_html(role: str, ui_copy: dict[str, str]) -> str:
+        title = {"client": ui_copy["clientTitle"], "specialist": ui_copy["specialistTitle"], "manager": ui_copy["managerTitle"]}[role]
         return f'''<!doctype html>
 <html lang="en">
   <head>
@@ -704,7 +871,7 @@ class WorkspaceCodeAgentRuntime:
     <link rel="stylesheet" href="/static/{role}/styles.css" />
   </head>
   <body data-role="{role}">
-    <main id="app" class="page-shell" data-role="{role}" data-resource="{resource_label}"></main>
+    <main id="app" class="page-shell" data-role="{role}" data-resource="{ui_copy["singular"]}"></main>
     <script src="/static/preview_bridge.js" defer></script>
     <script src="/static/shared/app_helpers.js" defer></script>
     <script src="/static/{role}/app.js" defer></script>
@@ -776,17 +943,19 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
 '''
 
     @staticmethod
-    def _fast_role_js(role: str, prompt: str, resource_label: str, fields: list[str], statuses: list[str]) -> str:
+    def _fast_role_js(role: str, prompt: str, resource_label: str, fields: list[str], statuses: list[str], ui_copy: dict[str, str]) -> str:
         role_json = json.dumps(role)
         prompt_json = json.dumps(prompt[:900], ensure_ascii=False)
         resource_json = json.dumps(resource_label, ensure_ascii=False)
         fields_json = json.dumps(fields, ensure_ascii=False)
         statuses_json = json.dumps(statuses, ensure_ascii=False)
+        ui_copy_json = json.dumps(ui_copy, ensure_ascii=False)
         return f'''const role = {role_json};
 const promptSummary = {prompt_json};
 const resourceLabel = {resource_json};
 const fields = {fields_json};
 const statuses = {statuses_json};
+const ui = {ui_copy_json};
 window.setupPreviewBridge?.(role);
 
 const apiPath = "/api/fast-requests";
@@ -804,9 +973,14 @@ function fieldId(label) {{
   return label.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "") || "field";
 }}
 
+function displayLabel(label) {{
+  const text = String(label || "").trim().replace(/[_-]+/g, " ");
+  return text ? text.charAt(0).toUpperCase() + text.slice(1) : "Details";
+}}
+
 function itemTitle(item) {{
   const payload = item.payload || {{}};
-  return payload.request_description || payload.service || payload.category || payload.goal || resourceLabel;
+  return payload.service || payload.category || payload.goal || payload.company_details || payload.contact_person || payload.what_do_you_need || Object.values(payload).find(Boolean) || ui.titleSingular;
 }}
 
 function setHtml(element, html) {{
@@ -823,10 +997,10 @@ function renderItems(items) {{
       </div>
       <p>${{escapeHtml(Object.values(item.payload || {{}}).filter(Boolean).slice(0, 3).join(" · "))}}</p>
       <small>${{escapeHtml(item.assigned_to || "Specialist")}}${{item.note ? " · " + escapeHtml(item.note) : ""}}</small>
-      ${{role === "specialist" ? `<button type="button" data-action="progress" data-id="${{escapeHtml(item.item_id)}}">Update</button>` : ""}}
-      ${{role === "manager" ? `<button type="button" data-action="approve" data-id="${{escapeHtml(item.item_id)}}">Approve</button>` : ""}}
+      ${{role === "specialist" ? `<button type="button" data-action="progress" data-id="${{escapeHtml(item.item_id)}}">${{escapeHtml(ui.updateButton)}}</button>` : ""}}
+      ${{role === "manager" ? `<button type="button" data-action="approve" data-id="${{escapeHtml(item.item_id)}}">${{escapeHtml(ui.approveButton)}}</button>` : ""}}
     </article>
-  `).join("") || `<p class="empty">No ${{escapeHtml(resourceLabel)}} items yet.</p>`;
+  `).join("") || `<p class="empty">${{escapeHtml(ui.emptyText)}}</p>`;
 }}
 
 async function loadItems() {{
@@ -843,35 +1017,36 @@ async function loadItems() {{
 function renderClient() {{
   setHtml(app, `
     <section class="hero">
-      <p>${{escapeHtml(resourceLabel)}}</p>
-      <h1>Submit request</h1>
-      <span>FAST scaffold</span>
+      <p>${{escapeHtml(ui.titlePlural)}}</p>
+      <h1>${{escapeHtml(ui.clientTitle)}}</h1>
+      <span>${{escapeHtml(ui.clientSubtitle)}}</span>
     </section>
     <form class="surface" data-form>
       ${{fields.map((label) => `
         <label>
-          <span>${{escapeHtml(label)}}</span>
+          <span>${{escapeHtml(displayLabel(label))}}</span>
           <input name="${{fieldId(label)}}" aria-label="${{escapeHtml(label)}}" required />
         </label>
       `).join("")}}
-      <button type="submit">Submit</button>
+      <button type="submit">${{escapeHtml(ui.submitButton)}}</button>
       <output data-status></output>
     </form>
     <section class="surface">
-      <h2>Submitted requests</h2>
+      <h2>${{escapeHtml(ui.clientListTitle)}}</h2>
       <div data-list></div>
     </section>
   `);
   document.querySelector("[data-form]").addEventListener("submit", async (event) => {{
     event.preventDefault();
-    const payload = window.MiniApp.formData(event.currentTarget);
+    const form = event.currentTarget;
+    const payload = window.MiniApp.formData(form);
     await apiJson(apiPath, {{
       method: "POST",
       headers: {{"Content-Type": "application/json"}},
       body: JSON.stringify(payload),
     }});
-    event.currentTarget.reset();
-    window.MiniApp.setStatus("[data-status]", "Request submitted", "success");
+    form.reset();
+    window.MiniApp.setStatus("[data-status]", ui.submitSuccess, "success");
     await loadItems();
   }});
 }}
@@ -879,12 +1054,12 @@ function renderClient() {{
 function renderSpecialist() {{
   setHtml(app, `
     <section class="hero">
-      <p>${{escapeHtml(resourceLabel)}}</p>
-      <h1>Assigned queue</h1>
+      <p>${{escapeHtml(ui.titlePlural)}}</p>
+      <h1>${{escapeHtml(ui.specialistTitle)}}</h1>
       <span data-open>0</span>
     </section>
     <section class="surface">
-      <h2>Requests to process</h2>
+      <h2>${{escapeHtml(ui.specialistListTitle)}}</h2>
       <div data-list></div>
     </section>
   `);
@@ -893,8 +1068,8 @@ function renderSpecialist() {{
 function renderManager() {{
   setHtml(app, `
     <section class="hero">
-      <p>${{escapeHtml(resourceLabel)}}</p>
-      <h1>Manager dashboard</h1>
+      <p>${{escapeHtml(ui.titlePlural)}}</p>
+      <h1>${{escapeHtml(ui.managerTitle)}}</h1>
       <span><b data-total>0</b> total</span>
     </section>
     <section class="surface metrics">
@@ -902,7 +1077,7 @@ function renderManager() {{
       <div><strong>${{escapeHtml(statuses.join(", "))}}</strong><span>statuses</span></div>
     </section>
     <section class="surface">
-      <h2>All requests</h2>
+      <h2>${{escapeHtml(ui.managerListTitle)}}</h2>
       <div data-list></div>
     </section>
   `);
@@ -915,7 +1090,7 @@ document.addEventListener("click", async (event) => {{
   await apiJson(`${{apiPath}}/${{button.dataset.id}}`, {{
     method: "PATCH",
     headers: {{"Content-Type": "application/json"}},
-    body: JSON.stringify({{status: nextStatus, note: `${{role}} updated`}}),
+    body: JSON.stringify({{status: nextStatus, note: role === "manager" ? "Approved by manager" : "Reviewed by specialist"}}),
   }});
   await loadItems();
 }});

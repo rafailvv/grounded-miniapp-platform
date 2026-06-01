@@ -1688,6 +1688,20 @@ class RunService:
         snapshot.iteration_count = max(int(snapshot.iteration_count or 0), len(job.repair_iterations or []))
         snapshot.repair_iterations = list(job.repair_iterations or snapshot.repair_iterations)
         snapshot.repair_issue_signatures = list(job.repair_issue_signatures or snapshot.repair_issue_signatures)
+        snapshot.fix_targets = list(job.fix_targets or snapshot.fix_targets)
+        snapshot.apply_result = dict(job.apply_result or snapshot.apply_result or {})
+        if not snapshot.touched_files:
+            changed_files = snapshot.apply_result.get("changed_files") if isinstance(snapshot.apply_result, dict) else []
+            source_paths = [
+                str(path).strip()
+                for path in [*(changed_files if isinstance(changed_files, list) else []), *snapshot.fix_targets]
+                if str(path).strip()
+            ]
+            snapshot.touched_files = [
+                path
+                for path in list(dict.fromkeys(source_paths))
+                if self._is_meaningful_source_path(path)
+            ]
         snapshot.prompt_contract_ref = job.prompt_contract_ref or snapshot.prompt_contract_ref
         snapshot.product_blueprint_ref = job.product_blueprint_ref or snapshot.product_blueprint_ref
         snapshot.product_blueprint = dict(job.product_blueprint or snapshot.product_blueprint)
@@ -2564,6 +2578,8 @@ class RunService:
             if isinstance(post_apply_checks, dict) and post_apply_checks.get("results")
             else self.code_agent_runtime.current_report(workspace_id, "check_results")
         )
+        if not (check_results_payload or {}).get("items") and getattr(job, "executed_checks", None):
+            check_results_payload = {"items": list(job.executed_checks or [])}
         if not patch_payload and effective_diff.strip():
             patch_paths = self._paths_from_diff(effective_diff)
             if not patch_paths:
@@ -3402,6 +3418,7 @@ class RunService:
         self._record_before_apply_checkpoint(run, source="auto_apply")
         revision = self.workspace_service.approve_draft(run.workspace_id, run.run_id, f"Auto-apply AI draft for run {run.run_id}")
         self.workspace_service.discard_draft(run.workspace_id, run.run_id)
+        pre_clear_targets = list(run.fix_targets or [])
         run.result_revision_id = revision.revision_id
         run.candidate_revision_id = revision.revision_id
         run.status = "completed"
@@ -3419,8 +3436,19 @@ class RunService:
             source_revision_id=run.source_revision_id,
             result_revision_id=run.result_revision_id,
         )
-        if revision_paths:
-            run.touched_files = revision_paths
+        revision_product_paths = [path for path in revision_paths if self._is_product_runtime_source_path(path)]
+        if revision_product_paths:
+            run.touched_files = revision_product_paths
+        else:
+            fallback_product_paths = [
+                path
+                for path in list(dict.fromkeys([*(run.touched_files or []), *pre_clear_targets]))
+                if self._is_product_runtime_source_path(path)
+            ]
+            if fallback_product_paths:
+                run.touched_files = fallback_product_paths
+            elif not any(self._is_product_runtime_source_path(path) for path in run.touched_files):
+                run.touched_files = revision_paths
         self._append_job_event(
             run.linked_job_id,
             "apply_completed",
