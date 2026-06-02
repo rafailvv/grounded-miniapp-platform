@@ -414,6 +414,22 @@ function isCompletedGenerateRun(run?: Run | null): boolean {
   return run.mode !== "fix" && run.status === "completed" && (run.apply_status === "applied" || run.apply_status === "noop");
 }
 
+function getDraftFileContextRunId(run?: Run | null): string {
+  if (!run) {
+    return "";
+  }
+  if (run.status === "awaiting_approval") {
+    return run.run_id;
+  }
+  if (!run.draft_ready || run.draft_status !== "ready") {
+    return "";
+  }
+  if (["applied", "noop", "rolled_back"].includes(run.apply_status)) {
+    return "";
+  }
+  return run.run_id;
+}
+
 type RunIterationView = {
   iteration_id: string;
   assistant_message: string;
@@ -1655,7 +1671,7 @@ export default function App() {
     }
     if (activeTab === "lsp" && workspace?.workspace_id) {
       const activeRun = runs.find((item) => item.run_id === selectedRunId);
-      const runId = activeRun?.draft_ready || activeRun?.status === "awaiting_approval" ? activeRun.run_id : "";
+      const runId = getDraftFileContextRunId(activeRun);
       void getLspDiagnostics(workspace.workspace_id, runId || undefined, { changedOnly: Boolean(runId) })
         .then((report) => {
           if (!cancelled) {
@@ -1679,7 +1695,7 @@ export default function App() {
       return;
     }
     const activeRun = runs.find((item) => item.run_id === selectedRunId);
-    const runId = activeRun?.draft_ready || activeRun?.status === "awaiting_approval" ? activeRun.run_id : "";
+    const runId = getDraftFileContextRunId(activeRun);
     let cancelled = false;
     const timer = window.setTimeout(() => {
       void searchWorkspaceFiles(workspace.workspace_id, fileSearchQuery, runId || undefined)
@@ -1736,7 +1752,7 @@ export default function App() {
       return;
     }
     const activeRun = runs.find((item) => item.run_id === selectedRunId);
-    const runId = activeRun?.draft_ready || activeRun?.status === "awaiting_approval" ? activeRun.run_id : "";
+    const runId = getDraftFileContextRunId(activeRun);
     let cancelled = false;
     void (async () => {
       try {
@@ -1861,7 +1877,47 @@ export default function App() {
         .map((run) => run.run_id),
     [runs],
   );
-  const draftContextRunId = selectedRun?.draft_ready || selectedRun?.status === "awaiting_approval" ? selectedRun.run_id : "";
+  const draftContextRunId = getDraftFileContextRunId(selectedRun);
+
+  useEffect(() => {
+    if (activeTab !== "code" || !workspace?.workspace_id || !selectedPath || !isSupportedEditorPath(selectedPath) || editorIsDirty) {
+      return;
+    }
+    let cancelled = false;
+    const loadSelectedFile = async () => {
+      try {
+        const payload = await request<{ path: string; content: string }>(
+          `/workspaces/${workspace.workspace_id}/files/content?path=${encodeURIComponent(selectedPath)}${
+            draftContextRunId ? `&run_id=${encodeURIComponent(draftContextRunId)}` : ""
+          }`,
+        );
+        if (!cancelled) {
+          setFileContent(payload.content);
+          setOriginalFileContent(payload.content);
+        }
+      } catch {
+        if (!draftContextRunId) {
+          return;
+        }
+        try {
+          const payload = await request<{ path: string; content: string }>(
+            `/workspaces/${workspace.workspace_id}/files/content?path=${encodeURIComponent(selectedPath)}`,
+          );
+          if (!cancelled) {
+            setFileContent(payload.content);
+            setOriginalFileContent(payload.content);
+          }
+        } catch {
+          // Keep the current editor content; do not replace visible code with an empty buffer.
+        }
+      }
+    };
+    void loadSelectedFile();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab, draftContextRunId, editorIsDirty, selectedPath, workspace?.workspace_id]);
+
   const commandPaletteActions = useMemo<CommandPaletteAction[]>(
     () => [
       { id: "slash:generate", label: "/generate", description: "Create the app from the current prompt", disabled: loading || !workspace || !prompt.trim() },
@@ -2098,7 +2154,7 @@ export default function App() {
       }
 
       const selectedRunForTree = nextRuns.find((run) => run.run_id === nextSelectedRunId);
-      const draftTreeRunId = selectedRunForTree?.draft_ready || selectedRunForTree?.status === "awaiting_approval" ? selectedRunForTree.run_id : "";
+      const draftTreeRunId = getDraftFileContextRunId(selectedRunForTree);
       if (draftTreeRunId) {
         try {
           const draftTree = await request<FileEntry[]>(
@@ -2489,9 +2545,22 @@ export default function App() {
       setOriginalFileContent(payload.content);
       setSelectedJumpLine(line || null);
     } catch {
+      if (draftContextRunId) {
+        try {
+          const payload = await request<{ path: string; content: string }>(
+            `/workspaces/${workspace.workspace_id}/files/content?path=${encodeURIComponent(path)}`,
+          );
+          setSelectedPath(path);
+          setFileContent(payload.content);
+          setOriginalFileContent(payload.content);
+          setSelectedJumpLine(line || null);
+          setActiveTab("code");
+          return;
+        } catch {
+          // Fall through to the non-destructive empty state below.
+        }
+      }
       setSelectedPath(path);
-      setFileContent("");
-      setOriginalFileContent("");
       setSelectedJumpLine(line || null);
     }
     setActiveTab("code");
