@@ -626,16 +626,17 @@ class PreviewService:
         return any(any(marker in line for marker in ready_markers) for line in preview.logs[-40:])
 
     def _gate_public_readiness(self, preview: PreviewRecord) -> PreviewRecord:
-        if preview.runtime_mode != "docker" or preview.status != "running" or not preview.url:
+        if preview.runtime_mode not in {"docker", "local"} or preview.status != "running" or not preview.url:
             return preview
-        if preview.proxy_port is None:
+        if preview.runtime_mode == "docker" and preview.proxy_port is None:
             return preview
         if self._http_preview_ready(preview.url):
             return preview
+        self._append_log(preview, f"{preview.runtime_mode.title()} preview runtime was not reachable. Marking preview for restart.")
         preview.url = None
-        preview.status = "starting"
-        preview.stage = "health_check"
-        preview.progress_percent = min(99, max(preview.progress_percent, 92))
+        preview.status = "stopped"
+        preview.stage = "idle"
+        preview.progress_percent = 0
         preview.frontend_url = None
         preview.backend_url = None
         preview.last_error = None

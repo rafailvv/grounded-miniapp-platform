@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
 from app.api.deps import get_container
+from app.api.routes_public_apps import _public_app_url_for_request, _role_urls_for_app
 from app.models.sandbox import SandboxPreviewLifecycle
 from app.services.container import ServiceContainer
 
@@ -51,12 +52,17 @@ def reset_preview(workspace_id: str, container: ServiceContainer = Depends(get_c
 
 
 @router.get("/workspaces/{workspace_id}/preview/url")
-def get_preview_url(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, object]:
+def get_preview_url(
+    workspace_id: str,
+    request: Request,
+    container: ServiceContainer = Depends(get_container),
+) -> dict[str, object]:
     preview = container.preview_service.get(workspace_id)
+    app_url = _public_app_url_for_request(request, workspace_id, container.preview_service.public_app_url(workspace_id, preview))
     return {
-        "url": container.preview_service.public_app_url(workspace_id, preview) or preview.url,
+        "url": app_url or preview.url,
         "runtime_url": preview.url,
-        "role_urls": container.preview_service.public_role_urls(workspace_id, preview),
+        "role_urls": _role_urls_for_app(app_url) if app_url else container.preview_service.public_role_urls(workspace_id, preview),
         "runtime_mode": preview.runtime_mode,
         "status": preview.status,
         "stage": preview.stage,

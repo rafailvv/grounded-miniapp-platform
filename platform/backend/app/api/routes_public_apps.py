@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -34,12 +34,17 @@ TEXTUAL_TYPES = (
 
 
 @router.get("/public/apps/{workspace_id}/links")
-def public_app_links(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, object]:
+def public_app_links(
+    workspace_id: str,
+    request: Request,
+    container: ServiceContainer = Depends(get_container),
+) -> dict[str, object]:
     preview = container.preview_service.get(workspace_id)
+    app_url = _public_app_url_for_request(request, workspace_id, container.preview_service.public_app_url(workspace_id, preview))
     return {
         "workspace_id": workspace_id,
-        "url": container.preview_service.public_app_url(workspace_id, preview) or preview.url,
-        "role_urls": container.preview_service.public_role_urls(workspace_id, preview),
+        "url": app_url or preview.url,
+        "role_urls": _role_urls_for_app(app_url) if app_url else container.preview_service.public_role_urls(workspace_id, preview),
         "runtime_status": preview.status,
         "runtime_mode": preview.runtime_mode,
         "runtime_url": preview.url,
@@ -47,8 +52,12 @@ def public_app_links(workspace_id: str, container: ServiceContainer = Depends(ge
 
 
 @router.get("/apps/{workspace_id}")
-def public_app_root(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> RedirectResponse:
-    base_url = container.preview_service.public_app_url(workspace_id)
+def public_app_root(
+    workspace_id: str,
+    request: Request,
+    container: ServiceContainer = Depends(get_container),
+) -> RedirectResponse:
+    base_url = _public_app_url_for_request(request, workspace_id, container.preview_service.public_app_url(workspace_id))
     if base_url:
         return RedirectResponse(f"{base_url}/client", status_code=307)
     return RedirectResponse(f"/apps/{workspace_id}/client", status_code=307)
@@ -122,6 +131,33 @@ def _response_headers(headers) -> dict[str, str]:
             continue
         returned[key] = value
     return returned
+
+
+def _public_app_url_for_request(request: Request, workspace_id: str, configured_url: str | None = None) -> str | None:
+    configured = (configured_url or "").strip().rstrip("/")
+    host = _request_host(request)
+    if configured and (not host or host == "testserver" or urlparse(configured).netloc.lower() == host.lower()):
+        return configured
+    origin = _request_origin(request)
+    if origin:
+        return f"{origin}/apps/{workspace_id}"
+    return configured or None
+
+
+def _role_urls_for_app(app_url: str) -> dict[str, str]:
+    base_url = app_url.rstrip("/")
+    return {role: f"{base_url}/{role}" for role in ("client", "specialist", "manager")}
+
+
+def _request_origin(request: Request) -> str:
+    scheme = (request.headers.get("x-forwarded-proto") or request.url.scheme or "https").split(",", 1)[0].strip()
+    host = _request_host(request)
+    return f"{scheme}://{host}" if host else ""
+
+
+def _request_host(request: Request) -> str:
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
+    return host.split(",", 1)[0].strip()
 
 
 def _should_rewrite(content_type: str) -> bool:
