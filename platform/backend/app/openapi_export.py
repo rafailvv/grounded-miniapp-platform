@@ -13,7 +13,7 @@ def export_openapi() -> dict[str, object]:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Export the Grounded Platform OpenAPI schema without starting a server.")
+    parser = argparse.ArgumentParser(description="Export the Upmini AI Studio OpenAPI schema without starting a server.")
     parser.add_argument("--output", "-o", type=Path, help="Output JSON path. Writes to stdout when omitted.")
     parser.add_argument("--indent", type=int, default=2)
     args = parser.parse_args(argv)

@@ -511,6 +511,22 @@ class PreviewService:
             return {}
         return {role: f"{preview.url}/{role}" for role in ROLE_ORDER}
 
+    def public_app_url(self, workspace_id: str, preview: PreviewRecord | None = None) -> str | None:
+        if preview is not None and not preview.url:
+            return None
+        base_url = (self.settings.public_miniapp_base_url or "").strip().rstrip("/")
+        if not base_url:
+            return None
+        return f"{base_url}/{workspace_id}"
+
+    def public_role_urls(self, workspace_id: str, preview: PreviewRecord | None = None) -> dict[str, str]:
+        app_url = self.public_app_url(workspace_id, preview)
+        if not app_url:
+            if preview is not None:
+                return self.role_urls_from_preview(preview)
+            return self.role_urls(workspace_id)
+        return {role: f"{app_url}/{role}" for role in ROLE_ORDER}
+
     def runtime_boundary(self, workspace_id: str) -> dict[str, object]:
         preview = self.peek(workspace_id)
         diagnostics: dict[str, object] = {

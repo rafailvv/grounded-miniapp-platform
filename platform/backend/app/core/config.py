@@ -19,6 +19,7 @@ class Settings:
     runtime_dir: Path
     template_dir: Path
     preview_base_url: str = "http://localhost:8000"
+    public_miniapp_base_url: str | None = None
     preview_runtime_mode: str = "docker"
     preview_port_base: int = 16000
     preview_start_timeout_sec: int = 120
@@ -76,6 +77,7 @@ def get_settings(
         runtime_dir=root / "runtime",
         template_dir=root / "runtime" / "templates" / "base-miniapp",
         preview_base_url=preview_base_url,
+        public_miniapp_base_url=os.getenv("PUBLIC_MINIAPP_BASE_URL") or None,
         preview_runtime_mode=os.getenv("PREVIEW_RUNTIME_MODE", "docker"),
         preview_port_base=int(os.getenv("PREVIEW_PORT_BASE", "16000")),
         preview_start_timeout_sec=timeout_profile.preview_start_sec,

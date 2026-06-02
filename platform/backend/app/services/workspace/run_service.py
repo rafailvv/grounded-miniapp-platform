@@ -880,7 +880,22 @@ class RunService:
                 self._store_run_artifacts(run, change_plan, job, preview)
                 payload = self.store.get("reports", f"run_artifacts:{run_id}")
         if not payload:
-            raise KeyError(f"Artifacts not found for run: {run_id}")
+            run = self.get_run(run_id)
+            payload = {
+                "run": run.model_dump(mode="json"),
+                "job": None,
+                "validation": None,
+                "trace": {"entries": []},
+                "iterations": [],
+                "check_results": [],
+                "checks": {"items": []},
+                "patch": {},
+                "diff": "",
+                "preview": {},
+                "draft_preview": {},
+                "missing_artifacts": True,
+            }
+            self.store.upsert("reports", f"run_artifacts:{run_id}", payload)
         run = self.get_run(run_id)
         preview = self.preview_service.get(run.workspace_id)
         preview_payload = self._preview_snapshot(run.workspace_id, preview)

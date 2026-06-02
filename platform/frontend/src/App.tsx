@@ -3418,9 +3418,10 @@ export default function App() {
               <span />
               <span />
             </button>
+            <img className="brand-logo" src="/upminiapp-logo.png" alt="Upmini" />
             <div className="topbar-title">
-              <p className="eyebrow">Agentic Mini-App Workspace</p>
-              <h1 className="topbar-heading">AI draft workspace for grounded mini-app code</h1>
+              <p className="eyebrow">Upmini.app</p>
+              <h1 className="topbar-heading">Upmini AI Studio</h1>
             </div>
           </div>
           <div className="topbar-meta">

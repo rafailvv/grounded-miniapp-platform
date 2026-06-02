@@ -32,7 +32,7 @@ def _request(base_url: str, method: str, path: str, payload: dict[str, Any] | No
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="grounded", description="Grounded Mini-App Platform CLI companion")
+    parser = argparse.ArgumentParser(prog="grounded", description="Upmini AI Studio CLI companion")
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
     sub = parser.add_subparsers(dest="command", required=True)
 

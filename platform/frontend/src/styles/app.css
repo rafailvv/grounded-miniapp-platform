@@ -98,6 +98,14 @@ button:disabled {
   min-width: 0;
 }
 
+.brand-logo {
+  width: 46px;
+  height: 46px;
+  flex: 0 0 auto;
+  border-radius: 14px;
+  box-shadow: 0 14px 36px rgba(16, 24, 40, 0.2);
+}
+
 .topbar-title {
   display: grid;
   gap: 8px;

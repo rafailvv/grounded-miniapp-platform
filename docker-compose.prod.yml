@@ -1,0 +1,82 @@
+name: upmini-ai-studio
+
+services:
+  traefik:
+    image: traefik:latest
+    restart: unless-stopped
+    environment:
+      DOCKER_API_VERSION: "1.44"
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --certificatesresolvers.letsencrypt.acme.email=${LETSENCRYPT_EMAIL:-admin@upmini.app}
+      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.letsencrypt.acme.httpchallenge=true
+      - --certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - letsencrypt:/letsencrypt
+
+  platform-backend:
+    build:
+      context: .
+      dockerfile: platform/backend/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - path: .env.prod
+        required: false
+    environment:
+      PLATFORM_DATA_DIR: /workspace/data
+      PLATFORM_HOST_DATA_DIR: /workspace/data
+      PREVIEW_RUNTIME_MODE: local
+      PREVIEW_BASE_URL: https://${PUBLIC_DOMAIN:-aistudio.upmini.app}
+      PUBLIC_MINIAPP_BASE_URL: https://${PUBLIC_DOMAIN:-aistudio.upmini.app}/apps
+      PREVIEW_PORT_BASE: ${PREVIEW_PORT_BASE:-16000}
+      PREVIEW_START_TIMEOUT_SEC: ${PREVIEW_START_TIMEOUT_SEC:-180}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      OPENAI_CODE_FAST_MODEL: ${OPENAI_CODE_FAST_MODEL:-gpt-5.2-codex}
+      OPENAI_CODE_BALANCED_MODEL: ${OPENAI_CODE_BALANCED_MODEL:-gpt-5.2-codex}
+      OPENAI_CODE_QUALITY_MODEL: ${OPENAI_CODE_QUALITY_MODEL:-gpt-5.2-codex}
+      OPENAI_CODE_REPAIR_MODEL: ${OPENAI_CODE_REPAIR_MODEL:-gpt-5.2-codex}
+      OPENAI_CODE_MAX_MODEL: ${OPENAI_CODE_MAX_MODEL:-gpt-5.2-codex}
+      OPENAI_CODE_MINI_MODEL: ${OPENAI_CODE_MINI_MODEL:-gpt-5.2-codex}
+      OPENAI_CODE_SUMMARY_MODEL: ${OPENAI_CODE_SUMMARY_MODEL:-gpt-4.1-mini}
+    volumes:
+      - platform_data:/workspace/data
+    labels:
+      - traefik.enable=true
+      - traefik.http.services.upmini-backend.loadbalancer.server.port=8000
+      - traefik.http.routers.upmini-backend.rule=Host(`${PUBLIC_DOMAIN:-aistudio.upmini.app}`) && (PathPrefix(`/api`) || PathPrefix(`/workspaces`) || PathPrefix(`/runs`) || PathPrefix(`/system`) || PathPrefix(`/preview`) || PathPrefix(`/apps`) || PathPrefix(`/public`) || PathPrefix(`/health`) || PathPrefix(`/rpc`) || PathPrefix(`/documents`) || PathPrefix(`/export`) || PathPrefix(`/validation`) || PathPrefix(`/files`) || PathPrefix(`/workbench`) || PathPrefix(`/chat`) || PathPrefix(`/tasks`))
+      - traefik.http.routers.upmini-backend.entrypoints=websecure
+      - traefik.http.routers.upmini-backend.tls.certresolver=letsencrypt
+      - traefik.http.routers.upmini-backend.priority=100
+      - traefik.http.routers.upmini-backend.middlewares=upmini-api-strip
+      - traefik.http.middlewares.upmini-api-strip.stripprefix.prefixes=/api
+
+  platform-frontend:
+    build:
+      context: .
+      dockerfile: platform/frontend/Dockerfile
+      args:
+        VITE_PLATFORM_NAME: Upmini AI Studio
+    restart: unless-stopped
+    depends_on:
+      - platform-backend
+    labels:
+      - traefik.enable=true
+      - traefik.http.services.upmini-frontend.loadbalancer.server.port=80
+      - traefik.http.routers.upmini-frontend.rule=Host(`${PUBLIC_DOMAIN:-aistudio.upmini.app}`)
+      - traefik.http.routers.upmini-frontend.entrypoints=websecure
+      - traefik.http.routers.upmini-frontend.tls.certresolver=letsencrypt
+      - traefik.http.routers.upmini-frontend.priority=1
+
+volumes:
+  platform_data:
+  letsencrypt:

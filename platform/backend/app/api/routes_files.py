@@ -17,6 +17,10 @@ def get_file_tree(
 ) -> list[dict[str, str]]:
     try:
         return container.workspace_service.file_tree(workspace_id, run_id=run_id)
+    except FileNotFoundError as exc:
+        if run_id:
+            return container.workspace_service.file_tree(workspace_id)
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except (KeyError, FileNotFoundError) as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 

@@ -54,8 +54,9 @@ def reset_preview(workspace_id: str, container: ServiceContainer = Depends(get_c
 def get_preview_url(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, object]:
     preview = container.preview_service.get(workspace_id)
     return {
-        "url": preview.url,
-        "role_urls": container.preview_service.role_urls_from_preview(preview),
+        "url": container.preview_service.public_app_url(workspace_id, preview) or preview.url,
+        "runtime_url": preview.url,
+        "role_urls": container.preview_service.public_role_urls(workspace_id, preview),
         "runtime_mode": preview.runtime_mode,
         "status": preview.status,
         "stage": preview.stage,

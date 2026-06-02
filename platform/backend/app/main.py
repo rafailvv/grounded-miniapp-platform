@@ -16,6 +16,7 @@ from app.api import (
     routes_export,
     routes_files,
     routes_preview,
+    routes_public_apps,
     routes_rpc,
     routes_runs,
     routes_validation,
@@ -41,9 +42,9 @@ def configure_logging() -> None:
 def create_app(*, repo_root: Path | None = None, data_dir: Path | None = None) -> FastAPI:
     configure_logging()
     app = FastAPI(
-        title="Grounded Mini-App Platform",
+        title="Upmini AI Studio",
         version="0.1.0",
-        description="Research-first grounded mini-app generation platform.",
+        description="AI studio for generating, repairing, validating, and publishing Upmini mini-apps.",
     )
     app.state.container = build_container(repo_root=repo_root, data_dir=data_dir)
     app.add_exception_handler(HTTPException, http_exception_handler)
@@ -96,6 +97,7 @@ def create_app(*, repo_root: Path | None = None, data_dir: Path | None = None) -
     app.include_router(routes_validation.router)
     app.include_router(routes_files.router)
     app.include_router(routes_preview.router)
+    app.include_router(routes_public_apps.router)
     app.include_router(routes_rpc.router)
     app.include_router(routes_export.router)
     app.include_router(routes_workbench.router)

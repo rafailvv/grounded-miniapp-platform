@@ -1,6 +1,6 @@
-# Grounded Mini-App Platform
+# Upmini AI Studio
 
-Grounded Mini-App Platform is a local workbench for generating, repairing, validating, and previewing Telegram-style mini-apps from natural-language product prompts.
+Upmini AI Studio is the AI generation workbench for Upmini.app. It generates, repairs, validates, previews, and publishes Telegram-style mini-apps from natural-language product prompts.
 
 The active runtime is a workspace code agent, not a loose chat-to-code demo:
 
@@ -135,6 +135,14 @@ Runs are intentionally draft-first: generated changes are validated in an isolat
 ## Preview
 
 Preview is managed per workspace and can run locally or through Docker depending on `PREVIEW_RUNTIME_MODE`.
+
+In production, mini-apps are exposed through stable public links under the studio domain:
+
+- `https://aistudio.upmini.app/apps/{workspace_id}/client`
+- `https://aistudio.upmini.app/apps/{workspace_id}/specialist`
+- `https://aistudio.upmini.app/apps/{workspace_id}/manager`
+
+Those links are proxied by the backend to the live preview runtime, so generated apps can keep their normal `/client`, `/manager`, `/specialist`, `/api`, and `/static` paths internally.
 
 For local development, use:
 

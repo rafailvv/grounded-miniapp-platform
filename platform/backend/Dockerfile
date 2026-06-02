@@ -1,16 +1,17 @@
 FROM python:3.12-slim
 
-WORKDIR /app
+WORKDIR /workspace/platform/backend
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends docker.io docker-compose git nodejs npm \
+    && apt-get install -y --no-install-recommends git nodejs npm curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml ./pyproject.toml
-COPY app ./app
+COPY platform/backend/pyproject.toml ./pyproject.toml
+COPY platform/backend/app ./app
+COPY runtime /workspace/runtime
 
 RUN pip install --no-cache-dir -e .
 RUN python -m playwright install --with-deps chromium
