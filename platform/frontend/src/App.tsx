@@ -3162,10 +3162,6 @@ export default function App() {
                   <span>Reasoning</span>
                   <strong>{runTokenUsageValue(selectedRun, "reasoning_tokens")}</strong>
                 </div>
-                <div className="run-detail-card">
-                  <span>Turns</span>
-                  <strong>{runTokenUsageValue(selectedRun, "turn_count")}</strong>
-                </div>
               </div>
             </section>
 
@@ -3294,10 +3290,6 @@ export default function App() {
                   <div className="run-detail-card">
                     <span>Repair phase</span>
                     <strong>{displayFixPhase(selectedRun, failureAnalysis.current_fix_phase ?? selectedRun.current_fix_phase)}</strong>
-                  </div>
-                  <div className="run-detail-card">
-                    <span>Repair turns</span>
-                    <strong>{selectedRun.repair_iterations?.length || 0}</strong>
                   </div>
                   <div className="run-detail-card">
                     <span>Exit code</span>
