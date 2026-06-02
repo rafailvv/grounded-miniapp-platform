@@ -20,6 +20,7 @@ from app.services.workspace.service import WorkspaceService
 
 
 TERMINAL_RUN_STATUSES = {"completed", "failed", "blocked"}
+LIVE_WRITER_INTERVAL_SECONDS = 5.0
 
 
 class ThreadService:
@@ -53,18 +54,33 @@ class ThreadService:
 
     def start_thread(self, *, workspace_id: str, title: str | None = None, metadata: dict[str, Any] | None = None) -> ThreadRecord:
         self.workspace_service.get_workspace(workspace_id)
-        thread = ThreadRecord(workspace_id=workspace_id, title=(title or "Mini-app session").strip() or "Mini-app session", metadata=metadata or {})
+        initial_metadata = dict(metadata or {})
+        initial_metadata.setdefault("protocol", {"protocol_version": "grounded.session_protocol.v1", "session_id_alias": "thread_id"})
+        thread = ThreadRecord(workspace_id=workspace_id, title=(title or "Mini-app session").strip() or "Mini-app session", metadata=initial_metadata)
+        self._refresh_stable_metadata(thread, reason="thread.start")
         self.db.upsert_thread(thread)
         self._append_event(thread.thread_id, None, "thread.started", {"thread": thread.model_dump(mode="json")})
+        self._journal_thread_event(
+            thread.thread_id,
+            None,
+            "session.started",
+            {"session_id": thread.thread_id, "thread": thread.model_dump(mode="json")},
+            actor="system",
+            source_ref=thread.thread_id,
+            idempotency_key=f"session.started:{thread.thread_id}",
+        )
+        self._refresh_stable_metadata(thread, reason="thread.started")
+        self.db.upsert_thread(thread)
         self.event_hub.publish("thread/started", {"thread": thread.model_dump(mode="json")})
         return thread
 
     def list_threads(self, *, workspace_id: str | None = None, include_archived: bool = False, limit: int = 50, cursor: str | None = None) -> dict[str, Any]:
         threads, next_cursor = self.db.list_threads(workspace_id=workspace_id, include_archived=include_archived, limit=limit, cursor=cursor)
+        threads = [self.recover_thread_state(thread.thread_id, emit_event=False) if thread.status == "running" else thread for thread in threads]
         return {"items": [thread.model_dump(mode="json") for thread in threads], "next_cursor": next_cursor}
 
     def read_thread(self, thread_id: str, *, include_events: bool = True) -> ThreadSnapshot:
-        thread = self._get_thread(thread_id)
+        thread = self.recover_thread_state(thread_id, emit_event=False)
         turns = self.db.list_turns(thread_id)
         items = self.db.list_items(thread_id, limit=1000)
         events = self.db.list_events(thread_id, limit=1000) if include_events else []
@@ -78,6 +94,7 @@ class ThreadService:
             "items": [item.model_dump(mode="json") for item in snapshot.items],
             "events": [event.model_dump(mode="json") for event in snapshot.events],
             "compact_boundary": reason == "compaction",
+            "stable_metadata": snapshot.thread.metadata.get("stable_thread") if isinstance(snapshot.thread.metadata, dict) else None,
         }
         record = self.db.insert_thread_snapshot(
             snapshot_id=new_id("snapshot"),
@@ -94,36 +111,54 @@ class ThreadService:
         return {"items": self.db.list_thread_snapshots(thread_id, limit=limit)}
 
     def resume_thread(self, thread_id: str) -> ThreadRecord:
-        thread = self._get_thread(thread_id)
+        thread = self.recover_thread_state(thread_id)
         if thread.archived:
             thread.archived = False
             thread.status = "idle"
             thread.updated_at = self._now()
+            self._refresh_stable_metadata(thread, reason="thread.unarchive")
             self.db.upsert_thread(thread)
+            self._append_event(thread.thread_id, None, "thread.unarchived", {"stable_metadata": thread.metadata.get("stable_thread")})
+        self._resume_live_writer(thread.thread_id)
         self.event_hub.publish("thread/status/changed", {"thread_id": thread.thread_id, "status": thread.status})
         return thread
 
     def fork_thread(self, thread_id: str, *, title: str | None = None) -> ThreadRecord:
-        source = self._get_thread(thread_id)
+        source = self.recover_thread_state(thread_id, emit_event=False)
+        source_snapshot = self.create_snapshot(source.thread_id, reason="fork_source")
         fork = ThreadRecord(
             workspace_id=source.workspace_id,
             title=title or f"{source.title} fork",
             forked_from_thread_id=source.thread_id,
-            metadata={"forked_from_thread_id": source.thread_id},
+            metadata={
+                "forked_from_thread_id": source.thread_id,
+                "fork": {
+                    "schema": "grounded.thread_fork.v1",
+                    "source_thread_id": source.thread_id,
+                    "source_snapshot_id": source_snapshot["snapshot_id"],
+                    "source_stable_metadata": source.metadata.get("stable_thread"),
+                    "created_at": self._now().isoformat(),
+                },
+            },
         )
+        self._refresh_stable_metadata(fork, reason="thread.fork")
         self.db.upsert_thread(fork)
-        self._append_item(fork.thread_id, None, "thread.forked", {"source_thread_id": source.thread_id})
-        self._append_event(fork.thread_id, None, "thread.forked", {"source_thread_id": source.thread_id})
+        payload = {"source_thread_id": source.thread_id, "source_snapshot_id": source_snapshot["snapshot_id"], "stable_metadata": fork.metadata.get("stable_thread")}
+        self._append_item(fork.thread_id, None, "thread.forked", payload)
+        self._append_event(fork.thread_id, None, "thread.forked", payload)
+        self._refresh_stable_metadata(fork, reason="thread.forked")
+        self.db.upsert_thread(fork)
         self.event_hub.publish("thread/started", {"thread": fork.model_dump(mode="json")})
         return fork
 
     def archive_thread(self, thread_id: str) -> ThreadRecord:
-        thread = self._get_thread(thread_id)
+        thread = self.recover_thread_state(thread_id, emit_event=False)
         thread.archived = True
         thread.status = "archived"
         thread.updated_at = self._now()
+        self._refresh_stable_metadata(thread, reason="thread.archive")
         self.db.upsert_thread(thread)
-        self._append_event(thread_id, None, "thread.archived", {})
+        self._append_event(thread_id, None, "thread.archived", {"stable_metadata": thread.metadata.get("stable_thread")})
         self.event_hub.publish("thread/status/changed", {"thread_id": thread_id, "status": "archived"})
         return thread
 
@@ -150,21 +185,43 @@ class ThreadService:
             kind=str(params.get("kind") or "agent"),  # type: ignore[arg-type]
             status="running",
             prompt=prompt,
+            parent_turn_id=params.get("parent_turn_id") or params.get("parentTurnId"),
             started_at=self._now(),
-            metadata={"request": dict(params)},
+            metadata={
+                "request": dict(params),
+                "protocol_version": "grounded.session_protocol.v1",
+                "parent_turn_id": params.get("parent_turn_id") or params.get("parentTurnId"),
+                "resume_from_turn_id": params.get("resume_from_turn_id") or params.get("resumeFromTurnId"),
+                "linked_run_id": None,
+                "started_by": str(params.get("started_by") or params.get("startedBy") or "user"),
+                "artifact_refs": [],
+                "proof_refs": [],
+                "memory_update_refs": [],
+            },
         )
         self.db.insert_turn(turn)
         thread.status = "running"
         thread.current_turn_id = turn.turn_id
         thread.updated_at = self._now()
+        self._refresh_stable_metadata(thread, reason="turn.start")
         self.db.upsert_thread(thread)
         self._append_item(thread.thread_id, turn.turn_id, "user.message", {"content": prompt})
         self._append_event(thread.thread_id, turn.turn_id, "turn.started", {"turn": turn.model_dump(mode="json")})
+        self._journal_thread_event(
+            thread.thread_id,
+            turn.turn_id,
+            "turn.started",
+            {"session_id": thread.thread_id, "turn": turn.model_dump(mode="json")},
+            actor="user",
+            source_ref=turn.turn_id,
+            idempotency_key=f"turn.started:{turn.turn_id}",
+        )
         self.event_hub.publish("turn/started", {"thread_id": thread.thread_id, "turn": turn.model_dump(mode="json")})
 
         run_request = CreateRunRequest(
             prompt=prompt,
             mode=params.get("mode") or "generate",
+            edit_mode=params.get("edit_mode") or "default",
             intent=params.get("intent") or "auto",
             apply_strategy=params.get("apply_strategy") or "staged_auto_apply",
             target_role_scope=list(params.get("target_role_scope") or []),
@@ -177,9 +234,30 @@ class ThreadService:
         )
         run = self.run_service.create_run(thread.workspace_id, run_request)
         turn.linked_run_id = run.run_id
+        turn.metadata["linked_run_id"] = run.run_id
+        turn.metadata["artifact_refs"] = [{"kind": "run_artifacts", "ref": f"run_artifacts:{run.run_id}"}]
+        turn.metadata["proof_refs"] = [{"kind": "latest_check", "ref": f"latest_check_execution:{run.run_id}"}]
+        turn.metadata["memory_update_refs"] = [{"kind": "memory_stage1", "ref": f"memory_stage1:{run.workspace_id}:{run.run_id}"}]
         turn.metadata["run"] = run.model_dump(mode="json")
         self.db.insert_turn(turn)
         self._append_item(thread.thread_id, turn.turn_id, "run.linked", {"run": run.model_dump(mode="json")})
+        self._journal_thread_event(
+            thread.thread_id,
+            turn.turn_id,
+            "run.linked",
+            {"session_id": thread.thread_id, "turn_id": turn.turn_id, "run_id": run.run_id, "run": run.model_dump(mode="json")},
+            actor="system",
+            source_ref=run.run_id,
+            idempotency_key=f"run.linked:{turn.turn_id}:{run.run_id}",
+        )
+        self._journal_run_protocol(
+            run.run_id,
+            "run.started",
+            {"session_id": thread.thread_id, "turn_id": turn.turn_id, "run_id": run.run_id, "status": run.status, "stage": run.current_stage},
+            summary="Run started for session turn.",
+            idempotency_key=f"run.started:{run.run_id}",
+        )
+        self._write_live_snapshot(thread.thread_id, turn.turn_id, run, reason="turn.start")
         self._ensure_monitor(turn.thread_id, turn.turn_id, run.run_id)
         return turn
 
@@ -195,6 +273,15 @@ class ThreadService:
         self.db.insert_turn(turn)
         self._append_item(thread_id, turn_id, "turn.interrupted", {})
         self._append_event(thread_id, turn_id, "turn.interrupted", {})
+        self._journal_thread_event(
+            thread_id,
+            turn_id,
+            "turn.interrupted",
+            {"session_id": thread_id, "turn_id": turn_id, "run_id": turn.linked_run_id, "status": "interrupted"},
+            actor="system",
+            source_ref=turn_id,
+            idempotency_key=f"turn.interrupted:{turn_id}",
+        )
         self.event_hub.publish("turn/interrupted", {"thread_id": thread_id, "turn": turn.model_dump(mode="json")})
         return turn
 
@@ -270,6 +357,15 @@ class ThreadService:
         self.db.insert_turn(turn)
         self._append_item(thread_id, turn.turn_id, "thread.compaction_summary", summary)
         self._append_event(thread_id, turn.turn_id, "thread.compacted", summary)
+        self._journal_thread_event(
+            thread_id,
+            turn.turn_id,
+            "turn.compacted",
+            {"session_id": thread_id, "turn_id": turn.turn_id, "summary": summary, "status": "completed"},
+            actor="system",
+            source_ref=turn.turn_id,
+            idempotency_key=f"turn.compacted:{turn.turn_id}",
+        )
         self.create_snapshot(thread_id, reason="compaction", turn_id=turn.turn_id)
         return turn
 
@@ -336,6 +432,72 @@ class ThreadService:
         self._append_item(thread_id, turn.turn_id, "review.summary", summary)
         self._append_event(thread_id, turn.turn_id, "review.completed", summary)
         return turn
+
+    def stable_metadata(self, thread_id: str) -> dict[str, Any]:
+        thread = self._get_thread(thread_id)
+        self._refresh_stable_metadata(thread, reason="metadata.read")
+        self.db.upsert_thread(thread)
+        return dict(thread.metadata.get("stable_thread") or {})
+
+    def write_live_snapshot(self, thread_id: str, *, reason: str = "manual") -> dict[str, Any]:
+        thread = self._get_thread(thread_id)
+        if not thread.current_turn_id:
+            raise ValueError("Thread has no current turn to snapshot.")
+        turn = self._get_turn(thread.current_turn_id)
+        if not turn.linked_run_id:
+            raise ValueError("Current turn is not linked to a run.")
+        run = self.run_service.get_run(turn.linked_run_id)
+        return self._write_live_snapshot(thread.thread_id, turn.turn_id, run, reason=reason)
+
+    def recover_thread_state(self, thread_id: str, *, emit_event: bool = True) -> ThreadRecord:
+        thread = self._get_thread(thread_id)
+        changed = False
+        recovery_payload: dict[str, Any] = {"schema": "grounded.thread_recovery.v1", "thread_id": thread_id, "repairs": []}
+        current_turn = self.db.get_turn(thread.current_turn_id) if thread.current_turn_id else None
+        if thread.status == "running" and current_turn is None:
+            thread.status = "idle"
+            thread.current_turn_id = None
+            changed = True
+            recovery_payload["repairs"].append({"kind": "missing_current_turn", "status": "idle"})
+        if current_turn is not None and current_turn.linked_run_id:
+            try:
+                run = self.run_service.get_run(current_turn.linked_run_id)
+            except Exception as exc:
+                if current_turn.status == "running":
+                    current_turn.status = "failed"
+                    current_turn.completed_at = self._now()
+                    current_turn.updated_at = self._now()
+                    self.db.insert_turn(current_turn)
+                    thread.status = "failed"
+                    changed = True
+                    recovery_payload["repairs"].append({"kind": "missing_run", "run_id": current_turn.linked_run_id, "error": str(exc)})
+            else:
+                if current_turn.status == "running" and run.status in TERMINAL_RUN_STATUSES:
+                    status = "completed" if run.status == "completed" else "failed"
+                    current_turn.status = status  # type: ignore[assignment]
+                    current_turn.completed_at = self._now()
+                    current_turn.updated_at = self._now()
+                    self.db.insert_turn(current_turn)
+                    thread.status = "idle" if status == "completed" else "failed"
+                    thread.current_turn_id = current_turn.turn_id
+                    changed = True
+                    recovery_payload["repairs"].append({"kind": "terminal_run", "run_id": run.run_id, "run_status": run.status, "turn_status": status})
+                    self._append_item(thread_id, current_turn.turn_id, f"turn.{status}", {"run": run.model_dump(mode="json"), "recovered": True})
+                elif current_turn.status == "running":
+                    self._write_live_snapshot(thread_id, current_turn.turn_id, run, reason="recovery")
+                    self._ensure_monitor(thread_id, current_turn.turn_id, run.run_id)
+        elif current_turn is not None and current_turn.status in {"completed", "failed", "interrupted"} and thread.status == "running":
+            thread.status = "idle" if current_turn.status == "completed" else "failed"
+            changed = True
+            recovery_payload["repairs"].append({"kind": "terminal_turn", "turn_id": current_turn.turn_id, "turn_status": current_turn.status})
+        self._refresh_stable_metadata(thread, reason="thread.recovery" if changed else "thread.read")
+        if changed:
+            thread.updated_at = self._now()
+        self.db.upsert_thread(thread)
+        if emit_event and changed:
+            recovery_payload["stable_metadata"] = thread.metadata.get("stable_thread")
+            self._append_event(thread_id, current_turn.turn_id if current_turn else None, "thread.recovered", recovery_payload)
+        return thread
 
     def fs_read_file(self, *, workspace_id: str, path: str, run_id: str | None = None) -> dict[str, str]:
         return {"path": path, "content": self.workspace_service.read_file(workspace_id, path, run_id=run_id)}
@@ -477,12 +639,33 @@ class ThreadService:
                 result = item.get("result") if isinstance(item.get("result"), dict) else {}
                 status = str(result.get("status") or item.get("status") or "completed").lower()
                 event_type = "tool.failed" if status in {"failed", "blocked", "error"} else "tool.completed"
+                base_payload = {
+                    **item,
+                    "session_id": run.session_id,
+                    "run_id": run_id,
+                    "turn_id": self._turn_id_for_run(run),
+                    "tool_call_id": item.get("tool_call_id"),
+                    "refs": {
+                        "output_ref": item.get("stdout_ref") or item.get("output_ref"),
+                        "stderr_ref": item.get("stderr_ref"),
+                        "artifact_refs": item.get("artifacts") or [],
+                    },
+                }
+                self.event_journal_service.append_run(
+                    workspace_id=run.workspace_id,
+                    run_id=run_id,
+                    event_type="tool.requested",
+                    actor=f"tool:{item.get('tool') or 'unknown'}",
+                    payload={k: v for k, v in base_payload.items() if k != "result"},
+                    summary=str(item.get("tool") or "Tool requested"),
+                    idempotency_key=f"thread_tool_requested:{run_id}:{item.get('tool_call_id') or item.get('sequence')}",
+                )
                 self.event_journal_service.append_run(
                     workspace_id=run.workspace_id,
                     run_id=run_id,
                     event_type=event_type,
                     actor=f"tool:{item.get('tool') or 'unknown'}",
-                    payload=item,
+                    payload=base_payload,
                     summary=str(item.get("tool") or "Tool event"),
                     idempotency_key=f"thread_tool:{run_id}:{item.get('tool_call_id') or item.get('sequence')}",
                 )
@@ -505,8 +688,18 @@ class ThreadService:
                 return str(item.get("status") or "")
         return None
 
+    def _turn_id_for_run(self, run: Any) -> str | None:
+        session_id = str(getattr(run, "session_id", "") or "")
+        if not session_id:
+            return None
+        for turn in self.db.list_turns(session_id, limit=500):
+            if turn.linked_run_id == getattr(run, "run_id", None):
+                return turn.turn_id
+        return None
+
     def _ensure_monitor(self, thread_id: str, turn_id: str, run_id: str) -> None:
-        if turn_id in self._monitors:
+        existing = self._monitors.get(turn_id)
+        if existing is not None and existing.is_alive():
             return
         worker = threading.Thread(target=self._monitor_run, args=(thread_id, turn_id, run_id), daemon=True)
         self._monitors[turn_id] = worker
@@ -515,13 +708,15 @@ class ThreadService:
     def _monitor_run(self, thread_id: str, turn_id: str, run_id: str) -> None:
         seen_activity = 0
         last_stage = ""
+        last_live_write = 0.0
         while True:
             try:
                 run = self.run_service.get_run(run_id)
             except Exception as exc:
                 self._finish_turn(thread_id, turn_id, "failed", {"error": str(exc)})
                 return
-            if run.current_stage != last_stage:
+            stage_changed = run.current_stage != last_stage
+            if stage_changed:
                 last_stage = run.current_stage
                 self._append_item(
                     thread_id,
@@ -530,12 +725,31 @@ class ThreadService:
                     {"stage": run.current_stage, "progress_percent": run.progress_percent, "run_id": run.run_id},
                     notify_method="item/tool/progress",
                 )
+                self._journal_run_protocol(
+                    run.run_id,
+                    "run.stage_changed",
+                    {"session_id": thread_id, "turn_id": turn_id, "run_id": run.run_id, "status": run.status, "stage": run.current_stage, "progress_percent": run.progress_percent},
+                    summary=run.current_stage,
+                    idempotency_key=f"run.stage:{run.run_id}:{run.current_stage}:{run.progress_percent}",
+                )
             activity = list(run.agent_activity_events or [])
-            for event in activity[seen_activity:]:
+            for offset, event in enumerate(activity[seen_activity:], start=seen_activity + 1):
                 self._append_item(thread_id, turn_id, "agent.activity", {"run_id": run.run_id, **dict(event)}, notify_method="item/tool/progress")
+                self._journal_run_protocol(
+                    run.run_id,
+                    "artifact.created" if dict(event).get("artifact_ref") else "tool.completed",
+                    {"session_id": thread_id, "turn_id": turn_id, "run_id": run.run_id, **dict(event)},
+                    summary=str(dict(event).get("message") or dict(event).get("event_type") or "Agent activity"),
+                    idempotency_key=f"agent.activity:{run.run_id}:{offset}",
+                )
             seen_activity = len(activity)
+            now = time.monotonic()
+            if run.status not in TERMINAL_RUN_STATUSES and (stage_changed or now - last_live_write >= LIVE_WRITER_INTERVAL_SECONDS):
+                self._write_live_snapshot(thread_id, turn_id, run, reason="monitor")
+                last_live_write = now
             if run.status in TERMINAL_RUN_STATUSES:
                 status = "completed" if run.status == "completed" else "failed"
+                self._journal_run_terminal(thread_id=thread_id, turn_id=turn_id, run=run)
                 self._finish_turn(thread_id, turn_id, status, {"run": run.model_dump(mode="json")})
                 return
             time.sleep(1.0)
@@ -549,10 +763,117 @@ class ThreadService:
         thread = self._get_thread(thread_id)
         thread.status = "idle" if status == "completed" else "failed"
         thread.updated_at = self._now()
+        self._refresh_stable_metadata(thread, reason=f"turn.{status}")
         self.db.upsert_thread(thread)
         self._append_item(thread_id, turn_id, f"turn.{status}", payload)
         self._append_event(thread_id, turn_id, f"turn.{status}", payload)
+        self._journal_thread_event(
+            thread_id,
+            turn_id,
+            f"turn.{status}",
+            {"session_id": thread_id, "turn_id": turn_id, "status": status, **payload},
+            actor="system",
+            source_ref=turn_id,
+            idempotency_key=f"turn.{status}:{turn_id}",
+        )
         self.event_hub.publish(f"turn/{status}", {"thread_id": thread_id, "turn": turn.model_dump(mode="json"), **payload})
+
+    def _resume_live_writer(self, thread_id: str) -> None:
+        thread = self._get_thread(thread_id)
+        if not thread.current_turn_id:
+            return
+        turn = self.db.get_turn(thread.current_turn_id)
+        if turn is None or turn.status != "running" or not turn.linked_run_id:
+            return
+        try:
+            run = self.run_service.get_run(turn.linked_run_id)
+        except Exception:
+            return
+        if run.status not in TERMINAL_RUN_STATUSES:
+            self._write_live_snapshot(thread_id, turn.turn_id, run, reason="resume")
+            self._ensure_monitor(thread_id, turn.turn_id, run.run_id)
+
+    def _write_live_snapshot(self, thread_id: str, turn_id: str | None, run: Any, *, reason: str) -> dict[str, Any]:
+        snapshot = {
+            "schema": "grounded.thread_live_writer.v1",
+            "reason": reason,
+            "thread_id": thread_id,
+            "turn_id": turn_id,
+            "run": self._run_live_payload(run),
+            "created_at": self._now().isoformat(),
+        }
+        if not self._should_write_live_snapshot(thread_id, turn_id, reason=reason):
+            return snapshot
+        self._append_item(thread_id, turn_id, "run.live_snapshot", snapshot, notify_method="item/tool/progress")
+        self._append_event(thread_id, turn_id, "run.live_snapshot", snapshot)
+        self._journal_run_protocol(
+            str(run.run_id),
+            "run.snapshot",
+            {"session_id": thread_id, "turn_id": turn_id, "run_id": str(run.run_id), "snapshot": snapshot, "status": str(run.status), "stage": str(getattr(run, "current_stage", ""))},
+            summary=f"Run snapshot: {getattr(run, 'current_stage', '')}",
+            idempotency_key=f"run.snapshot:{run.run_id}:{reason}:{snapshot['created_at']}",
+        )
+        try:
+            self.db.insert_run_state_snapshot(run_id=str(run.run_id), reason=f"thread_live:{reason}", payload=snapshot)
+        except Exception:
+            pass
+        return snapshot
+
+    def _should_write_live_snapshot(self, thread_id: str, turn_id: str | None, *, reason: str) -> bool:
+        if reason in {"manual", "test", "turn.start", "resume"}:
+            return True
+        events = self.db.list_events(thread_id, limit=50)
+        for event in reversed(events):
+            if event.event_type != "run.live_snapshot" or event.turn_id != turn_id:
+                continue
+            elapsed = (self._now() - event.created_at).total_seconds()
+            return elapsed >= LIVE_WRITER_INTERVAL_SECONDS
+        return True
+
+    def _refresh_stable_metadata(self, thread: ThreadRecord, *, reason: str) -> dict[str, Any]:
+        persisted = self.db.get_thread(thread.thread_id)
+        turns = self.db.list_turns(thread.thread_id, limit=500) if persisted else []
+        items = self.db.list_items(thread.thread_id, limit=1000) if persisted else []
+        events = self.db.list_events(thread.thread_id, limit=1000) if persisted else []
+        latest_turn = turns[-1] if turns else None
+        latest_run_id = latest_turn.linked_run_id if latest_turn else None
+        metadata = dict(thread.metadata or {})
+        metadata["stable_thread"] = {
+            "schema": "grounded.thread_metadata.v1",
+            "thread_id": thread.thread_id,
+            "workspace_id": thread.workspace_id,
+            "title": thread.title,
+            "status": thread.status,
+            "archived": thread.archived,
+            "current_turn_id": thread.current_turn_id,
+            "forked_from_thread_id": thread.forked_from_thread_id,
+            "latest_turn_id": latest_turn.turn_id if latest_turn else None,
+            "latest_run_id": latest_run_id,
+            "turn_count": len(turns),
+            "item_count": len(items),
+            "event_count": len(events),
+            "last_event_sequence": events[-1].sequence if events else 0,
+            "last_item_sequence": items[-1].sequence if items else 0,
+            "updated_reason": reason,
+            "updated_at": self._now().isoformat(),
+        }
+        thread.metadata = metadata
+        return metadata["stable_thread"]
+
+    @staticmethod
+    def _run_live_payload(run: Any) -> dict[str, Any]:
+        return {
+            "run_id": str(run.run_id),
+            "status": str(run.status),
+            "apply_status": str(getattr(run, "apply_status", "")),
+            "current_stage": str(getattr(run, "current_stage", "")),
+            "progress_percent": int(getattr(run, "progress_percent", 0) or 0),
+            "iteration_count": int(getattr(run, "iteration_count", 0) or 0),
+            "summary": getattr(run, "summary", None),
+            "failure_reason": getattr(run, "failure_reason", None),
+            "touched_files": list(getattr(run, "touched_files", []) or [])[:50],
+            "active_tool_uses": list(getattr(run, "active_tool_uses", []) or [])[:20],
+        }
 
     def _append_item(self, thread_id: str, turn_id: str | None, item_type: str, payload: dict[str, Any], *, notify_method: str | None = None) -> ItemRecord:
         item = self.db.append_item(ItemRecord(thread_id=thread_id, turn_id=turn_id, item_type=item_type, payload=payload))
@@ -610,6 +931,66 @@ class ThreadService:
             )
         except Exception:
             pass
+
+    def _journal_run_protocol(
+        self,
+        run_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+        *,
+        actor: str = "system",
+        summary: str = "",
+        source_ref: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> None:
+        if self.event_journal_service is None:
+            return
+        try:
+            run = self.run_service.get_run(run_id)
+            self.event_journal_service.append_run(
+                workspace_id=run.workspace_id,
+                run_id=run_id,
+                event_type=event_type,
+                actor=actor,
+                payload=payload,
+                summary=summary or event_type,
+                source_ref=source_ref,
+                idempotency_key=idempotency_key,
+            )
+        except Exception:
+            pass
+
+    def _journal_run_terminal(self, *, thread_id: str, turn_id: str, run: Any) -> None:
+        refs = {
+            "run_artifacts": f"run_artifacts:{run.run_id}",
+            "latest_check_ref": f"latest_check_execution:{run.run_id}",
+            "browser_proof_ref": getattr(run, "browser_proof_ref", None),
+            "trace_bundle_ref": getattr(run, "trace_bundle_ref", None),
+            "memory_ref": f"memory_stage1:{run.workspace_id}:{run.run_id}",
+        }
+        self._journal_run_protocol(
+            run.run_id,
+            "proof.completed",
+            {"session_id": thread_id, "turn_id": turn_id, "run_id": run.run_id, "status": run.status, "refs": refs},
+            summary="Run proof completed.",
+            idempotency_key=f"proof.completed:{run.run_id}",
+        )
+        self._journal_run_protocol(
+            run.run_id,
+            "run.completed",
+            {"session_id": thread_id, "turn_id": turn_id, "run_id": run.run_id, "status": run.status, "apply_status": run.apply_status, "stage": run.current_stage, "refs": refs},
+            summary=getattr(run, "summary", None) or getattr(run, "failure_reason", None) or f"Run {run.status}.",
+            idempotency_key=f"run.completed:{run.run_id}",
+        )
+        self._journal_thread_event(
+            thread_id,
+            turn_id,
+            "memory.updated",
+            {"session_id": thread_id, "turn_id": turn_id, "run_id": run.run_id, "status": "recorded", "refs": {"memory_ref": refs["memory_ref"]}},
+            actor="system",
+            source_ref=refs["memory_ref"],
+            idempotency_key=f"memory.updated:{turn_id}:{run.run_id}",
+        )
 
     @staticmethod
     def _actor_for_item(item_type: str) -> str:

@@ -202,6 +202,15 @@ class ContextPackBuilder:
             lines.append(summary_text)
         else:
             lines.append("Workspace memory summary (always loaded; retrieve details on demand):")
+        repeated_stats = WorkspaceMemoryPipeline.repeated_failure_stats(payload.get("items") or [])
+        repeated_items = [item for item in repeated_stats.get("items") or [] if isinstance(item, dict)]
+        if repeated_items:
+            lines.append("Repeated failure refs:")
+            for item in repeated_items[:3]:
+                lines.append(
+                    f"- {item.get('failure_signature') or item.get('key')}: count={item.get('count')}; "
+                    f"check={item.get('check_name') or item.get('failure_class') or 'unknown'}"
+                )
         hits_by_id = {
             str((hit.get("item") or {}).get("memory_id") or ""): hit
             for hit in retrieval.get("hits") or []

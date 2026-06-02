@@ -153,7 +153,7 @@ const ROLE_LABELS: Record<RoleKey, string> = {
 
 const DEFAULT_PROMPT = "";
 const ROOT_PREVIEW_PATH = "/";
-const PRODUCT_SLASH_COMMANDS = new Set(["generate", "fix", "polish", "add-flow", "review", "acceptance", "deploy", "babysit-pr", "docs"]);
+const PRODUCT_SLASH_COMMANDS = new Set(["generate", "fix", "polish", "add-flow", "improve", "review", "acceptance", "deploy", "babysit-pr", "docs"]);
 
 function parseProductSlashCommand(value: string): { commandId: string; detail: string } | null {
   const match = value.trim().match(/^\/([a-z-]+)(?:\s+([\s\S]*))?$/i);
@@ -434,6 +434,7 @@ type AgentActivityView = {
   phase?: string;
   elapsed_ms?: number;
   artifact_ref?: string;
+  label?: string;
   summary?: string;
   duration_ms?: number;
   status?: string;
@@ -465,6 +466,7 @@ function normalizeAgentActivityEvents(events: unknown): AgentActivityView[] {
         phase: typeof record.phase === "string" ? record.phase : undefined,
         elapsed_ms: typeof record.elapsed_ms === "number" ? record.elapsed_ms : undefined,
         artifact_ref: typeof record.artifact_ref === "string" ? record.artifact_ref : undefined,
+        label: typeof record.label === "string" ? record.label : undefined,
         summary: typeof record.summary === "string" ? record.summary : undefined,
         duration_ms: typeof record.duration_ms === "number" ? record.duration_ms : undefined,
         status: typeof record.status === "string" ? record.status : undefined,
@@ -1908,6 +1910,7 @@ export default function App() {
   const displayActivityEvents = normalizeAgentActivityEvents(
     runArtifacts?.agent_activity_events?.length ? runArtifacts.agent_activity_events : selectedRun?.agent_activity_events,
   ).slice(-12);
+  const productBlueprint = (runArtifacts?.product_blueprint || selectedRun?.product_blueprint || null) as Record<string, unknown> | null;
   const filesSectionTitle =
     completedGenerateRun && selectedRun?.intent === "create"
       ? "Created files"
@@ -2397,11 +2400,11 @@ export default function App() {
     setLoading(true);
     setError("");
     setStatusMessage("");
-    if (["generate", "fix", "polish", "add-flow"].includes(commandId)) {
+    if (["generate", "fix", "polish", "add-flow", "improve"].includes(commandId)) {
       setPreviewBooting(true);
     }
     try {
-      const commandPrompt = detail || (["generate", "add-flow"].includes(commandId) ? prompt.trim() : "");
+      const commandPrompt = detail || (["generate", "add-flow", "improve"].includes(commandId) ? prompt.trim() : "");
       const execution = await executeSlashCommand(commandId, {
         workspace_id: workspace.workspace_id,
         run_id: selectedRun?.run_id,
@@ -2608,7 +2611,7 @@ export default function App() {
     setCommandPaletteOpen(false);
     if (actionId.startsWith("slash:")) {
       const commandId = actionId.slice("slash:".length);
-      await handleExecuteSlashCommand(commandId, ["generate", "add-flow"].includes(commandId) ? prompt.trim() : "");
+      await handleExecuteSlashCommand(commandId, ["generate", "add-flow", "improve"].includes(commandId) ? prompt.trim() : "");
       return;
     }
     if (actionId === "generate") {
@@ -3173,13 +3176,13 @@ export default function App() {
                   {displayActivityEvents.map((event, index) => (
                     <div key={`${event.type}-${event.created_at ?? index}`} className="run-detail-item">
                       <div className="run-detail-item-top">
-                        <strong>{event.type.replace(/_/g, " ")}</strong>
+                        <strong>{event.label || event.summary || event.message}</strong>
                         <span>{event.created_at ? formatTimestamp(event.created_at) : ""}</span>
                       </div>
-                      <p>{event.message}</p>
-                      {(event.summary || event.status || event.worker || event.duration_ms !== undefined) && (
+                      <p>{event.message === (event.label || event.summary) ? event.type.replace(/_/g, " ") : event.message}</p>
+                      {(event.type || event.status || event.worker || event.duration_ms !== undefined) && (
                         <small className="muted">
-                          {[event.summary, event.status, event.worker, event.owner_scope, event.duration_ms !== undefined ? `${event.duration_ms} ms` : ""]
+                          {[event.type.replace(/_/g, " "), event.status, event.worker, event.owner_scope, event.duration_ms !== undefined ? `${event.duration_ms} ms` : ""]
                             .filter(Boolean)
                             .join(" · ")}
                         </small>
@@ -3189,6 +3192,36 @@ export default function App() {
                 </div>
               ) : (
                 <p className="muted">No agent activity recorded yet.</p>
+              )}
+            </section>
+
+            <section className="run-detail-section">
+              <h4>Product blueprint</h4>
+              {productBlueprint ? (
+                <div className="run-details-grid">
+                  <div className="run-detail-card">
+                    <span>Status</span>
+                    <strong>{String(productBlueprint.status || "planned")}</strong>
+                  </div>
+                  <div className="run-detail-card">
+                    <span>Roles</span>
+                    <strong>{asStringArray(productBlueprint.roles).length}</strong>
+                  </div>
+                  <div className="run-detail-card">
+                    <span>Entities</span>
+                    <strong>{asRecordArray(productBlueprint.entities).length}</strong>
+                  </div>
+                  <div className="run-detail-card">
+                    <span>Workflows</span>
+                    <strong>{asRecordArray(productBlueprint.workflows).length}</strong>
+                  </div>
+                  <div className="run-detail-card">
+                    <span>Screens</span>
+                    <strong>{asRecordArray(productBlueprint.screens).length}</strong>
+                  </div>
+                </div>
+              ) : (
+                <p className="muted">No product blueprint recorded yet.</p>
               )}
             </section>
 
@@ -3503,30 +3536,6 @@ export default function App() {
               <h3>Run Timeline</h3>
               <span>{runs.length} total</span>
             </div>
-            {observabilityReport ? (
-              <div className="observability-strip" aria-label="Workspace observability summary">
-                <div>
-                  <span>Cost</span>
-                  <strong>{formatUsd(observabilityReport.cost.estimated_cost_usd)}</strong>
-                </div>
-                <div>
-                  <span>Green</span>
-                  <strong>{formatRate(observabilityGreenRate(observabilityReport))}</strong>
-                </div>
-                <div>
-                  <span>Repair</span>
-                  <strong>{formatRate(repairRate)}</strong>
-                </div>
-                <div>
-                  <span>p95</span>
-                  <strong>{formatDurationMs(observabilityReport.latency.p95_ms)}</strong>
-                </div>
-                <div className="observability-strip-wide">
-                  <span>Failure</span>
-                  <strong>{dominantFailureClass}</strong>
-                </div>
-              </div>
-            ) : null}
             <div className="run-list">
               {runs.length ? (
                 runs.map((run) => {

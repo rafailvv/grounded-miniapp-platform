@@ -23,6 +23,7 @@ The agent reads the workspace, edits files through draft operations, runs checks
 
 The platform now exposes reusable generation-quality primitives inspired by mature coding-agent workflows:
 
+- Product config contract: `runtime/platform.config.json` defines generation modes, required checks, model profiles, skill activation, browser proof, and SLA policy. Its generated schema is `platform/backend/app/schemas/platform.config.schema.json`.
 - Project instructions: `AGENTS.md` and template `AGENTS.md` are loaded into context summaries.
 - Runtime skill packs: `runtime/skills/*/SKILL.md` provide focused guidance for Telegram product generation, FastAPI persistence, mobile polish, repair, browser proof, and existing-app edits.
 - Persistent workspace memory: `/workspaces/{id}/memory` stores preferences, decisions, known failures, and stale-reference checks.

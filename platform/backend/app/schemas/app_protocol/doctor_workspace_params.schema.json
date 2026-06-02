@@ -1,0 +1,37 @@
+{
+  "$id": "https://grounded.local/schemas/app_protocol/doctor_workspace_params.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "run_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Run Id"
+    },
+    "scope": {
+      "default": "quick",
+      "enum": [
+        "quick",
+        "full"
+      ],
+      "title": "Scope",
+      "type": "string"
+    },
+    "workspace_id": {
+      "title": "Workspace Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspace_id"
+  ],
+  "title": "DoctorWorkspaceParams",
+  "type": "object"
+}

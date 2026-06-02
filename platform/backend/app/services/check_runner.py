@@ -24,6 +24,7 @@ from app.models.common import GenerationMode
 from app.models.artifacts import ValidationIssue
 from app.models.domain import CheckExecutionRecord, RunCheckResult, utc_now
 from app.modules.miniapp_validation.agent_static_validation import AgentStaticValidation
+from app.services.command_canonicalizer import CommandCanonicalizer
 from app.services.workspace.preview_service import PreviewService
 from app.validators.static_analysis import (
     extract_declared_routes,
@@ -437,10 +438,25 @@ class CheckRunner:
                         command="browser/preview flow deferred during focused edit" if focused_details else "browser/preview flow deferred during fast gate",
                         logs=[],
                     ),
+                    RunCheckResult(
+                        name="acceptance_replay_tests",
+                        status="skipped",
+                        details=(
+                            "Replayable acceptance tests were skipped for a focused CSS-only visual edit."
+                            if focused_details
+                            else "Replayable acceptance tests were deferred until acceptance artifacts exist."
+                        ),
+                        command=f"{sys.executable} -m unittest discover -s tests -p test_acceptance.py",
+                        logs=[],
+                    ),
                 ]
             )
             completed_at = utc_now()
             self._cleanup_runtime_database_artifacts(source_dir)
+            results = self._canonicalize_check_results(
+                results,
+                workspace_id=workspace_id,
+            )
             return CheckExecutionRecord(
                 workspace_id=workspace_id,
                 run_id=run_id,
@@ -643,8 +659,28 @@ class CheckRunner:
                 check_profile=check_profile,
             )
 
+        self._emit_check_progress(progress_callback, "acceptance_replay_tests", "started", check_profile=check_profile)
+        acceptance_started = time.perf_counter()
+        acceptance_result = self._run_acceptance_replay_tests(
+            backend_dir,
+            require_present=self._acceptance_replay_files_present(backend_dir),
+        )
+        acceptance_result.duration_ms = int((time.perf_counter() - acceptance_started) * 1000)
+        results.append(acceptance_result)
+        self._emit_check_progress(
+            progress_callback,
+            "acceptance_replay_tests",
+            acceptance_result.status,
+            duration_ms=acceptance_result.duration_ms,
+            check_profile=check_profile,
+        )
+
         completed_at = utc_now()
         self._cleanup_runtime_database_artifacts(source_dir)
+        results = self._canonicalize_check_results(
+            results,
+            workspace_id=workspace_id,
+        )
         return CheckExecutionRecord(
             workspace_id=workspace_id,
             run_id=run_id,
@@ -662,6 +698,39 @@ class CheckRunner:
             and result.status in {"failed", "blocked"}
             for result in results
         )
+
+    @staticmethod
+    def _canonicalize_check_results(
+        results: list[RunCheckResult],
+        *,
+        workspace_id: str,
+    ) -> list[RunCheckResult]:
+        canonicalized: list[RunCheckResult] = []
+        for result in results:
+            if not result.command:
+                canonicalized.append(result)
+                continue
+            logs = "\n".join(str(item) for item in (result.logs or [])[:20])
+            canonical, classification = CommandCanonicalizer.classify_execution(
+                command=result.command,
+                workspace_id=workspace_id,
+                exit_code=result.exit_code,
+                timed_out="timed out" in f"{result.details or ''}\n{logs}".lower(),
+                stdout=logs,
+                stderr=logs,
+                semantic_status=(
+                    "passed"
+                    if result.status == "passed"
+                    else "not_started"
+                    if result.status == "skipped"
+                    else None
+                ),
+            )
+            diagnostics = dict(result.diagnostics or {})
+            diagnostics.setdefault("command_canonical", canonical)
+            diagnostics.setdefault("execution_classification", classification)
+            canonicalized.append(result.model_copy(update={"command_canonical": canonical, "diagnostics": diagnostics}))
+        return canonicalized
 
     @staticmethod
     def _emit_check_progress(
@@ -4101,6 +4170,10 @@ except Exception as exc:
                 location = "miniapp/app/static"
                 code = "platform.frontend_interaction_static"
                 message = next((line for line in result.logs if line.strip()), message)
+            if result.name == "acceptance_replay_tests":
+                location = "tests/acceptance"
+                code = "tests.acceptance_replay"
+                message = next((line for line in reversed(result.logs) if line.strip()), message)
             if result.name in {"generated_app_python_tests", "generated_app_js_tests"}:
                 location = "tests"
                 code = "tests.python_generated_app" if result.name == "generated_app_python_tests" else "tests.js_generated_app"
@@ -4245,7 +4318,7 @@ except Exception as exc:
             return "syntax/build"
         if "platform_invariants" in failed_names or "frontend_interaction_static_smoke" in failed_names:
             return "validator/contract"
-        if "generated_app_python_tests" in failed_names or "generated_app_js_tests" in failed_names:
+        if "generated_app_python_tests" in failed_names or "generated_app_js_tests" in failed_names or "acceptance_replay_tests" in failed_names:
             return "app/runtime_test"
         for result in results:
             if result.name == "browser_flow_smoke" and result.status == "failed":
@@ -4594,6 +4667,43 @@ except Exception as exc:
                     )
                 )
                 continue
+            js_text = ""
+            try:
+                js_text = expected_files["js"].read_text(encoding="utf-8")
+            except OSError:
+                js_text = ""
+            js_marker = cls._js_placeholder_marker(js_text)
+            if js_marker:
+                coverage[role] = {
+                    "status": "placeholder_js",
+                    "marker": js_marker,
+                    "route_count": len(role_routes),
+                    "secondary_route_count": len(secondary_routes),
+                    "routes": role_routes,
+                }
+                issues.append(
+                    ValidationIssue(
+                        code="platform.placeholder_role_js",
+                        message=(
+                            f"{role} role JavaScript is still a platform shell placeholder. "
+                            f"Generate static/{role}/app.js with prompt-derived rendering, form handlers, and /api persistence."
+                        ),
+                        severity="high",
+                        location=f"miniapp/app/static/{role}/app.js",
+                        blocking=True,
+                        repair_recipe={
+                            "recipe_id": "frontend.role_app_js_required",
+                            "required_next_tool": "write_file",
+                            "target_files": [f"miniapp/app/static/{role}/app.js"],
+                            "verification_check": "platform_invariants",
+                            "instruction": (
+                                f"Replace miniapp/app/static/{role}/app.js with real role behavior: render prompt-specific UI, "
+                                "bind visible forms/buttons, send user-provided state to the matching /api route, and refresh visible state."
+                            ),
+                        },
+                    )
+                )
+                continue
             css_text = ""
             try:
                 css_text = expected_files["css"].read_text(encoding="utf-8")
@@ -4615,6 +4725,13 @@ except Exception as exc:
                         severity="high",
                         location=f"miniapp/app/static/{role}/styles.css",
                         blocking=True,
+                        repair_recipe={
+                            "recipe_id": "frontend.role_css_required",
+                            "required_next_tool": "write_file",
+                            "target_files": [f"miniapp/app/static/{role}/styles.css"],
+                            "verification_check": "platform_invariants",
+                            "instruction": f"Replace miniapp/app/static/{role}/styles.css with non-placeholder mobile UI styling for this prompt-specific role.",
+                        },
                     )
                 )
                 continue
@@ -5064,8 +5181,32 @@ except Exception as exc:
         del combined
         css_rule_count = len(re.findall(r"[.#]?[a-z][a-z0-9_-]*\s*\{", css))
         min_rules = 12 if value in {GenerationMode.QUALITY.value, GenerationMode.PRODUCTION.value} else 8
-        quality_structure_ok = value not in {GenerationMode.QUALITY.value, GenerationMode.PRODUCTION.value} or ("@media" in css and ("focus-visible" in css or ":focus" in css))
-        rich_quality_css = value in {GenerationMode.QUALITY.value, GenerationMode.PRODUCTION.value} and css_rule_count >= min_rules + 6
+        generic_reason = CheckRunner._generic_role_design_reason(css, value)
+        if generic_reason:
+            return ValidationIssue(
+                code="platform.generic_mode_design_template",
+                message=(
+                    f"{role} role design uses a generic or FAST-like template for {value} mode ({generic_reason}). "
+                    "Balanced/Quality must use prompt-specific visual profile, role accents, and state styling."
+                ),
+                severity="high",
+                location=f"miniapp/app/static/{role}/styles.css",
+                blocking=True,
+                repair_recipe={
+                    "recipe_id": "frontend.generic_mode_design_template",
+                    "required_next_tool": "write_file",
+                    "target_files": [f"miniapp/app/static/{role}/styles.css"],
+                    "verification_check": "platform_invariants",
+                    "instruction": f"Replace generic CSS in miniapp/app/static/{role}/styles.css with a prompt-specific {value} visual system, including visual-profile marker, palette variables, role accent, responsive/focus styles, and visible states.",
+                },
+            )
+        quality_structure_ok = value not in {GenerationMode.QUALITY.value, GenerationMode.PRODUCTION.value} or (
+            "@media" in css
+            and ("focus-visible" in css or ":focus" in css)
+            and all(marker in css for marker in (".success", ".loading", ".error"))
+            and (".toolbar" in css or ".timeline" in css)
+        )
+        rich_quality_css = value in {GenerationMode.QUALITY.value, GenerationMode.PRODUCTION.value} and css_rule_count >= min_rules + 10 and quality_structure_ok
         if css_rule_count >= min_rules and (quality_structure_ok or rich_quality_css):
             return None
         return ValidationIssue(
@@ -5077,7 +5218,49 @@ except Exception as exc:
             severity="high",
             location=f"miniapp/app/static/{role}/styles.css",
             blocking=True,
+            repair_recipe={
+                "recipe_id": "frontend.mode_design_depth",
+                "required_next_tool": "write_file",
+                "target_files": [f"miniapp/app/static/{role}/styles.css"],
+                "verification_check": "platform_invariants",
+                "instruction": f"Expand miniapp/app/static/{role}/styles.css to meet {value} design depth with real selectors, responsive states, and role-specific layout.",
+            },
         )
+
+    @staticmethod
+    def _generic_role_design_reason(css: str, generation_mode_value: str) -> str | None:
+        if "visual-profile:fast-modern" in css:
+            return "fast baseline marker"
+        old_template_markers = (
+            "background: #f6f7fb",
+            "background: #f6f7f9",
+            "background: #1f2937",
+            ".hero { display: grid; gap: 8px; padding: 18px; border-radius: 8px; background: #1f2937",
+        )
+        if any(marker in css for marker in old_template_markers):
+            return "old scaffold colors/layout"
+        has_profile = "visual-profile:" in css
+        has_role_tokens = "--role-accent" in css and "--surface-tint" in css
+        if not has_profile or not has_role_tokens:
+            generic_selectors = sum(1 for marker in (".hero", ".panel", ".surface", ".item-card", ".request-card") if marker in css)
+            domain_depth = sum(1 for marker in ("--profile-primary", "--profile-secondary", ".empty", ".status", "focus-visible", "@media") if marker in css)
+            if generic_selectors >= 3 and domain_depth < 4:
+                return "generic hero/panel/card shell"
+            if generation_mode_value in {GenerationMode.QUALITY.value, GenerationMode.PRODUCTION.value}:
+                return "missing quality visual profile tokens"
+        return None
+
+    @staticmethod
+    def _js_placeholder_marker(content: str) -> str | None:
+        text = str(content or "")
+        lowered = text.lower()
+        stripped = re.sub(r"\s+", "", lowered)
+        if not stripped:
+            return "empty js"
+        if "setuppreviewbridge" in lowered and len(stripped) < 160:
+            return "preview bridge only"
+        behavior_signals = ("fetch(", "addeventlistener", "queryselector", "replacechildren", "insertadjacenthtml", "innerhtml")
+        return None if sum(1 for signal in behavior_signals if signal in lowered) >= 2 else "insufficient role behavior"
 
     @staticmethod
     def _css_placeholder_marker(content: str) -> str | None:
@@ -5452,6 +5635,22 @@ except Exception as exc:
                     severity="medium" if raw_post_present else "high",
                     location="miniapp/app/static",
                     blocking=not raw_post_present,
+                    repair_recipe={
+                        "recipe_id": "frontend.create_post_api_required",
+                        "required_next_tool": "read_files",
+                        "suggested_tool_after_read": "write_file",
+                        "target_files": [
+                            "miniapp/app/static/client/app.js",
+                            "miniapp/app/static/specialist/app.js",
+                            "miniapp/app/static/manager/app.js",
+                        ],
+                        "verification_check": "platform_invariants",
+                        "instruction": (
+                            "At least one role app.js must bind a visible user input form/control and POST user-provided state "
+                            "to the matching prompt-specific /api route. Manager/specialist role scripts should load and update "
+                            "the same persisted resource when the prompt assigns review/update workflows."
+                        ),
+                    },
                 )
             )
         return issues, {
@@ -6851,6 +7050,91 @@ except Exception as exc:
             if all(left == right or "{param}" in {left, right} or (left.startswith("{") and right.startswith("{")) for left, right in zip(ref_parts, declared_parts)):
                 return True
         return False
+
+    @staticmethod
+    def _acceptance_replay_files_present(backend_dir: Path) -> bool:
+        test_file = backend_dir / "tests" / "test_acceptance.py"
+        acceptance_dir = backend_dir / "tests" / "acceptance"
+        return test_file.exists() or (acceptance_dir.exists() and any(acceptance_dir.glob("*.spec.ts")))
+
+    def _run_acceptance_replay_tests(self, backend_dir: Path, *, require_present: bool = False) -> RunCheckResult:
+        test_file = backend_dir / "tests" / "test_acceptance.py"
+        acceptance_dir = backend_dir / "tests" / "acceptance"
+        specs = sorted(acceptance_dir.glob("*.spec.ts")) if acceptance_dir.exists() else []
+        command_text = f"{sys.executable} -m unittest discover -s tests -p test_acceptance.py"
+        if not test_file.exists() or not specs:
+            return RunCheckResult(
+                name="acceptance_replay_tests",
+                status="failed" if require_present else "skipped",
+                details=(
+                    "Replayable acceptance tests are required because acceptance artifacts exist, but the runner/spec files are incomplete."
+                    if require_present
+                    else "Replayable acceptance tests were not present in the draft workspace."
+                ),
+                command=command_text,
+                logs=[],
+                diagnostics={
+                    "missing_test_file": "tests/test_acceptance.py" if not test_file.exists() else None,
+                    "missing_acceptance_specs": not bool(specs),
+                    "target_files": ["miniapp/tests/test_acceptance.py", "miniapp/tests/acceptance/*.spec.ts", "miniapp/app/static/**", "miniapp/app/routes/**"],
+                }
+                if require_present
+                else {},
+            )
+        install_result = self._install_python_requirements(
+            backend_dir,
+            result_name="acceptance_replay_tests",
+            purpose="Acceptance replay Python dependency",
+        )
+        if install_result is not None:
+            return install_result
+        env = {**os.environ}
+        python_path_parts = [str(backend_dir)]
+        existing_python_path = env.get("PYTHONPATH")
+        if existing_python_path:
+            python_path_parts.append(existing_python_path)
+        env["PYTHONPATH"] = os.pathsep.join(python_path_parts)
+        command = [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test_acceptance.py"]
+        try:
+            result = subprocess.run(
+                command,
+                cwd=backend_dir,
+                capture_output=True,
+                text=True,
+                timeout=int(os.getenv("ACCEPTANCE_REPLAY_TEST_TIMEOUT_SEC", "240")),
+                env=env,
+            )
+        except subprocess.TimeoutExpired as exc:
+            return RunCheckResult(
+                name="acceptance_replay_tests",
+                status="failed",
+                details="Replayable acceptance tests timed out.",
+                command=" ".join(command),
+                logs=self._command_logs("Replayable acceptance tests timed out.", exc.stdout or "", exc.stderr or ""),
+                diagnostics={"target_files": ["miniapp/tests/test_acceptance.py", "miniapp/tests/acceptance/*.spec.ts"]},
+            )
+        if result.returncode != 0:
+            return RunCheckResult(
+                name="acceptance_replay_tests",
+                status="failed",
+                details="Replayable acceptance tests failed for the draft miniapp.",
+                command=" ".join(command),
+                exit_code=result.returncode,
+                logs=self._command_logs("Replayable acceptance tests failed.", result.stdout, result.stderr),
+                diagnostics={
+                    "target_files": ["miniapp/tests/test_acceptance.py", "miniapp/tests/acceptance/*.spec.ts", "miniapp/app/static/**", "miniapp/app/routes/**"],
+                    "acceptance_spec_count": len(specs),
+                },
+            )
+        return RunCheckResult(
+            name="acceptance_replay_tests",
+            status="passed",
+            details="Replayable acceptance tests passed.",
+            command=" ".join(command),
+            exit_code=result.returncode,
+            logs=["Replayable acceptance tests passed."],
+            diagnostics={"acceptance_spec_count": len(specs)},
+        )
 
     def _run_python_app_tests(self, backend_dir: Path, *, require_present: bool = False) -> RunCheckResult:
         test_file = backend_dir / "tests" / "test_generated_app.py"

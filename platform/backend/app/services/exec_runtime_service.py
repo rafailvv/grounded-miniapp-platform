@@ -325,6 +325,7 @@ class ExecRuntimeService:
             workspace_id = str(session.get("workspace_id") or "").strip()
             if not run_id or not workspace_id:
                 return None
+            metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
             return self.output_artifact_service.store_command_output(
                 workspace_id=workspace_id,
                 run_id=run_id,
@@ -335,7 +336,7 @@ class ExecRuntimeService:
                 head_tail=payload.get("head_tail") if isinstance(payload.get("head_tail"), dict) else {},
                 exit_code=payload.get("exit_code") if isinstance(payload.get("exit_code"), int) else None,
                 semantic_status=str(payload.get("semantic_status") or "") or None,
-                metadata={"source": "exec_runtime", "thread_id": session.get("thread_id"), "turn_id": session.get("turn_id")},
+                metadata={"source": "exec_runtime", "thread_id": session.get("thread_id"), "turn_id": session.get("turn_id"), **metadata},
             )
 
         return write

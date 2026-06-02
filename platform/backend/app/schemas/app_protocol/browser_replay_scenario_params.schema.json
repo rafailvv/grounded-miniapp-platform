@@ -1,0 +1,21 @@
+{
+  "$id": "https://grounded.local/schemas/app_protocol/browser_replay_scenario_params.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "scenario_id": {
+      "title": "Scenario Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "run_id",
+    "scenario_id"
+  ],
+  "title": "BrowserReplayScenarioParams",
+  "type": "object"
+}

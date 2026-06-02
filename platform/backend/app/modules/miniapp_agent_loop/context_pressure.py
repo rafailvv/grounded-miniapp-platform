@@ -62,6 +62,12 @@ class AgentContextPressureAnalyzer:
                 "context_pack_retrieval": ((parsed.get("context_pack") or {}).get("retrieval_stats") if isinstance(parsed.get("context_pack"), dict) else {}),
             },
             "context_packs": parsed.get("context_packs"),
+            "transcript": {
+                "normalization": (parsed.get("transcript") or {}).get("normalization") if isinstance(parsed.get("transcript"), dict) else {},
+                "token_budget": (parsed.get("transcript") or {}).get("token_budget") if isinstance(parsed.get("transcript"), dict) else {},
+                "context_fragments": (parsed.get("transcript") or {}).get("context_fragments") if isinstance(parsed.get("transcript"), dict) else [],
+                "ghost_snapshots": (parsed.get("transcript") or {}).get("ghost_snapshots") if isinstance(parsed.get("transcript"), dict) else [],
+            },
             "checks": {
                 "latest_checks": parsed.get("latest_checks"),
                 "diagnostics_delta": parsed.get("diagnostics_delta"),
@@ -81,6 +87,7 @@ class AgentContextPressureAnalyzer:
             {
                 "file_contexts": section_tokens["files"],
                 "tool_results": section_tokens["tool_outputs"],
+                "transcript": section_tokens["transcript"],
                 "agent_memory": section_tokens["memory"],
                 "context_packs": section_tokens["context_packs"],
                 "latest_checks": self._tokens(parsed.get("latest_checks")),

@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from app.models.sandbox import SandboxExecutionPlan, SandboxKillDiagnostics, SandboxLogCapture, SandboxLogStreamCapture
 from app.modules.miniapp_agent_loop.agent_command_policy import CommandPolicyDecision
+from app.services.command_canonicalizer import CommandCanonicalizer
 from app.services.sandbox_service import SandboxService
 
 
@@ -139,6 +140,8 @@ class AgentCommandResult:
     stdout_sha256: str | None = None
     stderr_sha256: str | None = None
     output_artifacts: list[dict[str, Any]] = field(default_factory=list)
+    command_canonical: dict[str, Any] = field(default_factory=dict)
+    execution_classification: dict[str, Any] = field(default_factory=dict)
     sandbox_boundary: dict[str, Any] = field(default_factory=dict)
     environment_snapshot: dict[str, Any] = field(default_factory=dict)
     log_capture: dict[str, Any] = field(default_factory=dict)
@@ -174,6 +177,8 @@ class AgentCommandResult:
             "stdout_sha256": self.stdout_sha256,
             "stderr_sha256": self.stderr_sha256,
             "output_artifacts": list(self.output_artifacts),
+            "command_canonical": dict(self.command_canonical),
+            "execution_classification": dict(self.execution_classification),
             "output_delta_count": self.output_delta_count,
             "policy_decision": self.policy_decision,
         }
@@ -194,19 +199,33 @@ class AgentCommandSemantics:
     """Map diagnostic command exit codes to agent-readable status."""
 
     @staticmethod
-    def classify(*, argv: list[str], exit_code: int | None, timed_out: bool) -> tuple[str, bool]:
-        if timed_out:
-            return "timeout", False
-        if exit_code is None:
-            return "not_started", False
-        executable = Path(argv[0]).name.lower() if argv else ""
-        if exit_code == 0:
-            return "passed", True
-        if executable == "rg" and exit_code == 1:
-            return "no_matches", True
-        if executable == "diff" and exit_code == 1:
-            return "differences_found", True
-        return "failed", False
+    def classify(
+        *,
+        command: str,
+        argv: list[str],
+        exit_code: int | None,
+        timed_out: bool,
+        stdout: str = "",
+        stderr: str = "",
+        workspace_id: str | None = None,
+        semantic_status: str | None = None,
+    ) -> tuple[str, bool, dict[str, Any], dict[str, Any]]:
+        canonical, classification = CommandCanonicalizer.classify_execution(
+            command=command,
+            argv=argv,
+            workspace_id=workspace_id,
+            exit_code=exit_code,
+            timed_out=timed_out,
+            stdout=stdout,
+            stderr=stderr,
+            semantic_status=semantic_status,
+        )
+        return (
+            str(classification.get("semantic_status") or "unknown_failure"),
+            bool(classification.get("success")),
+            canonical,
+            classification,
+        )
 
 
 class AgentProcessManager:
@@ -234,6 +253,7 @@ class AgentProcessManager:
         decision: CommandPolicyDecision,
         timeout_seconds: int,
         max_output_chars: int,
+        workspace_id: str | None = None,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
         yield_time_ms: int = 1000,
         process_id: str | None = None,
@@ -260,6 +280,21 @@ class AgentProcessManager:
         )
         exec_argv = list(plan.wrapped_argv or base_exec_argv)
         policy_payload = self._policy_payload(decision)
+        command_canonical = CommandCanonicalizer.canonicalize(
+            command,
+            argv=list(decision.argv),
+            workspace_id=workspace_id,
+            status_taxonomy="not_started",
+        )
+        execution_classification = {
+            "schema": "grounded.command_execution_classification.v1",
+            "command_family": command_canonical.get("command_family"),
+            "status_taxonomy": "not_started",
+            "semantic_status": "not_started",
+            "success": False,
+            "retry_recipe_id": command_canonical.get("retry_recipe_id"),
+            "failure_hint": "",
+        }
         sandbox_summary = self._sandbox_summary(draft_source=draft_source, cwd=cwd, decision=decision, execution_plan=plan)
         planned_env, tmp_dir, home_dir = self._sandbox_env(cwd, create_dirs=False)
         environment_snapshot_model = self.sandbox_service.environment_snapshot(
@@ -301,6 +336,22 @@ class AgentProcessManager:
             }
 
         def early_result(*, semantic_status: str, error: str, kill_reason: str = "not_started") -> AgentCommandResult:
+            nonlocal command_canonical, execution_classification
+            status_override = (
+                "policy_blocked"
+                if semantic_status == "blocked_by_policy"
+                else "sandbox_blocked"
+                if semantic_status == "blocked_by_sandbox"
+                else semantic_status
+            )
+            command_canonical, execution_classification = CommandCanonicalizer.classify_execution(
+                command=command,
+                argv=list(decision.argv),
+                workspace_id=workspace_id,
+                exit_code=None,
+                timed_out=False,
+                semantic_status=status_override,
+            )
             diagnostics = self._kill_diagnostics(
                 reason=kill_reason,
                 timed_out=False,
@@ -330,6 +381,8 @@ class AgentProcessManager:
                 environment_snapshot=environment_snapshot,
                 log_capture=log_capture,
                 killed_diagnostics=diagnostics,
+                command_canonical=command_canonical,
+                execution_classification=execution_classification,
             )
 
         def emit(payload: dict[str, Any]) -> None:
@@ -429,6 +482,8 @@ class AgentProcessManager:
                 "argv": list(decision.argv),
                 "resolved_argv": exec_argv,
                 "cwd": str(cwd),
+                "command_canonical": command_canonical,
+                "execution_classification": execution_classification,
                 "sandbox": sandbox_summary,
                 "sandbox_boundary": sandbox_boundary,
                 "environment_snapshot": environment_snapshot,
@@ -450,6 +505,8 @@ class AgentProcessManager:
                 "stdout_content": "",
                 "stderr_content": "",
                 "output_delta_count": 0,
+                "command_canonical": command_canonical,
+                "execution_classification": execution_classification,
                 "sandbox": sandbox_summary,
                 "sandbox_boundary": sandbox_boundary,
                 "environment_snapshot": environment_snapshot,
@@ -557,10 +614,14 @@ class AgentProcessManager:
                 else None
             ),
         )
-        semantic_status, success = AgentCommandSemantics.classify(
+        semantic_status, success, command_canonical, execution_classification = AgentCommandSemantics.classify(
+            command=command,
             argv=list(decision.argv),
             exit_code=exit_code,
             timed_out=timed_out,
+            stdout=stdout_buffer.excerpt(),
+            stderr=stderr_buffer.excerpt(),
+            workspace_id=workspace_id,
         )
         duration_ms = int((time.perf_counter() - started) * 1000)
         stdout_artifact = self._write_output_artifact(
@@ -575,6 +636,7 @@ class AgentProcessManager:
             truncated_full=stdout_spool.truncated_full,
             exit_code=exit_code,
             semantic_status=semantic_status,
+            metadata={"command_canonical": command_canonical, "execution_classification": execution_classification},
         )
         stderr_artifact = self._write_output_artifact(
             writer=output_artifact_writer,
@@ -588,6 +650,7 @@ class AgentProcessManager:
             truncated_full=stderr_spool.truncated_full,
             exit_code=exit_code,
             semantic_status=semantic_status,
+            metadata={"command_canonical": command_canonical, "execution_classification": execution_classification},
         )
         output_artifacts = [item for item in (stdout_artifact, stderr_artifact) if isinstance(item, dict)]
         log_capture = self._log_capture(
@@ -607,6 +670,8 @@ class AgentProcessManager:
                 "elapsed_ms": duration_ms,
                 "exit_code": exit_code,
                 "semantic_status": semantic_status,
+                "command_canonical": command_canonical,
+                "execution_classification": execution_classification,
                 "success": success,
                 "sandbox": sandbox_summary,
                 "sandbox_boundary": sandbox_boundary,
@@ -624,6 +689,8 @@ class AgentProcessManager:
                     "status": "completed",
                     "exit_code": exit_code,
                     "semantic_status": semantic_status,
+                    "command_canonical": command_canonical,
+                    "execution_classification": execution_classification,
                     "success": success,
                     "duration_ms": duration_ms,
                     "stdout": stdout_buffer.snapshot(),
@@ -667,6 +734,8 @@ class AgentProcessManager:
             stdout_sha256=stdout_spool.sha256 if stdout_spool.total_chars else None,
             stderr_sha256=stderr_spool.sha256 if stderr_spool.total_chars else None,
             output_artifacts=output_artifacts,
+            command_canonical=command_canonical,
+            execution_classification=execution_classification,
             sandbox_boundary=sandbox_boundary,
             environment_snapshot=environment_snapshot,
             log_capture=log_capture,
@@ -765,6 +834,7 @@ class AgentProcessManager:
         truncated_full: bool,
         exit_code: int | None,
         semantic_status: str,
+        metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         if writer is None or not content:
             return None
@@ -781,6 +851,7 @@ class AgentProcessManager:
                     "truncated_full": truncated_full,
                     "exit_code": exit_code,
                     "semantic_status": semantic_status,
+                    "metadata": dict(metadata or {}),
                 }
             )
         except Exception:

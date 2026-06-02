@@ -1,4 +1,5 @@
 ---
+metadata_schema: grounded.skill.v2
 description: Telegram mobile UX patterns for generated mini-apps.
 whenToUse:
   - telegram mobile ux
@@ -21,10 +22,18 @@ allowedTools:
   - browser_verify
 model: default
 effort: high
+triggerRules:
+  - Match prompts using this skill domain and path scope.
 validation:
   - telegram_mobile_ux
   - mobile_layout
   - browser_flow_smoke
+requiredProof:
+  - Final readiness proof covers this skill.
+incompatibleSkills:
+  - ""
+outputExpectations:
+  - Produce working product changes and cite proof artifacts.
 ---
 # Telegram Mobile UX
 

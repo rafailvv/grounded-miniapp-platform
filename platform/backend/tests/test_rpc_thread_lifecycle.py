@@ -5,6 +5,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from app.main import create_app
+from app.models.domain import RunRecord
 from app.models.threads import ItemRecord, ThreadRecord, TurnRecord
 from app.repositories.platform_db import PlatformDb
 
@@ -128,6 +129,64 @@ def test_rpc_accepts_legacy_param_aliases_paginates_and_dedupes_idempotency(tmp_
         page_two = _receive_response(ws, 6)["result"]
         assert len(page_two["items"]) == 1
         assert page_two["items"][0]["thread_id"] != page_one["items"][0]["thread_id"]
+
+
+def test_rpc_v2_returns_typed_run_worker_and_browser_proof_responses(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "RPC Protocol V2",
+            "description": "Typed protocol response test",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    run = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Build a typed protocol app",
+        intent="create",
+        status="completed",
+        apply_status="applied",
+        current_stage="complete",
+        touched_files=["miniapp/app/static/client/app.js"],
+    )
+    app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+    app.state.container.event_journal_service.append_run(
+        workspace_id=workspace["workspace_id"],
+        run_id=run.run_id,
+        event_type="run.completed",
+        payload={"status": "completed"},
+        summary="Run completed.",
+    )
+
+    with client.websocket_connect("/rpc") as ws:
+        ws.send_json({"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "pytest"}}})
+        _receive_response(ws, 1)
+
+        ws.send_json({"id": 2, "method": "run/events", "params": {"runId": run.run_id}})
+        run_events = _receive_response(ws, 2)["result"]
+        assert run_events["schema"] == "grounded.app_protocol.run_events_response.v2"
+        assert run_events["items"][0]["schema"] == "grounded.app_protocol.event_state.v2"
+        assert run_events["compatibility"]["legacy_endpoint"].endswith("/events-v2")
+
+        ws.send_json({"id": 3, "method": "worker/updates", "params": {"run_id": run.run_id}})
+        workers = _receive_response(ws, 3)["result"]
+        assert workers["schema"] == "grounded.app_protocol.worker_update_response.v2"
+        assert any(item["schema"] == "grounded.app_protocol.worker_update.v2" for item in workers["workers"])
+        assert workers["compatibility"]["legacy_endpoint"].endswith("/workers")
+
+        ws.send_json({"id": 4, "method": "browser/proof", "params": {"run_id": run.run_id}})
+        browser = _receive_response(ws, 4)["result"]
+        assert browser["schema"] == "grounded.app_protocol.browser_proof_response.v2"
+        assert browser["proof"]["schema"] == "grounded.app_protocol.browser_proof_state.v2"
+        assert browser["compatibility"]["legacy_endpoint"].endswith("/browser-proof")
+
+        ws.send_json({"id": 5, "method": "workbench/events", "params": {"workspaceId": workspace["workspace_id"]}})
+        workbench = _receive_response(ws, 5)["result"]
+        assert workbench["schema"] == "grounded.app_protocol.workbench_event_response.v2"
+        assert workbench["protocol_version"] == "v2"
 
 
 def _receive_response(ws, request_id: int) -> dict:

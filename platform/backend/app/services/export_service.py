@@ -81,6 +81,7 @@ class ExportService:
                 candidate_keys = [
                     f"browser_proof:{run_id}",
                     f"browser_proof:{workspace_id}:{run_id}",
+                    f"browser_replay_proof:{workspace_id}:{run_id}",
                     f"final_report:{run_id}",
                     f"gate:{run_id}",
                     f"run_artifacts:{run_id}",
@@ -97,6 +98,20 @@ class ExportService:
                             archive_name = f"screenshots/{run_id}/{len(manifest['screenshots']) + 1:03d}-{path.name}"
                             archive.write(path, archive_name)
                             manifest["screenshots"].append({"run_id": run_id, "source": str(path), "archive_path": archive_name})
+                        if key.startswith("browser_replay_proof:"):
+                            for scenario in payload.get("scenarios") or []:
+                                if not isinstance(scenario, dict):
+                                    continue
+                                scenario_id = str(scenario.get("scenario_id") or "scenario")
+                                archive.writestr(f"replay/{run_id}/{scenario_id}.json", json.dumps(scenario, indent=2, default=str))
+                                if scenario.get("playwright_spec"):
+                                    archive.writestr(f"playwright/{run_id}/{scenario_id}.spec.ts", str(scenario.get("playwright_spec") or ""))
+                                for index, snapshot in enumerate(scenario.get("dom_snapshot_refs") or [], start=1):
+                                    archive.writestr(f"dom/{run_id}/{scenario_id}-{index:03d}.json", json.dumps(snapshot, indent=2, default=str))
+                                if scenario.get("console_logs"):
+                                    archive.writestr(f"logs/{run_id}/{scenario_id}-console.log", "\n".join(str(item) for item in scenario.get("console_logs") or []))
+                                if scenario.get("network_logs"):
+                                    archive.writestr(f"logs/{run_id}/{scenario_id}-network.log", "\n".join(str(item) for item in scenario.get("network_logs") or []))
             archive.writestr("manifest.json", json.dumps(manifest, indent=2, default=str))
         return self._store_export(workspace_id, "browser_proof_bundle", export_path)
 

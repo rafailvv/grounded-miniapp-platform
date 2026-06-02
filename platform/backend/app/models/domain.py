@@ -164,6 +164,7 @@ class JobRecord(StrictModel):
     prompt: str
     status: Literal["pending", "running", "blocked", "completed", "failed"] = "pending"
     mode: RunMode = "generate"
+    edit_mode: Literal["default", "improve"] = "default"
     generation_mode: GenerationMode = GenerationMode.BALANCED
     target_platform: TargetPlatform
     preview_profile: PreviewProfile
@@ -203,6 +204,7 @@ class JobRecord(StrictModel):
     budget_status: dict[str, Any] = Field(default_factory=dict)
     orchestration_phases: list[dict[str, Any]] = Field(default_factory=list)
     implementation_plan: dict[str, Any] = Field(default_factory=dict)
+    product_blueprint: dict[str, Any] = Field(default_factory=dict)
     agent_turns: list[dict[str, Any]] = Field(default_factory=list)
     agent_activity_events: list[dict[str, Any]] = Field(default_factory=list)
     agent_memory: dict[str, Any] = Field(default_factory=dict)
@@ -217,6 +219,14 @@ class JobRecord(StrictModel):
     tool_batch_summaries_ref: str | None = None
     task_ledger_ref: str | None = None
     worker_mailbox_ref: str | None = None
+    worker_sessions_ref: str | None = None
+    worker_ownership_ref: str | None = None
+    draft_isolation_ref: str | None = None
+    draft_gate_ref: str | None = None
+    draft_apply_decision_ref: str | None = None
+    existing_app_map_ref: str | None = None
+    improve_slice_ref: str | None = None
+    guardian_gate_ref: str | None = None
     scratchpad_ref: str | None = None
     memory_ref: str | None = None
     worker_drafts_ref: str | None = None
@@ -236,12 +246,20 @@ class JobRecord(StrictModel):
     worker_branch_refs: list[str] = Field(default_factory=list)
     verifier_review_ref: str | None = None
     browser_step_refs: list[str] = Field(default_factory=list)
+    browser_replay_proof_ref: str | None = None
+    acceptance_tests_ref: str | None = None
+    acceptance_test_files: list[str] = Field(default_factory=list)
+    acceptance_replay_source_ref: str | None = None
+    lsp_context_ref: str | None = None
+    context_manager_ref: str | None = None
     context_pressure_ref: str | None = None
     hook_trace_ref: str | None = None
     semantic_graph_ref: str | None = None
     worker_prefix_ref: str | None = None
     replay_trace_ref: str | None = None
     compaction_summaries: list[dict[str, Any]] = Field(default_factory=list)
+    prompt_contract_ref: str | None = None
+    product_blueprint_ref: str | None = None
     miniapp_contract_ref: str | None = None
     route_registry_ref: str | None = None
     contract_compile_ref: str | None = None
@@ -364,6 +382,7 @@ class CreateChatTurnRequest(StrictModel):
 class GenerateRequest(StrictModel):
     prompt: str
     mode: RunMode = "generate"
+    edit_mode: Literal["default", "improve"] = "default"
     target_platform: TargetPlatform = TargetPlatform.TELEGRAM
     preview_profile: PreviewProfile = PreviewProfile.TELEGRAM_MOCK
     generation_mode: GenerationMode = GenerationMode.BALANCED
@@ -450,6 +469,7 @@ class RunCheckResult(StrictModel):
     details: str | None = None
     duration_ms: int | None = None
     command: str | None = None
+    command_canonical: dict[str, Any] = Field(default_factory=dict)
     exit_code: int | None = None
     logs: list[str] = Field(default_factory=list)
     diagnostics: dict[str, Any] = Field(default_factory=dict)
@@ -548,6 +568,7 @@ class RunRecord(StrictModel):
     workspace_id: str
     prompt: str
     mode: RunMode = "generate"
+    edit_mode: Literal["default", "improve"] = "default"
     intent: Literal["create", "edit", "refine", "role_only_change"]
     apply_strategy: Literal["staged_auto_apply", "manual_approve"] = "staged_auto_apply"
     target_role_scope: list[Literal["client", "specialist", "manager"]] = Field(default_factory=list)
@@ -597,6 +618,7 @@ class RunRecord(StrictModel):
     budget_status: dict[str, Any] = Field(default_factory=dict)
     orchestration_phases: list[dict[str, Any]] = Field(default_factory=list)
     implementation_plan: dict[str, Any] = Field(default_factory=dict)
+    product_blueprint: dict[str, Any] = Field(default_factory=dict)
     agent_turns: list[dict[str, Any]] = Field(default_factory=list)
     agent_activity_events: list[dict[str, Any]] = Field(default_factory=list)
     agent_memory: dict[str, Any] = Field(default_factory=dict)
@@ -611,6 +633,14 @@ class RunRecord(StrictModel):
     tool_batch_summaries_ref: str | None = None
     task_ledger_ref: str | None = None
     worker_mailbox_ref: str | None = None
+    worker_sessions_ref: str | None = None
+    worker_ownership_ref: str | None = None
+    draft_isolation_ref: str | None = None
+    draft_gate_ref: str | None = None
+    draft_apply_decision_ref: str | None = None
+    existing_app_map_ref: str | None = None
+    improve_slice_ref: str | None = None
+    guardian_gate_ref: str | None = None
     scratchpad_ref: str | None = None
     memory_ref: str | None = None
     worker_drafts_ref: str | None = None
@@ -630,12 +660,20 @@ class RunRecord(StrictModel):
     worker_branch_refs: list[str] = Field(default_factory=list)
     verifier_review_ref: str | None = None
     browser_step_refs: list[str] = Field(default_factory=list)
+    browser_replay_proof_ref: str | None = None
+    acceptance_tests_ref: str | None = None
+    acceptance_test_files: list[str] = Field(default_factory=list)
+    acceptance_replay_source_ref: str | None = None
+    lsp_context_ref: str | None = None
+    context_manager_ref: str | None = None
     context_pressure_ref: str | None = None
     hook_trace_ref: str | None = None
     semantic_graph_ref: str | None = None
     worker_prefix_ref: str | None = None
     replay_trace_ref: str | None = None
     compaction_summaries: list[dict[str, Any]] = Field(default_factory=list)
+    prompt_contract_ref: str | None = None
+    product_blueprint_ref: str | None = None
     miniapp_contract_ref: str | None = None
     route_registry_ref: str | None = None
     contract_compile_ref: str | None = None
@@ -662,6 +700,7 @@ class RunRecord(StrictModel):
 class CreateRunRequest(StrictModel):
     prompt: str
     mode: RunMode = "generate"
+    edit_mode: Literal["default", "improve"] = "default"
     intent: Literal["auto", "create", "edit", "refine", "role_only_change"] = "auto"
     apply_strategy: Literal["staged_auto_apply", "manual_approve"] = "staged_auto_apply"
     target_role_scope: list[Literal["client", "specialist", "manager"]] = Field(default_factory=list)

@@ -23,7 +23,7 @@ MOCK_DATA_PATTERNS: tuple[tuple[str, str], ...] = (
 SECURITY_PRIVACY_PATTERNS: tuple[tuple[str, str, str], ...] = (
     (r"(?i)\b(?:api[_-]?key|secret|access[_-]?token|auth[_-]?token|password|private[_-]?key)\b\s*[:=]\s*['\"]([^'\"]{12,})['\"]", "hardcoded_secret", "Changed source appears to contain a hard-coded secret or credential."),
     (r"\b(?:eval|Function)\s*\(", "dynamic_code_execution", "Changed source uses dynamic code execution."),
-    (r"\.innerHTML\s*=", "unsafe_inner_html", "Changed source writes raw HTML and may expose injection risk."),
+    (r"\.innerHTML\s*=", "unsafe_inner_html", "Changed source writes unescaped raw HTML and may expose injection risk."),
     (r"\bdocument\.cookie\s*=", "cookie_write", "Changed source writes browser cookies directly."),
     (r"(?i)\blocalStorage\.setItem\s*\(\s*['\"][^'\"]*(?:token|password|secret|email|phone|address)", "sensitive_local_storage", "Changed source stores sensitive data in localStorage."),
 )
@@ -45,6 +45,105 @@ DIFF_LINE_LIMIT = 3_000
 
 class GuardianReview:
     """Deterministic pre-apply reviewer that emits blocker findings only."""
+
+    RISK_ORDER = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+
+    @classmethod
+    def review_risky_action(
+        cls,
+        *,
+        workspace_id: str,
+        run_id: str,
+        draft_source: Path | None,
+        file_changes: list[Any],
+        action_kind: str = "draft_apply",
+        previous_rejections: list[dict[str, Any]] | None = None,
+        diff_text: str = "",
+    ) -> GuardianReviewReport:
+        findings: list[GuardianFinding] = []
+        changes = [item for item in file_changes if getattr(item, "file_path", None)]
+        changed_files = cls._normalize_paths([str(getattr(item, "file_path", "")) for item in changes])
+        destructive = [item for item in changes if str(getattr(item, "operation", "")) == "delete"]
+        if destructive:
+            findings.append(
+                cls._finding(
+                    code="guardian.destructive_action.delete_operation",
+                    category="destructive_action",
+                    message="Draft action attempts to delete files and requires a narrower reviewed edit.",
+                    evidence={"files": [str(getattr(item, "file_path", "")) for item in destructive][:20], "action_kind": action_kind},
+                    repair_hint="Replace delete operations with targeted patches unless the user explicitly requested deletion and proof covers the removed surface.",
+                    severity="critical",
+                )
+            )
+        forbidden_paths = [
+            path
+            for path in changed_files
+            if path.startswith((".git/", "node_modules/", "dist/", "build/", ".cache/", ".sandbox/"))
+            or "/.git/" in path
+            or path in {".git", "node_modules", "dist", "build"}
+        ]
+        if forbidden_paths:
+            findings.append(
+                cls._finding(
+                    code="guardian.policy.forbidden_mutation_path",
+                    category="policy",
+                    message="Draft action targets a path outside the product mutation surface.",
+                    evidence={"forbidden_paths": forbidden_paths[:20]},
+                    repair_hint="Use allowed draft file tools only for product source, tests, docs, or explicit app configuration.",
+                    severity="critical",
+                )
+            )
+        large_payloads = [
+            {
+                "file_path": str(getattr(item, "file_path", "")),
+                "operation": str(getattr(item, "operation", "")),
+                "chars": len(str(getattr(item, "content", "") or getattr(item, "diff", "") or "")),
+            }
+            for item in changes
+            if len(str(getattr(item, "content", "") or getattr(item, "diff", "") or "")) > 250_000
+        ]
+        if large_payloads or len(changes) > 20:
+            findings.append(
+                cls._finding(
+                    code="guardian.changed_size_risk.large_mutation_batch",
+                    category="changed_size_risk",
+                    message="Mutation batch is large enough to require splitting or focused review.",
+                    evidence={"change_count": len(changes), "large_payloads": large_payloads[:20]},
+                    repair_hint="Split the change into a smaller coherent patch and verify that slice before continuing.",
+                    severity="high",
+                )
+            )
+        findings.extend(cls._action_secret_findings(changes))
+        findings.extend(cls._rejection_circuit_findings(changed_files=changed_files, findings=findings, previous_rejections=previous_rejections or []))
+        findings = cls._dedupe(findings)
+        risk_level = cls._risk_level(findings)
+        blocker_count = sum(1 for item in findings if item.is_blocker_for_apply)
+        status = "failed" if blocker_count else "passed"
+        return GuardianReviewReport(
+            run_id=run_id,
+            workspace_id=workspace_id,
+            status=status,
+            source="pre_mutation_guardian",
+            findings=findings,
+            checklist=[],
+            final_review_gate={
+                "schema": "grounded.guardian_action_gate.v1",
+                "status": status,
+                "action_kind": action_kind,
+                "risk_level": risk_level,
+                "blocker_count": blocker_count,
+                "finding_codes": [item.code for item in findings],
+                "rejection_circuit_open": any(item.code == "guardian.rejection_circuit.repeated_rejected_action" for item in findings),
+            },
+            review_prompt=cls._review_prompt(action_kind=action_kind, changed_files=changed_files, diff_text=diff_text, risk_level=risk_level),
+            summary={
+                "finding_count": len(findings),
+                "blocker_count": blocker_count,
+                "risk_level": risk_level,
+                "action_kind": action_kind,
+            },
+            evidence={"changed_files": changed_files[:80], "change_count": len(changes), "previous_rejection_count": len(previous_rejections or [])},
+        )
 
     @classmethod
     def review(
@@ -170,9 +269,11 @@ class GuardianReview:
                 "failed_checks": [item.key for item in checklist if item.status == "failed"],
                 "finding_codes": [item.code for item in findings],
             },
+            review_prompt=cls._review_prompt(action_kind="diff_apply", changed_files=changed, diff_text=diff_text, risk_level=cls._risk_level(findings)),
             summary={
                 "finding_count": len(findings),
                 "blocker_count": blocker_count,
+                "risk_level": cls._risk_level(findings),
                 "category_counts": category_counts,
                 "severity_counts": severity_counts,
                 "final_review_gate_status": "failed" if blocker_count else "passed",
@@ -330,6 +431,8 @@ class GuardianReview:
                     continue
                 if reason == "hardcoded_secret" and cls._placeholder_secret(match.group(1)):
                     continue
+                if reason == "unsafe_inner_html" and cls._inner_html_usage_looks_escaped(text):
+                    continue
                 line = text.count("\n", 0, match.start()) + 1
                 findings.append(
                     cls._finding(
@@ -382,6 +485,140 @@ class GuardianReview:
                 )
             )
         return findings
+
+    @classmethod
+    def _action_secret_findings(cls, changes: list[Any]) -> list[GuardianFinding]:
+        findings: list[GuardianFinding] = []
+        for item in changes:
+            path = str(getattr(item, "file_path", "") or "")
+            payload = str(getattr(item, "content", "") or getattr(item, "diff", "") or "")
+            if not payload:
+                continue
+            for pattern, reason, message in SECURITY_PRIVACY_PATTERNS:
+                match = re.search(pattern, payload)
+                if not match:
+                    continue
+                if reason == "hardcoded_secret" and cls._placeholder_secret(match.group(1)):
+                    continue
+                if reason == "unsafe_inner_html" and cls._inner_html_usage_looks_escaped(payload):
+                    continue
+                findings.append(
+                    cls._finding(
+                        code=f"guardian.security_privacy.{reason}",
+                        category="security_privacy",
+                        message=message,
+                        file_path=path,
+                        evidence={"pattern": reason, "payload": "draft_action"},
+                        repair_hint="Remove the risky payload from the proposed mutation before applying the draft action.",
+                        severity="critical" if reason == "hardcoded_secret" else "high",
+                    )
+                )
+                break
+        return findings
+
+    @classmethod
+    def _inner_html_usage_looks_escaped(cls, text: str) -> bool:
+        """Allow common generated UI templates when user data is visibly escaped.
+
+        Guardian should block raw user-controlled interpolation, not every
+        template-string render. Mini-app agents commonly render cards with
+        innerHTML plus an escape helper; treating that as categorically unsafe
+        makes ordinary frontend generation unrecoverable.
+        """
+        source = str(text or "")
+        if ".innerHTML" not in source:
+            return True
+        has_escape_helper = bool(
+            re.search(r"\bfunction\s+(?:esc|escapeHtml)\s*\(", source)
+            or re.search(r"\bconst\s+(?:esc|escapeHtml)\s*=", source)
+        )
+        if not has_escape_helper:
+            return False
+        html_sinks = cls._inner_html_sink_snippets(source)
+        if not html_sinks:
+            return True
+        raw_property_interpolation = re.compile(
+            r"\$\{\s*(?!esc\s*\(|escapeHtml\s*\(|String\s*\()\s*"
+            r"(?:[A-Za-z_$][\w$]*\.)+[A-Za-z_$][\w$]*(?:\s*[|?:},)]|$)"
+        )
+        raw_form_interpolation = re.compile(
+            r"\$\{\s*(?!esc\s*\(|escapeHtml\s*\(|String\s*\()\s*"
+            r"(?:formData\.get|input\.value|textarea\.value|event\.target\.value)"
+        )
+        for snippet in html_sinks:
+            if raw_property_interpolation.search(snippet) or raw_form_interpolation.search(snippet):
+                return False
+        return True
+
+    @staticmethod
+    def _inner_html_sink_snippets(source: str) -> list[str]:
+        snippets: list[str] = []
+        for match in re.finditer(r"\.innerHTML\s*=", source):
+            start = match.end()
+            end = source.find(";", start)
+            if end == -1 or end - start > 4000:
+                end = min(len(source), start + 4000)
+            snippets.append(source[start:end])
+        return snippets
+
+    @classmethod
+    def _rejection_circuit_findings(
+        cls,
+        *,
+        changed_files: list[str],
+        findings: list[GuardianFinding],
+        previous_rejections: list[dict[str, Any]],
+    ) -> list[GuardianFinding]:
+        if not findings or not previous_rejections:
+            return []
+        current_signatures = {cls._rejection_signature(code=finding.code, paths=changed_files) for finding in findings}
+        repeats = [
+            item
+            for item in previous_rejections
+            if isinstance(item, dict) and str(item.get("signature") or "") in current_signatures
+        ]
+        if len(repeats) < 1:
+            return []
+        return [
+            cls._finding(
+                code="guardian.rejection_circuit.repeated_rejected_action",
+                category="policy",
+                message="This mutation repeats a previously rejected risky action.",
+                evidence={"repeat_count": len(repeats), "signatures": sorted(current_signatures)[:20], "changed_files": changed_files[:20]},
+                repair_hint="Do not retry the same workaround. Read the prior rejection, choose a different implementation path, and reduce the risky surface.",
+                severity="critical",
+            )
+        ]
+
+    @classmethod
+    def _risk_level(cls, findings: list[GuardianFinding]) -> str:
+        if not findings:
+            return "low"
+        highest = max(cls.RISK_ORDER.get(item.severity, 0) for item in findings)
+        for label, value in cls.RISK_ORDER.items():
+            if value == highest:
+                return label
+        return "high"
+
+    @staticmethod
+    def _rejection_signature(*, code: str, paths: list[str]) -> str:
+        normalized_paths = ",".join(sorted(str(path or "").strip().replace("\\", "/") for path in paths if str(path or "").strip())[:20])
+        return f"{code}:{normalized_paths}"
+
+    @staticmethod
+    def _review_prompt(*, action_kind: str, changed_files: list[str], diff_text: str, risk_level: str) -> dict[str, Any]:
+        return {
+            "schema": "grounded.guardian_review_prompt.v1",
+            "action_kind": action_kind,
+            "risk_level": risk_level,
+            "instructions": [
+                "Review only the proposed diff/action, not unrelated code.",
+                "Block destructive, secret-bearing, broad, or policy-bypassing changes.",
+                "After a rejection, do not approve a repeated workaround with the same risky signature.",
+            ],
+            "changed_files": changed_files[:80],
+            "diff_preview": diff_text[:4000],
+        }
 
     @classmethod
     def _check_green_findings(cls, latest_execution: CheckExecutionRecord | None, *, acceptance_required: bool) -> list[GuardianFinding]:

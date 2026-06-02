@@ -1,4 +1,5 @@
 ---
+metadata_schema: grounded.skill.v2
 description: Delivery, orders, fulfillment, courier, and status tracking workflow pack.
 whenToUse:
   - доставка
@@ -24,11 +25,19 @@ allowedTools:
   - browser_verify
 model: default
 effort: high
+triggerRules:
+  - Match prompts using this skill domain and path scope.
 validation:
   - delivery_workflow
   - persisted_workflow
   - role_coverage
   - browser_flow_smoke
+requiredProof:
+  - Final readiness proof covers this skill.
+incompatibleSkills:
+  - ""
+outputExpectations:
+  - Produce working product changes and cite proof artifacts.
 ---
 # Delivery / Orders
 

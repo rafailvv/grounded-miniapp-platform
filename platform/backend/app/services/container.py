@@ -11,6 +11,14 @@ from app.services.thread_service import ThreadService
 from app.services.check_runner import CheckRunner
 from app.services.code_index_service import CodeIndexService
 from app.services.context_pack_builder import ContextPackBuilder
+from app.services.context_manager import ContextManagerService
+from app.services.lsp_context import LspContextService
+from app.services.existing_app_map import ExistingAppMapService
+from app.services.lsp_server_manager import LspServerManager
+from app.services.worker_sessions import WorkerSessionService
+from app.services.draft_isolation import DraftIsolationService
+from app.services.guardian_gate import GuardianGateService
+from app.services.browser_replay_proof import BrowserReplayProofService
 from app.services.document_intelligence import DocumentIntelligenceService
 from app.services.export_service import ExportService
 from app.services.engine import (
@@ -29,6 +37,7 @@ from app.services.workspace.service import WorkspaceService
 from app.validators.suite import ValidationSuite
 from app.ai.openai_client import OpenAIClient
 from app.services.exec_policy_service import ExecPolicyService
+from app.services.doctor_service import DoctorService
 from app.services.exec_runtime_service import ExecRuntimeService
 from app.services.sandbox_service import SandboxService
 from app.services.hook_policy_service import HookPolicyService
@@ -39,7 +48,9 @@ from app.services.background_task_service import BackgroundTaskService
 from app.services.pr_babysitter import PrBabysitterService
 from app.services.run_compaction import RunCompactionService
 from app.services.run_protocol import RunProtocolService
+from app.services.session_protocol import SessionProtocolReducer
 from app.services.repair_cases import RepairCaseService
+from app.services.prompt_contract_compiler import PromptContractCompilerService
 from app.services.workbench_service import WorkbenchService
 from app.services.starter_workspace_service import StarterWorkspaceService
 
@@ -52,6 +63,12 @@ class ServiceContainer:
         self.event_journal_service = EventJournalService(self.platform_db)
         self.output_artifact_service = OutputArtifactService(self.store, event_journal_service=self.event_journal_service)
         self.run_protocol_service = RunProtocolService(self.platform_db, self.store, event_journal_service=self.event_journal_service)
+        self.session_protocol_reducer = SessionProtocolReducer(
+            db=self.platform_db,
+            store=self.store,
+            event_journal_service=self.event_journal_service,
+            run_protocol_service=self.run_protocol_service,
+        )
         self.run_compaction_service = RunCompactionService(self.store, self.run_protocol_service)
         self.repair_case_service = RepairCaseService(self.store, event_journal_service=self.event_journal_service)
         self.rpc_event_hub = RpcEventHub()
@@ -61,6 +78,18 @@ class ServiceContainer:
         self.sandbox_service = SandboxService()
         self.hook_policy_service = HookPolicyService(self.store, self.settings.runtime_dir / "policies" / "agent_hooks.json")
         self.workspace_service = WorkspaceService(self.settings, self.store, self.workspace_log_service, sandbox_service=self.sandbox_service)
+        self.draft_isolation_service = DraftIsolationService(
+            store=self.store,
+            workspace_service=self.workspace_service,
+            event_journal_service=self.event_journal_service,
+        )
+        self.guardian_gate_service = GuardianGateService(
+            store=self.store,
+            workspace_service=self.workspace_service,
+            event_journal_service=self.event_journal_service,
+        )
+        self.browser_replay_proof_service = BrowserReplayProofService(self.store, event_journal_service=self.event_journal_service)
+        self.workspace_service.attach_draft_isolation_service(self.draft_isolation_service)
         self.pr_babysitter_service = PrBabysitterService(store=self.store, workspace_service=self.workspace_service)
         self.code_index_service = CodeIndexService(self.settings, self.store)
         self.workspace_service.attach_code_index_service(self.code_index_service)
@@ -74,13 +103,32 @@ class ServiceContainer:
             self.runtime_manager,
             self.workspace_log_service,
         )
+        self.lsp_server_manager = LspServerManager()
+        self.lsp_context_service = LspContextService(
+            store=self.store,
+            workspace_service=self.workspace_service,
+            server_manager=self.lsp_server_manager,
+            event_journal_service=self.event_journal_service,
+        )
+        self.existing_app_map_service = ExistingAppMapService(
+            store=self.store,
+            workspace_service=self.workspace_service,
+            lsp_context_service=self.lsp_context_service,
+            event_journal_service=self.event_journal_service,
+        )
         self.agent_context_builder = AgentContextBuilder(store=self.store, workspace_service=self.workspace_service)
-        self.agent_tool_call_loop = AgentToolCallLoop(context_builder=self.agent_context_builder)
+        self.agent_tool_call_loop = AgentToolCallLoop(context_builder=self.agent_context_builder, lsp_context_service=self.lsp_context_service)
         self.validation_suite = ValidationSuite()
         self.check_runner = CheckRunner(self.validation_suite, self.preview_service)
         self.openai_client = OpenAIClient(self.settings, self.workspace_log_service, model_manager=self.model_manager_service)
         self.context_budget_manager = ContextBudgetManager()
         self.prompt_state_manager = PromptStateManager()
+        self.context_manager_service = ContextManagerService(
+            self.store,
+            budget_manager=self.context_budget_manager,
+            event_journal_service=self.event_journal_service,
+        )
+        self.worker_session_service = WorkerSessionService(self.store, event_journal_service=self.event_journal_service)
         self.context_pack_builder = ContextPackBuilder(
             self.code_index_service,
             self.workspace_service,
@@ -100,6 +148,9 @@ class ServiceContainer:
             platform_db=self.platform_db,
             run_protocol_service=self.run_protocol_service,
             run_compaction_service=self.run_compaction_service,
+            context_manager_service=self.context_manager_service,
+            lsp_context_service=self.lsp_context_service,
+            worker_session_service=self.worker_session_service,
             event_journal_service=self.event_journal_service,
             hook_policy_service=self.hook_policy_service,
             output_artifact_service=self.output_artifact_service,
@@ -114,8 +165,23 @@ class ServiceContainer:
             self.workspace_log_service,
             run_protocol_service=self.run_protocol_service,
             event_journal_service=self.event_journal_service,
+            prompt_contract_compiler_service=PromptContractCompilerService(
+                store=self.store,
+                openai_client=self.openai_client,
+                event_journal_service=self.event_journal_service,
+            ),
+            existing_app_map_service=self.existing_app_map_service,
         )
+        self.run_service.attach_guardian_gate_service(self.guardian_gate_service)
         self.exec_policy_service = ExecPolicyService(self.settings.runtime_dir / "policies" / "agent_exec_policy.json", sandbox_service=self.sandbox_service)
+        self.doctor_service = DoctorService(
+            settings=self.settings,
+            store=self.store,
+            openai_client=self.openai_client,
+            exec_policy_service=self.exec_policy_service,
+            event_journal_service=self.event_journal_service,
+            run_protocol_service=self.run_protocol_service,
+        )
         self.exec_runtime_service = ExecRuntimeService(
             workspace_service=self.workspace_service,
             platform_db=self.platform_db,
@@ -132,6 +198,7 @@ class ServiceContainer:
             preview_service=self.preview_service,
             check_runner=self.check_runner,
             pr_babysitter_service=self.pr_babysitter_service,
+            lsp_context_service=self.lsp_context_service,
         )
         self.run_service.attach_background_task_service(self.background_task_service)
         self.workbench_service = WorkbenchService(
@@ -146,9 +213,17 @@ class ServiceContainer:
             run_compaction_service=self.run_compaction_service,
             background_task_service=self.background_task_service,
             repair_case_service=self.repair_case_service,
+            context_manager_service=self.context_manager_service,
+            worker_session_service=self.worker_session_service,
+            draft_isolation_service=self.draft_isolation_service,
+            guardian_gate_service=self.guardian_gate_service,
+            lsp_context_service=self.lsp_context_service,
             event_journal_service=self.event_journal_service,
             output_artifact_service=self.output_artifact_service,
             pr_babysitter_service=self.pr_babysitter_service,
+            browser_replay_proof_service=self.browser_replay_proof_service,
+            doctor_service=self.doctor_service,
+            existing_app_map_service=self.existing_app_map_service,
         )
         self.thread_service = ThreadService(
             self.platform_db,

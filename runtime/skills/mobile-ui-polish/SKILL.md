@@ -1,4 +1,5 @@
 ---
+metadata_schema: grounded.skill.v2
 description: Polish generated role UI for Telegram-sized mobile screens and layout proof.
 whenToUse:
   - mobile polish
@@ -18,9 +19,17 @@ allowedTools:
   - browser_verify
 model: default
 effort: medium
+triggerRules:
+  - Match prompts using this skill domain and path scope.
 validation:
   - browser_flow_smoke
   - mobile_layout
+requiredProof:
+  - Final readiness proof covers this skill.
+incompatibleSkills:
+  - ""
+outputExpectations:
+  - Produce working product changes and cite proof artifacts.
 ---
 # Mobile UI Polish
 

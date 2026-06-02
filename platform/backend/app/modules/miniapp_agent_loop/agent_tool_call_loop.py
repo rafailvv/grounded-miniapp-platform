@@ -25,6 +25,7 @@ from app.modules.miniapp_agent_loop.lsp_tools import LspToolService
 from app.modules.miniapp_agent_loop.repair_packets import RepairTransitionPolicy
 from app.modules.miniapp_agent_loop.result_classifier import AgentLoopResultFactory
 from app.modules.miniapp_agent_loop.types import AgentLoopCallbacks, AgentLoopResult
+from app.services.lsp_context import LspContextService
 from app.services.repair_cases import RepairCaseService, patch_sha256
 from app.services.repair_catalog import RepairCatalog
 
@@ -39,8 +40,9 @@ class AgentToolCallLoop:
     blocker.
     """
 
-    def __init__(self, *, context_builder: AgentContextBuilder) -> None:
+    def __init__(self, *, context_builder: AgentContextBuilder, lsp_context_service: LspContextService | None = None) -> None:
         self.context_builder = context_builder
+        self.lsp_context_service = lsp_context_service
         self.feedback = AgentCheckFeedback()
         self.edit_validator = AgentEditValidator()
         self.results = AgentLoopResultFactory()
@@ -897,11 +899,16 @@ class AgentToolCallLoop:
             )
             current_patch_hash = patch_sha256(synced_file_changes)
             changed_targets = [operation.file_path for operation in synced_file_changes if operation.file_path]
-            diagnostics_before = (
-                LspToolService.diagnostics(root=draft_source, targets=changed_targets, include_optional_tools=False)
-                if changed_targets
-                else {}
-            )
+            diagnostics_before = {}
+            if changed_targets and self.lsp_context_service is not None:
+                diagnostics_before = self.lsp_context_service.diagnostics(
+                    workspace_id=workspace_id,
+                    run_id=run_id,
+                    files=changed_targets,
+                    include_optional_tools=False,
+                )
+            elif changed_targets:
+                diagnostics_before = LspToolService.diagnostics(root=draft_source, targets=changed_targets, include_optional_tools=False)
             if active_repair_case_id and self.repair_cases.repeated_patch(run_id=run_id, case_id=active_repair_case_id, patch_hash=current_patch_hash):
                 repeated_packet = {
                     "signature": f"repair.repeated_patch:{active_repair_case_id}",
@@ -1080,11 +1087,17 @@ class AgentToolCallLoop:
                 continue
 
             changed_files = callbacks.post_apply_stabilize(workspace_id, run_id, apply_result, [operation.file_path for operation in synced_file_changes]) if callbacks.post_apply_stabilize else [operation.file_path for operation in synced_file_changes]
-            diagnostics_after = (
-                LspToolService.diagnostics(root=draft_source, changed_files=list(changed_files), changed_only=True, include_optional_tools=False)
-                if changed_files
-                else {}
-            )
+            diagnostics_after = {}
+            if changed_files and self.lsp_context_service is not None:
+                diagnostics_after = self.lsp_context_service.diagnostics(
+                    workspace_id=workspace_id,
+                    run_id=run_id,
+                    changed_only=True,
+                    files=list(changed_files),
+                    include_optional_tools=False,
+                )
+            elif changed_files:
+                diagnostics_after = LspToolService.diagnostics(root=draft_source, changed_files=list(changed_files), changed_only=True, include_optional_tools=False)
             if active_repair_case_id:
                 before_errors = int(diagnostics_before.get("error_count") or 0) if isinstance(diagnostics_before, dict) else 0
                 after_errors = int(diagnostics_after.get("error_count") or 0) if isinstance(diagnostics_after, dict) else 0

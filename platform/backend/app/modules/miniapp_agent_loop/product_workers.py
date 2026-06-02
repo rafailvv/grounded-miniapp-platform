@@ -17,11 +17,14 @@ class ProductWorkerRole:
     worker_id: str
     worker_type: str
     aliases: tuple[str, ...]
+    lane_id: str
+    ownership_kind: str
     owner_scope: str
     allowed_paths: tuple[str, ...]
     forbidden_paths: tuple[str, ...]
     role: str | None
     expected_proof: tuple[str, ...]
+    merge_evidence: tuple[str, ...]
     writes: bool = True
 
 
@@ -29,73 +32,94 @@ PRODUCT_WORKERS: tuple[ProductWorkerRole, ...] = (
     ProductWorkerRole(
         worker_id="backend_api_worker",
         worker_type="backend_api_worker",
-        aliases=(),
+        aliases=("backend_worker", "api_worker", "persistence_api_worker", "persistence_worker"),
+        lane_id="backend",
+        ownership_kind="backend_api_persistence",
         owner_scope="Backend API, schemas, persistence, and shared role state",
         allowed_paths=("miniapp/app/routes", "miniapp/app/schemas.py", "miniapp/app/db.py"),
         forbidden_paths=("miniapp/app/main.py", "miniapp/app/static/client", "miniapp/app/static/specialist", "miniapp/app/static/manager", "miniapp/tests"),
         role=None,
         expected_proof=("api_workflow_smoke", "lsp_static_diagnostics"),
+        merge_evidence=("owned_paths_only", "apply_result", "lsp_changed_files", "api_or_route_proof"),
     ),
     ProductWorkerRole(
         worker_id="client_surface_worker",
         worker_type="client_surface_worker",
-        aliases=(),
+        aliases=("role_ui_worker:client", "client_ui_worker"),
+        lane_id="role_ui",
+        ownership_kind="role_ui_surface",
         owner_scope="Client role surface and client child pages",
         allowed_paths=("miniapp/app/static/client",),
         forbidden_paths=("miniapp/app/static/specialist", "miniapp/app/static/manager", "miniapp/app/routes", "miniapp/tests"),
         role="client",
         expected_proof=("browser_flow_smoke:client", "mobile_layout:client"),
+        merge_evidence=("owned_paths_only", "apply_result", "role_browser_or_mobile_proof"),
     ),
     ProductWorkerRole(
         worker_id="specialist_surface_worker",
         worker_type="specialist_surface_worker",
-        aliases=(),
+        aliases=("role_ui_worker:specialist", "specialist_ui_worker"),
+        lane_id="role_ui",
+        ownership_kind="role_ui_surface",
         owner_scope="Specialist role surface and specialist child pages",
         allowed_paths=("miniapp/app/static/specialist",),
         forbidden_paths=("miniapp/app/static/client", "miniapp/app/static/manager", "miniapp/app/routes", "miniapp/tests"),
         role="specialist",
         expected_proof=("browser_flow_smoke:specialist", "mobile_layout:specialist"),
+        merge_evidence=("owned_paths_only", "apply_result", "role_browser_or_mobile_proof"),
     ),
     ProductWorkerRole(
         worker_id="manager_surface_worker",
         worker_type="manager_surface_worker",
-        aliases=(),
+        aliases=("role_ui_worker:manager", "manager_ui_worker"),
+        lane_id="role_ui",
+        ownership_kind="role_ui_surface",
         owner_scope="Manager role surface and manager child pages",
         allowed_paths=("miniapp/app/static/manager",),
         forbidden_paths=("miniapp/app/static/client", "miniapp/app/static/specialist", "miniapp/app/routes", "miniapp/tests"),
         role="manager",
         expected_proof=("browser_flow_smoke:manager", "mobile_layout:manager"),
+        merge_evidence=("owned_paths_only", "apply_result", "role_browser_or_mobile_proof"),
     ),
     ProductWorkerRole(
         worker_id="test_verifier_worker",
         worker_type="test_verifier_worker",
-        aliases=(),
+        aliases=("tests_worker", "test_worker", "acceptance_tests_worker"),
+        lane_id="tests",
+        ownership_kind="generated_acceptance_tests",
         owner_scope="Generated acceptance tests and independent verification artifacts",
         allowed_paths=("miniapp/tests",),
         forbidden_paths=("miniapp/app/static/client", "miniapp/app/static/specialist", "miniapp/app/static/manager"),
         role=None,
         expected_proof=("generated_acceptance_tests", "api_workflow_smoke", "browser_flow_smoke"),
+        merge_evidence=("owned_paths_only", "apply_result", "generated_tests_reference_product_paths"),
     ),
     ProductWorkerRole(
         worker_id="mobile_polish_worker",
         worker_type="mobile_polish_worker",
-        aliases=(),
+        aliases=("verifier_worker", "product_verifier_worker", "visual_verifier_worker"),
+        lane_id="verifier",
+        ownership_kind="read_only_product_verification",
         owner_scope="Mobile polish pass for role UI surfaces after green workflow",
         allowed_paths=("miniapp/app/static/client", "miniapp/app/static/specialist", "miniapp/app/static/manager", "miniapp/app/static/shared"),
         forbidden_paths=("miniapp/app/routes", "miniapp/app/schemas.py", "miniapp/app/db.py", "miniapp/tests"),
         role=None,
         expected_proof=("mobile_layout", "browser_flow_smoke"),
+        merge_evidence=("read_only", "browser_proof", "mobile_layout", "blocker_findings"),
         writes=False,
     ),
     ProductWorkerRole(
         worker_id="repair_worker",
         worker_type="repair_worker",
-        aliases=(),
+        aliases=("targeted_repair_worker",),
+        lane_id="repair",
+        ownership_kind="targeted_repair_slice",
         owner_scope="Owned repair slice from a failure signature or repair packet",
         allowed_paths=("miniapp/app", "miniapp/tests"),
         forbidden_paths=("runtime", ".github", "docker"),
         role=None,
         expected_proof=("repair_packet_resolved", "latest_failed_check_passes"),
+        merge_evidence=("repair_packet", "owned_paths_only", "latest_failed_check_passes"),
     ),
 )
 
@@ -103,7 +127,7 @@ PRODUCT_WORKERS: tuple[ProductWorkerRole, ...] = (
 def canonical_worker_id(worker_id: str) -> str:
     value = str(worker_id or "").strip()
     for role in PRODUCT_WORKERS:
-        if value == role.worker_id:
+        if value == role.worker_id or value in role.aliases:
             return role.worker_id
     return value
 
@@ -141,7 +165,41 @@ def ownership_for_worker(worker_id: str) -> dict[str, Any]:
         "forbidden_paths": list(role.forbidden_paths),
         "exclusive_write": role.writes,
         "role": role.role,
+        "lane_id": role.lane_id,
+        "ownership_kind": role.ownership_kind,
         "expected_proof": list(role.expected_proof),
+        "merge_evidence": list(role.merge_evidence),
+    }
+
+
+def product_owner_contract(worker_id: str) -> dict[str, Any]:
+    role = role_for_worker(canonical_worker_id(worker_id))
+    if role is None:
+        return {
+            "worker_id": canonical_worker_id(worker_id),
+            "status": "unknown_worker",
+            "lane_id": "unknown",
+            "ownership_kind": "unknown",
+            "writes": False,
+            "allowed_paths": [],
+            "forbidden_paths": [],
+            "expected_proof": [],
+            "merge_evidence": [],
+        }
+    return {
+        "worker_id": role.worker_id,
+        "worker_type": role.worker_type,
+        "alias_ids": list(role.aliases),
+        "lane_id": role.lane_id,
+        "ownership_kind": role.ownership_kind,
+        "owner_scope": role.owner_scope,
+        "writes": role.writes,
+        "role": role.role,
+        "allowed_paths": list(role.allowed_paths),
+        "forbidden_paths": list(role.forbidden_paths),
+        "expected_proof": list(role.expected_proof),
+        "merge_evidence": list(role.merge_evidence),
+        "merge_policy": "merge only owned paths with structural proof now and runtime/browser proof before final readiness",
     }
 
 

@@ -7,6 +7,7 @@ from typing import Any
 from app.models.domain import RunCheckResult
 from app.models.workbench import ProductReadinessCheck, ProductReadinessResult
 from app.services.generation_sla import GenerationSla
+from app.services.platform_config import platform_config
 
 
 ROLE_ORDER = ("client", "specialist", "manager")
@@ -52,8 +53,12 @@ class ProductReadinessContract:
         mode = str(run_mode or "").lower()
         generation = str(generation_mode or "").lower()
         sla_profile = GenerationSla.profile(generation)
+        product_config = platform_config()
+        browser_config = product_config.browser_proof
         required_product_checks = tuple(sla_profile.required_checks)
-        browser_required = "browser_flow_smoke" in required_product_checks
+        browser_required = browser_config.enabled and ("browser_flow_smoke" in required_product_checks or generation in set(browser_config.required_modes))
+        require_browser_ui_steps = not generation or generation in set(browser_config.require_ui_steps_modes)
+        require_browser_persisted_marker = not generation or generation in set(browser_config.require_persisted_marker_modes)
         full_audit_required = GenerationSla.requires_full_audit(generation)
         acceptance_required = bool(contract.get("required")) or mode in {"generate", "fix"} or generation in {"quality", "balanced", "production"}
         diff_paths = cls._paths_from_diff(diff_text)
@@ -71,6 +76,9 @@ class ProductReadinessContract:
                 "required_checks": list(required_product_checks),
                 "audit_level": sla_profile.audit_level,
                 "proof_requirements": list(sla_profile.proof_requirements),
+            },
+            "platform_config": {
+                "browser_proof": browser_config.model_dump(mode="json"),
             },
         }
 
@@ -176,9 +184,9 @@ class ProductReadinessContract:
             }
             evidence["mobile"] = mobile if isinstance(mobile, dict) else {}
             if browser_required and browser.get("status") == "passed":
-                if not isinstance(browser_steps, list) or not browser_steps:
+                if require_browser_ui_steps and (not isinstance(browser_steps, list) or not browser_steps):
                     add_issue("browser_proof_missing_ui_steps", "browser_flow_smoke", "Browser proof lacks concrete UI workflow steps.", evidence_payload=browser)
-                if not browser_marker:
+                if require_browser_persisted_marker and not browser_marker:
                     add_issue("browser_proof_missing_persisted_marker", "browser_flow_smoke", "Browser proof does not show UI-created state persisted after read/reload.", evidence_payload=browser)
                 missing_roles = sorted(set(required_roles) - checked_roles)
                 if missing_roles:
@@ -648,6 +656,14 @@ class ProductReadinessContract:
         if cls._is_product_runtime_source_path(normalized):
             return True
         if normalized.startswith(("miniapp/tests/", "tests/", "runtime/templates/", "docker/")):
+            return True
+        if normalized in {
+            "miniapp/app/generated/miniapp_contract.json",
+            "miniapp/app/generated/contract_validator.json",
+            "miniapp/app/generated/route_manifest.json",
+        }:
+            return True
+        if re.match(r"^miniapp/app/generated/[a-zA-Z0-9_-]+_store\.json$", normalized):
             return True
         if normalized in {"miniapp/requirements.txt", "miniapp/package.json", "miniapp/package-lock.json", "miniapp/pyproject.toml"}:
             return True

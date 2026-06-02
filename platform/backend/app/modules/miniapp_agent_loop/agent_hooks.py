@@ -2,19 +2,23 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import json
 from typing import Any, Literal
 
-from app.models.hooks import HookContext, HookEvaluation
+from app.models.hooks import HookContext, HookContextItem, HookEvaluation, HookOutput, HookRuntimePayload
 from app.services.hook_policy_service import HookPolicyService
 
 
 AgentHookName = Literal[
     "session_start",
+    "user_prompt_submit",
     "before_run",
     "after_run",
     "pre_tool_use",
     "post_tool_use",
     "post_tool_use_failure",
+    "permission_request",
+    "stop",
     "before_apply",
     "after_apply",
     "before_checks",
@@ -68,6 +72,7 @@ class AgentHookOutcome:
             "context_items": list(self.context_items or []),
             "matched_rules": list(evaluation.get("matched_rules") or []),
             "tags": dict(evaluation.get("tags") or {}),
+            "permission_request": (evaluation.get("tags") or {}).get("permission_request"),
             "validation_issues": list(evaluation.get("validation_issues") or []),
             "evaluation": evaluation or None,
             "event": self.event,
@@ -114,10 +119,12 @@ class AgentHookManager:
         *,
         payload: dict[str, Any] | None = None,
     ) -> AgentHookOutcome:
-        safe_payload = dict(payload or {})
-        safe_payload.setdefault("run_id", run_id)
+        safe_payload = self._runtime_payload(run_id=run_id, hook=hook, payload=payload or {})
         workspace_id = self._workspace_id_from_payload(safe_payload)
         evaluation = self._evaluate(run_id=run_id, workspace_id=workspace_id, hook=hook, payload=safe_payload)
+        parsed_output = self.parse_output(safe_payload.get("hook_output"))
+        if parsed_output is not None:
+            evaluation = self._merge_output(evaluation, parsed_output)
         context_items = list(evaluation.get("added_contexts") or [])
         additional_contexts = [
             str(item.get("text") or "")
@@ -141,6 +148,7 @@ class AgentHookManager:
                 "evaluation": evaluation,
                 "matched_rules": evaluation.get("matched_rules") or [],
                 "tags": evaluation.get("tags") or {},
+                "permission_request": (evaluation.get("tags") or {}).get("permission_request"),
                 "validation_issues": evaluation.get("validation_issues") or [],
             },
         )
@@ -163,6 +171,38 @@ class AgentHookManager:
             evaluation=evaluation,
             context_items=context_items,
         )
+
+    @classmethod
+    def parse_output(cls, raw_output: Any) -> dict[str, Any] | None:
+        if raw_output is None or raw_output == "":
+            return None
+        raw = raw_output
+        if isinstance(raw_output, str):
+            try:
+                raw = json.loads(raw_output)
+            except (TypeError, ValueError):
+                return HookOutput(added_contexts=[HookContextItem(text=raw_output[:2000], source="runtime", target="next_turn")]).model_dump(mode="json", by_alias=True)
+        if isinstance(raw, list):
+            raw = {"additional_contexts": [str(item) for item in raw if str(item or "").strip()]}
+        if not isinstance(raw, dict):
+            raw = {"additional_contexts": [str(raw)[:2000]]}
+        normalized = dict(raw)
+        normalized.setdefault("schema", "grounded.hook_output.v1")
+        context_items = normalized.get("added_contexts")
+        if not isinstance(context_items, list):
+            context_items = []
+        for text in normalized.get("additional_contexts") or []:
+            if str(text or "").strip():
+                context_items.append({"text": str(text)[:2000], "source": "runtime", "target": "next_turn"})
+        normalized["added_contexts"] = context_items
+        normalized.pop("additional_contexts", None)
+        try:
+            return HookOutput.model_validate(normalized).model_dump(mode="json", by_alias=True)
+        except Exception:
+            return HookOutput(
+                added_contexts=[HookContextItem(text="Hook output could not be parsed; continue without applying unsafe output.", source="runtime", target="next_turn")],
+                tags={"hook_output_parse_failed": True},
+            ).model_dump(mode="json", by_alias=True)
 
     def snapshot(self, run_id: str) -> dict[str, Any]:
         events = [item.as_dict() for item in self._events.get(run_id, [])]
@@ -206,6 +246,36 @@ class AgentHookManager:
             )
             return evaluation.model_dump(mode="json", by_alias=True)
         return self._fallback_evaluation(run_id=run_id, workspace_id=workspace_id, hook=hook, payload=payload).model_dump(mode="json", by_alias=True)
+
+    def _runtime_payload(self, *, run_id: str, hook: AgentHookName, payload: dict[str, Any]) -> dict[str, Any]:
+        raw = dict(payload or {})
+        raw.setdefault("run_id", run_id)
+        raw.setdefault("hook", hook)
+        runtime = HookRuntimePayload(
+            hook=hook,
+            workspace_id=self._workspace_id_from_payload(raw),
+            run_id=run_id,
+            payload={key: value for key, value in raw.items() if key not in {"schema", "hook"}},
+        ).model_dump(mode="json", by_alias=True)
+        return {**raw, "hook_runtime": runtime, "schema": "grounded.hook_payload.v1"}
+
+    @staticmethod
+    def _merge_output(evaluation: dict[str, Any], output: dict[str, Any]) -> dict[str, Any]:
+        merged = dict(evaluation)
+        output_contexts = [item for item in output.get("added_contexts") or [] if isinstance(item, dict)]
+        if output_contexts:
+            merged["added_contexts"] = [*list(merged.get("added_contexts") or []), *output_contexts][:20]
+        if output.get("should_block"):
+            merged["should_block"] = True
+            merged["block_reason"] = output.get("block_reason") or merged.get("block_reason") or "Hook output blocked this action."
+        tags = dict(merged.get("tags") or {})
+        tags.update(output.get("tags") if isinstance(output.get("tags"), dict) else {})
+        if output.get("permission_request"):
+            tags["permission_request"] = output.get("permission_request")
+        if output.get("metadata"):
+            tags["hook_output_metadata"] = output.get("metadata")
+        merged["tags"] = tags
+        return merged
 
     def _fallback_evaluation(
         self,

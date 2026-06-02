@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from app.main import create_app
 from app.models.domain import RunRecord
 from app.services.generation_enhancements import AcceptanceScenarioGenerator
-from app.services.golden_generated_apps import GoldenGeneratedAppCatalog, READINESS_CHECKLIST_KEYS
+from app.services.golden_generated_apps import CORE_SUITE_TAGS, GoldenGeneratedAppCatalog, READINESS_CHECKLIST_KEYS
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -67,20 +67,66 @@ def test_golden_generated_app_catalog_is_available_and_contract_owned() -> None:
 
     assert catalog["schema"] == "grounded.golden.generated_apps.v1"
     assert catalog["status"] == "ready"
-    assert set(catalog["ids"]) == {
+    assert catalog["count"] >= 20
+    assert {
         salon_app_id,
         "restaurant-reservations",
         "shop-catalog-orders",
         "crm-request-pipeline",
         "specialist-schedule",
         "event-registration",
-    }
+    }.issubset(set(catalog["ids"]))
+    assert catalog["regression_score"]["schema"] == "grounded.golden.generated_app_regression_score.v1"
+    assert catalog["regression_score"]["status"] == "passed"
+    assert catalog["regression_score"]["score"] == 1.0
+    assert set(CORE_SUITE_TAGS).issubset(set(catalog["suites"]))
+    assert catalog["suite_scores"]["core"]["status"] == "passed"
+    assert catalog["suite_scores"]["core"]["score"] == 1.0
+    assert set(CORE_SUITE_TAGS).issubset(
+        {
+            tag
+            for item in catalog["items"]
+            if item["golden_tier"] == "core"
+            for tag in item["suite_tags"]
+        }
+    )
     assert catalog["issues"] == []
     for item in catalog["items"]:
         assert item["prompt"]
         assert item["prompt_analysis"]["resource_hint"]
+        assert item["suite_tags"]
+        assert item["golden_tier"] in {"core", "extended"}
+        assert item["regression_profile"] == "contract_smoke"
+        assert item["acceptance_focus"]
         assert set(READINESS_CHECKLIST_KEYS).issubset(set(item["readiness_required_checks"]))
+        assert item["expected_roles"] == ["client", "specialist", "manager"]
+        assert item["expected_routes"]
+        assert item["expected_api"]
+        assert item["expected_persistence_markers"]
+        assert item["visual_mobile_thresholds"]["max_horizontal_overflow_px"] == 0
         assert "source-code templates" in catalog["description"]
+
+
+def test_golden_generated_app_core_and_contract_smoke_suites_are_explicit() -> None:
+    catalog = GoldenGeneratedAppCatalog.load(ROOT / "runtime")
+    items = catalog["items"]
+
+    assert len({item["id"] for item in items}) == len(items)
+    core_items = GoldenGeneratedAppCatalog.core_suite(items)
+    contract_smoke_items = GoldenGeneratedAppCatalog.regression_suite(items, profile="contract_smoke")
+
+    assert {item["id"] for item in core_items}.issubset({item["id"] for item in contract_smoke_items})
+    assert len(core_items) >= len(CORE_SUITE_TAGS)
+    for suite in CORE_SUITE_TAGS:
+        suite_items = [item for item in core_items if suite in item["suite_tags"]]
+        assert suite_items, suite
+        for item in suite_items:
+            assert item["golden_tier"] == "core"
+            assert set(READINESS_CHECKLIST_KEYS).issubset(set(item["readiness_required_checks"]))
+            assert item["expected_skill_ids"]
+            assert item["expected_api"]
+            assert item["expected_persistence_markers"]
+            assert item["visual_mobile_thresholds"]["max_horizontal_overflow_px"] == 0
 
 
 def test_golden_generated_apps_compile_to_acceptance_and_skill_regressions() -> None:
@@ -89,7 +135,10 @@ def test_golden_generated_apps_compile_to_acceptance_and_skill_regressions() -> 
     for item in catalog["items"]:
         compiled = GoldenGeneratedAppCatalog.compile(item, runtime_dir=ROOT / "runtime", repo_root=ROOT, max_skills=8)
         assert compiled["status"] == "passed", (item["id"], compiled["issues"])
+        assert compiled["regression_score"]["score"] == 1.0
         assert set(item["expected_skill_ids"]).issubset(set(compiled["selected_skill_ids"]))
+        assert compiled["benchmark_expectations"]["expected_api"]
+        assert compiled["benchmark_expectations"]["expected_persistence_markers"]
 
         contract = compiled["contract"]
         assert contract["required"] is True
@@ -134,7 +183,18 @@ def test_golden_generated_apps_are_exposed_through_workbench_api(tmp_path: Path)
 
     assert catalog["schema"] == "grounded.golden.generated_apps.v1"
     assert catalog["status"] == "ready"
-    assert catalog["count"] == 6
+    assert catalog["count"] >= 20
+    assert catalog["regression_score"]["score"] == 1.0
+    assert set(CORE_SUITE_TAGS).issubset(set(catalog["suites"]))
+    assert catalog["suite_scores"]["core"]["score"] == 1.0
+    assert catalog["core_suite_ids"]
+    assert catalog["regression_profiles"]["contract_smoke"]["required"] is True
     assert detail["id"] == salon_app_id
+    assert detail["golden_tier"] == "core"
+    assert "book" + "ing" in detail["suite_tags"]
+    assert detail["regression_profile"] == "contract_smoke"
+    assert detail["acceptance_focus"]
     assert detail["compiled"]["status"] == "passed"
+    assert detail["compiled"]["regression_score"]["score"] == 1.0
+    assert detail["compiled"]["golden_tier"] == "core"
     assert reservations_skill_id in detail["compiled"]["selected_skill_ids"]

@@ -1,0 +1,191 @@
+{
+  "$defs": {
+    "ProtocolEventState": {
+      "additionalProperties": false,
+      "properties": {
+        "actor": {
+          "default": "system",
+          "title": "Actor",
+          "type": "string"
+        },
+        "created_at": {
+          "title": "Created At",
+          "type": "string"
+        },
+        "event_id": {
+          "title": "Event Id",
+          "type": "string"
+        },
+        "event_type": {
+          "title": "Event Type",
+          "type": "string"
+        },
+        "payload_ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Payload Ref"
+        },
+        "payload_sha256": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Payload Sha256"
+        },
+        "refs": {
+          "additionalProperties": true,
+          "title": "Refs",
+          "type": "object"
+        },
+        "run_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Run Id"
+        },
+        "schema": {
+          "default": "grounded.app_protocol.event_state.v2",
+          "title": "Schema",
+          "type": "string"
+        },
+        "sequence": {
+          "title": "Sequence",
+          "type": "integer"
+        },
+        "summary": {
+          "default": "",
+          "title": "Summary",
+          "type": "string"
+        },
+        "thread_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Thread Id"
+        },
+        "turn_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Turn Id"
+        },
+        "workspace_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Workspace Id"
+        }
+      },
+      "required": [
+        "event_id",
+        "sequence",
+        "event_type",
+        "created_at"
+      ],
+      "title": "ProtocolEventState",
+      "type": "object"
+    }
+  },
+  "$id": "https://grounded.local/schemas/app_protocol/run_events_response.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "compatibility": {
+      "additionalProperties": true,
+      "title": "Compatibility",
+      "type": "object"
+    },
+    "items": {
+      "items": {
+        "$ref": "#/$defs/ProtocolEventState"
+      },
+      "title": "Items",
+      "type": "array"
+    },
+    "legacy_event_page_ref": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Legacy Event Page Ref"
+    },
+    "next_sequence": {
+      "default": 0,
+      "title": "Next Sequence",
+      "type": "integer"
+    },
+    "protocol_version": {
+      "const": "v2",
+      "default": "v2",
+      "title": "Protocol Version",
+      "type": "string"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "schema": {
+      "default": "grounded.app_protocol.run_events_response.v2",
+      "title": "Schema",
+      "type": "string"
+    },
+    "workspace_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Workspace Id"
+    }
+  },
+  "required": [
+    "run_id"
+  ],
+  "title": "RunEventsResponse",
+  "type": "object"
+}

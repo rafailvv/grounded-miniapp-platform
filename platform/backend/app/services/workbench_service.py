@@ -20,6 +20,7 @@ from uuid import uuid4
 from app.ai.model_registry import model_capabilities
 from app.models.domain import CheckExecutionRecord, CreateRunRequest, RunCheckResult, RunRecord
 from app.models.context_pressure import ContextPressureReport
+from app.models.context_manager import ContextManagerReport
 from app.models.event_journal import EventJournalPage
 from app.models.memory import MemoryConsolidationReport, MemoryRetrievalRequest
 from app.models.observability import ObservabilityReport
@@ -54,6 +55,7 @@ from app.modules.miniapp_agent_loop.product_workers import (
     PRODUCT_WORKERS,
     canonical_worker_id,
     ownership_for_worker,
+    product_owner_contract,
     worker_refs,
 )
 from app.modules.workspace_code_agent_runtime.browser_replay import BrowserProofReplay
@@ -63,6 +65,7 @@ from app.services.event_journal import EventJournalService
 from app.services.export_service import ExportService
 from app.repositories.state_store import StateStore
 from app.services.exec_policy_service import ExecPolicyService
+from app.services.doctor_service import DoctorService
 from app.services.diagnostic_workflows import DiagnosticWorkflow
 from app.services.generation_enhancements import (
     AcceptanceScenarioGenerator,
@@ -79,6 +82,7 @@ from app.services.generation_enhancements import (
 )
 from app.services.generation_sla import GenerationSla
 from app.services.golden_generated_apps import GoldenGeneratedAppCatalog
+from app.services.existing_app_map import ExistingAppMapService
 from app.services.skill_registry import SkillRegistryService
 from app.services.simplify_pass import SimplifyPass
 from app.services.miniapp_contract import MiniAppContractMaterializer, MiniAppRouteRegistry
@@ -96,9 +100,15 @@ from app.services.product_readiness import ProductReadinessContract
 from app.services.requirement_traceability import PromptArtifactCompletionAudit, RequirementTraceabilityMatrix
 from app.services.rollout_trace_evidence import RolloutTraceEvidence
 from app.services.run_compaction import RunCompactionService
+from app.services.context_manager import ContextManagerService
+from app.services.browser_replay_proof import BrowserReplayProofService
+from app.services.draft_isolation import DraftIsolationService
+from app.services.guardian_gate import GuardianGateService
+from app.services.lsp_context import LspContextService
 from app.services.run_protocol import RunProtocolConflict, RunProtocolService, diff_sha256
 from app.services.trace_bundle import TraceBundleReducer
 from app.services.run_task_ledger import RunTaskLedger
+from app.services.worker_sessions import WorkerSessionService
 from app.services.skillify import SkillifyService
 from app.services.session_memory import SessionMemorySections
 from app.services.workspace.run_service import RunService
@@ -115,6 +125,46 @@ def re_slug(value: object) -> str:
 
 class WorkbenchService:
     """Read-model and scaffold service for the agent workbench APIs."""
+
+    REVIEW_TARGET_DEFINITIONS: tuple[dict[str, str], ...] = (
+        {
+            "id": "current_draft",
+            "label": "Current draft",
+            "description": "Review the current draft diff for this run.",
+        },
+        {
+            "id": "against_base_template",
+            "label": "Against base template",
+            "description": "Review files that differ from the canonical starter template.",
+        },
+        {
+            "id": "since_last_successful_run",
+            "label": "Since last successful run",
+            "description": "Review changes relative to the previous applied successful run in this workspace.",
+        },
+        {
+            "id": "product_runtime_files",
+            "label": "Product runtime files",
+            "description": "Review only generated product runtime files, excluding tests and platform-only evidence.",
+        },
+        {
+            "id": "failed_repair_patch",
+            "label": "Failed repair patch",
+            "description": "Review the patch and target files from a failed or blocked repair attempt.",
+        },
+    )
+    REVIEW_TARGET_ALIASES: dict[str, str] = {
+        "draft": "current_draft",
+        "current": "current_draft",
+        "base_template": "against_base_template",
+        "template": "against_base_template",
+        "last_success": "since_last_successful_run",
+        "since_last_success": "since_last_successful_run",
+        "runtime": "product_runtime_files",
+        "product": "product_runtime_files",
+        "repair": "failed_repair_patch",
+        "failed_patch": "failed_repair_patch",
+    }
 
     @staticmethod
     def _typed_payload(model: type[WorkbenchApiModel], payload: dict[str, Any]) -> dict[str, Any]:
@@ -134,9 +184,17 @@ class WorkbenchService:
         run_compaction_service: RunCompactionService | None = None,
         background_task_service: BackgroundTaskService | None = None,
         repair_case_service: RepairCaseService | None = None,
+        context_manager_service: ContextManagerService | None = None,
+        worker_session_service: WorkerSessionService | None = None,
+        draft_isolation_service: DraftIsolationService | None = None,
+        guardian_gate_service: GuardianGateService | None = None,
+        lsp_context_service: LspContextService | None = None,
         event_journal_service: EventJournalService | None = None,
         output_artifact_service: OutputArtifactService | None = None,
         pr_babysitter_service: PrBabysitterService | None = None,
+        browser_replay_proof_service: BrowserReplayProofService | None = None,
+        doctor_service: DoctorService | None = None,
+        existing_app_map_service: ExistingAppMapService | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
@@ -147,11 +205,31 @@ class WorkbenchService:
         self.platform_db = platform_db
         self.run_protocol_service = run_protocol_service
         self.run_compaction_service = run_compaction_service
+        self.context_manager_service = context_manager_service
+        self.worker_session_service = worker_session_service or WorkerSessionService(store, event_journal_service=event_journal_service)
+        self.draft_isolation_service = draft_isolation_service or DraftIsolationService(store=store, workspace_service=workspace_service, event_journal_service=event_journal_service)
+        self.guardian_gate_service = guardian_gate_service or GuardianGateService(store=store, workspace_service=workspace_service, event_journal_service=event_journal_service)
+        self.lsp_context_service = lsp_context_service
         self.background_task_service = background_task_service
         self.event_journal_service = event_journal_service
         self.output_artifact_service = output_artifact_service
         self.pr_babysitter_service = pr_babysitter_service or PrBabysitterService(store=store, workspace_service=workspace_service)
+        self.browser_replay_proof_service = browser_replay_proof_service or BrowserReplayProofService(store, event_journal_service=event_journal_service)
         self.repair_case_service = repair_case_service or RepairCaseService(store, event_journal_service=event_journal_service)
+        self.doctor_service = doctor_service or DoctorService(
+            settings=settings,
+            store=store,
+            openai_client=openai_client,
+            exec_policy_service=exec_policy_service,
+            event_journal_service=event_journal_service,
+            run_protocol_service=run_protocol_service,
+        )
+        self.existing_app_map_service = existing_app_map_service or ExistingAppMapService(
+            store=store,
+            workspace_service=workspace_service,
+            lsp_context_service=lsp_context_service,
+            event_journal_service=event_journal_service,
+        )
         self.prompt_suggestion_service = PromptSuggestionService()
 
     def list_webhooks(self, *, workspace_id: str | None = None) -> dict[str, Any]:
@@ -1169,6 +1247,7 @@ class WorkbenchService:
                     "scope": approval.get("scope") or "workspace",
                     "workspace_id": workspace_id,
                     "command_fingerprint": approval.get("command_fingerprint") or evaluation.get("command_fingerprint"),
+                    "command_prefix": approval.get("command_prefix") or evaluation.get("command_prefix") or {},
                     "risk": decision.get("risk"),
                     "summary": self.exec_policy_service.redact(command),
                     "input": {"command": self.exec_policy_service.redact(command), "workspace_id": workspace_id},
@@ -1352,6 +1431,12 @@ class WorkbenchService:
         worker_ids = [role.worker_id for role in PRODUCT_WORKERS if role.worker_id != "repair_worker"]
         if any((item.get("repair_worker") if isinstance(item, dict) else None) for item in [merge_decision]):
             worker_ids.append("repair_worker")
+        worker_sessions_report = self.worker_sessions(run_id)
+        sessions_by_worker = {
+            canonical_worker_id(str(item.get("worker_id") or "")): item
+            for item in worker_sessions_report.get("items") or []
+            if isinstance(item, dict)
+        }
         lanes = []
         for worker_id in worker_ids:
             canonical = canonical_worker_id(worker_id)
@@ -1379,15 +1464,24 @@ class WorkbenchService:
             )
             task = real_tasks.get(canonical) or {}
             status = self._worker_status(canonical, run, summaries, merge_reports, mailbox_workers)
+            worker_session = sessions_by_worker.get(canonical) or {}
             if isinstance(output, dict) and output.get("status"):
                 status = str(output.get("status"))
+            if isinstance(worker_session, dict) and worker_session.get("status") not in {None, "", "planned"}:
+                status = str(worker_session.get("status"))
             if isinstance(decision, dict) and decision.get("decision") in {"accepted", "rejected", "needs_repair"}:
                 status = {"accepted": "merged", "rejected": "rejected", "needs_repair": "blocked"}[str(decision.get("decision"))]
             lanes.append(
                 {
                     "worker_id": canonical,
+                    "worker_session_id": worker_session.get("worker_session_id") if isinstance(worker_session, dict) else None,
+                    "latest_turn_id": worker_session.get("latest_turn_id") if isinstance(worker_session, dict) else None,
+                    "mailbox_ref": worker_sessions_report.get("mailbox_ref"),
+                    "ownership_ref": worker_sessions_report.get("ownership_ref"),
                     "worker_type": canonical,
-                    "alias_ids": [],
+                    "alias_ids": list(product_owner_contract(canonical).get("alias_ids") or []),
+                    "lane_id": product_owner_contract(canonical).get("lane_id"),
+                    "ownership_kind": product_owner_contract(canonical).get("ownership_kind"),
                     "branch_role": AgentWorkerManager.branch_role(canonical),
                     "branch_stage": AgentWorkerManager.branch_stage(canonical),
                     "branch_policy": AgentWorkerManager.branch_policy(canonical),
@@ -1395,6 +1489,7 @@ class WorkbenchService:
                     "badge": str(output.get("badge") or status) if isinstance(output, dict) else status,
                     "owner_scope": self._worker_scope(canonical),
                     "ownership": ownership_for_worker(canonical),
+                    "product_owner_contract": product_owner_contract(canonical),
                     "changed_files": list(output.get("changed_files") or [path for path in run.touched_files if self._path_owned_by_worker(canonical, path)]),
                     "summaries": summaries,
                     "merge_reports": merge_reports,
@@ -1404,6 +1499,7 @@ class WorkbenchService:
                     "output_ref": refs["output_ref"] if output else None,
                     "task_id": task.get("task_id") if isinstance(task, dict) else None,
                     "proof_refs": list(output.get("proof_refs") or []) if isinstance(output, dict) else [],
+                    "merge_evidence": decision.get("merge_evidence") if isinstance(decision, dict) else None,
                     "merge_decision_ref": merge_decision_ref if merge_decision else None,
                     "merge_decision": decision or None,
                 }
@@ -1414,11 +1510,98 @@ class WorkbenchService:
             "run_id": run_id,
             "workspace_id": run.workspace_id,
             "workers": lanes,
+            "ownership_contract": {
+                "schema": "grounded.product_worker_ownership_contract.v1",
+                "lanes": {
+                    "backend": ["backend_api_worker"],
+                    "role_ui": ["client_surface_worker", "specialist_surface_worker", "manager_surface_worker"],
+                    "persistence_api": ["backend_api_worker"],
+                    "tests": ["test_verifier_worker"],
+                    "verifier": ["mobile_polish_worker"],
+                    "repair": ["repair_worker"],
+                },
+                "contracts": [product_owner_contract(worker_id) for worker_id in worker_ids],
+                "merge_policy": "accept only owned diffs with merge evidence; route rejected/blocked paths to repair_worker",
+            },
             "worker_branch_refs": run.worker_branch_refs,
+            "worker_sessions_ref": worker_sessions_report.get("sessions_ref"),
+            "worker_sessions": worker_sessions_report.get("items") or [],
+            "worker_mailbox_v2": worker_sessions_report.get("mailbox") or {},
+            "worker_ownership": worker_sessions_report.get("ownership") or {},
             "merge_decision_ref": merge_decision_ref if merge_decision else None,
             "mailbox": (mailbox or {}).get("mailbox") if isinstance(mailbox, dict) else {},
             "branch_plan": ((mailbox or {}).get("mailbox") or {}).get("execution_stages") if isinstance(mailbox, dict) else [],
         }
+
+    def worker_sessions(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        artifact_run_id = self._worker_artifact_run_id(run)
+        report = self.worker_session_service.list_sessions(
+            workspace_id=run.workspace_id,
+            parent_run_id=run_id,
+            artifact_run_id=artifact_run_id,
+        )
+        if not report.get("items"):
+            mailbox_payload = self.store.get("reports", run.worker_mailbox_ref) if run.worker_mailbox_ref else {}
+            mailbox = mailbox_payload.get("mailbox") if isinstance(mailbox_payload, dict) and isinstance(mailbox_payload.get("mailbox"), dict) else {}
+            worker_tasks = mailbox_payload.get("worker_tasks") if isinstance(mailbox_payload, dict) and isinstance(mailbox_payload.get("worker_tasks"), list) else []
+            if worker_tasks:
+                report = self.worker_session_service.create_sessions(
+                    workspace_id=run.workspace_id,
+                    parent_run_id=run_id,
+                    artifact_run_id=artifact_run_id,
+                    worker_tasks=worker_tasks,
+                    mailbox=mailbox,
+                    implementation_plan=run.implementation_plan or {},
+                    acceptance_contract=run.acceptance_contract or {},
+                )
+        return report
+
+    def worker_session(self, run_id: str, worker_session_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        return self.worker_session_service.get_session(
+            workspace_id=run.workspace_id,
+            parent_run_id=run_id,
+            artifact_run_id=self._worker_artifact_run_id(run),
+            worker_session_id=worker_session_id,
+        )
+
+    def worker_mailbox(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        return self.worker_session_service.mailbox(
+            workspace_id=run.workspace_id,
+            parent_run_id=run_id,
+            artifact_run_id=self._worker_artifact_run_id(run),
+        )
+
+    def resume_worker_session(self, run_id: str, worker_session_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        return self.worker_session_service.resume(
+            workspace_id=run.workspace_id,
+            parent_run_id=run_id,
+            artifact_run_id=self._worker_artifact_run_id(run),
+            worker_session_id=worker_session_id,
+        )
+
+    def message_worker_session(self, run_id: str, worker_session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        artifact_run_id = self._worker_artifact_run_id(run)
+        detail = self.worker_session_service.get_session(
+            workspace_id=run.workspace_id,
+            parent_run_id=run_id,
+            artifact_run_id=artifact_run_id,
+            worker_session_id=worker_session_id,
+        )
+        session = detail.get("session") if isinstance(detail.get("session"), dict) else {}
+        return self.worker_session_service.append_message(
+            workspace_id=run.workspace_id,
+            parent_run_id=run_id,
+            artifact_run_id=artifact_run_id,
+            from_worker=str(payload.get("from") or payload.get("from_worker") or "coordinator"),
+            to_worker=str(payload.get("to") or payload.get("to_worker") or session.get("worker_id") or ""),
+            kind=str(payload.get("kind") or "manual"),
+            payload=payload.get("payload") if isinstance(payload.get("payload"), dict) else payload,
+        )
 
     def worker_orchestration(self, run_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
@@ -1471,6 +1654,10 @@ class WorkbenchService:
             "worker_merge": merge,
             "merge_decision_ref": merge_decision_ref if merge_decision else None,
             "merge_decision": merge_decision,
+            "worker_sessions": workers.get("worker_sessions") or [],
+            "mailbox_v2": workers.get("worker_mailbox_v2") or {},
+            "ownership": workers.get("worker_ownership") or {},
+            "resume_candidates": (self.worker_sessions(run_id).get("resume_candidates") or []),
             "workers": workers.get("workers") or [],
             "worker_memory_refs": [
                 item.get("memory_snapshot_ref")
@@ -1694,9 +1881,12 @@ class WorkbenchService:
         owned_files = [path for path in run.touched_files if self._path_owned_by_worker(canonical, path)]
         return {"run_id": run_id, "worker_id": canonical, "owned_files": owned_files, "diff": self._filter_diff(diff, owned_files)}
 
-    def review(self, run_id: str) -> dict[str, Any]:
+    def review(self, run_id: str, *, target: str | None = None) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
         artifacts = self._run_artifacts_or_empty(run_id)
+        target_context = self._review_target_context(run=run, artifacts=artifacts, selected_target=target)
+        selected_target = target_context["selected_target"]
+        review_targets = target_context["targets"]
         findings: list[dict[str, Any]] = []
         for issue in run.checks_summary.issues:
             findings.append(
@@ -1712,8 +1902,8 @@ class WorkbenchService:
                     blocker=bool(issue.get("blocking") or issue.get("blocker") or run.checks_summary.gate_status in {"failed", "blocked"}),
                 )
             )
-        diff_text = str(artifacts.get("diff") or "")
-        changed_files = run.touched_files or self._paths_from_diff(diff_text)
+        diff_text = str(target_context.get("diff") or "")
+        changed_files = [str(path) for path in target_context.get("changed_files") or [] if str(path).strip()]
         check_results = [item for item in artifacts.get("check_results") or [] if isinstance(item, dict)]
         check_by_name = {str(item.get("name") or ""): item for item in check_results}
         acceptance_required = bool((run.acceptance_contract or {}).get("required")) or run.intent == "create"
@@ -1751,7 +1941,8 @@ class WorkbenchService:
             source="manual_review",
             review_context={
                 "run": run.model_dump(mode="json"),
-                "diff": str(artifacts.get("diff") or ""),
+                "diff": diff_text,
+                "review_target": selected_target,
                 "token_usage": run.token_usage,
                 "context_pressure": self.store.get("reports", run.context_pressure_ref) if run.context_pressure_ref else {},
             },
@@ -1859,7 +2050,9 @@ class WorkbenchService:
             "schema": "grounded.review_report.v2",
             "run_id": run_id,
             "workspace_id": run.workspace_id,
-            "status": "failed" if findings else "passed",
+            "status": "unavailable" if not selected_target.get("available", True) and not findings else "failed" if findings else "passed",
+            "review_target": selected_target,
+            "review_targets": review_targets,
             "summary": {
                 "finding_count": len(findings),
                 "blocker_count": blocker_count,
@@ -1868,12 +2061,16 @@ class WorkbenchService:
                 "stale_test_risks": sum(1 for item in findings if item.get("category") == "stale_test_risk"),
                 "browser_proof_gaps": sum(1 for item in findings if item.get("category") == "browser_proof"),
                 "contract_mismatches": sum(1 for item in findings if item.get("category") == "product_contract"),
+                "review_target": selected_target.get("id"),
+                "review_target_available": bool(selected_target.get("available", True)),
             },
             "findings": findings,
             "repair_cases": repair_cases,
             "evidence": {
-                "diff_available": bool(artifacts.get("diff")),
+                "diff_available": bool(diff_text),
                 "changed_files": changed_files,
+                "review_target": selected_target,
+                "review_targets": review_targets,
                 "checks": check_results,
                 "browser_proof_ref": run.browser_proof_ref,
                 "verifier_review_ref": run.verifier_review_ref,
@@ -1883,8 +2080,147 @@ class WorkbenchService:
             },
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
-        self.store.upsert("reports", f"review:{run_id}", payload)
+        review_ref = f"review:{run_id}" if selected_target.get("id") == "current_draft" else f"review:{run_id}:{selected_target.get('id')}"
+        self.store.upsert("reports", review_ref, payload)
         return payload
+
+    def _review_target_context(self, *, run: RunRecord, artifacts: dict[str, Any], selected_target: str | None) -> dict[str, Any]:
+        raw_target = str(selected_target or "current_draft").strip().lower().replace("-", "_")
+        target_id = self.REVIEW_TARGET_ALIASES.get(raw_target, raw_target)
+        allowed = {item["id"] for item in self.REVIEW_TARGET_DEFINITIONS}
+        if target_id not in allowed:
+            target_id = "current_draft"
+        raw_diff = str(artifacts.get("diff") or "")
+        if not raw_diff:
+            try:
+                raw_diff = str(self.workspace_service.diff(run.workspace_id, run_id=run.run_id) or "")
+            except KeyError:
+                raw_diff = ""
+        all_changed = self._dedupe_paths([*(run.touched_files or []), *self._paths_from_diff(raw_diff)])
+        targets = [self._review_target_descriptor(definition["id"], run=run, artifacts=artifacts, raw_diff=raw_diff, all_changed=all_changed) for definition in self.REVIEW_TARGET_DEFINITIONS]
+        selected = next((item for item in targets if item.get("id") == target_id), targets[0])
+        changed_files = [str(path) for path in selected.get("files") or [] if str(path).strip()]
+        diff_text = raw_diff if target_id == "current_draft" else self._filter_diff(raw_diff, changed_files)
+        return {
+            "selected_target": selected,
+            "targets": targets,
+            "changed_files": changed_files,
+            "diff": diff_text,
+        }
+
+    def _review_target_descriptor(self, target_id: str, *, run: RunRecord, artifacts: dict[str, Any], raw_diff: str, all_changed: list[str]) -> dict[str, Any]:
+        definition = next(item for item in self.REVIEW_TARGET_DEFINITIONS if item["id"] == target_id)
+        files = list(all_changed)
+        available = True
+        reason: str | None = None
+        metadata: dict[str, Any] = {}
+        if target_id == "against_base_template":
+            files = [path for path in all_changed if self._path_differs_from_base_template(run.workspace_id, run.run_id, path)]
+            available = bool(files)
+            reason = None if available else "No changed files differ from the canonical base template."
+            metadata["base"] = "canonical_template"
+        elif target_id == "since_last_successful_run":
+            previous = self._previous_successful_run(run)
+            if previous is None:
+                files = []
+                available = False
+                reason = "No previous completed applied run exists for this workspace."
+            else:
+                previous_files = self._dedupe_paths([*(previous.touched_files or []), *self._paths_from_diff(str(self._run_artifacts_or_empty(previous.run_id).get("diff") or ""))])
+                files = self._dedupe_paths([*all_changed, *[path for path in previous_files if path in all_changed]])
+                metadata["base_run_id"] = previous.run_id
+                metadata["base_result_revision_id"] = previous.result_revision_id
+                metadata["shared_files"] = sorted(set(previous_files) & set(all_changed))[:80]
+                metadata["new_files"] = sorted(set(all_changed) - set(previous_files))[:80]
+        elif target_id == "product_runtime_files":
+            files = [path for path in all_changed if self._is_product_runtime_file(path)]
+            available = bool(files)
+            reason = None if available else "No product runtime files changed in this draft."
+        elif target_id == "failed_repair_patch":
+            repair_failed = run.mode == "fix" and (run.status in {"failed", "blocked"} or bool(run.remaining_issues) or bool(run.failure_reason))
+            files = self._dedupe_paths([*(run.fix_targets or []), *all_changed])
+            available = bool(repair_failed and files)
+            reason = None if available else "Run is not a failed or blocked repair patch."
+            metadata["failure_class"] = run.failure_class
+            metadata["failure_signature"] = run.failure_signature
+            metadata["remaining_issue_count"] = len(run.remaining_issues or [])
+            metadata["repair_iteration_count"] = len(run.repair_iterations or [])
+        stats = self._diff_file_stats(self._filter_diff(raw_diff, files) if target_id != "current_draft" else raw_diff)
+        return {
+            **definition,
+            "available": available,
+            "reason": reason,
+            "files": files[:120],
+            "file_count": len(files),
+            "diff_available": bool(raw_diff and files),
+            "summary": {
+                "additions": sum(int(item.get("additions") or 0) for item in stats.values()),
+                "deletions": sum(int(item.get("deletions") or 0) for item in stats.values()),
+                "diff_file_count": len(stats),
+            },
+            "metadata": metadata,
+        }
+
+    def _previous_successful_run(self, run: RunRecord) -> RunRecord | None:
+        candidates: list[RunRecord] = []
+        for _, payload in self.store.items("runs"):
+            if not isinstance(payload, dict):
+                continue
+            try:
+                candidate = RunRecord.model_validate(payload)
+            except Exception:
+                continue
+            if candidate.workspace_id != run.workspace_id or candidate.run_id == run.run_id:
+                continue
+            if candidate.status == "completed" and candidate.apply_status == "applied" and candidate.created_at <= run.created_at:
+                candidates.append(candidate)
+        candidates.sort(key=lambda item: item.created_at, reverse=True)
+        return candidates[0] if candidates else None
+
+    def _path_differs_from_base_template(self, workspace_id: str, run_id: str, relative_path: str) -> bool:
+        path = str(relative_path or "").replace("\\", "/").strip()
+        if not path or path.startswith("/") or ".." in Path(path).parts:
+            return False
+        base_path = self.settings.template_dir / path
+        draft_path = self.workspace_service.draft_source_dir(workspace_id, run_id) / path
+        source_path = self.workspace_service.source_dir(workspace_id) / path
+        current_path = draft_path if draft_path.exists() else source_path
+        if not current_path.exists():
+            return base_path.exists()
+        if not base_path.exists():
+            return True
+        if current_path.is_dir() or base_path.is_dir():
+            return current_path.is_dir() != base_path.is_dir()
+        return self._file_digest(current_path) != self._file_digest(base_path)
+
+    @staticmethod
+    def _file_digest(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 256), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _is_product_runtime_file(path: str) -> bool:
+        normalized = str(path or "").replace("\\", "/")
+        if normalized.startswith(("miniapp/tests/", "tests/", "docs/", ".github/")):
+            return False
+        if normalized.startswith("miniapp/app/"):
+            return True
+        return normalized in {"miniapp/requirements.txt", "miniapp/Dockerfile", "miniapp/pyproject.toml", "miniapp/package.json", "miniapp/package-lock.json"}
+
+    @staticmethod
+    def _dedupe_paths(paths: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for path in paths:
+            item = str(path or "").strip().replace("\\", "/")
+            while item.startswith("./"):
+                item = item[2:]
+            if not item or item.startswith("/") or ".." in Path(item).parts:
+                continue
+            normalized.append(item)
+        return list(dict.fromkeys(normalized))
 
     def prompt_suggestions(self, run_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
@@ -2118,10 +2454,49 @@ class WorkbenchService:
         run = self.run_service.get_run(run_id)
         artifacts = self._run_artifacts_or_empty(run_id)
         payload = self._normalize_browser_proof_payload(run, artifacts)
+        failed_packet = self._latest_browser_replay_packet(run)
+        replay = self.browser_replay_proof_service.build(workspace_id=run.workspace_id, run_id=run_id, browser_proof=payload, failed_packet=failed_packet)
+        run.browser_replay_proof_ref = replay.replay_proof_ref
+        run.browser_step_refs = list(dict.fromkeys([*list(run.browser_step_refs or []), *replay.scenario_refs]))
+        run.updated_at = datetime.now(timezone.utc)
+        self.store.upsert("runs", run_id, run.model_dump(mode="json"))
+        payload["replay_proof_ref"] = replay.replay_proof_ref
+        payload["replay_scenarios"] = [item.model_dump(mode="json", by_alias=True) for item in replay.scenarios]
+        payload["playwright_spec_refs"] = list(replay.playwright_spec_refs)
+        payload["artifact_refs"] = {**dict(payload.get("artifact_refs") or {}), "browser_replay_proof": replay.replay_proof_ref}
         self.store.upsert("reports", f"browser_proof:{run_id}", payload)
         if run.browser_proof_ref:
             self.store.upsert("reports", run.browser_proof_ref, payload)
         return payload
+
+    def browser_replay_proof(self, run_id: str, *, build: bool = False) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        existing = self.browser_replay_proof_service.get(workspace_id=run.workspace_id, run_id=run_id)
+        if existing and not build:
+            return existing
+        return self.browser_proof(run_id).get("replay_proof_ref") and self.browser_replay_proof_service.get(workspace_id=run.workspace_id, run_id=run_id) or {}
+
+    def browser_replay_scenario(self, run_id: str, scenario_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        scenario = self.browser_replay_proof_service.scenario(workspace_id=run.workspace_id, run_id=run_id, scenario_id=scenario_id)
+        if scenario is None:
+            self.browser_replay_proof(run_id, build=True)
+            scenario = self.browser_replay_proof_service.scenario(workspace_id=run.workspace_id, run_id=run_id, scenario_id=scenario_id)
+        if scenario is None:
+            raise KeyError(f"Browser replay scenario not found: {scenario_id}")
+        return scenario
+
+    def _latest_browser_replay_packet(self, run: RunRecord) -> dict[str, Any] | None:
+        refs = [ref for ref in list(getattr(run, "browser_step_refs", []) or []) if str(ref).startswith("browser_replay:")]
+        if not refs:
+            refs = [key for key, payload in self.store.items("reports") if key.startswith(f"browser_replay:{run.workspace_id}:{run.run_id}") and isinstance(payload, dict)]
+        for ref in reversed(refs):
+            payload = self.store.get("reports", ref)
+            if isinstance(payload, dict):
+                packet = payload.get("packet") if isinstance(payload.get("packet"), dict) else payload
+                if isinstance(packet, dict):
+                    return packet
+        return None
 
     def browser_replay(self, run_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
@@ -2144,6 +2519,7 @@ class WorkbenchService:
             packet = payload.get("packet") if isinstance(payload.get("packet"), dict) else payload
             items.append({"ref": ref, "packet": packet})
         latest = items[-1]["packet"] if items else {}
+        replay_proof = self.browser_replay_proof(run_id)
         return {
             "schema": "grounded.browser_replay.v1",
             "run_id": run_id,
@@ -2151,6 +2527,13 @@ class WorkbenchService:
             "status": "ready" if latest else "empty",
             "items": items,
             "latest_packet": latest,
+            "replay_proof": replay_proof,
+            "scenario_bundles": replay_proof.get("scenarios") if isinstance(replay_proof, dict) else [],
+            "playwright_specs": [
+                {"scenario_id": item.get("scenario_id"), "playwright_spec": item.get("playwright_spec")}
+                for item in (replay_proof.get("scenarios") or [])
+                if isinstance(item, dict)
+            ] if isinstance(replay_proof, dict) else [],
             "replay_first": BrowserProofReplay.should_rerun_step_first(latest if isinstance(latest, dict) else None),
             "replay_plan": latest.get("replay_plan") if isinstance(latest, dict) else {},
         }
@@ -2317,10 +2700,10 @@ class WorkbenchService:
         )
         return payload
 
-    def doctor_workspace(self, workspace_id: str) -> dict[str, Any]:
+    def doctor_workspace(self, workspace_id: str, *, scope: str = "quick", run_id: str | None = None) -> dict[str, Any]:
         self.workspace_service.get_workspace(workspace_id)
         runs = self.run_service.list_runs(workspace_id)
-        latest = runs[0] if runs else None
+        latest = self.run_service.get_run(run_id) if run_id else runs[0] if runs else None
         reports = {
             "gate": self.store.get("reports", f"gate:{latest.run_id}") if latest else {},
             "trace_state": self.trace_bundle_state(latest.run_id) if latest else {},
@@ -2336,7 +2719,12 @@ class WorkbenchService:
             api_logs=self._workspace_log_lines(workspace_id, kind="api"),
             reports=reports,
         )
-        payload["environment_health"] = self._doctor_workspace_environment_health()
+        payload["environment_health"] = self.doctor_service.workspace_report(
+            workspace_id=workspace_id,
+            run_id=getattr(latest, "run_id", None),
+            scope=scope,
+            preview=self._preview_payload(workspace_id),
+        )
         self.store.upsert("reports", f"doctor_workspace:{workspace_id}", payload)
         return payload
 
@@ -2522,16 +2910,21 @@ class WorkbenchService:
         diff_text = str(artifacts.get("diff") or "")
         check_results = [item for item in artifacts.get("check_results") or [] if isinstance(item, dict)]
         mode_value = str(getattr(run.generation_mode, "value", run.generation_mode) or "").lower()
+        emergency_scaffold = (
+            isinstance(run.token_usage, dict)
+            and str(run.token_usage.get("fallback_kind") or "") == "emergency_scaffold"
+        )
         generation_sla = GenerationSla.profile(mode_value)
-        full_audit_required = GenerationSla.requires_full_audit(mode_value)
+        full_audit_required = GenerationSla.requires_full_audit(mode_value) and not emergency_scaffold
+        fast_scaffold_gate = mode_value in {"fast", "basic"} or emergency_scaffold
         readiness = ProductReadinessContract.evaluate(
             run_mode=run.mode,
-            generation_mode=mode_value,
+            generation_mode="fast" if fast_scaffold_gate else mode_value,
             intent=run.intent,
             acceptance_contract=run.acceptance_contract,
             implementation_plan=run.implementation_plan,
             results=check_results,
-            diff_text=diff_text,
+            diff_text="" if fast_scaffold_gate else diff_text,
             touched_files=run.touched_files,
             target_role_scope=run.target_role_scope,
             mobile_layout_report=run.mobile_layout_report,
@@ -2544,6 +2937,13 @@ class WorkbenchService:
         )
         acceptance_required = readiness.acceptance_required
         issues: list[dict[str, Any]] = [item.model_dump(mode="json") if hasattr(item, "model_dump") else dict(item) for item in readiness.blocking_reasons]
+        if fast_scaffold_gate:
+            issues = [
+                item
+                for item in issues
+                if str(item.get("kind") or "") not in {"product_task_ledger", "diff_scope"}
+                and str(item.get("check") or "") not in {"product_task_ledger", "meaningful_product_diff"}
+            ]
 
         def add_issue(kind: str, check: str, details: str, *, blocking: bool = True, evidence: dict[str, Any] | None = None) -> None:
             issues.append({"kind": kind, "check": check, "details": details, "blocking": blocking, "evidence": evidence or {}})
@@ -2552,6 +2952,17 @@ class WorkbenchService:
             add_issue("preview_infra", "browser_flow_smoke", run.failure_reason or "Browser/preview infrastructure blocked product proof.", evidence=artifacts.get("preview_infra_diagnostics") or {})
         apply_ok = run.apply_status == "applied"
         browser_proof = self._normalize_browser_proof_payload(run, artifacts)
+        browser_product_proof = self._browser_product_proof_for_run(run=run, artifacts=artifacts, browser_proof=browser_proof)
+        if acceptance_required and not fast_scaffold_gate:
+            for issue in browser_product_proof.get("issues") or []:
+                if not isinstance(issue, dict) or not issue.get("blocking", True):
+                    continue
+                add_issue(
+                    str(issue.get("kind") or "browser_product_proof"),
+                    "browser_product_proof",
+                    str(issue.get("details") or "Browser product proof is incomplete."),
+                    evidence={"browser_product_proof": issue},
+                )
         traceability = self.requirement_traceability(run_id, run=run, artifacts=artifacts, browser_proof=browser_proof)
         if full_audit_required:
             issues.extend(RequirementTraceabilityMatrix.blocking_issues(traceability))
@@ -2570,7 +2981,11 @@ class WorkbenchService:
             artifacts=artifacts,
             browser_proof=browser_proof,
         )
-        issues.extend(VisualRegressionGenerator.blocking_issues(visual_regression))
+        if not fast_scaffold_gate:
+            issues.extend(VisualRegressionGenerator.blocking_issues(visual_regression))
+        lsp_verification = self._lsp_verification_for_run(run=run, artifacts=artifacts, diff_text=diff_text)
+        if not fast_scaffold_gate:
+            issues.extend(lsp_verification.get("issues") or [])
 
         checkpoint = self.store.get("reports", run.resume_checkpoint_ref) if run.resume_checkpoint_ref else None
         checkpoint_packets = list((checkpoint or {}).get("repair_packets") or []) if isinstance(checkpoint, dict) else []
@@ -2632,6 +3047,19 @@ class WorkbenchService:
             "issue_count": len(visual_regression.get("issues") or []),
             "report_ref": f"visual_regression:{run_id}",
         }
+        readiness_evidence["browser_product_proof"] = {
+            "status": browser_product_proof.get("status"),
+            "blocking": browser_product_proof.get("blocking"),
+            "issue_count": len(browser_product_proof.get("issues") or []),
+            "report_ref": f"browser_product_proof:{run_id}",
+        }
+        readiness_evidence["lsp_verification"] = {
+            "status": lsp_verification.get("status"),
+            "blocking": lsp_verification.get("blocking"),
+            "issue_count": len(lsp_verification.get("issues") or []),
+            "diagnostics_ref": lsp_verification.get("diagnostics_ref"),
+            "route_graph_ref": lsp_verification.get("route_graph_ref"),
+        }
         readiness_payload["evidence"] = readiness_evidence
         status = "passed" if not blocking and apply_ok else "blocked" if blocking else "pending"
         payload = {
@@ -2649,6 +3077,8 @@ class WorkbenchService:
             "requirement_traceability": traceability,
             "prompt_completion_audit": completion_audit,
             "visual_regression": visual_regression,
+            "browser_product_proof": browser_product_proof,
+            "lsp_verification": lsp_verification,
             "requirements": {
                 "acceptance_required": acceptance_required,
                 "generation_sla": generation_sla.to_dict(),
@@ -2656,6 +3086,13 @@ class WorkbenchService:
                 "requirement_traceability": full_audit_required,
                 "prompt_completion_audit": full_audit_required,
                 "visual_regression": acceptance_required,
+                "browser_product_proof": acceptance_required,
+                "browser_role_screenshots": acceptance_required,
+                "browser_console_network_capture": acceptance_required,
+                "browser_reload_persistence": acceptance_required,
+                "acceptance_contract_scenarios": bool((run.acceptance_contract or {}).get("flows")),
+                "lsp_changed_files_diagnostics": acceptance_required,
+                "lsp_route_graph": acceptance_required,
                 "meaningful_diff": True,
                 "api_workflow_smoke": acceptance_required,
                 "browser_flow_smoke": acceptance_required,
@@ -2671,6 +3108,10 @@ class WorkbenchService:
                 "requirement_traceability": f"requirement_traceability:{run_id}",
                 "prompt_completion_audit": f"prompt_completion_audit:{run_id}",
                 "visual_regression": f"visual_regression:{run_id}",
+                "browser_product_proof": f"browser_product_proof:{run_id}",
+                "lsp_verification": f"lsp_verification:{run_id}",
+                "lsp_diagnostics": lsp_verification.get("diagnostics_ref"),
+                "lsp_route_graph": lsp_verification.get("route_graph_ref"),
                 "repair_recipes": run.repair_recipes_ref,
                 "final_report": f"final_report:{run_id}",
                 "resume_checkpoint": run.resume_checkpoint_ref,
@@ -2678,6 +3119,7 @@ class WorkbenchService:
                 "repair_cases": RepairCaseService.index_ref(run_id),
             },
         }
+        self.store.upsert("reports", f"browser_product_proof:{run_id}", browser_product_proof)
         state = RunStateMachine.evaluate(run=run, gate=payload, artifacts=artifacts, browser_proof=browser_proof)
         if state.get("invariant_issues"):
             payload["issues"] = [*payload["issues"], *state["invariant_issues"]]
@@ -2705,6 +3147,39 @@ class WorkbenchService:
             state = RunStateMachine.evaluate(run=run, gate=payload, artifacts=artifacts, browser_proof=browser_proof)
         payload["run_state"] = state
         payload["artifact_refs"]["run_state"] = f"run_state:{run_id}"
+        try:
+            draft_gate = self.draft_isolation_service.create_gate(
+                workspace_id=run.workspace_id,
+                run_id=run_id,
+                checks_ref=f"run_artifacts:{run_id}",
+                lsp_ref=getattr(run, "lsp_context_ref", None) or f"lsp_context:{run.workspace_id}:{run_id}",
+                readiness_ref=f"gate:{run_id}",
+            )
+            draft_manifest = self.store.get("reports", draft_gate.isolation_ref) or {}
+            payload["draft_isolation"] = draft_manifest
+            payload["draft_gate"] = draft_gate.model_dump(mode="json", by_alias=True)
+            payload["artifact_refs"]["draft_isolation"] = draft_gate.isolation_ref
+            payload["artifact_refs"]["draft_gate"] = draft_gate.gate_ref
+            self._sync_draft_refs(run, isolation_ref=draft_gate.isolation_ref, gate_ref=draft_gate.gate_ref, persist=True)
+        except Exception as exc:
+            payload["draft_isolation"] = {"status": "unavailable", "reason": str(exc)}
+        try:
+            guardian_gate = self.guardian_gate_service.latest_gate(workspace_id=run.workspace_id, run_id=run_id)
+            if guardian_gate is None:
+                guardian_gate = self.guardian_gate_service.run_gate(
+                    run=run,
+                    source="manual_review",
+                    changed_files=self.workspace_service.draft_changed_paths(run.workspace_id, run_id) if self.workspace_service.draft_exists(run.workspace_id, run_id) else run.touched_files,
+                ).model_dump(mode="json", by_alias=True)
+            payload["guardian_gate"] = guardian_gate
+            payload["guardian_gate_ref"] = guardian_gate.get("guardian_gate_ref")
+            payload["semantic_verdict"] = guardian_gate.get("semantic_verdict")
+            payload["guardian_repair_packets"] = guardian_gate.get("repair_packets") or []
+            payload["artifact_refs"]["guardian_gate"] = guardian_gate.get("guardian_gate_ref")
+            run.guardian_gate_ref = guardian_gate.get("guardian_gate_ref") or run.guardian_gate_ref
+            self.store.upsert("runs", run_id, run.model_dump(mode="json"))
+        except Exception as exc:
+            payload["guardian_gate"] = {"status": "unavailable", "reason": str(exc)}
         self.store.upsert("reports", f"gate:{run_id}", payload)
         self.store.upsert("reports", f"run_state:{run_id}", state)
         digest = hashlib.sha256(
@@ -2759,6 +3234,18 @@ class WorkbenchService:
                 pass
         return self._typed_payload(GateReport, payload)
 
+    def guardian_gate(self, run_id: str, *, create: bool = False, semantic_override: str | None = None) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        existing = self.guardian_gate_service.latest_gate(workspace_id=run.workspace_id, run_id=run_id)
+        if existing and not create and semantic_override is None:
+            return existing
+        changed_files = self.workspace_service.draft_changed_paths(run.workspace_id, run_id) if self.workspace_service.draft_exists(run.workspace_id, run_id) else run.touched_files
+        report = self.guardian_gate_service.run_gate(run=run, source="manual_review", changed_files=changed_files, semantic_override=semantic_override)
+        run.guardian_gate_ref = report.guardian_gate_ref
+        run.updated_at = datetime.now(timezone.utc)
+        self.store.upsert("runs", run_id, run.model_dump(mode="json"))
+        return report.model_dump(mode="json", by_alias=True)
+
     @classmethod
     def _has_product_runtime_change(cls, diff_text: str, touched_files: list[str] | None) -> bool:
         paths = [*cls._paths_from_diff(str(diff_text or "")), *[str(path) for path in (touched_files or [])]]
@@ -2779,6 +3266,110 @@ class WorkbenchService:
         if normalized.endswith((".pyc", ".pyo", ".tsbuildinfo")):
             return False
         return normalized.startswith(("miniapp/app/", "miniapp/requirements.txt", "miniapp/Dockerfile"))
+
+    def _lsp_verification_for_run(self, *, run: RunRecord, artifacts: dict[str, Any], diff_text: str) -> dict[str, Any]:
+        del artifacts
+        changed_files = self._dedupe_paths([*(run.touched_files or []), *self._paths_from_diff(str(diff_text or ""))])
+        product_changed_files = [path for path in changed_files if self._is_product_runtime_source_path(path)]
+        root = self.workspace_service.draft_source_dir(run.workspace_id, run.run_id)
+        if not root.exists():
+            root = self.workspace_service.source_dir(run.workspace_id)
+        should_run = bool(product_changed_files or self._has_product_runtime_change(diff_text, run.touched_files))
+        diagnostics: dict[str, Any] = {
+            "schema": "grounded.lsp_diagnostics.v1",
+            "tool": "lsp.diagnostics",
+            "status": "skipped",
+            "items": [],
+            "error_count": 0,
+            "warning_count": 0,
+            "changed_only": True,
+            "changed_files": product_changed_files,
+            "targets": product_changed_files,
+        }
+        route_graph: dict[str, Any] = {
+            "schema": "grounded.lsp_route_graph.v1",
+            "tool": "lsp.route_graph",
+            "status": "skipped",
+            "summary": {},
+            "missing_edges": [],
+            "api_mismatches": [],
+        }
+        if should_run:
+            diagnostics = LspToolService.diagnostics(
+                root=root,
+                targets=product_changed_files or None,
+                changed_files=product_changed_files,
+                changed_only=True,
+                include_optional_tools=False,
+            )
+            route_graph = LspToolService.route_graph(root=root, targets=["miniapp/app/routes", "miniapp/app/static"])
+        diagnostics_ref = f"lsp_diagnostics:{run.workspace_id}:{run.run_id}:changed"
+        route_graph_ref = f"lsp_route_graph:{run.workspace_id}:{run.run_id}"
+        self.store.upsert("reports", diagnostics_ref, {**diagnostics, "workspace_id": run.workspace_id, "run_id": run.run_id, "gate_required": should_run})
+        self.store.upsert("reports", route_graph_ref, {**route_graph, "workspace_id": run.workspace_id, "run_id": run.run_id, "gate_required": should_run})
+        issues: list[dict[str, Any]] = []
+        for item in diagnostics.get("items") or []:
+            if not isinstance(item, dict) or item.get("severity") != "error":
+                continue
+            issues.append(
+                {
+                    "kind": "lsp_changed_files_diagnostics",
+                    "check": "lsp_diagnostics_changed_only",
+                    "details": str(item.get("message") or "Changed file diagnostics failed."),
+                    "blocking": True,
+                    "evidence": {
+                        "diagnostic": item,
+                        "changed_files": product_changed_files,
+                        "diagnostics_ref": diagnostics_ref,
+                        "required_next_tool": "lsp_diagnostics",
+                        "suggested_tool_after_read": "lsp_symbol_context",
+                    },
+                }
+            )
+        route_summary = route_graph.get("summary") if isinstance(route_graph.get("summary"), dict) else {}
+        route_issue_count = int(route_summary.get("missing_edge_count") or 0) + int(route_summary.get("api_mismatch_count") or 0)
+        if should_run and route_issue_count:
+            issues.append(
+                {
+                    "kind": "lsp_route_graph",
+                    "check": "lsp_route_graph",
+                    "details": "FastAPI/static route graph has unresolved frontend API edges.",
+                    "blocking": True,
+                    "evidence": {
+                        "summary": route_summary,
+                        "missing_edges": list(route_graph.get("missing_edges") or [])[:12],
+                        "api_mismatches": list(route_graph.get("api_mismatches") or [])[:12],
+                        "route_graph_ref": route_graph_ref,
+                        "required_next_tool": "lsp_route_graph",
+                        "suggested_tool_after_read": "lsp_find_references",
+                    },
+                }
+            )
+        status = "skipped" if not should_run else "failed" if issues else "passed"
+        report = {
+            "schema": "grounded.lsp_verification.v1",
+            "workspace_id": run.workspace_id,
+            "run_id": run.run_id,
+            "status": status,
+            "blocking": bool(issues),
+            "changed_only": True,
+            "changed_files": product_changed_files,
+            "diagnostics_ref": diagnostics_ref,
+            "route_graph_ref": route_graph_ref,
+            "diagnostics": diagnostics,
+            "route_graph": route_graph,
+            "issues": issues,
+            "policy": {
+                "diagnostics_after_each_patch": True,
+                "changed_files_only_gate": True,
+                "symbol_context_before_edit": "Use lsp_symbol_context before semantic edits when file names/symbols are uncertain.",
+                "find_references_before_rename": "Use lsp_find_references before renaming symbols, routes, ids, or API paths.",
+                "route_graph_required_for_fastapi_static": True,
+            },
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.store.upsert("reports", f"lsp_verification:{run.run_id}", report)
+        return report
 
     def repair_signatures(self, run_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
@@ -2942,6 +3533,7 @@ class WorkbenchService:
             "prompt_completion_audit": gate.get("prompt_completion_audit") or self.prompt_completion_audit(run_id),
             "visual_regression": gate.get("visual_regression") or self.visual_regression(run_id),
             "browser_proof": self.browser_proof(run_id),
+            "acceptance_tests": artifacts.get("acceptance_tests") or (self.store.get("reports", run.acceptance_tests_ref) if run.acceptance_tests_ref else None),
             "repair_signatures": self.repair_signatures(run_id).get("items", []),
             "repair_packets": gate.get("repair_packets", []),
             "repair_cases": gate.get("repair_cases") or self.repair_case_service.list_cases(run_id),
@@ -2959,6 +3551,8 @@ class WorkbenchService:
                 "run_artifacts": f"run_artifacts:{run_id}",
                 "gate": f"gate:{run_id}",
                 "browser_proof": run.browser_proof_ref,
+                "acceptance_tests": run.acceptance_tests_ref,
+                "acceptance_replay_source": run.acceptance_replay_source_ref,
                 "requirement_traceability": f"requirement_traceability:{run_id}",
                 "prompt_completion_audit": f"prompt_completion_audit:{run_id}",
                 "visual_regression": f"visual_regression:{run_id}",
@@ -3031,10 +3625,17 @@ class WorkbenchService:
             "do_not_change": [],
             "platform_constraints": [],
             "repeated_fixes": [],
+            "product_memory_types": {},
+            "preferences": [],
+            "product_facts": [],
+            "successful_patterns": [],
+            "ui_vocabulary": [],
+            "persistence_schema_decisions": [],
         }
         stale_check = WorkspaceMemoryPipeline.stale_check(self.workspace_service.source_dir(workspace_id), current)
         current["stale_check"] = stale_check
         WorkspaceMemoryPipeline.apply_stale_status(current, stale_check)
+        WorkspaceMemoryPipeline._populate_buckets(current)
         current["pipeline"] = self.memory_pipeline(workspace_id)
         current["memory_summary"] = WorkspaceMemoryPipeline.summary(workspace_id, current)
         current["session_memory"] = self.session_memory(workspace_id, memory=current)
@@ -3052,6 +3653,18 @@ class WorkbenchService:
             summary="Raw run memory extracted.",
             source_ref=f"memory_stage1:{run.workspace_id}:{run_id}",
             idempotency_key=f"memory.raw_extracted:{run_id}",
+        )
+        self._journal_run_event(
+            run_id,
+            "memory.phase1.extracted",
+            {
+                "memory_ref": f"memory_stage1:{run.workspace_id}:{run_id}",
+                "raw_count": len(payload.get("items") or []),
+                "kinds": sorted({str(item.get("kind") or "") for item in payload.get("items") or [] if isinstance(item, dict)}),
+            },
+            summary="Phase 1 run memory extracted.",
+            source_ref=f"memory_stage1:{run.workspace_id}:{run_id}",
+            idempotency_key=f"memory.phase1.extracted:{run_id}",
         )
         return payload
 
@@ -3071,6 +3684,8 @@ class WorkbenchService:
         superseded_count = sum(1 for item in items if item.get("status") == "superseded")
         memory_summary = WorkspaceMemoryPipeline.summary(workspace_id, workspace_memory)
         category_counts = WorkspaceMemoryPipeline._category_counts(items)
+        type_buckets = WorkspaceMemoryPipeline.type_buckets(items)
+        repeated_failure_stats = WorkspaceMemoryPipeline.repeated_failure_stats(items)
         return {
             "schema": "grounded.memory_pipeline.v1",
             "workspace_id": workspace_id,
@@ -3092,6 +3707,9 @@ class WorkbenchService:
             "stage1_count": len(stage1),
             "stage1_items": sum(len(payload.get("items") or []) for payload in stage1),
             "category_counts": category_counts,
+            "type_counts": {key: len(value) for key, value in type_buckets.items()},
+            "repeated_failure_stats": repeated_failure_stats,
+            "product_memory_types": type_buckets,
             "active_count": active_count,
             "stale_count": stale_count,
             "expired_count": expired_count,
@@ -3123,6 +3741,98 @@ class WorkbenchService:
         consolidated["session_memory"] = self.session_memory(workspace_id, memory=consolidated)
         self.store.upsert("reports", f"workspace_memory:{workspace_id}", consolidated)
         pipeline = consolidated.get("pipeline") if isinstance(consolidated.get("pipeline"), dict) else {}
+        repeated_failure_stats = pipeline.get("repeated_failure_stats") if isinstance(pipeline.get("repeated_failure_stats"), dict) else {}
+        self.store.upsert(
+            "reports",
+            f"memory_consolidation:{workspace_id}",
+            {
+                "schema": "grounded.memory_consolidation.v1",
+                "workspace_id": workspace_id,
+                "status": "auto_consolidated",
+                "stage1_count": len(stage1),
+                "raw_count": int(pipeline.get("stage1_items", 0) or 0),
+                "active_count": int(pipeline.get("active_count", 0) or 0),
+                "stale_count": int(pipeline.get("stale_count", 0) or 0),
+                "expired_count": int(pipeline.get("expired_count", 0) or 0),
+                "superseded_count": int(pipeline.get("superseded_count", 0) or 0),
+                "deduped_count": int(pipeline.get("deduped_count", 0) or 0),
+                "repeated_failure_stats": repeated_failure_stats,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        for payload in stage1:
+            run_id = str(payload.get("run_id") or "")
+            if not run_id:
+                continue
+            self._journal_run_event(
+                run_id,
+                "memory.phase2.consolidated",
+                {
+                    "memory_ref": f"workspace_memory:{workspace_id}",
+                    "consolidation_ref": f"memory_consolidation:{workspace_id}",
+                    "stage1_count": len(stage1),
+                    "repeated_failure_stats": repeated_failure_stats,
+                },
+                summary="Phase 2 workspace memory consolidated.",
+                source_ref=f"workspace_memory:{workspace_id}",
+                idempotency_key=f"memory.phase2.consolidated:{workspace_id}:{run_id}",
+            )
+            if int(repeated_failure_stats.get("repeated_failure_count", 0) or 0) > 0:
+                self._journal_run_event(
+                    run_id,
+                    "memory.repeated_failure.updated",
+                    {"memory_ref": f"workspace_memory:{workspace_id}", "repeated_failure_stats": repeated_failure_stats},
+                    summary="Repeated failure memory updated.",
+                    source_ref=f"workspace_memory:{workspace_id}",
+                    idempotency_key=f"memory.repeated_failure.updated:{workspace_id}:{run_id}",
+                )
+        pipeline = consolidated.get("pipeline") if isinstance(consolidated.get("pipeline"), dict) else {}
+        self.store.upsert(
+            "reports",
+            f"memory_consolidation:{workspace_id}",
+            {
+                "schema": "grounded.memory_consolidation.v1",
+                "workspace_id": workspace_id,
+                "status": "auto_consolidated",
+                "stage1_count": len(stage1),
+                "raw_count": int(pipeline.get("stage1_items", 0) or 0),
+                "active_count": int(pipeline.get("active_count", 0) or 0),
+                "stale_count": int(pipeline.get("stale_count", 0) or 0),
+                "expired_count": int(pipeline.get("expired_count", 0) or 0),
+                "superseded_count": int(pipeline.get("superseded_count", 0) or 0),
+                "deduped_count": int(pipeline.get("deduped_count", 0) or 0),
+                "repeated_failure_stats": pipeline.get("repeated_failure_stats") or WorkspaceMemoryPipeline.repeated_failure_stats(consolidated.get("items") or []),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        repeated_failure_stats = pipeline.get("repeated_failure_stats") if isinstance(pipeline.get("repeated_failure_stats"), dict) else {}
+        for payload in stage1:
+            run_id = str(payload.get("run_id") or "")
+            if not run_id:
+                continue
+            self._journal_run_event(
+                run_id,
+                "memory.phase2.consolidated",
+                {
+                    "memory_ref": f"workspace_memory:{workspace_id}",
+                    "consolidation_ref": f"memory_consolidation:{workspace_id}",
+                    "stage1_count": len(stage1),
+                    "repeated_failure_stats": repeated_failure_stats,
+                },
+                summary="Phase 2 workspace memory consolidated.",
+                source_ref=f"workspace_memory:{workspace_id}",
+                idempotency_key=f"memory.phase2.consolidated:{workspace_id}:{run_id}",
+            )
+            if int(repeated_failure_stats.get("repeated_failure_count", 0) or 0) > 0:
+                self._journal_run_event(
+                    run_id,
+                    "memory.repeated_failure.updated",
+                    {"memory_ref": f"workspace_memory:{workspace_id}", "repeated_failure_stats": repeated_failure_stats},
+                    summary="Repeated failure memory updated.",
+                    source_ref=f"workspace_memory:{workspace_id}",
+                    idempotency_key=f"memory.repeated_failure.updated:{workspace_id}:{run_id}",
+                )
+        pipeline = consolidated.get("pipeline") if isinstance(consolidated.get("pipeline"), dict) else {}
         summary = MemoryConsolidationReport(
             workspace_id=workspace_id,
             status="consolidated",
@@ -3136,6 +3846,7 @@ class WorkbenchService:
             updated_at=datetime.now(timezone.utc).isoformat(),
         ).model_dump(mode="json", by_alias=True)
         self.store.upsert("reports", f"memory_consolidation:{workspace_id}", summary)
+        repeated_failure_stats = (pipeline.get("repeated_failure_stats") if isinstance(pipeline.get("repeated_failure_stats"), dict) else {}) or WorkspaceMemoryPipeline.repeated_failure_stats(consolidated.get("items") or [])
         for payload in stage1:
             run_id = str(payload.get("run_id") or "")
             if not run_id:
@@ -3148,6 +3859,28 @@ class WorkbenchService:
                 source_ref=f"workspace_memory:{workspace_id}",
                 idempotency_key=f"memory.consolidated:{workspace_id}:{run_id}",
             )
+            self._journal_run_event(
+                run_id,
+                "memory.phase2.consolidated",
+                {
+                    "memory_ref": f"workspace_memory:{workspace_id}",
+                    "consolidation_ref": f"memory_consolidation:{workspace_id}",
+                    "stage1_count": len(stage1),
+                    "repeated_failure_stats": repeated_failure_stats,
+                },
+                summary="Phase 2 workspace memory consolidated.",
+                source_ref=f"workspace_memory:{workspace_id}",
+                idempotency_key=f"memory.phase2.consolidated:{workspace_id}:{run_id}",
+            )
+            if int(repeated_failure_stats.get("repeated_failure_count", 0) or 0) > 0:
+                self._journal_run_event(
+                    run_id,
+                    "memory.repeated_failure.updated",
+                    {"memory_ref": f"workspace_memory:{workspace_id}", "repeated_failure_stats": repeated_failure_stats},
+                    summary="Repeated failure memory updated.",
+                    source_ref=f"workspace_memory:{workspace_id}",
+                    idempotency_key=f"memory.repeated_failure.updated:{workspace_id}:{run_id}",
+                )
         return {**consolidated, "pipeline": self.memory_pipeline(workspace_id)}
 
     def retrieve_memory(self, workspace_id: str, payload: dict[str, Any] | MemoryRetrievalRequest) -> dict[str, Any]:
@@ -3199,6 +3932,52 @@ class WorkbenchService:
         consolidated["memory_summary"] = WorkspaceMemoryPipeline.summary(workspace_id, consolidated)
         consolidated["session_memory"] = self.session_memory(workspace_id, memory=consolidated)
         self.store.upsert("reports", f"workspace_memory:{workspace_id}", consolidated)
+        pipeline = consolidated.get("pipeline") if isinstance(consolidated.get("pipeline"), dict) else {}
+        repeated_failure_stats = pipeline.get("repeated_failure_stats") if isinstance(pipeline.get("repeated_failure_stats"), dict) else {}
+        self.store.upsert(
+            "reports",
+            f"memory_consolidation:{workspace_id}",
+            {
+                "schema": "grounded.memory_consolidation.v1",
+                "workspace_id": workspace_id,
+                "status": "auto_consolidated",
+                "stage1_count": len(stage1),
+                "raw_count": int(pipeline.get("stage1_items", 0) or 0),
+                "active_count": int(pipeline.get("active_count", 0) or 0),
+                "stale_count": int(pipeline.get("stale_count", 0) or 0),
+                "expired_count": int(pipeline.get("expired_count", 0) or 0),
+                "superseded_count": int(pipeline.get("superseded_count", 0) or 0),
+                "deduped_count": int(pipeline.get("deduped_count", 0) or 0),
+                "repeated_failure_stats": repeated_failure_stats,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        for payload in stage1:
+            run_id = str(payload.get("run_id") or "")
+            if not run_id:
+                continue
+            self._journal_run_event(
+                run_id,
+                "memory.phase2.consolidated",
+                {
+                    "memory_ref": f"workspace_memory:{workspace_id}",
+                    "consolidation_ref": f"memory_consolidation:{workspace_id}",
+                    "stage1_count": len(stage1),
+                    "repeated_failure_stats": repeated_failure_stats,
+                },
+                summary="Phase 2 workspace memory consolidated.",
+                source_ref=f"workspace_memory:{workspace_id}",
+                idempotency_key=f"memory.phase2.consolidated:{workspace_id}:{run_id}",
+            )
+            if int(repeated_failure_stats.get("repeated_failure_count", 0) or 0) > 0:
+                self._journal_run_event(
+                    run_id,
+                    "memory.repeated_failure.updated",
+                    {"memory_ref": f"workspace_memory:{workspace_id}", "repeated_failure_stats": repeated_failure_stats},
+                    summary="Repeated failure memory updated.",
+                    source_ref=f"workspace_memory:{workspace_id}",
+                    idempotency_key=f"memory.repeated_failure.updated:{workspace_id}:{run_id}",
+                )
 
     def project_instructions(self) -> dict[str, Any]:
         payload = ProjectInstructionBundle.build(repo_root=self.settings.repo_root, template_dir=self.settings.template_dir)
@@ -3221,11 +4000,56 @@ class WorkbenchService:
         self.store.upsert("reports", f"golden_generated_app:{app_id}", payload)
         return payload
 
+    def existing_app_map(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        return self.existing_app_map_service.read_map(workspace_id=run.workspace_id, run_id=run.run_id)
+
+    def improve_mode(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        return self.existing_app_map_service.report(workspace_id=run.workspace_id, run_id=run.run_id)
+
+    def improve_workspace(self, workspace_id: str, payload: dict[str, Any] | None = None) -> RunRecord:
+        payload = payload or {}
+        self.workspace_service.get_workspace(workspace_id)
+        prompt = str(payload.get("prompt") or payload.get("detail") or "").strip()
+        if not prompt:
+            raise ValueError("Improve mode requires prompt.")
+        base_run_id = str(payload.get("resume_from_run_id") or payload.get("run_id") or "").strip()
+        base_run = self.run_service.get_run(base_run_id) if base_run_id else self._latest_run_for_slash(workspace_id, prefer_failed=False, required=False)
+        return self.run_service.create_run(
+            workspace_id,
+            CreateRunRequest(
+                prompt=prompt,
+                mode="fix",
+                edit_mode="improve",
+                intent="refine",
+                generation_mode=str(payload.get("generation_mode") or (base_run.generation_mode if base_run else "balanced")),  # type: ignore[arg-type]
+                target_role_scope=[role for role in payload.get("target_role_scope") or (base_run.target_role_scope if base_run else []) if role in {"client", "specialist", "manager"}],  # type: ignore[arg-type]
+                model_profile=str(payload.get("model_profile") or (base_run.model_profile if base_run else "")),
+                resume_from_run_id=base_run.run_id if base_run else None,
+            ),
+        )
+
     def upsert_memory(self, workspace_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         current = self.memory(workspace_id)
+        raw_kind = str(payload.get("memory_type") or payload.get("kind") or "note") if str(payload.get("kind") or "") == "note" else str(payload.get("kind") or payload.get("memory_type") or "note")
+        kind_aliases = {
+            "preferences": "preference",
+            "user_preference": "preference",
+            "product_facts": "product_fact",
+            "product_fact": "product_fact",
+            "known_failures": "failure_signature",
+            "successful_patterns": "successful_app_pattern",
+            "rejected_approaches": "rejected_approach",
+            "ui_vocabulary": "ui_vocabulary",
+            "persistence_schema_decisions": "persistence_schema_decision",
+            "persistence_schema": "persistence_schema_decision",
+        }
+        normalized_kind = kind_aliases.get(raw_kind, raw_kind)
         item = {
             "memory_id": f"mem_{uuid4().hex}",
-            "kind": str(payload.get("kind") or "note"),
+            "kind": normalized_kind,
+            "memory_type": str(payload.get("memory_type") or WorkspaceMemoryPipeline.memory_type_for_kind(normalized_kind)),
             "text": str(payload.get("text") or payload.get("content") or "").strip(),
             "citation": payload.get("citation"),
             "citations": [payload.get("citation")] if isinstance(payload.get("citation"), dict) else [],
@@ -3256,12 +4080,18 @@ class WorkbenchService:
             "rejected_approach": "rejected_approaches",
             "avoidance": "rejected_approaches",
             "reusable_workflow": "reusable_workflows",
+            "successful_app_pattern": "successful_app_patterns",
+            "ui_vocabulary": "ui_vocabulary",
+            "persistence_schema_decision": "persistence_schema_decisions",
             "do_not_change": "do_not_change",
             "repeated_fix": "repeated_fixes",
         }
         bucket = bucket_map.get(item["kind"])
         if bucket:
             current.setdefault(bucket, []).append(item)
+        memory_type = str(item.get("memory_type") or WorkspaceMemoryPipeline.memory_type_for_kind(item["kind"]))
+        current.setdefault(memory_type, []).append(item)
+        current["product_memory_types"] = WorkspaceMemoryPipeline.type_buckets(current.get("items") or [])
         current["stale_check"] = self._memory_stale_check(workspace_id, current)
         current["memory_summary"] = WorkspaceMemoryPipeline.summary(workspace_id, current)
         current["session_memory"] = self.session_memory(workspace_id, memory=current)
@@ -3378,9 +4208,12 @@ class WorkbenchService:
             target = run or self._latest_run_for_slash(workspace_id, prefer_failed=False, required=False)
             created = self._execute_add_flow_slash(workspace_id or (target.workspace_id if target else ""), target, payload)
             return self._store_slash_execution({**base, "workspace_id": created.workspace_id, "run_id": target.run_id if target else None, "status": "started", "workflow": "add_product_flow", "run": created.model_dump(mode="json")})
+        if command_id == "improve":
+            created = self._execute_improve_slash(workspace_id, run, payload)
+            return self._store_slash_execution({**base, "workspace_id": created.workspace_id, "run_id": run.run_id if run else None, "status": "started", "workflow": "improve_existing_app", "run": created.model_dump(mode="json")})
         if command_id == "review":
             target = run or self._latest_run_for_slash(workspace_id, prefer_failed=False)
-            report = self.review(target.run_id)
+            report = self.review(target.run_id, target=str(payload.get("target") or (payload.get("metadata") or {}).get("target") or "") or None)
             return self._store_slash_execution({**base, "workspace_id": target.workspace_id, "run_id": target.run_id, "status": report.get("status") or "available", "workflow": "risk_review", "report": report})
         if command_id == "acceptance":
             target = run or self._latest_run_for_slash(workspace_id, prefer_failed=False)
@@ -3553,6 +4386,22 @@ class WorkbenchService:
             self._slash_run_request(prompt=prompt, mode="fix" if run else "generate", intent="refine", payload=payload, base_run=run, generation_mode=str(payload.get("generation_mode") or "balanced")),
         )
 
+    def _execute_improve_slash(self, workspace_id: str, run: RunRecord | None, payload: dict[str, Any]) -> RunRecord:
+        if not workspace_id:
+            raise ValueError("/improve requires workspace_id.")
+        detail = self._slash_prompt(payload)
+        if not detail:
+            raise ValueError("/improve requires an improvement description.")
+        return self.improve_workspace(
+            workspace_id,
+            {
+                **dict(payload or {}),
+                "prompt": detail,
+                "run_id": run.run_id if run else payload.get("run_id"),
+                "generation_mode": payload.get("generation_mode") or "balanced",
+            },
+        )
+
     def _execute_acceptance_slash(self, run: RunRecord) -> dict[str, Any]:
         source_dir = (
             self.workspace_service.draft_source_dir(run.workspace_id, run.run_id)
@@ -3719,48 +4568,10 @@ class WorkbenchService:
             "input": payload,
         }
 
-    def doctor(self) -> dict[str, Any]:
-        checks = [
-            self._python_version_check(),
-            self._python_deps_check(),
-            self._node_version_check(),
-            self._npm_version_check(),
-            self._binary_check("docker"),
-            self._compose_check(),
-            self._docker_daemon_check(),
-            self._playwright_check(),
-            self._playwright_browsers_check(),
-            self._browser_availability_check(),
-            self._openai_check(),
-            self._model_access_check(),
-            self._writable_check("data_dir", self.settings.data_dir),
-            self._writable_dirs_check(),
-            self._db_writable_check(),
-            self._disk_space_check(),
-            self._template_check(),
-            self._template_hash_check(),
-            self._port_check(),
-            self._preview_port_range_check(),
-            self._preview_runtime_check(),
-            self._backend_routes_check(),
-            self._backend_imports_check(),
-            self._stale_backend_check(),
-            self._preview_container_check(),
-            self._test_command_check(),
-            self._runtime_policy_files_check(),
-            self.exec_policy_service.doctor_check(),
-        ]
-        status = "passed" if all(item["status"] == "passed" for item in checks if item["required"]) else "failed"
-        payload = {
-            "schema": "grounded.doctor_health_panel.v1",
-            "status": status,
-            "checks": checks,
-            "sections": self._doctor_sections(checks),
-            "summary": self._doctor_summary(checks),
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
+    def doctor(self, *, scope: str = "quick", workspace_id: str | None = None, run_id: str | None = None) -> dict[str, Any]:
+        preview = self._preview_payload(workspace_id) if workspace_id else None
+        payload = self.doctor_service.global_report(scope=scope, workspace_id=workspace_id, run_id=run_id, preview=preview)
         self.store.upsert("reports", "doctor:exec_policy", self.exec_policy_service.doctor_check())
-        self.store.upsert("reports", "doctor:last", payload)
         return payload
 
     def metrics_summary(self) -> dict[str, Any]:
@@ -4518,22 +5329,26 @@ class WorkbenchService:
 
     def prompt_contract(self, run_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
-        contract = dict(run.acceptance_contract or {})
-        prompt_hints = contract.get("prompt_hints") if isinstance(contract.get("prompt_hints"), dict) else {}
-        analysis_status = str(prompt_hints.get("analysis_status") or "unknown")
-        status = "passed" if not contract.get("required") or analysis_status == "ok" else "needs_review"
-        payload = {
-            "run_id": run_id,
-            "status": status,
-            "analysis_source": prompt_hints.get("analysis_source"),
-            "analysis_status": analysis_status,
-            "resource_hint": prompt_hints.get("resource_hint"),
-            "field_hints": list(prompt_hints.get("field_hints") or [])[:12],
-            "role_field_hints": dict(prompt_hints.get("role_field_hints") or {}),
-            "findings": [] if status == "passed" else [{"severity": "medium", "message": "Prompt contract analysis is unavailable; generation should use LLM prompt analysis before applying product fields."}],
+        payload = self.run_service.prompt_contract_compiler_service.read(workspace_id=run.workspace_id, run_id=run_id)
+        legacy_status = "passed" if payload.get("status") in {"planned", "inherited", "not_required"} else "needs_review"
+        return {
+            **payload,
+            "status": legacy_status,
+            "contract_status": payload.get("status"),
+            "legacy_status": legacy_status,
+            "analysis_source": ((payload.get("contract") or {}).get("analysis_source") if isinstance(payload.get("contract"), dict) else None),
+            "analysis_status": ((payload.get("contract") or {}).get("analysis_status") if isinstance(payload.get("contract"), dict) else None),
+            "resource_hint": (((payload.get("acceptance_contract") or {}).get("prompt_hints") or {}).get("resource_hint") if isinstance((payload.get("acceptance_contract") or {}).get("prompt_hints"), dict) else None),
+            "field_hints": list((((payload.get("acceptance_contract") or {}).get("prompt_hints") or {}).get("field_hints") or []) if isinstance((payload.get("acceptance_contract") or {}).get("prompt_hints"), dict) else [])[:12],
+            "findings": [] if legacy_status == "passed" else [{"severity": "medium", "message": "Prompt contract analysis is unavailable or blocked."}],
         }
-        self.store.upsert("reports", f"prompt_contract:{run_id}", payload)
-        return payload
+
+    def compile_prompt_contract(self, run_id: str) -> dict[str, Any]:
+        return self.prompt_contract(run_id)
+
+    def workspace_prompt_contracts(self, workspace_id: str) -> dict[str, Any]:
+        self.workspace_service.get_workspace(workspace_id)
+        return self.run_service.prompt_contract_compiler_service.list_for_workspace(workspace_id)
 
     def miniapp_contract(self, run_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
@@ -4730,7 +5545,7 @@ class WorkbenchService:
         fingerprint = str(approval.get("command_fingerprint") or evaluation.get("command_fingerprint") or "")
         if not fingerprint:
             return evaluation
-        grant = self._workspace_approval_grant(workspace_id, fingerprint)
+        grant = self._workspace_approval_grant(workspace_id, evaluation)
         if not grant:
             return evaluation
         updated_approval = {
@@ -4739,6 +5554,7 @@ class WorkbenchService:
             "status": "approved_by_workspace_grant",
             "approval_id": grant.get("approval_id"),
             "grant_id": grant.get("grant_id"),
+            "grant_scope": grant.get("grant_scope") or grant.get("scope"),
         }
         updated = {**evaluation, "approval": updated_approval}
         decision = updated.get("decision") if isinstance(updated.get("decision"), dict) else {}
@@ -4752,10 +5568,22 @@ class WorkbenchService:
             }
         return updated
 
-    def _workspace_approval_grant(self, workspace_id: str, command_fingerprint: str) -> dict[str, Any] | None:
+    def _workspace_approval_grant(self, workspace_id: str, evaluation: dict[str, Any]) -> dict[str, Any] | None:
+        command_fingerprint = str(evaluation.get("command_fingerprint") or "")
+        command_prefix = evaluation.get("command_prefix") if isinstance(evaluation.get("command_prefix"), dict) else {}
+        prefix_fingerprint = str(command_prefix.get("prefix_fingerprint") or "")
+        decision = evaluation.get("decision") if isinstance(evaluation.get("decision"), dict) else {}
+        risk = str(decision.get("risk") or "")
         grants = self.workspace_approval_grants(workspace_id)
         for item in grants.get("items") or []:
             if isinstance(item, dict) and item.get("command_fingerprint") == command_fingerprint and item.get("status") == "approved":
+                return item
+        if not prefix_fingerprint or risk in {"network", "destructive", "forbidden"}:
+            return None
+        for item in grants.get("items") or []:
+            if not isinstance(item, dict) or item.get("status") != "approved":
+                continue
+            if item.get("prefix_fingerprint") == prefix_fingerprint and item.get("grant_scope") == "approved_command_prefix":
                 return item
         return None
 
@@ -4776,13 +5604,28 @@ class WorkbenchService:
             "approval_id": item.get("approval_id"),
             "workspace_id": workspace_id,
             "scope": "workspace",
+            "grant_scope": "exact_command",
             "kind": item.get("kind") or "command",
             "status": "approved",
             "command_fingerprint": fingerprint,
+            "command_prefix": item.get("command_prefix") if isinstance(item.get("command_prefix"), dict) else {},
+            "prefix_fingerprint": ((item.get("command_prefix") or {}).get("prefix_fingerprint") if isinstance(item.get("command_prefix"), dict) else None),
             "summary": item.get("summary") or "",
             "risk": item.get("risk") or "unknown",
             "decided_at": item.get("decided_at") or datetime.now(timezone.utc).isoformat(),
         }
+        prefix_grant = None
+        command_prefix = grant["command_prefix"] if isinstance(grant.get("command_prefix"), dict) else {}
+        prefix_fingerprint = str(command_prefix.get("prefix_fingerprint") or "")
+        if prefix_fingerprint and grant["risk"] not in {"network", "destructive", "forbidden"}:
+            prefix_grant = {
+                **grant,
+                "grant_id": f"grant_prefix_{prefix_fingerprint[:20]}",
+                "grant_scope": "approved_command_prefix",
+                "command_fingerprint": None,
+                "prefix_fingerprint": prefix_fingerprint,
+                "summary": f"Approved command prefix: {command_prefix.get('prefix_text') or grant.get('summary') or ''}".strip(),
+            }
         replaced = False
         for index, existing in enumerate(items):
             if existing.get("command_fingerprint") == fingerprint:
@@ -4791,6 +5634,15 @@ class WorkbenchService:
                 break
         if not replaced:
             items.append(grant)
+        if prefix_grant is not None:
+            replaced_prefix = False
+            for index, existing in enumerate(items):
+                if existing.get("prefix_fingerprint") == prefix_fingerprint and existing.get("grant_scope") == "approved_command_prefix":
+                    items[index] = {**existing, **prefix_grant}
+                    replaced_prefix = True
+                    break
+            if not replaced_prefix:
+                items.append(prefix_grant)
         payload["items"] = items[-250:]
         payload["updated_at"] = datetime.now(timezone.utc).isoformat()
         self.store.upsert("reports", key, payload)
@@ -4802,6 +5654,32 @@ class WorkbenchService:
         artifacts = self._run_artifacts_or_empty(run_id)
         checkpoint = self.store.get("reports", run.resume_checkpoint_ref) if run.resume_checkpoint_ref else {}
         context_pressure = self.store.get("reports", run.context_pressure_ref) if run.context_pressure_ref else {}
+        context_manager_ref = run.context_manager_ref
+        if self.context_manager_service is not None:
+            prepared = self.context_manager_service.prepare_turn_context(
+                workspace_id=run.workspace_id,
+                run_id=run.run_id,
+                session_id=run.session_id,
+                prompt=run.prompt,
+                generation_mode=run.generation_mode,
+                run_mode=run.mode,
+                prompt_payload={
+                    "task": run.prompt,
+                    "run": run.model_dump(mode="json"),
+                    "artifacts": artifacts,
+                    "checkpoint": checkpoint if isinstance(checkpoint, dict) else {},
+                    "context_pressure": context_pressure if isinstance(context_pressure, dict) else {},
+                },
+                transcript_snapshot=self.store.get("reports", run.agent_transcript_ref) if run.agent_transcript_ref else {},
+                context_pressure=context_pressure if isinstance(context_pressure, dict) else {},
+                artifacts=artifacts,
+                proofs={
+                    "browser_proof_ref": run.browser_proof_ref,
+                    "verification_report_ref": run.verification_report_ref,
+                    "trace_bundle_ref": run.trace_bundle_ref,
+                },
+            )
+            context_manager_ref = str(prepared.get("report_ref") or context_manager_ref or "")
         return self.run_compaction_service.compact_run(
             run=run,
             artifacts=artifacts,
@@ -4809,6 +5687,7 @@ class WorkbenchService:
             context_pressure=context_pressure if isinstance(context_pressure, dict) else {},
             reason="manual",
             source="manual",
+            context_manager_ref=context_manager_ref or None,
         )
 
     def compaction(self, run_id: str) -> dict[str, Any]:
@@ -4850,6 +5729,58 @@ class WorkbenchService:
         }
         return ContextPressureReport.model_validate(normalized).model_dump(mode="json", by_alias=True)
 
+    def context_manager(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        ref = run.context_manager_ref or f"context_manager:{run.workspace_id}:{run_id}"
+        payload = self.store.get("reports", ref)
+        if isinstance(payload, dict):
+            return ContextManagerReport.model_validate(payload).model_dump(mode="json", by_alias=True)
+        if self.context_manager_service is not None:
+            return self.context_manager_service.get_run_report(
+                workspace_id=run.workspace_id,
+                run_id=run_id,
+                session_id=run.session_id,
+            )
+        raise KeyError("Context manager report is unavailable.")
+
+    def session_context_manager(self, session_id: str) -> dict[str, Any]:
+        if self.context_manager_service is None:
+            raise KeyError("Context manager service is unavailable.")
+        if self.platform_db is None:
+            return self.context_manager_service.session_report(session_id=session_id, run_reports=[])
+        turns = self.platform_db.list_turns(session_id, limit=500)
+        run_ids = [str(turn.linked_run_id) for turn in turns if turn.linked_run_id]
+        reports: list[dict[str, Any]] = []
+        for run_id in run_ids:
+            try:
+                reports.append(self.context_manager(run_id))
+            except KeyError:
+                continue
+        return self.context_manager_service.session_report(session_id=session_id, run_reports=reports)
+
+    def compact_context_manager(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        if self.context_manager_service is None:
+            raise KeyError("Context manager service is unavailable.")
+        context_pressure = self.store.get("reports", run.context_pressure_ref) if run.context_pressure_ref else {}
+        prepared = self.context_manager_service.prepare_turn_context(
+            workspace_id=run.workspace_id,
+            run_id=run.run_id,
+            session_id=run.session_id,
+            prompt=run.prompt,
+            generation_mode=run.generation_mode,
+            run_mode=run.mode,
+            prompt_payload={
+                "task": run.prompt,
+                "run": run.model_dump(mode="json"),
+                "context_pressure": context_pressure if isinstance(context_pressure, dict) else {},
+            },
+            transcript_snapshot=self.store.get("reports", run.agent_transcript_ref) if run.agent_transcript_ref else {},
+            context_pressure=context_pressure if isinstance(context_pressure, dict) else {},
+            artifacts=self._run_artifacts_or_empty(run_id),
+        )
+        return prepared.get("report") if isinstance(prepared.get("report"), dict) else self.context_manager(run_id)
+
     def compaction_boundaries(self, run_id: str) -> dict[str, Any]:
         self.run_service.get_run(run_id)
         if self.run_compaction_service is None:
@@ -4879,6 +5810,87 @@ class WorkbenchService:
         if self.run_compaction_service is None:
             raise KeyError("Run compaction service is unavailable.")
         return self.run_compaction_service.post_compact_message(run_id, boundary_id)
+
+    def draft_isolation(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        manifest = self.draft_isolation_service.ensure_manifest(workspace_id=run.workspace_id, run_id=run_id)
+        self._sync_draft_refs(run, isolation_ref=self.draft_isolation_service.manifest_ref(run.workspace_id, run_id), persist=True)
+        return manifest.model_dump(mode="json", by_alias=True)
+
+    def draft_gate(self, run_id: str, *, create: bool = False) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        report = self.draft_isolation_service.latest_gate(workspace_id=run.workspace_id, run_id=run_id)
+        if create or report is None:
+            report = self.draft_isolation_service.create_gate(
+                workspace_id=run.workspace_id,
+                run_id=run_id,
+                checks_ref=f"run_artifacts:{run_id}",
+                lsp_ref=getattr(run, "lsp_context_ref", None) or f"lsp_context:{run.workspace_id}:{run_id}",
+                readiness_ref=f"gate:{run_id}",
+            )
+        self._sync_draft_refs(run, isolation_ref=self.draft_isolation_service.manifest_ref(run.workspace_id, run_id), gate_ref=report.gate_ref, persist=True)
+        return report.model_dump(mode="json", by_alias=True)
+
+    def draft_apply(self, run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        files = self._normalize_file_list(payload.get("files") or [])
+        gate = self.draft_isolation_service.latest_gate(workspace_id=run.workspace_id, run_id=run_id)
+        if gate is None or gate.status != "passed":
+            gate = self.draft_isolation_service.create_gate(
+                workspace_id=run.workspace_id,
+                run_id=run_id,
+                checks_ref=f"run_artifacts:{run_id}",
+                lsp_ref=getattr(run, "lsp_context_ref", None) or f"lsp_context:{run.workspace_id}:{run_id}",
+                readiness_ref=f"gate:{run_id}",
+            )
+        decision = self.draft_isolation_service.validate_apply_gate(
+            workspace_id=run.workspace_id,
+            run_id=run_id,
+            apply_token=payload.get("apply_token") or gate.apply_token,
+            selected_files=files or gate.changed_files,
+        )
+        if decision.decision == "blocked":
+            self._sync_draft_refs(
+                run,
+                isolation_ref=self.draft_isolation_service.manifest_ref(run.workspace_id, run_id),
+                gate_ref=gate.gate_ref,
+                apply_decision_ref=self.draft_isolation_service.apply_decision_ref(run.workspace_id, run_id),
+                persist=True,
+            )
+            return decision.model_dump(mode="json", by_alias=True)
+        if files:
+            self.stage_files(run_id, {"files": files})
+        self.apply_staged(run_id)
+        latest = self.store.get("reports", self.draft_isolation_service.apply_decision_ref(run.workspace_id, run_id))
+        return latest if isinstance(latest, dict) else decision.model_dump(mode="json", by_alias=True)
+
+    def draft_variants(self, run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        report = self.draft_isolation_service.create_variant(
+            workspace_id=run.workspace_id,
+            source_run_id=run_id,
+            variant_run_id=payload.get("variant_run_id") or payload.get("variantRunId"),
+        )
+        return report.model_dump(mode="json", by_alias=True)
+
+    def _sync_draft_refs(
+        self,
+        run: RunRecord,
+        *,
+        isolation_ref: str | None = None,
+        gate_ref: str | None = None,
+        apply_decision_ref: str | None = None,
+        persist: bool = False,
+    ) -> None:
+        if isolation_ref:
+            run.draft_isolation_ref = isolation_ref
+        if gate_ref:
+            run.draft_gate_ref = gate_ref
+        if apply_decision_ref:
+            run.draft_apply_decision_ref = apply_decision_ref
+        if persist:
+            run.updated_at = datetime.now(timezone.utc)
+            self.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
 
     def stage_files(self, run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
@@ -4920,6 +5932,33 @@ class WorkbenchService:
             if path in contract_owned or path.startswith("miniapp/app/generated/")
         )
         files = list(dict.fromkeys([*files, *blocking_required]))
+        draft_gate = self.draft_isolation_service.create_gate(
+            workspace_id=run.workspace_id,
+            run_id=run_id,
+            checks_ref=f"run_artifacts:{run_id}",
+            lsp_ref=getattr(run, "lsp_context_ref", None) or f"lsp_context:{run.workspace_id}:{run_id}",
+            readiness_ref=f"gate:{run_id}",
+        )
+        draft_decision = self.draft_isolation_service.validate_apply_gate(
+            workspace_id=run.workspace_id,
+            run_id=run_id,
+            apply_token=draft_gate.apply_token,
+            selected_files=files,
+        )
+        self._sync_draft_refs(
+            run,
+            isolation_ref=self.draft_isolation_service.manifest_ref(run.workspace_id, run_id),
+            gate_ref=draft_gate.gate_ref,
+            apply_decision_ref=self.draft_isolation_service.apply_decision_ref(run.workspace_id, run_id),
+        )
+        if draft_decision.decision == "blocked":
+            run.apply_status = "blocked"
+            run.status = "blocked"
+            run.failure_reason = "Draft apply blocked by isolation gate."
+            run.remaining_issues = [*run.remaining_issues, *draft_decision.blocked_reasons]
+            run.updated_at = datetime.now(timezone.utc)
+            self.store.upsert("runs", run_id, run.model_dump(mode="json"))
+            return run
         allowed, guardian_report = self.run_service.enforce_guardian_before_apply(
             run,
             source="pre_apply_guardian",
@@ -4931,6 +5970,12 @@ class WorkbenchService:
             artifacts["run"] = self.run_service.get_run(run_id).model_dump(mode="json")
             self.store.upsert("reports", f"run_artifacts:{run_id}", artifacts)
             return self.run_service.get_run(run_id)
+        self.draft_isolation_service.record_apply_started(
+            workspace_id=run.workspace_id,
+            run_id=run_id,
+            gate_ref=draft_gate.gate_ref,
+            selected_files=files,
+        )
         revision = self.workspace_service.apply_selected_draft_files(run.workspace_id, run_id, files, message=f"Apply staged AI draft files for run {run_id}")
         fully_applied = bool(changed_before_apply) and set(files).issuperset(changed_before_apply)
         run.result_revision_id = revision.revision_id
@@ -4945,11 +5990,31 @@ class WorkbenchService:
         run.updated_at = datetime.now(timezone.utc)
         if fully_applied:
             self.workspace_service.discard_draft(run.workspace_id, run_id)
+        apply_decision = self.draft_isolation_service.record_apply(
+            workspace_id=run.workspace_id,
+            run_id=run_id,
+            revision_id=revision.revision_id,
+            selected_files=files,
+            gate_ref=draft_gate.gate_ref,
+            apply_token=draft_gate.apply_token,
+        )
+        self._sync_draft_refs(
+            run,
+            isolation_ref=self.draft_isolation_service.manifest_ref(run.workspace_id, run_id),
+            gate_ref=draft_gate.gate_ref,
+            apply_decision_ref=self.draft_isolation_service.apply_decision_ref(run.workspace_id, run_id),
+        )
         self.store.upsert("runs", run_id, run.model_dump(mode="json"))
         artifacts = self._run_artifacts_or_empty(run_id)
         artifacts["run"] = run.model_dump(mode="json")
         artifacts["guardian_review"] = guardian_report
         artifacts["staged_apply"] = {"files": files, "revision_id": revision.revision_id, "fully_applied": fully_applied}
+        artifacts["draft_isolation"] = {
+            "isolation_ref": run.draft_isolation_ref,
+            "gate_ref": run.draft_gate_ref,
+            "apply_decision_ref": run.draft_apply_decision_ref,
+            "apply_decision": apply_decision.model_dump(mode="json", by_alias=True),
+        }
         self.store.upsert("reports", f"run_artifacts:{run_id}", artifacts)
         self.record_tool_event(run_id, tool_envelope(tool="patch.apply", input_payload={"files": files}, result=artifacts["staged_apply"], risk="mutating"))
         self._journal_run_event(
@@ -5077,11 +6142,23 @@ class WorkbenchService:
         }
 
     def lsp_diagnostics(self, workspace_id: str, *, run_id: str | None = None, changed_only: bool = False, files: list[str] | None = None) -> dict[str, Any]:
+        if self.lsp_context_service is not None:
+            return self.lsp_context_service.diagnostics(
+                workspace_id=workspace_id,
+                run_id=run_id,
+                changed_only=changed_only,
+                files=files,
+            )
         self.workspace_service.get_workspace(workspace_id)
         root = self.workspace_service.draft_source_dir(workspace_id, run_id) if run_id else self.workspace_service.source_dir(workspace_id)
         changed_files: list[str] = []
         if run_id:
-            changed_files = self._paths_from_diff(self.workspace_service.diff(workspace_id, run_id=run_id))
+            run = self.run_service.get_run(run_id)
+            try:
+                diff_paths = self._paths_from_diff(self.workspace_service.diff(workspace_id, run_id=run_id))
+            except KeyError:
+                diff_paths = []
+            changed_files = self._dedupe_paths([*(run.touched_files or []), *diff_paths])
         report = LspToolService.diagnostics(
             root=root,
             targets=files,
@@ -5161,29 +6238,78 @@ class WorkbenchService:
         }
 
     def lsp_symbol_context(self, workspace_id: str, *, run_id: str | None = None, query: str = "", targets: list[str] | None = None) -> dict[str, Any]:
+        if self.lsp_context_service is not None:
+            return self.lsp_context_service.symbol_context(workspace_id=workspace_id, run_id=run_id, query=query, targets=targets, persist=True)
         self.workspace_service.get_workspace(workspace_id)
         root = self.workspace_service.draft_source_dir(workspace_id, run_id) if run_id else self.workspace_service.source_dir(workspace_id)
         return {**LspToolService.symbol_context(root=root, query=query, targets=targets), "workspace_id": workspace_id, "run_id": run_id}
 
     def lsp_definition(self, workspace_id: str, *, run_id: str | None = None, symbol: str = "", targets: list[str] | None = None) -> dict[str, Any]:
+        if self.lsp_context_service is not None:
+            return self.lsp_context_service.definition(workspace_id=workspace_id, run_id=run_id, symbol=symbol, targets=targets)
         self.workspace_service.get_workspace(workspace_id)
         root = self.workspace_service.draft_source_dir(workspace_id, run_id) if run_id else self.workspace_service.source_dir(workspace_id)
         return {**LspToolService.definition(root=root, symbol=symbol, targets=targets), "workspace_id": workspace_id, "run_id": run_id}
 
     def lsp_find_references(self, workspace_id: str, *, run_id: str | None = None, symbol: str = "", targets: list[str] | None = None) -> dict[str, Any]:
+        if self.lsp_context_service is not None:
+            return self.lsp_context_service.find_references(workspace_id=workspace_id, run_id=run_id, symbol=symbol, targets=targets)
         self.workspace_service.get_workspace(workspace_id)
         root = self.workspace_service.draft_source_dir(workspace_id, run_id) if run_id else self.workspace_service.source_dir(workspace_id)
         return {**LspToolService.find_references(root=root, symbol=symbol, targets=targets), "workspace_id": workspace_id, "run_id": run_id}
 
     def lsp_route_static_context(self, workspace_id: str, *, run_id: str | None = None, targets: list[str] | None = None) -> dict[str, Any]:
+        if self.lsp_context_service is not None:
+            return self.lsp_context_service.route_static_context(workspace_id=workspace_id, run_id=run_id, targets=targets)
         self.workspace_service.get_workspace(workspace_id)
         root = self.workspace_service.draft_source_dir(workspace_id, run_id) if run_id else self.workspace_service.source_dir(workspace_id)
         return {**LspToolService.route_static_context(root=root, targets=targets), "workspace_id": workspace_id, "run_id": run_id}
 
     def lsp_route_graph(self, workspace_id: str, *, run_id: str | None = None, targets: list[str] | None = None) -> dict[str, Any]:
+        if self.lsp_context_service is not None:
+            return self.lsp_context_service.route_graph(workspace_id=workspace_id, run_id=run_id, targets=targets, persist=True)
         self.workspace_service.get_workspace(workspace_id)
         root = self.workspace_service.draft_source_dir(workspace_id, run_id) if run_id else self.workspace_service.source_dir(workspace_id)
         return {**LspToolService.route_graph(root=root, targets=targets), "workspace_id": workspace_id, "run_id": run_id}
+
+    def lsp_context(self, workspace_id: str, *, run_id: str | None = None, files: list[str] | None = None) -> dict[str, Any]:
+        if self.lsp_context_service is None:
+            self.workspace_service.get_workspace(workspace_id)
+            diagnostics = self.lsp_diagnostics(workspace_id, run_id=run_id, files=files)
+            return {
+                "schema": "grounded.lsp_context.v1",
+                "workspace_id": workspace_id,
+                "run_id": run_id,
+                "status": diagnostics.get("status") or "ready",
+                "engine": diagnostics.get("engine") or "static",
+                "fallback_used": True,
+                "lsp_context_ref": f"lsp_context:{workspace_id}:{run_id or 'source'}",
+                "diagnostics": diagnostics,
+                "items": diagnostics.get("items") or [],
+                "jumps": diagnostics.get("jumps") or [],
+                "next_sequence": 1,
+            }
+        return self.lsp_context_service.context(workspace_id=workspace_id, run_id=run_id, files=files)
+
+    def lsp_servers(self, workspace_id: str) -> dict[str, Any]:
+        self.workspace_service.get_workspace(workspace_id)
+        if self.lsp_context_service is None:
+            return {"schema": "grounded.lsp_servers.v1", "status": "unavailable", "items": []}
+        return self.lsp_context_service.servers(workspace_id=workspace_id)
+
+    def restart_lsp(self, workspace_id: str, *, run_id: str | None = None) -> dict[str, Any]:
+        self.workspace_service.get_workspace(workspace_id)
+        if self.lsp_context_service is None:
+            return {"schema": "grounded.lsp_restart.v1", "status": "unavailable", "items": []}
+        return self.lsp_context_service.restart(workspace_id=workspace_id, run_id=run_id)
+
+    def run_lsp_context(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        ref = getattr(run, "lsp_context_ref", None) or f"lsp_context:{run.workspace_id}:{run.run_id}"
+        payload = self.store.get("reports", ref)
+        if isinstance(payload, dict):
+            return payload
+        return self.lsp_context(run.workspace_id, run_id=run.run_id)
 
     def patch_preflight(self, workspace_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         raw_ops = payload.get("ops") or payload.get("patch_actions") or []
@@ -5201,12 +6327,36 @@ class WorkbenchService:
             base_revision_id=payload.get("base_revision_id"),
         )
         run_id = payload.get("run_id")
+        target_files = self._dedupe_paths([str(operation.file_path or "") for operation in ops])
+        root = self.workspace_service.draft_source_dir(workspace_id, str(run_id)) if run_id else self.workspace_service.source_dir(workspace_id)
+        query_terms = [Path(path).stem for path in target_files if Path(path).stem and Path(path).stem not in {"__init__", "index"}]
+        report["lsp_pre_edit_context"] = {
+            **LspToolService.symbol_context(
+                root=root,
+                query=" ".join(query_terms[:6]),
+                targets=target_files or None,
+                limit=40,
+            ),
+            "policy": {
+                "required_before_patch": True,
+                "targets": target_files,
+                "reason": "Symbol context is captured before patch application so edits can use local code structure.",
+            },
+        }
         if run_id:
             event_type = "sandbox.preflight_passed" if (report.get("sandbox_report") or {}).get("status") == "passed" else "sandbox.preflight_blocked"
             self._journal_run_event(
                 str(run_id),
                 event_type,
-                {"workspace_id": workspace_id, "report": report.get("sandbox_report") or {}},
+                {
+                    "workspace_id": workspace_id,
+                    "report": report.get("sandbox_report") or {},
+                    "lsp_pre_edit_context": {
+                        "schema": report["lsp_pre_edit_context"].get("schema"),
+                        "item_count": len(report["lsp_pre_edit_context"].get("items") or []),
+                        "targets": target_files,
+                    },
+                },
                 summary="Sandbox preflight completed.",
                 idempotency_key=f"{event_type}:{run_id}:{len(ops)}:{report.get('status')}",
             )
@@ -5218,6 +6368,204 @@ class WorkbenchService:
         except KeyError:
             self.run_service.get_run(run_id)
             return {}
+
+    def _browser_product_proof_for_run(self, *, run: RunRecord, artifacts: dict[str, Any], browser_proof: dict[str, Any]) -> dict[str, Any]:
+        contract = run.acceptance_contract if isinstance(run.acceptance_contract, dict) else {}
+        browser_check = self._check_result_by_name(artifacts, "browser_flow_smoke")
+        diagnostics = browser_check.get("diagnostics") if isinstance(browser_check.get("diagnostics"), dict) else {}
+        proof = browser_proof if isinstance(browser_proof, dict) else {}
+        raw_proof = proof.get("role_workflows") if isinstance(proof.get("role_workflows"), dict) else {}
+        roles_required = self._browser_required_roles(run=run, acceptance_contract=contract)
+        screenshots = proof.get("role_page_screenshots") if isinstance(proof.get("role_page_screenshots"), list) else []
+        screenshot_roles = {
+            str(item.get("role") or self._role_from_text(str(item.get("route") or item.get("path") or ""))).strip().lower()
+            for item in screenshots
+            if isinstance(item, dict)
+        }
+        missing_screenshot_roles = sorted(role for role in roles_required if role not in screenshot_roles)
+        console_capture_present = self._browser_capture_field_present("console_errors", proof, raw_proof, diagnostics)
+        network_capture_present = self._browser_capture_field_present("network_errors", proof, raw_proof, diagnostics)
+        console_errors = [str(item) for item in proof.get("console_errors") or [] if str(item).strip()]
+        network_errors = [str(item) for item in proof.get("network_errors") or [] if str(item).strip()]
+        reload_evidence = self._browser_reload_evidence(proof=proof, raw_proof=raw_proof, diagnostics=diagnostics)
+        persisted_marker = (
+            proof.get("persisted_state_marker")
+            or raw_proof.get("persisted_state_marker")
+            or diagnostics.get("persisted_state_marker")
+            or raw_proof.get("created_marker")
+            or diagnostics.get("created_marker")
+        )
+        mobile_layout = proof.get("mobile_layout") if isinstance(proof.get("mobile_layout"), dict) else {}
+        flow_coverage = proof.get("flow_coverage") if isinstance(proof.get("flow_coverage"), dict) else {}
+        if not flow_coverage and isinstance(artifacts.get("flow_coverage"), dict):
+            flow_coverage = artifacts.get("flow_coverage") or {}
+        flow_coverage_passed = str(flow_coverage.get("status") or "").strip().lower() == "passed"
+        mobile_ok = (
+            bool(mobile_layout)
+            and str(mobile_layout.get("status") or "passed").lower() != "failed"
+            and not bool(mobile_layout.get("horizontal_overflow"))
+            and not bool(mobile_layout.get("critical_overlap") or mobile_layout.get("overlap"))
+        )
+        contract_scenarios = self._browser_contract_scenarios(acceptance_contract=contract, browser_proof=proof)
+        missing_contract_scenarios = [item for item in contract_scenarios if item.get("status") != "passed"]
+        issues: list[dict[str, Any]] = []
+
+        def issue(kind: str, details: str, evidence: dict[str, Any]) -> None:
+            issues.append({"kind": kind, "details": details, "blocking": True, "evidence": evidence})
+
+        if str(proof.get("status") or "").lower() != "passed":
+            issue("browser_product_proof_failed", "Normalized browser proof is not passing.", {"browser_status": proof.get("status"), "browser_issues": proof.get("issues") or []})
+        if missing_screenshot_roles:
+            issue("browser_product_proof_missing_role_screenshots", "Browser proof is missing screenshot evidence for required roles.", {"missing_roles": missing_screenshot_roles, "required_roles": roles_required})
+        if not console_capture_present:
+            issue("browser_product_proof_missing_console_capture", "Browser proof did not record console error capture.", {"required_field": "console_errors"})
+        if not network_capture_present:
+            issue("browser_product_proof_missing_network_capture", "Browser proof did not record network error capture.", {"required_field": "network_errors"})
+        if console_errors:
+            issue("browser_product_proof_console_errors", "Browser proof recorded console errors.", {"items": console_errors[:20]})
+        if network_errors:
+            issue("browser_product_proof_network_errors", "Browser proof recorded network errors.", {"items": network_errors[:20]})
+        if persisted_marker and not reload_evidence.get("verified") and not flow_coverage_passed:
+            issue("browser_product_proof_missing_reload_marker", "Persisted browser workflow was not verified after reload.", {"persisted_marker": persisted_marker, "reload_evidence": reload_evidence})
+        if not mobile_ok:
+            issue("browser_product_proof_mobile_layout", "Browser proof is missing a passing mobile overflow/overlap check.", {"mobile_layout": mobile_layout})
+        if missing_contract_scenarios and not flow_coverage_passed:
+            issue("browser_product_proof_missing_acceptance_scenarios", "Browser proof does not cover all acceptance-contract scenarios.", {"missing": missing_contract_scenarios})
+
+        status = "passed" if not issues else "failed"
+        return {
+            "schema": "grounded.browser_product_proof.v1",
+            "run_id": run.run_id,
+            "workspace_id": run.workspace_id,
+            "status": status,
+            "blocking": bool(issues),
+            "source": "acceptance_contract",
+            "required_roles": roles_required,
+            "role_screenshot_coverage": {
+                "status": "passed" if not missing_screenshot_roles else "failed",
+                "roles_with_screenshots": sorted(role for role in screenshot_roles if role),
+                "missing_roles": missing_screenshot_roles,
+                "items": screenshots,
+            },
+            "console_network_capture": {
+                "status": "passed" if console_capture_present and network_capture_present and not console_errors and not network_errors else "failed",
+                "console_capture_present": console_capture_present,
+                "network_capture_present": network_capture_present,
+                "console_errors": console_errors[:20],
+                "network_errors": network_errors[:20],
+            },
+            "reload_persistence": reload_evidence | {"persisted_marker": persisted_marker},
+            "mobile_layout": {
+                "status": "passed" if mobile_ok else "failed",
+                "report": mobile_layout,
+            },
+            "acceptance_scenario_coverage": {
+                "status": "passed" if not missing_contract_scenarios or flow_coverage_passed else "failed",
+                "scenarios": contract_scenarios,
+                "flow_coverage": flow_coverage,
+            },
+            "issues": issues,
+            "artifact_refs": {
+                "browser_proof": proof.get("artifact_refs", {}).get("browser_proof") if isinstance(proof.get("artifact_refs"), dict) else run.browser_proof_ref,
+                "run_artifacts": f"run_artifacts:{run.run_id}",
+                "browser_product_proof": f"browser_product_proof:{run.run_id}",
+            },
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    @staticmethod
+    def _browser_required_roles(*, run: RunRecord, acceptance_contract: dict[str, Any]) -> list[str]:
+        raw_roles: list[Any] = []
+        if run.target_role_scope:
+            raw_roles.extend(run.target_role_scope)
+        roles = acceptance_contract.get("roles")
+        if isinstance(roles, list):
+            raw_roles.extend(roles)
+        role_actions = acceptance_contract.get("role_actions")
+        if isinstance(role_actions, dict):
+            raw_roles.extend(role_actions.keys())
+        normalized = {str(role or "").strip().lower() for role in raw_roles}
+        known = [role for role in ("client", "specialist", "manager") if role in normalized]
+        return known or ["client"]
+
+    @staticmethod
+    def _browser_capture_field_present(field: str, proof: dict[str, Any], raw_proof: dict[str, Any], diagnostics: dict[str, Any]) -> bool:
+        del proof
+        return field in raw_proof or field in diagnostics
+
+    @classmethod
+    def _browser_reload_evidence(cls, *, proof: dict[str, Any], raw_proof: dict[str, Any], diagnostics: dict[str, Any]) -> dict[str, Any]:
+        marker_after_reload = (
+            proof.get("persisted_marker_after_reload")
+            or raw_proof.get("persisted_marker_after_reload")
+            or diagnostics.get("persisted_marker_after_reload")
+            or proof.get("reload_persisted_state_marker")
+            or raw_proof.get("reload_persisted_state_marker")
+            or diagnostics.get("reload_persisted_state_marker")
+        )
+        explicit = any(bool(value) for value in (proof.get("reload_verified"), raw_proof.get("reload_verified"), diagnostics.get("reload_verified")))
+        snapshots = proof.get("dom_snapshots") if isinstance(proof.get("dom_snapshots"), list) else []
+        reload_snapshots = [
+            item
+            for item in snapshots
+            if isinstance(item, dict)
+            and any(token in str(item.get("phase") or item.get("action") or "").lower() for token in ("reload", "after_reload", "post_reload"))
+        ]
+        return {
+            "status": "passed" if explicit or marker_after_reload or reload_snapshots else "not_recorded",
+            "verified": bool(explicit or marker_after_reload or reload_snapshots),
+            "persisted_marker_after_reload": marker_after_reload,
+            "reload_snapshots": reload_snapshots[:20],
+        }
+
+    @classmethod
+    def _browser_contract_scenarios(cls, *, acceptance_contract: dict[str, Any], browser_proof: dict[str, Any]) -> list[dict[str, Any]]:
+        flows = [item for item in acceptance_contract.get("flows") or [] if isinstance(item, dict)]
+        if not flows:
+            return []
+        proof_scenarios = [
+            item
+            for item in [
+                *(browser_proof.get("scenarios") or []),
+                *((browser_proof.get("role_workflows") or {}).get("acceptance_scenarios") or [] if isinstance(browser_proof.get("role_workflows"), dict) else []),
+            ]
+            if isinstance(item, dict)
+        ]
+        steps = [item for item in browser_proof.get("steps") or [] if isinstance(item, dict)]
+        result: list[dict[str, Any]] = []
+        for flow in flows:
+            flow_id = str(flow.get("id") or flow.get("name") or flow.get("title") or "").strip()
+            role = str(flow.get("role") or "").strip().lower()
+            if not flow_id:
+                continue
+            matched = cls._browser_contract_flow_matched(flow_id=flow_id, role=role, proof_scenarios=proof_scenarios, steps=steps)
+            result.append(
+                {
+                    "id": flow_id,
+                    "role": role or None,
+                    "status": "passed" if matched else "missing",
+                    "source": "acceptance_contract",
+                    "required": True,
+                }
+            )
+        return result
+
+    @staticmethod
+    def _browser_contract_flow_matched(*, flow_id: str, role: str, proof_scenarios: list[dict[str, Any]], steps: list[dict[str, Any]]) -> bool:
+        needles = {flow_id.lower()}
+        for item in proof_scenarios:
+            status = str(item.get("status") or "").lower()
+            item_role = str(item.get("role") or "").lower()
+            haystack = " ".join(str(item.get(key) or "") for key in ("id", "scenario_id", "flow_id", "name", "title", "action")).lower()
+            if any(needle and needle in haystack for needle in needles) and status in {"passed", "proved", "ok", "success"}:
+                return not role or item_role in {"", role}
+        for step in steps:
+            status = str(step.get("status") or "passed").lower()
+            item_role = str(step.get("role") or "").lower()
+            haystack = " ".join(str(step.get(key) or "") for key in ("flow_id", "scenario_id", "action", "step", "name")).lower()
+            if any(needle and needle in haystack for needle in needles) and status not in {"failed", "blocked"}:
+                return not role or item_role in {"", role}
+        return False
 
     def _normalize_browser_proof_payload(self, run: RunRecord, artifacts: dict[str, Any]) -> dict[str, Any]:
         stored_ref_payload = self.store.get("reports", run.browser_proof_ref) if run.browser_proof_ref else None

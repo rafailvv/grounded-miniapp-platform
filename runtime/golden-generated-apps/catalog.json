@@ -15,14 +15,47 @@
       ],
       "expected_contract": {
         "resource_hint": "appointment",
-        "required_resource_hints": ["appointment", "service", "master", "slot"],
-        "required_fields": ["service", "master", "date", "slot", "client_name", "phone", "status"],
-        "source_roles": ["client"],
-        "update_roles": ["specialist", "manager"],
-        "observer_roles": ["manager"],
-        "status_values": ["new", "confirmed", "completed", "canceled"],
-        "min_role_routes": {"client": 2, "specialist": 2, "manager": 2},
-        "required_step_kinds": ["prompt_state_source", "prompt_state_update", "mobile_layout"]
+        "required_resource_hints": [
+          "appointment",
+          "service",
+          "master",
+          "slot"
+        ],
+        "required_fields": [
+          "service",
+          "master",
+          "date",
+          "slot",
+          "client_name",
+          "phone",
+          "status"
+        ],
+        "source_roles": [
+          "client"
+        ],
+        "update_roles": [
+          "specialist",
+          "manager"
+        ],
+        "observer_roles": [
+          "manager"
+        ],
+        "status_values": [
+          "new",
+          "confirmed",
+          "completed",
+          "canceled"
+        ],
+        "min_role_routes": {
+          "client": 2,
+          "specialist": 2,
+          "manager": 2
+        },
+        "required_step_kinds": [
+          "prompt_state_source",
+          "prompt_state_update",
+          "mobile_layout"
+        ]
       },
       "readiness_required_checks": [
         "api",
@@ -36,43 +69,203 @@
       "prompt_analysis": {
         "prompt_summary": "Salon booking app with service and master selection, persisted appointment status, specialist schedule operations, and manager utilization view.",
         "resource_hint": "appointment",
-        "resource_hints": ["appointment", "service", "master", "slot"],
-        "field_hints": ["service", "master", "date", "slot", "client_name", "phone", "status", "notes"],
-        "business_capabilities": ["service selection", "slot booking", "specialist day schedule", "manager utilization"],
+        "resource_hints": [
+          "appointment",
+          "service",
+          "master",
+          "slot"
+        ],
+        "field_hints": [
+          "service",
+          "master",
+          "date",
+          "slot",
+          "client_name",
+          "phone",
+          "status",
+          "notes"
+        ],
+        "business_capabilities": [
+          "service selection",
+          "slot booking",
+          "specialist day schedule",
+          "manager utilization"
+        ],
         "role_action_prompts": {
-          "client": ["choose service and master", "book available slot", "view booking status"],
-          "specialist": ["view daily appointments", "update appointment status", "block unavailable slot"],
-          "manager": ["monitor utilization", "resolve cancellations", "manage schedule"]
+          "client": [
+            "choose service and master",
+            "book available slot",
+            "view booking status"
+          ],
+          "specialist": [
+            "view daily appointments",
+            "update appointment status",
+            "block unavailable slot"
+          ],
+          "manager": [
+            "monitor utilization",
+            "resolve cancellations",
+            "manage schedule"
+          ]
         },
         "role_field_hints": {
-          "client": ["service", "master", "date", "slot", "client_name", "phone"],
-          "specialist": ["appointment_time", "client_name", "service", "status", "notes"],
-          "manager": ["utilization", "cancellations", "specialist_load", "schedule_conflicts"]
+          "client": [
+            "service",
+            "master",
+            "date",
+            "slot",
+            "client_name",
+            "phone"
+          ],
+          "specialist": [
+            "appointment_time",
+            "client_name",
+            "service",
+            "status",
+            "notes"
+          ],
+          "manager": [
+            "utilization",
+            "cancellations",
+            "specialist_load",
+            "schedule_conflicts"
+          ]
         },
         "role_state_contract": {
-          "source_roles": ["client"],
-          "update_roles": ["specialist", "manager"],
-          "observer_roles": ["manager"],
-          "status_values": ["new", "confirmed", "completed", "canceled"]
+          "source_roles": [
+            "client"
+          ],
+          "update_roles": [
+            "specialist",
+            "manager"
+          ],
+          "observer_roles": [
+            "manager"
+          ],
+          "status_values": [
+            "new",
+            "confirmed",
+            "completed",
+            "canceled"
+          ]
         },
         "routeable_screen_plan": {
           "multi_page_recommended": true,
           "roles": {
             "client": [
-              {"intent": "services", "purpose": "choose service and master"},
-              {"intent": "booking", "purpose": "pick slot and confirm appointment"}
+              {
+                "intent": "services",
+                "purpose": "choose service and master"
+              },
+              {
+                "intent": "booking",
+                "purpose": "pick slot and confirm appointment"
+              }
             ],
             "specialist": [
-              {"intent": "today", "purpose": "manage daily appointments"},
-              {"intent": "availability", "purpose": "block unavailable slots"}
+              {
+                "intent": "today",
+                "purpose": "manage daily appointments"
+              },
+              {
+                "intent": "availability",
+                "purpose": "block unavailable slots"
+              }
             ],
             "manager": [
-              {"intent": "operations", "purpose": "monitor bookings and cancellations"},
-              {"intent": "schedule", "purpose": "inspect utilization and conflicts"}
+              {
+                "intent": "operations",
+                "purpose": "monitor bookings and cancellations"
+              },
+              {
+                "intent": "schedule",
+                "purpose": "inspect utilization and conflicts"
+              }
             ]
           }
         }
-      }
+      },
+      "expected_roles": [
+        "client",
+        "specialist",
+        "manager"
+      ],
+      "expected_routes": [
+        {
+          "role": "client",
+          "min_count": 2,
+          "intents": [
+            "services",
+            "booking"
+          ]
+        },
+        {
+          "role": "specialist",
+          "min_count": 2,
+          "intents": [
+            "today",
+            "availability"
+          ]
+        },
+        {
+          "role": "manager",
+          "min_count": 2,
+          "intents": [
+            "operations",
+            "schedule"
+          ]
+        }
+      ],
+      "expected_api": [
+        {
+          "method": "GET",
+          "path": "/api/appointments",
+          "resource": "appointment"
+        },
+        {
+          "method": "POST",
+          "path": "/api/appointments",
+          "resource": "appointment"
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/appointments/{id}",
+          "resource": "appointment"
+        }
+      ],
+      "expected_persistence_markers": [
+        "service",
+        "master",
+        "date",
+        "slot",
+        "client_name",
+        "phone",
+        "status"
+      ],
+      "visual_mobile_thresholds": {
+        "min_mobile_width": 390,
+        "max_horizontal_overflow_px": 0,
+        "max_critical_overlaps": 0,
+        "required_viewports": [
+          "390x844"
+        ],
+        "required_role_screenshots": true
+      },
+      "suite_tags": [
+        "core",
+        "booking",
+        "beauty_salon"
+      ],
+      "golden_tier": "core",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "services",
+        "booking",
+        "today",
+        "availability",
+        "operations",
+        "schedule"
+      ]
     },
     {
       "id": "restaurant-reservations",
@@ -87,14 +280,47 @@
       ],
       "expected_contract": {
         "resource_hint": "reservation",
-        "required_resource_hints": ["reservation", "table", "guest", "waitlist"],
-        "required_fields": ["date", "time", "party_size", "guest_name", "phone", "status"],
-        "source_roles": ["client"],
-        "update_roles": ["specialist", "manager"],
-        "observer_roles": ["manager"],
-        "status_values": ["new", "confirmed", "seated", "waitlist", "canceled"],
-        "min_role_routes": {"client": 2, "specialist": 2, "manager": 2},
-        "required_step_kinds": ["prompt_state_source", "prompt_state_update", "mobile_layout"]
+        "required_resource_hints": [
+          "reservation",
+          "table",
+          "guest",
+          "waitlist"
+        ],
+        "required_fields": [
+          "date",
+          "time",
+          "party_size",
+          "guest_name",
+          "phone",
+          "status"
+        ],
+        "source_roles": [
+          "client"
+        ],
+        "update_roles": [
+          "specialist",
+          "manager"
+        ],
+        "observer_roles": [
+          "manager"
+        ],
+        "status_values": [
+          "new",
+          "confirmed",
+          "seated",
+          "waitlist",
+          "canceled"
+        ],
+        "min_role_routes": {
+          "client": 2,
+          "specialist": 2,
+          "manager": 2
+        },
+        "required_step_kinds": [
+          "prompt_state_source",
+          "prompt_state_update",
+          "mobile_layout"
+        ]
       },
       "readiness_required_checks": [
         "api",
@@ -108,43 +334,200 @@
       "prompt_analysis": {
         "prompt_summary": "Restaurant table reservation workflow with guest booking, host confirmation and seating, manager room load and waitlist control.",
         "resource_hint": "reservation",
-        "resource_hints": ["reservation", "table", "guest", "waitlist"],
-        "field_hints": ["date", "time", "party_size", "guest_name", "phone", "status", "table_zone"],
-        "business_capabilities": ["table booking", "host confirmation", "waitlist", "room load analytics"],
+        "resource_hints": [
+          "reservation",
+          "table",
+          "guest",
+          "waitlist"
+        ],
+        "field_hints": [
+          "date",
+          "time",
+          "party_size",
+          "guest_name",
+          "phone",
+          "status",
+          "table_zone"
+        ],
+        "business_capabilities": [
+          "table booking",
+          "host confirmation",
+          "waitlist",
+          "room load analytics"
+        ],
         "role_action_prompts": {
-          "client": ["choose date and time", "reserve table", "view reservation status"],
-          "specialist": ["confirm reservation", "mark guest seated", "move guest to waitlist"],
-          "manager": ["monitor room load", "resolve cancellations", "manage waitlist"]
+          "client": [
+            "choose date and time",
+            "reserve table",
+            "view reservation status"
+          ],
+          "specialist": [
+            "confirm reservation",
+            "mark guest seated",
+            "move guest to waitlist"
+          ],
+          "manager": [
+            "monitor room load",
+            "resolve cancellations",
+            "manage waitlist"
+          ]
         },
         "role_field_hints": {
-          "client": ["date", "time", "party_size", "guest_name", "phone"],
-          "specialist": ["reservation_time", "party_size", "table_zone", "status"],
-          "manager": ["capacity", "waitlist_count", "cancellations", "room_load"]
+          "client": [
+            "date",
+            "time",
+            "party_size",
+            "guest_name",
+            "phone"
+          ],
+          "specialist": [
+            "reservation_time",
+            "party_size",
+            "table_zone",
+            "status"
+          ],
+          "manager": [
+            "capacity",
+            "waitlist_count",
+            "cancellations",
+            "room_load"
+          ]
         },
         "role_state_contract": {
-          "source_roles": ["client"],
-          "update_roles": ["specialist", "manager"],
-          "observer_roles": ["manager"],
-          "status_values": ["new", "confirmed", "seated", "waitlist", "canceled"]
+          "source_roles": [
+            "client"
+          ],
+          "update_roles": [
+            "specialist",
+            "manager"
+          ],
+          "observer_roles": [
+            "manager"
+          ],
+          "status_values": [
+            "new",
+            "confirmed",
+            "seated",
+            "waitlist",
+            "canceled"
+          ]
         },
         "routeable_screen_plan": {
           "multi_page_recommended": true,
           "roles": {
             "client": [
-              {"intent": "reservation", "purpose": "select date, time, and party size"},
-              {"intent": "status", "purpose": "view reservation confirmation"}
+              {
+                "intent": "reservation",
+                "purpose": "select date, time, and party size"
+              },
+              {
+                "intent": "status",
+                "purpose": "view reservation confirmation"
+              }
             ],
             "specialist": [
-              {"intent": "host-queue", "purpose": "confirm and seat reservations"},
-              {"intent": "waitlist", "purpose": "manage waitlisted guests"}
+              {
+                "intent": "host-queue",
+                "purpose": "confirm and seat reservations"
+              },
+              {
+                "intent": "waitlist",
+                "purpose": "manage waitlisted guests"
+              }
             ],
             "manager": [
-              {"intent": "floor-load", "purpose": "track room capacity"},
-              {"intent": "exceptions", "purpose": "handle cancellations and waitlist pressure"}
+              {
+                "intent": "floor-load",
+                "purpose": "track room capacity"
+              },
+              {
+                "intent": "exceptions",
+                "purpose": "handle cancellations and waitlist pressure"
+              }
             ]
           }
         }
-      }
+      },
+      "expected_roles": [
+        "client",
+        "specialist",
+        "manager"
+      ],
+      "expected_routes": [
+        {
+          "role": "client",
+          "min_count": 2,
+          "intents": [
+            "reservation",
+            "status"
+          ]
+        },
+        {
+          "role": "specialist",
+          "min_count": 2,
+          "intents": [
+            "host-queue",
+            "waitlist"
+          ]
+        },
+        {
+          "role": "manager",
+          "min_count": 2,
+          "intents": [
+            "floor-load",
+            "exceptions"
+          ]
+        }
+      ],
+      "expected_api": [
+        {
+          "method": "GET",
+          "path": "/api/reservations",
+          "resource": "reservation"
+        },
+        {
+          "method": "POST",
+          "path": "/api/reservations",
+          "resource": "reservation"
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/reservations/{id}",
+          "resource": "reservation"
+        }
+      ],
+      "expected_persistence_markers": [
+        "date",
+        "time",
+        "party_size",
+        "guest_name",
+        "phone",
+        "status"
+      ],
+      "visual_mobile_thresholds": {
+        "min_mobile_width": 390,
+        "max_horizontal_overflow_px": 0,
+        "max_critical_overlaps": 0,
+        "required_viewports": [
+          "390x844"
+        ],
+        "required_role_screenshots": true
+      },
+      "suite_tags": [
+        "extended",
+        "booking",
+        "restaurant"
+      ],
+      "golden_tier": "extended",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "reservation",
+        "status",
+        "host-queue",
+        "waitlist",
+        "floor-load",
+        "exceptions"
+      ]
     },
     {
       "id": "shop-catalog-orders",
@@ -159,14 +542,47 @@
       ],
       "expected_contract": {
         "resource_hint": "order",
-        "required_resource_hints": ["product", "cart", "order", "stock"],
-        "required_fields": ["product", "category", "quantity", "price", "customer_name", "status"],
-        "source_roles": ["client"],
-        "update_roles": ["specialist", "manager"],
-        "observer_roles": ["manager"],
-        "status_values": ["new", "confirmed", "packing", "ready", "canceled"],
-        "min_role_routes": {"client": 3, "specialist": 2, "manager": 2},
-        "required_step_kinds": ["prompt_state_source", "prompt_state_update", "mobile_layout"]
+        "required_resource_hints": [
+          "product",
+          "cart",
+          "order",
+          "stock"
+        ],
+        "required_fields": [
+          "product",
+          "category",
+          "quantity",
+          "price",
+          "customer_name",
+          "status"
+        ],
+        "source_roles": [
+          "client"
+        ],
+        "update_roles": [
+          "specialist",
+          "manager"
+        ],
+        "observer_roles": [
+          "manager"
+        ],
+        "status_values": [
+          "new",
+          "confirmed",
+          "packing",
+          "ready",
+          "canceled"
+        ],
+        "min_role_routes": {
+          "client": 3,
+          "specialist": 2,
+          "manager": 2
+        },
+        "required_step_kinds": [
+          "prompt_state_source",
+          "prompt_state_update",
+          "mobile_layout"
+        ]
       },
       "readiness_required_checks": [
         "api",
@@ -180,44 +596,205 @@
       "prompt_analysis": {
         "prompt_summary": "Shop app with catalog browsing, cart checkout, fulfillment queue, stock and order management.",
         "resource_hint": "order",
-        "resource_hints": ["product", "cart", "order", "stock"],
-        "field_hints": ["product", "category", "quantity", "price", "customer_name", "phone", "status"],
-        "business_capabilities": ["catalog browsing", "cart checkout", "fulfillment queue", "stock management"],
+        "resource_hints": [
+          "product",
+          "cart",
+          "order",
+          "stock"
+        ],
+        "field_hints": [
+          "product",
+          "category",
+          "quantity",
+          "price",
+          "customer_name",
+          "phone",
+          "status"
+        ],
+        "business_capabilities": [
+          "catalog browsing",
+          "cart checkout",
+          "fulfillment queue",
+          "stock management"
+        ],
         "role_action_prompts": {
-          "client": ["browse product catalog", "filter categories", "add product to cart", "submit order"],
-          "specialist": ["prepare ordered items", "update fulfillment status", "flag missing stock"],
-          "manager": ["manage catalog", "monitor stock", "review order metrics"]
+          "client": [
+            "browse product catalog",
+            "filter categories",
+            "add product to cart",
+            "submit order"
+          ],
+          "specialist": [
+            "prepare ordered items",
+            "update fulfillment status",
+            "flag missing stock"
+          ],
+          "manager": [
+            "manage catalog",
+            "monitor stock",
+            "review order metrics"
+          ]
         },
         "role_field_hints": {
-          "client": ["product", "category", "quantity", "customer_name", "phone"],
-          "specialist": ["order_items", "quantity", "status", "stock_issue"],
-          "manager": ["stock", "top_products", "revenue", "order_count"]
+          "client": [
+            "product",
+            "category",
+            "quantity",
+            "customer_name",
+            "phone"
+          ],
+          "specialist": [
+            "order_items",
+            "quantity",
+            "status",
+            "stock_issue"
+          ],
+          "manager": [
+            "stock",
+            "top_products",
+            "revenue",
+            "order_count"
+          ]
         },
         "role_state_contract": {
-          "source_roles": ["client"],
-          "update_roles": ["specialist", "manager"],
-          "observer_roles": ["manager"],
-          "status_values": ["new", "confirmed", "packing", "ready", "canceled"]
+          "source_roles": [
+            "client"
+          ],
+          "update_roles": [
+            "specialist",
+            "manager"
+          ],
+          "observer_roles": [
+            "manager"
+          ],
+          "status_values": [
+            "new",
+            "confirmed",
+            "packing",
+            "ready",
+            "canceled"
+          ]
         },
         "routeable_screen_plan": {
           "multi_page_recommended": true,
           "roles": {
             "client": [
-              {"intent": "catalog", "purpose": "browse and filter products"},
-              {"intent": "product-detail", "purpose": "inspect item and options"},
-              {"intent": "cart", "purpose": "review cart and submit order"}
+              {
+                "intent": "catalog",
+                "purpose": "browse and filter products"
+              },
+              {
+                "intent": "product-detail",
+                "purpose": "inspect item and options"
+              },
+              {
+                "intent": "cart",
+                "purpose": "review cart and submit order"
+              }
             ],
             "specialist": [
-              {"intent": "fulfillment", "purpose": "prepare active orders"},
-              {"intent": "stock-issues", "purpose": "flag missing items"}
+              {
+                "intent": "fulfillment",
+                "purpose": "prepare active orders"
+              },
+              {
+                "intent": "stock-issues",
+                "purpose": "flag missing items"
+              }
             ],
             "manager": [
-              {"intent": "catalog-admin", "purpose": "manage stock and availability"},
-              {"intent": "orders", "purpose": "review order metrics and exceptions"}
+              {
+                "intent": "catalog-admin",
+                "purpose": "manage stock and availability"
+              },
+              {
+                "intent": "orders",
+                "purpose": "review order metrics and exceptions"
+              }
             ]
           }
         }
-      }
+      },
+      "expected_roles": [
+        "client",
+        "specialist",
+        "manager"
+      ],
+      "expected_routes": [
+        {
+          "role": "client",
+          "min_count": 3,
+          "intents": [
+            "catalog",
+            "product-detail",
+            "cart"
+          ]
+        },
+        {
+          "role": "specialist",
+          "min_count": 2,
+          "intents": [
+            "fulfillment",
+            "stock-issues"
+          ]
+        },
+        {
+          "role": "manager",
+          "min_count": 2,
+          "intents": [
+            "catalog-admin",
+            "orders"
+          ]
+        }
+      ],
+      "expected_api": [
+        {
+          "method": "GET",
+          "path": "/api/orders",
+          "resource": "order"
+        },
+        {
+          "method": "POST",
+          "path": "/api/orders",
+          "resource": "order"
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/orders/{id}",
+          "resource": "order"
+        }
+      ],
+      "expected_persistence_markers": [
+        "product",
+        "category",
+        "quantity",
+        "price",
+        "customer_name",
+        "status"
+      ],
+      "visual_mobile_thresholds": {
+        "min_mobile_width": 390,
+        "max_horizontal_overflow_px": 0,
+        "max_critical_overlaps": 0,
+        "required_viewports": [
+          "390x844"
+        ],
+        "required_role_screenshots": true
+      },
+      "suite_tags": [
+        "core",
+        "shop"
+      ],
+      "golden_tier": "core",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "catalog",
+        "product-detail",
+        "cart",
+        "fulfillment",
+        "stock-issues",
+        "catalog-admin"
+      ]
     },
     {
       "id": "crm-request-pipeline",
@@ -232,14 +809,48 @@
       ],
       "expected_contract": {
         "resource_hint": "request",
-        "required_resource_hints": ["request", "lead", "pipeline", "follow-up"],
-        "required_fields": ["contact_name", "phone", "source", "priority", "assignee", "status"],
-        "source_roles": ["client"],
-        "update_roles": ["specialist", "manager"],
-        "observer_roles": ["manager"],
-        "status_values": ["new", "qualified", "in progress", "waiting for client", "done", "lost"],
-        "min_role_routes": {"client": 2, "specialist": 2, "manager": 2},
-        "required_step_kinds": ["prompt_state_source", "prompt_state_update", "mobile_layout"]
+        "required_resource_hints": [
+          "request",
+          "lead",
+          "pipeline",
+          "follow-up"
+        ],
+        "required_fields": [
+          "contact_name",
+          "phone",
+          "source",
+          "priority",
+          "assignee",
+          "status"
+        ],
+        "source_roles": [
+          "client"
+        ],
+        "update_roles": [
+          "specialist",
+          "manager"
+        ],
+        "observer_roles": [
+          "manager"
+        ],
+        "status_values": [
+          "new",
+          "qualified",
+          "in progress",
+          "waiting for client",
+          "done",
+          "lost"
+        ],
+        "min_role_routes": {
+          "client": 2,
+          "specialist": 2,
+          "manager": 2
+        },
+        "required_step_kinds": [
+          "prompt_state_source",
+          "prompt_state_update",
+          "mobile_layout"
+        ]
       },
       "readiness_required_checks": [
         "api",
@@ -253,43 +864,199 @@
       "prompt_analysis": {
         "prompt_summary": "CRM app for incoming requests, lead qualification, follow-up ownership, manager pipeline and conversion analytics.",
         "resource_hint": "request",
-        "resource_hints": ["request", "lead", "pipeline", "follow-up"],
-        "field_hints": ["contact_name", "phone", "source", "priority", "assignee", "status", "next_contact_at"],
-        "business_capabilities": ["lead capture", "qualification", "follow-up scheduling", "pipeline analytics"],
+        "resource_hints": [
+          "request",
+          "lead",
+          "pipeline",
+          "follow-up"
+        ],
+        "field_hints": [
+          "contact_name",
+          "phone",
+          "source",
+          "priority",
+          "assignee",
+          "status",
+          "next_contact_at"
+        ],
+        "business_capabilities": [
+          "lead capture",
+          "qualification",
+          "follow-up scheduling",
+          "pipeline analytics"
+        ],
         "role_action_prompts": {
-          "client": ["submit request", "add contact details", "view request status"],
-          "specialist": ["qualify lead", "assign status", "schedule follow-up"],
-          "manager": ["monitor pipeline", "find overdue requests", "review conversion"]
+          "client": [
+            "submit request",
+            "add contact details",
+            "view request status"
+          ],
+          "specialist": [
+            "qualify lead",
+            "assign status",
+            "schedule follow-up"
+          ],
+          "manager": [
+            "monitor pipeline",
+            "find overdue requests",
+            "review conversion"
+          ]
         },
         "role_field_hints": {
-          "client": ["contact_name", "phone", "request_text"],
-          "specialist": ["source", "priority", "assignee", "status", "next_contact_at"],
-          "manager": ["pipeline_stage", "overdue_count", "assignee_load", "conversion"]
+          "client": [
+            "contact_name",
+            "phone",
+            "request_text"
+          ],
+          "specialist": [
+            "source",
+            "priority",
+            "assignee",
+            "status",
+            "next_contact_at"
+          ],
+          "manager": [
+            "pipeline_stage",
+            "overdue_count",
+            "assignee_load",
+            "conversion"
+          ]
         },
         "role_state_contract": {
-          "source_roles": ["client"],
-          "update_roles": ["specialist", "manager"],
-          "observer_roles": ["manager"],
-          "status_values": ["new", "qualified", "in progress", "waiting for client", "done", "lost"]
+          "source_roles": [
+            "client"
+          ],
+          "update_roles": [
+            "specialist",
+            "manager"
+          ],
+          "observer_roles": [
+            "manager"
+          ],
+          "status_values": [
+            "new",
+            "qualified",
+            "in progress",
+            "waiting for client",
+            "done",
+            "lost"
+          ]
         },
         "routeable_screen_plan": {
           "multi_page_recommended": true,
           "roles": {
             "client": [
-              {"intent": "new-request", "purpose": "submit request and contacts"},
-              {"intent": "request-status", "purpose": "view current status"}
+              {
+                "intent": "new-request",
+                "purpose": "submit request and contacts"
+              },
+              {
+                "intent": "request-status",
+                "purpose": "view current status"
+              }
             ],
             "specialist": [
-              {"intent": "lead-queue", "purpose": "qualify and assign requests"},
-              {"intent": "follow-up", "purpose": "schedule next action"}
+              {
+                "intent": "lead-queue",
+                "purpose": "qualify and assign requests"
+              },
+              {
+                "intent": "follow-up",
+                "purpose": "schedule next action"
+              }
             ],
             "manager": [
-              {"intent": "pipeline", "purpose": "monitor stage health"},
-              {"intent": "risks", "purpose": "review overdue and load risks"}
+              {
+                "intent": "pipeline",
+                "purpose": "monitor stage health"
+              },
+              {
+                "intent": "risks",
+                "purpose": "review overdue and load risks"
+              }
             ]
           }
         }
-      }
+      },
+      "expected_roles": [
+        "client",
+        "specialist",
+        "manager"
+      ],
+      "expected_routes": [
+        {
+          "role": "client",
+          "min_count": 2,
+          "intents": [
+            "new-request",
+            "request-status"
+          ]
+        },
+        {
+          "role": "specialist",
+          "min_count": 2,
+          "intents": [
+            "lead-queue",
+            "follow-up"
+          ]
+        },
+        {
+          "role": "manager",
+          "min_count": 2,
+          "intents": [
+            "pipeline",
+            "risks"
+          ]
+        }
+      ],
+      "expected_api": [
+        {
+          "method": "GET",
+          "path": "/api/requests",
+          "resource": "request"
+        },
+        {
+          "method": "POST",
+          "path": "/api/requests",
+          "resource": "request"
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/requests/{id}",
+          "resource": "request"
+        }
+      ],
+      "expected_persistence_markers": [
+        "contact_name",
+        "phone",
+        "source",
+        "priority",
+        "assignee",
+        "status"
+      ],
+      "visual_mobile_thresholds": {
+        "min_mobile_width": 390,
+        "max_horizontal_overflow_px": 0,
+        "max_critical_overlaps": 0,
+        "required_viewports": [
+          "390x844"
+        ],
+        "required_role_screenshots": true
+      },
+      "suite_tags": [
+        "core",
+        "crm"
+      ],
+      "golden_tier": "core",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "new-request",
+        "request-status",
+        "lead-queue",
+        "follow-up",
+        "pipeline",
+        "risks"
+      ]
     },
     {
       "id": "specialist-schedule",
@@ -304,14 +1071,45 @@
       ],
       "expected_contract": {
         "resource_hint": "schedule_slot",
-        "required_resource_hints": ["schedule_slot", "specialist", "shift", "break"],
-        "required_fields": ["specialist", "date", "start_time", "end_time", "availability", "status"],
-        "source_roles": ["specialist"],
-        "update_roles": ["client", "manager"],
-        "observer_roles": ["manager"],
-        "status_values": ["available", "booked", "break", "blocked"],
-        "min_role_routes": {"client": 2, "specialist": 2, "manager": 2},
-        "required_step_kinds": ["prompt_state_source", "mobile_layout"]
+        "required_resource_hints": [
+          "schedule_slot",
+          "specialist",
+          "shift",
+          "break"
+        ],
+        "required_fields": [
+          "specialist",
+          "date",
+          "start_time",
+          "end_time",
+          "availability",
+          "status"
+        ],
+        "source_roles": [
+          "specialist"
+        ],
+        "update_roles": [
+          "client",
+          "manager"
+        ],
+        "observer_roles": [
+          "manager"
+        ],
+        "status_values": [
+          "available",
+          "booked",
+          "break",
+          "blocked"
+        ],
+        "min_role_routes": {
+          "client": 2,
+          "specialist": 2,
+          "manager": 2
+        },
+        "required_step_kinds": [
+          "prompt_state_source",
+          "mobile_layout"
+        ]
       },
       "readiness_required_checks": [
         "api",
@@ -325,43 +1123,199 @@
       "prompt_analysis": {
         "prompt_summary": "Specialist schedule app with availability windows, shift editing, client booking, and manager load control.",
         "resource_hint": "schedule_slot",
-        "resource_hints": ["schedule_slot", "specialist", "shift", "break"],
-        "field_hints": ["specialist", "date", "start_time", "end_time", "availability", "status", "notes"],
-        "business_capabilities": ["availability view", "shift editing", "client booking", "load control"],
+        "resource_hints": [
+          "schedule_slot",
+          "specialist",
+          "shift",
+          "break"
+        ],
+        "field_hints": [
+          "specialist",
+          "date",
+          "start_time",
+          "end_time",
+          "availability",
+          "status",
+          "notes"
+        ],
+        "business_capabilities": [
+          "availability view",
+          "shift editing",
+          "client booking",
+          "load control"
+        ],
         "role_action_prompts": {
-          "client": ["view available windows", "book a schedule slot", "view appointment status"],
-          "specialist": ["edit shifts", "add breaks", "mark busy time"],
-          "manager": ["control schedule coverage", "find overload", "inspect free windows"]
+          "client": [
+            "view available windows",
+            "book a schedule slot",
+            "view appointment status"
+          ],
+          "specialist": [
+            "edit shifts",
+            "add breaks",
+            "mark busy time"
+          ],
+          "manager": [
+            "control schedule coverage",
+            "find overload",
+            "inspect free windows"
+          ]
         },
         "role_field_hints": {
-          "client": ["specialist", "date", "start_time", "service"],
-          "specialist": ["date", "start_time", "end_time", "availability", "break"],
-          "manager": ["specialist_load", "free_windows", "overload", "blocked_slots"]
+          "client": [
+            "specialist",
+            "date",
+            "start_time",
+            "service"
+          ],
+          "specialist": [
+            "date",
+            "start_time",
+            "end_time",
+            "availability",
+            "break"
+          ],
+          "manager": [
+            "specialist_load",
+            "free_windows",
+            "overload",
+            "blocked_slots"
+          ]
         },
         "role_state_contract": {
-          "source_roles": ["specialist"],
-          "update_roles": ["client", "manager"],
-          "observer_roles": ["manager"],
-          "status_values": ["available", "booked", "break", "blocked"]
+          "source_roles": [
+            "specialist"
+          ],
+          "update_roles": [
+            "client",
+            "manager"
+          ],
+          "observer_roles": [
+            "manager"
+          ],
+          "status_values": [
+            "available",
+            "booked",
+            "break",
+            "blocked"
+          ]
         },
         "routeable_screen_plan": {
           "multi_page_recommended": true,
           "roles": {
             "client": [
-              {"intent": "availability", "purpose": "view open specialist windows"},
-              {"intent": "booking", "purpose": "reserve a selected slot"}
+              {
+                "intent": "availability",
+                "purpose": "view open specialist windows"
+              },
+              {
+                "intent": "booking",
+                "purpose": "reserve a selected slot"
+              }
             ],
             "specialist": [
-              {"intent": "shift-editor", "purpose": "edit shifts and breaks"},
-              {"intent": "busy-time", "purpose": "mark unavailable time"}
+              {
+                "intent": "shift-editor",
+                "purpose": "edit shifts and breaks"
+              },
+              {
+                "intent": "busy-time",
+                "purpose": "mark unavailable time"
+              }
             ],
             "manager": [
-              {"intent": "coverage", "purpose": "review schedule coverage"},
-              {"intent": "overload", "purpose": "identify overload and free windows"}
+              {
+                "intent": "coverage",
+                "purpose": "review schedule coverage"
+              },
+              {
+                "intent": "overload",
+                "purpose": "identify overload and free windows"
+              }
             ]
           }
         }
-      }
+      },
+      "expected_roles": [
+        "client",
+        "specialist",
+        "manager"
+      ],
+      "expected_routes": [
+        {
+          "role": "client",
+          "min_count": 2,
+          "intents": [
+            "availability",
+            "booking"
+          ]
+        },
+        {
+          "role": "specialist",
+          "min_count": 2,
+          "intents": [
+            "shift-editor",
+            "busy-time"
+          ]
+        },
+        {
+          "role": "manager",
+          "min_count": 2,
+          "intents": [
+            "coverage",
+            "overload"
+          ]
+        }
+      ],
+      "expected_api": [
+        {
+          "method": "GET",
+          "path": "/api/schedule_slots",
+          "resource": "schedule_slot"
+        },
+        {
+          "method": "POST",
+          "path": "/api/schedule_slots",
+          "resource": "schedule_slot"
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/schedule_slots/{id}",
+          "resource": "schedule_slot"
+        }
+      ],
+      "expected_persistence_markers": [
+        "specialist",
+        "date",
+        "start_time",
+        "end_time",
+        "availability",
+        "status"
+      ],
+      "visual_mobile_thresholds": {
+        "min_mobile_width": 390,
+        "max_horizontal_overflow_px": 0,
+        "max_critical_overlaps": 0,
+        "required_viewports": [
+          "390x844"
+        ],
+        "required_role_screenshots": true
+      },
+      "suite_tags": [
+        "extended",
+        "booking",
+        "schedule"
+      ],
+      "golden_tier": "extended",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "availability",
+        "booking",
+        "shift-editor",
+        "busy-time",
+        "coverage",
+        "overload"
+      ]
     },
     {
       "id": "event-registration",
@@ -376,14 +1330,47 @@
       ],
       "expected_contract": {
         "resource_hint": "registration",
-        "required_resource_hints": ["event", "registration", "ticket", "attendance"],
-        "required_fields": ["event", "attendee_name", "phone", "ticket_type", "status", "check_in"],
-        "source_roles": ["client"],
-        "update_roles": ["specialist", "manager"],
-        "observer_roles": ["manager"],
-        "status_values": ["registered", "waitlist", "checked in", "attended", "canceled"],
-        "min_role_routes": {"client": 2, "specialist": 2, "manager": 2},
-        "required_step_kinds": ["prompt_state_source", "prompt_state_update", "mobile_layout"]
+        "required_resource_hints": [
+          "event",
+          "registration",
+          "ticket",
+          "attendance"
+        ],
+        "required_fields": [
+          "event",
+          "attendee_name",
+          "phone",
+          "ticket_type",
+          "status",
+          "check_in"
+        ],
+        "source_roles": [
+          "client"
+        ],
+        "update_roles": [
+          "specialist",
+          "manager"
+        ],
+        "observer_roles": [
+          "manager"
+        ],
+        "status_values": [
+          "registered",
+          "waitlist",
+          "checked in",
+          "attended",
+          "canceled"
+        ],
+        "min_role_routes": {
+          "client": 2,
+          "specialist": 2,
+          "manager": 2
+        },
+        "required_step_kinds": [
+          "prompt_state_source",
+          "prompt_state_update",
+          "mobile_layout"
+        ]
       },
       "readiness_required_checks": [
         "api",
@@ -397,43 +1384,4443 @@
       "prompt_analysis": {
         "prompt_summary": "Event registration app with attendee signup, organizer check-in, manager capacity, waitlist and conversion tracking.",
         "resource_hint": "registration",
-        "resource_hints": ["event", "registration", "ticket", "attendance"],
-        "field_hints": ["event", "attendee_name", "phone", "ticket_type", "status", "check_in", "capacity"],
-        "business_capabilities": ["event browsing", "registration", "check-in", "capacity and waitlist analytics"],
+        "resource_hints": [
+          "event",
+          "registration",
+          "ticket",
+          "attendance"
+        ],
+        "field_hints": [
+          "event",
+          "attendee_name",
+          "phone",
+          "ticket_type",
+          "status",
+          "check_in",
+          "capacity"
+        ],
+        "business_capabilities": [
+          "event browsing",
+          "registration",
+          "check-in",
+          "capacity and waitlist analytics"
+        ],
         "role_action_prompts": {
-          "client": ["choose event", "register for event", "view ticket status"],
-          "specialist": ["check in attendee", "update attendance", "manage event-day tasks"],
-          "manager": ["monitor capacity", "review waitlist", "track registrations and conversion"]
+          "client": [
+            "choose event",
+            "register for event",
+            "view ticket status"
+          ],
+          "specialist": [
+            "check in attendee",
+            "update attendance",
+            "manage event-day tasks"
+          ],
+          "manager": [
+            "monitor capacity",
+            "review waitlist",
+            "track registrations and conversion"
+          ]
         },
         "role_field_hints": {
-          "client": ["event", "attendee_name", "phone", "ticket_type"],
-          "specialist": ["attendee_name", "ticket_type", "check_in", "status"],
-          "manager": ["capacity", "waitlist", "registration_count", "conversion"]
+          "client": [
+            "event",
+            "attendee_name",
+            "phone",
+            "ticket_type"
+          ],
+          "specialist": [
+            "attendee_name",
+            "ticket_type",
+            "check_in",
+            "status"
+          ],
+          "manager": [
+            "capacity",
+            "waitlist",
+            "registration_count",
+            "conversion"
+          ]
         },
         "role_state_contract": {
-          "source_roles": ["client"],
-          "update_roles": ["specialist", "manager"],
-          "observer_roles": ["manager"],
-          "status_values": ["registered", "waitlist", "checked in", "attended", "canceled"]
+          "source_roles": [
+            "client"
+          ],
+          "update_roles": [
+            "specialist",
+            "manager"
+          ],
+          "observer_roles": [
+            "manager"
+          ],
+          "status_values": [
+            "registered",
+            "waitlist",
+            "checked in",
+            "attended",
+            "canceled"
+          ]
         },
         "routeable_screen_plan": {
           "multi_page_recommended": true,
           "roles": {
             "client": [
-              {"intent": "events", "purpose": "choose event"},
-              {"intent": "registration", "purpose": "register and view ticket status"}
+              {
+                "intent": "events",
+                "purpose": "choose event"
+              },
+              {
+                "intent": "registration",
+                "purpose": "register and view ticket status"
+              }
             ],
             "specialist": [
-              {"intent": "check-in", "purpose": "mark attendee check-in"},
-              {"intent": "attendance", "purpose": "update attendance and event tasks"}
+              {
+                "intent": "check-in",
+                "purpose": "mark attendee check-in"
+              },
+              {
+                "intent": "attendance",
+                "purpose": "update attendance and event tasks"
+              }
             ],
             "manager": [
-              {"intent": "capacity", "purpose": "monitor capacity and waitlist"},
-              {"intent": "registrations", "purpose": "review registrations and conversion"}
+              {
+                "intent": "capacity",
+                "purpose": "monitor capacity and waitlist"
+              },
+              {
+                "intent": "registrations",
+                "purpose": "review registrations and conversion"
+              }
             ]
           }
         }
-      }
+      },
+      "expected_roles": [
+        "client",
+        "specialist",
+        "manager"
+      ],
+      "expected_routes": [
+        {
+          "role": "client",
+          "min_count": 2,
+          "intents": [
+            "events",
+            "registration"
+          ]
+        },
+        {
+          "role": "specialist",
+          "min_count": 2,
+          "intents": [
+            "check-in",
+            "attendance"
+          ]
+        },
+        {
+          "role": "manager",
+          "min_count": 2,
+          "intents": [
+            "capacity",
+            "registrations"
+          ]
+        }
+      ],
+      "expected_api": [
+        {
+          "method": "GET",
+          "path": "/api/registrations",
+          "resource": "registration"
+        },
+        {
+          "method": "POST",
+          "path": "/api/registrations",
+          "resource": "registration"
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/registrations/{id}",
+          "resource": "registration"
+        }
+      ],
+      "expected_persistence_markers": [
+        "event",
+        "attendee_name",
+        "phone",
+        "ticket_type",
+        "status",
+        "check_in"
+      ],
+      "visual_mobile_thresholds": {
+        "min_mobile_width": 390,
+        "max_horizontal_overflow_px": 0,
+        "max_critical_overlaps": 0,
+        "required_viewports": [
+          "390x844"
+        ],
+        "required_role_screenshots": true
+      },
+      "suite_tags": [
+        "core",
+        "events"
+      ],
+      "golden_tier": "core",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "events",
+        "registration",
+        "check-in",
+        "attendance",
+        "capacity",
+        "registrations"
+      ]
+    },
+    {
+      "id": "clinic-appointment-triage",
+      "title": "Clinic appointment triage",
+      "domain": "clinic",
+      "generation_mode": "quality",
+      "prompt": "Создай Telegram mini-app клиники: пациент выбирает врача и слот, описывает симптом и записывается; врач видит приемы и триаж; администратор управляет расписанием, отменами и загрузкой врачей.",
+      "expected_skill_ids": [
+        "booking-reservations"
+      ],
+      "expected_contract": {
+        "resource_hint": "appointment",
+        "required_resource_hints": [
+          "appointment",
+          "doctor",
+          "patient",
+          "triage"
+        ],
+        "required_fields": [
+          "doctor",
+          "specialty",
+          "date",
+          "slot",
+          "patient_name",
+          "phone",
+          "symptom",
+          "status"
+        ],
+        "source_roles": [
+          "client"
+        ],
+        "update_roles": [
+          "specialist",
+          "manager"
+        ],
+        "observer_roles": [
+          "manager"
+        ],
+        "status_values": [
+          "new",
+          "triaged",
+          "confirmed",
+          "visited",
+          "canceled"
+        ],
+        "min_role_routes": {
+          "client": 2,
+          "specialist": 2,
+          "manager": 2
+        },
+        "required_step_kinds": [
+          "prompt_state_source",
+          "prompt_state_update",
+          "mobile_layout"
+        ]
+      },
+      "readiness_required_checks": [
+        "api",
+        "persistence",
+        "ui",
+        "roles",
+        "mobile",
+        "tests",
+        "apply_guardian"
+      ],
+      "prompt_analysis": {
+        "prompt_summary": "Clinic appointment workflow with patient booking, doctor triage, and admin schedule load.",
+        "resource_hint": "appointment",
+        "resource_hints": [
+          "appointment",
+          "doctor",
+          "patient",
+          "triage"
+        ],
+        "field_hints": [
+          "doctor",
+          "specialty",
+          "date",
+          "slot",
+          "patient_name",
+          "phone",
+          "symptom",
+          "status"
+        ],
+        "business_capabilities": [
+          "doctor booking",
+          "patient triage",
+          "schedule management",
+          "load analytics"
+        ],
+        "role_action_prompts": {
+          "client": [
+            "choose doctor and slot",
+            "submit symptom note",
+            "view appointment status"
+          ],
+          "specialist": [
+            "review patient triage",
+            "confirm visit",
+            "update appointment status"
+          ],
+          "manager": [
+            "manage doctor schedule",
+            "monitor cancellations",
+            "track doctor load"
+          ]
+        },
+        "role_field_hints": {
+          "client": [
+            "doctor",
+            "specialty",
+            "date",
+            "slot",
+            "patient_name",
+            "phone",
+            "symptom"
+          ],
+          "specialist": [
+            "patient_name",
+            "symptom",
+            "triage_status",
+            "appointment_time"
+          ],
+          "manager": [
+            "doctor_load",
+            "cancellations",
+            "schedule_conflicts"
+          ]
+        },
+        "role_state_contract": {
+          "source_roles": [
+            "client"
+          ],
+          "update_roles": [
+            "specialist",
+            "manager"
+          ],
+          "observer_roles": [
+            "manager"
+          ],
+          "status_values": [
+            "new",
+            "triaged",
+            "confirmed",
+            "visited",
+            "canceled"
+          ]
+        },
+        "routeable_screen_plan": {
+          "multi_page_recommended": true,
+          "roles": {
+            "client": [
+              {
+                "intent": "doctors",
+                "purpose": "choose doctor and specialty"
+              },
+              {
+                "intent": "appointment",
+                "purpose": "book slot and submit symptom"
+              }
+            ],
+            "specialist": [
+              {
+                "intent": "triage",
+                "purpose": "review incoming appointments"
+              },
+              {
+                "intent": "visits",
+                "purpose": "update visit status"
+              }
+            ],
+            "manager": [
+              {
+                "intent": "schedule",
+                "purpose": "manage doctor schedule"
+              },
+              {
+                "intent": "load",
+                "purpose": "monitor load and cancellations"
+              }
+            ]
+          }
+        }
+      },
+      "expected_roles": [
+        "client",
+        "specialist",
+        "manager"
+      ],
+      "expected_routes": [
+        {
+          "role": "client",
+          "min_count": 2,
+          "intents": [
+            "doctors",
+            "appointment"
+          ]
+        },
+        {
+          "role": "specialist",
+          "min_count": 2,
+          "intents": [
+            "triage",
+            "visits"
+          ]
+        },
+        {
+          "role": "manager",
+          "min_count": 2,
+          "intents": [
+            "schedule",
+            "load"
+          ]
+        }
+      ],
+      "expected_api": [
+        {
+          "method": "GET",
+          "path": "/api/appointments",
+          "resource": "appointment"
+        },
+        {
+          "method": "POST",
+          "path": "/api/appointments",
+          "resource": "appointment"
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/appointments/{id}",
+          "resource": "appointment"
+        }
+      ],
+      "expected_persistence_markers": [
+        "doctor",
+        "specialty",
+        "date",
+        "slot",
+        "patient_name",
+        "phone",
+        "symptom",
+        "status"
+      ],
+      "visual_mobile_thresholds": {
+        "min_mobile_width": 390,
+        "max_horizontal_overflow_px": 0,
+        "max_critical_overlaps": 0,
+        "required_viewports": [
+          "390x844"
+        ],
+        "required_role_screenshots": true
+      },
+      "suite_tags": [
+        "extended",
+        "booking",
+        "clinic"
+      ],
+      "golden_tier": "extended",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "doctors",
+        "appointment",
+        "triage",
+        "visits",
+        "schedule",
+        "load"
+      ]
+    },
+    {
+      "id": "car-service-repair-orders",
+      "title": "Car service repair orders",
+      "domain": "auto_service",
+      "generation_mode": "quality",
+      "prompt": "Создай Telegram mini-app автосервиса: клиент выбирает услугу и время, оставляет данные авто; мастер ведет диагностику и статус ремонта; менеджер видит очередь, загрузку боксов и выручку.",
+      "expected_skill_ids": [
+        "services-masters"
+      ],
+      "expected_contract": {
+        "resource_hint": "repair_order",
+        "required_resource_hints": [
+          "repair_order",
+          "vehicle",
+          "service",
+          "mechanic"
+        ],
+        "required_fields": [
+          "vehicle_model",
+          "plate",
+          "service",
+          "date",
+          "slot",
+          "customer_name",
+          "phone",
+          "status"
+        ],
+        "source_roles": [
+          "client"
+        ],
+        "update_roles": [
+          "specialist",
+          "manager"
+        ],
+        "observer_roles": [
+          "manager"
+        ],
+        "status_values": [
+          "new",
+          "diagnostics",
+          "in repair",
+          "ready",
+          "delivered",
+          "canceled"
+        ],
+        "min_role_routes": {
+          "client": 2,
+          "specialist": 2,
+          "manager": 2
+        },
+        "required_step_kinds": [
+          "prompt_state_source",
+          "prompt_state_update",
+          "mobile_layout"
+        ]
+      },
+      "readiness_required_checks": [
+        "api",
+        "persistence",
+        "ui",
+        "roles",
+        "mobile",
+        "tests",
+        "apply_guardian"
+      ],
+      "prompt_analysis": {
+        "prompt_summary": "Auto service repair order app with customer booking, mechanic repair status, and manager bay load.",
+        "resource_hint": "repair_order",
+        "resource_hints": [
+          "repair_order",
+          "vehicle",
+          "service",
+          "mechanic"
+        ],
+        "field_hints": [
+          "vehicle_model",
+          "plate",
+          "service",
+          "date",
+          "slot",
+          "customer_name",
+          "phone",
+          "status"
+        ],
+        "business_capabilities": [
+          "service booking",
+          "vehicle intake",
+          "repair tracking",
+          "bay utilization"
+        ],
+        "role_action_prompts": {
+          "client": [
+            "choose repair service",
+            "book service slot",
+            "track repair status"
+          ],
+          "specialist": [
+            "run diagnostics",
+            "update repair status",
+            "mark vehicle ready"
+          ],
+          "manager": [
+            "monitor queue",
+            "track bay load",
+            "review revenue"
+          ]
+        },
+        "role_field_hints": {
+          "client": [
+            "vehicle_model",
+            "plate",
+            "service",
+            "date",
+            "slot",
+            "customer_name"
+          ],
+          "specialist": [
+            "vehicle_model",
+            "diagnostics",
+            "status",
+            "notes"
+          ],
+          "manager": [
+            "queue_length",
+            "bay_load",
+            "revenue",
+            "cancellations"
+          ]
+        },
+        "role_state_contract": {
+          "source_roles": [
+            "client"
+          ],
+          "update_roles": [
+            "specialist",
+            "manager"
+          ],
+          "observer_roles": [
+            "manager"
+          ],
+          "status_values": [
+            "new",
+            "diagnostics",
+            "in repair",
+            "ready",
+            "delivered",
+            "canceled"
+          ]
+        },
+        "routeable_screen_plan": {
+          "multi_page_recommended": true,
+          "roles": {
+            "client": [
+              {
+                "intent": "services",
+                "purpose": "choose repair service"
+              },
+              {
+                "intent": "booking",
+                "purpose": "submit vehicle and slot"
+              }
+            ],
+            "specialist": [
+              {
+                "intent": "diagnostics",
+                "purpose": "manage diagnostics queue"
+              },
+              {
+                "intent": "repairs",
+                "purpose": "update repair progress"
+              }
+            ],
+            "manager": [
+              {
+                "intent": "queue",
+                "purpose": "monitor repair queue"
+              },
+              {
+                "intent": "analytics",
+                "purpose": "track bay load and revenue"
+              }
+            ]
+          }
+        }
+      },
+      "expected_roles": [
+        "client",
+        "specialist",
+        "manager"
+      ],
+      "expected_routes": [
+        {
+          "role": "client",
+          "min_count": 2,
+          "intents": [
+            "services",
+            "booking"
+          ]
+        },
+        {
+          "role": "specialist",
+          "min_count": 2,
+          "intents": [
+            "diagnostics",
+            "repairs"
+          ]
+        },
+        {
+          "role": "manager",
+          "min_count": 2,
+          "intents": [
+            "queue",
+            "analytics"
+          ]
+        }
+      ],
+      "expected_api": [
+        {
+          "method": "GET",
+          "path": "/api/repair_orders",
+          "resource": "repair_order"
+        },
+        {
+          "method": "POST",
+          "path": "/api/repair_orders",
+          "resource": "repair_order"
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/repair_orders/{id}",
+          "resource": "repair_order"
+        }
+      ],
+      "expected_persistence_markers": [
+        "vehicle_model",
+        "plate",
+        "service",
+        "date",
+        "slot",
+        "customer_name",
+        "phone",
+        "status"
+      ],
+      "visual_mobile_thresholds": {
+        "min_mobile_width": 390,
+        "max_horizontal_overflow_px": 0,
+        "max_critical_overlaps": 0,
+        "required_viewports": [
+          "390x844"
+        ],
+        "required_role_screenshots": true
+      },
+      "suite_tags": [
+        "extended",
+        "booking",
+        "auto_service"
+      ],
+      "golden_tier": "extended",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "services",
+        "booking",
+        "diagnostics",
+        "repairs",
+        "queue",
+        "analytics"
+      ]
+    },
+    {
+      "id": "fitness-class-booking",
+      "title": "Fitness class booking",
+      "domain": "fitness",
+      "generation_mode": "quality",
+      "prompt": "Создай Telegram mini-app фитнес-клуба: участник выбирает тренировку и тренера, бронирует место; тренер отмечает посещение; менеджер видит заполненность групп, waitlist и абонементы.",
+      "expected_skill_ids": [
+        "manager-dashboard"
+      ],
+      "expected_contract": {
+        "resource_hint": "booking",
+        "required_resource_hints": [
+          "class",
+          "booking",
+          "trainer",
+          "membership"
+        ],
+        "required_fields": [
+          "class_name",
+          "trainer",
+          "date",
+          "slot",
+          "member_name",
+          "phone",
+          "membership",
+          "status"
+        ],
+        "source_roles": [
+          "client"
+        ],
+        "update_roles": [
+          "specialist",
+          "manager"
+        ],
+        "observer_roles": [
+          "manager"
+        ],
+        "status_values": [
+          "booked",
+          "checked in",
+          "completed",
+          "waitlist",
+          "canceled"
+        ],
+        "min_role_routes": {
+          "client": 2,
+          "specialist": 2,
+          "manager": 2
+        },
+        "required_step_kinds": [
+          "prompt_state_source",
+          "prompt_state_update",
+          "mobile_layout"
+        ]
+      },
+      "readiness_required_checks": [
+        "api",
+        "persistence",
+        "ui",
+        "roles",
+        "mobile",
+        "tests",
+        "apply_guardian"
+      ],
+      "prompt_analysis": {
+        "prompt_summary": "Fitness class booking with member signup, trainer attendance, and manager class fill analytics.",
+        "resource_hint": "booking",
+        "resource_hints": [
+          "class",
+          "booking",
+          "trainer",
+          "membership"
+        ],
+        "field_hints": [
+          "class_name",
+          "trainer",
+          "date",
+          "slot",
+          "member_name",
+          "phone",
+          "membership",
+          "status"
+        ],
+        "business_capabilities": [
+          "class booking",
+          "trainer schedule",
+          "attendance",
+          "membership analytics"
+        ],
+        "role_action_prompts": {
+          "client": [
+            "choose class",
+            "book trainer slot",
+            "view booking status"
+          ],
+          "specialist": [
+            "mark attendance",
+            "manage class roster",
+            "update booking status"
+          ],
+          "manager": [
+            "monitor class fill",
+            "manage waitlist",
+            "review memberships"
+          ]
+        },
+        "role_field_hints": {
+          "client": [
+            "class_name",
+            "trainer",
+            "date",
+            "slot",
+            "member_name",
+            "membership"
+          ],
+          "specialist": [
+            "class_name",
+            "member_name",
+            "attendance",
+            "status"
+          ],
+          "manager": [
+            "fill_rate",
+            "waitlist",
+            "membership_count"
+          ]
+        },
+        "role_state_contract": {
+          "source_roles": [
+            "client"
+          ],
+          "update_roles": [
+            "specialist",
+            "manager"
+          ],
+          "observer_roles": [
+            "manager"
+          ],
+          "status_values": [
+            "booked",
+            "checked in",
+            "completed",
+            "waitlist",
+            "canceled"
+          ]
+        },
+        "routeable_screen_plan": {
+          "multi_page_recommended": true,
+          "roles": {
+            "client": [
+              {
+                "intent": "classes",
+                "purpose": "browse classes"
+              },
+              {
+                "intent": "booking",
+                "purpose": "book class place"
+              }
+            ],
+            "specialist": [
+              {
+                "intent": "roster",
+                "purpose": "manage class roster"
+              },
+              {
+                "intent": "attendance",
+                "purpose": "mark attendance"
+              }
+            ],
+            "manager": [
+              {
+                "intent": "fill",
+                "purpose": "monitor fill rates"
+              },
+              {
+                "intent": "memberships",
+                "purpose": "review memberships and waitlist"
+              }
+            ]
+          }
+        }
+      },
+      "expected_roles": [
+        "client",
+        "specialist",
+        "manager"
+      ],
+      "expected_routes": [
+        {
+          "role": "client",
+          "min_count": 2,
+          "intents": [
+            "classes",
+            "booking"
+          ]
+        },
+        {
+          "role": "specialist",
+          "min_count": 2,
+          "intents": [
+            "roster",
+            "attendance"
+          ]
+        },
+        {
+          "role": "manager",
+          "min_count": 2,
+          "intents": [
+            "fill",
+            "memberships"
+          ]
+        }
+      ],
+      "expected_api": [
+        {
+          "method": "GET",
+          "path": "/api/bookings",
+          "resource": "booking"
+        },
+        {
+          "method": "POST",
+          "path": "/api/bookings",
+          "resource": "booking"
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/bookings/{id}",
+          "resource": "booking"
+        }
+      ],
+      "expected_persistence_markers": [
+        "class_name",
+        "trainer",
+        "date",
+        "slot",
+        "member_name",
+        "phone",
+        "membership",
+        "status"
+      ],
+      "visual_mobile_thresholds": {
+        "min_mobile_width": 390,
+        "max_horizontal_overflow_px": 0,
+        "max_critical_overlaps": 0,
+        "required_viewports": [
+          "390x844"
+        ],
+        "required_role_screenshots": true
+      },
+      "suite_tags": [
+        "extended",
+        "booking",
+        "fitness"
+      ],
+      "golden_tier": "extended",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "classes",
+        "booking",
+        "roster",
+        "attendance",
+        "fill",
+        "memberships"
+      ]
+    },
+    {
+      "id": "courier-delivery-orders",
+      "title": "Courier delivery orders",
+      "domain": "delivery",
+      "generation_mode": "quality",
+      "prompt": "Создай Telegram mini-app курьерской доставки: клиент оформляет доставку с адресами и окном времени; курьер меняет статусы; менеджер видит SLA, проблемные доставки и загрузку курьеров.",
+      "expected_skill_ids": [
+        "delivery-orders"
+      ],
+      "expected_contract": {
+        "resource_hint": "delivery",
+        "required_resource_hints": [
+          "delivery",
+          "courier",
+          "address",
+          "parcel"
+        ],
+        "required_fields": [
+          "pickup_address",
+          "dropoff_address",
+          "sender_name",
+          "phone",
+          "parcel_type",
+          "time_window",
+          "courier",
+          "status"
+        ],
+        "source_roles": [
+          "client"
+        ],
+        "update_roles": [
+          "specialist",
+          "manager"
+        ],
+        "observer_roles": [
+          "manager"
+        ],
+        "status_values": [
+          "new",
+          "assigned",
+          "picked up",
+          "in transit",
+          "delivered",
+          "canceled"
+        ],
+        "min_role_routes": {
+          "client": 2,
+          "specialist": 2,
+          "manager": 2
+        },
+        "required_step_kinds": [
+          "prompt_state_source",
+          "prompt_state_update",
+          "mobile_layout"
+        ]
+      },
+      "readiness_required_checks": [
+        "api",
+        "persistence",
+        "ui",
+        "roles",
+        "mobile",
+        "tests",
+        "apply_guardian"
+      ],
+      "prompt_analysis": {
+        "prompt_summary": "Courier delivery workflow with client order, courier status updates, and manager SLA control.",
+        "resource_hint": "delivery",
+        "resource_hints": [
+          "delivery",
+          "courier",
+          "address",
+          "parcel"
+        ],
+        "field_hints": [
+          "pickup_address",
+          "dropoff_address",
+          "sender_name",
+          "phone",
+          "parcel_type",
+          "time_window",
+          "courier",
+          "status"
+        ],
+        "business_capabilities": [
+          "delivery order",
+          "courier assignment",
+          "status tracking",
+          "SLA monitoring"
+        ],
+        "role_action_prompts": {
+          "client": [
+            "create delivery order",
+            "set pickup and dropoff",
+            "track status"
+          ],
+          "specialist": [
+            "accept delivery",
+            "update transit status",
+            "mark delivered"
+          ],
+          "manager": [
+            "monitor SLA",
+            "handle problem deliveries",
+            "balance courier load"
+          ]
+        },
+        "role_field_hints": {
+          "client": [
+            "pickup_address",
+            "dropoff_address",
+            "sender_name",
+            "phone",
+            "time_window"
+          ],
+          "specialist": [
+            "courier",
+            "status",
+            "route",
+            "delivery_time"
+          ],
+          "manager": [
+            "sla",
+            "problem_count",
+            "courier_load"
+          ]
+        },
+        "role_state_contract": {
+          "source_roles": [
+            "client"
+          ],
+          "update_roles": [
+            "specialist",
+            "manager"
+          ],
+          "observer_roles": [
+            "manager"
+          ],
+          "status_values": [
+            "new",
+            "assigned",
+            "picked up",
+            "in transit",
+            "delivered",
+            "canceled"
+          ]
+        },
+        "routeable_screen_plan": {
+          "multi_page_recommended": true,
+          "roles": {
+            "client": [
+              {
+                "intent": "order",
+                "purpose": "create delivery order"
+              },
+              {
+                "intent": "tracking",
+                "purpose": "track delivery status"
+              }
+            ],
+            "specialist": [
+              {
+                "intent": "assigned",
+                "purpose": "view assigned deliveries"
+              },
+              {
+                "intent": "status",
+                "purpose": "update delivery status"
+              }
+            ],
+            "manager": [
+              {
+                "intent": "sla",
+                "purpose": "monitor SLA"
+              },
+              {
+                "intent": "load",
+                "purpose": "balance courier load"
+              }
+            ]
+          }
+        }
+      },
+      "expected_roles": [
+        "client",
+        "specialist",
+        "manager"
+      ],
+      "expected_routes": [
+        {
+          "role": "client",
+          "min_count": 2,
+          "intents": [
+            "order",
+            "tracking"
+          ]
+        },
+        {
+          "role": "specialist",
+          "min_count": 2,
+          "intents": [
+            "assigned",
+            "status"
+          ]
+        },
+        {
+          "role": "manager",
+          "min_count": 2,
+          "intents": [
+            "sla",
+            "load"
+          ]
+        }
+      ],
+      "expected_api": [
+        {
+          "method": "GET",
+          "path": "/api/deliveries",
+          "resource": "delivery"
+        },
+        {
+          "method": "POST",
+          "path": "/api/deliveries",
+          "resource": "delivery"
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/deliveries/{id}",
+          "resource": "delivery"
+        }
+      ],
+      "expected_persistence_markers": [
+        "pickup_address",
+        "dropoff_address",
+        "sender_name",
+        "phone",
+        "parcel_type",
+        "time_window",
+        "courier",
+        "status"
+      ],
+      "visual_mobile_thresholds": {
+        "min_mobile_width": 390,
+        "max_horizontal_overflow_px": 0,
+        "max_critical_overlaps": 0,
+        "required_viewports": [
+          "390x844"
+        ],
+        "required_role_screenshots": true
+      },
+      "suite_tags": [
+        "core",
+        "delivery"
+      ],
+      "golden_tier": "core",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "order",
+        "tracking",
+        "assigned",
+        "status",
+        "sla",
+        "load"
+      ]
+    },
+    {
+      "id": "online-course-enrollment",
+      "title": "Online course enrollment",
+      "domain": "education",
+      "generation_mode": "quality",
+      "prompt": "Создай Telegram mini-app онлайн-школы: ученик выбирает курс и уровень, записывается; преподаватель ведет прогресс и домашки; менеджер видит оплаты, активность и конверсию.",
+      "expected_skill_ids": [
+        "education"
+      ],
+      "expected_contract": {
+        "resource_hint": "enrollment",
+        "required_resource_hints": [
+          "course",
+          "enrollment",
+          "lesson",
+          "student"
+        ],
+        "required_fields": [
+          "course",
+          "student_name",
+          "phone",
+          "level",
+          "start_date",
+          "payment_status",
+          "progress",
+          "status"
+        ],
+        "source_roles": [
+          "client"
+        ],
+        "update_roles": [
+          "specialist",
+          "manager"
+        ],
+        "observer_roles": [
+          "manager"
+        ],
+        "status_values": [
+          "new",
+          "enrolled",
+          "active",
+          "completed",
+          "paused",
+          "canceled"
+        ],
+        "min_role_routes": {
+          "client": 2,
+          "specialist": 2,
+          "manager": 2
+        },
+        "required_step_kinds": [
+          "prompt_state_source",
+          "prompt_state_update",
+          "mobile_layout"
+        ]
+      },
+      "readiness_required_checks": [
+        "api",
+        "persistence",
+        "ui",
+        "roles",
+        "mobile",
+        "tests",
+        "apply_guardian"
+      ],
+      "prompt_analysis": {
+        "prompt_summary": "Online school enrollment with student course signup, teacher progress tracking, and manager payment/conversion analytics.",
+        "resource_hint": "enrollment",
+        "resource_hints": [
+          "course",
+          "enrollment",
+          "lesson",
+          "student"
+        ],
+        "field_hints": [
+          "course",
+          "student_name",
+          "phone",
+          "level",
+          "start_date",
+          "payment_status",
+          "progress",
+          "status"
+        ],
+        "business_capabilities": [
+          "course enrollment",
+          "homework tracking",
+          "progress",
+          "payment analytics"
+        ],
+        "role_action_prompts": {
+          "client": [
+            "choose course",
+            "submit enrollment",
+            "view progress"
+          ],
+          "specialist": [
+            "review homework",
+            "update progress",
+            "mark lesson completion"
+          ],
+          "manager": [
+            "monitor payments",
+            "track activity",
+            "review conversion"
+          ]
+        },
+        "role_field_hints": {
+          "client": [
+            "course",
+            "student_name",
+            "phone",
+            "level",
+            "start_date"
+          ],
+          "specialist": [
+            "student_name",
+            "homework",
+            "progress",
+            "lesson_status"
+          ],
+          "manager": [
+            "payment_status",
+            "activity",
+            "conversion"
+          ]
+        },
+        "role_state_contract": {
+          "source_roles": [
+            "client"
+          ],
+          "update_roles": [
+            "specialist",
+            "manager"
+          ],
+          "observer_roles": [
+            "manager"
+          ],
+          "status_values": [
+            "new",
+            "enrolled",
+            "active",
+            "completed",
+            "paused",
+            "canceled"
+          ]
+        },
+        "routeable_screen_plan": {
+          "multi_page_recommended": true,
+          "roles": {
+            "client": [
+              {
+                "intent": "courses",
+                "purpose": "browse courses"
+              },
+              {
+                "intent": "enrollment",
+                "purpose": "submit enrollment"
+              }
+            ],
+            "specialist": [
+              {
+                "intent": "students",
+                "purpose": "manage student progress"
+              },
+              {
+                "intent": "homework",
+                "purpose": "review homework"
+              }
+            ],
+            "manager": [
+              {
+                "intent": "payments",
+                "purpose": "monitor payments"
+              },
+              {
+                "intent": "analytics",
+                "purpose": "track activity and conversion"
+              }
+            ]
+          }
+        }
+      },
+      "expected_roles": [
+        "client",
+        "specialist",
+        "manager"
+      ],
+      "expected_routes": [
+        {
+          "role": "client",
+          "min_count": 2,
+          "intents": [
+            "courses",
+            "enrollment"
+          ]
+        },
+        {
+          "role": "specialist",
+          "min_count": 2,
+          "intents": [
+            "students",
+            "homework"
+          ]
+        },
+        {
+          "role": "manager",
+          "min_count": 2,
+          "intents": [
+            "payments",
+            "analytics"
+          ]
+        }
+      ],
+      "expected_api": [
+        {
+          "method": "GET",
+          "path": "/api/enrollments",
+          "resource": "enrollment"
+        },
+        {
+          "method": "POST",
+          "path": "/api/enrollments",
+          "resource": "enrollment"
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/enrollments/{id}",
+          "resource": "enrollment"
+        }
+      ],
+      "expected_persistence_markers": [
+        "course",
+        "student_name",
+        "phone",
+        "level",
+        "start_date",
+        "payment_status",
+        "progress",
+        "status"
+      ],
+      "visual_mobile_thresholds": {
+        "min_mobile_width": 390,
+        "max_horizontal_overflow_px": 0,
+        "max_critical_overlaps": 0,
+        "required_viewports": [
+          "390x844"
+        ],
+        "required_role_screenshots": true
+      },
+      "suite_tags": [
+        "core",
+        "school",
+        "education"
+      ],
+      "golden_tier": "core",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "courses",
+        "enrollment",
+        "students",
+        "homework",
+        "payments",
+        "analytics"
+      ]
+    },
+    {
+      "id": "tutoring-homework-tracker",
+      "title": "Tutoring homework tracker",
+      "domain": "education",
+      "generation_mode": "quality",
+      "prompt": "Создай Telegram mini-app репетитора: ученик видит уроки и отправляет домашку; преподаватель проверяет и ставит оценку; менеджер контролирует дедлайны, оплаты и прогресс учеников.",
+      "expected_skill_ids": [
+        "education"
+      ],
+      "expected_contract": {
+        "resource_hint": "homework",
+        "required_resource_hints": [
+          "student",
+          "homework",
+          "lesson",
+          "tutor"
+        ],
+        "required_fields": [
+          "subject",
+          "student_name",
+          "lesson_date",
+          "homework_title",
+          "due_date",
+          "score",
+          "status"
+        ],
+        "source_roles": [
+          "client"
+        ],
+        "update_roles": [
+          "specialist",
+          "manager"
+        ],
+        "observer_roles": [
+          "manager"
+        ],
+        "status_values": [
+          "assigned",
+          "submitted",
+          "reviewed",
+          "needs revision",
+          "completed"
+        ],
+        "min_role_routes": {
+          "client": 2,
+          "specialist": 2,
+          "manager": 2
+        },
+        "required_step_kinds": [
+          "prompt_state_source",
+          "prompt_state_update",
+          "mobile_layout"
+        ]
+      },
+      "readiness_required_checks": [
+        "api",
+        "persistence",
+        "ui",
+        "roles",
+        "mobile",
+        "tests",
+        "apply_guardian"
+      ],
+      "prompt_analysis": {
+        "prompt_summary": "Tutoring tracker with student homework submission, tutor review, and manager deadline/payment control.",
+        "resource_hint": "homework",
+        "resource_hints": [
+          "student",
+          "homework",
+          "lesson",
+          "tutor"
+        ],
+        "field_hints": [
+          "subject",
+          "student_name",
+          "lesson_date",
+          "homework_title",
+          "due_date",
+          "score",
+          "status"
+        ],
+        "business_capabilities": [
+          "lesson schedule",
+          "homework submission",
+          "grading",
+          "deadline monitoring"
+        ],
+        "role_action_prompts": {
+          "client": [
+            "view lessons",
+            "submit homework",
+            "check score"
+          ],
+          "specialist": [
+            "review homework",
+            "assign revision",
+            "grade work"
+          ],
+          "manager": [
+            "monitor deadlines",
+            "track payments",
+            "review student progress"
+          ]
+        },
+        "role_field_hints": {
+          "client": [
+            "subject",
+            "lesson_date",
+            "homework_title",
+            "due_date"
+          ],
+          "specialist": [
+            "student_name",
+            "score",
+            "status",
+            "feedback"
+          ],
+          "manager": [
+            "deadline_risk",
+            "payment_status",
+            "progress"
+          ]
+        },
+        "role_state_contract": {
+          "source_roles": [
+            "client"
+          ],
+          "update_roles": [
+            "specialist",
+            "manager"
+          ],
+          "observer_roles": [
+            "manager"
+          ],
+          "status_values": [
+            "assigned",
+            "submitted",
+            "reviewed",
+            "needs revision",
+            "completed"
+          ]
+        },
+        "routeable_screen_plan": {
+          "multi_page_recommended": true,
+          "roles": {
+            "client": [
+              {
+                "intent": "lessons",
+                "purpose": "view upcoming lessons"
+              },
+              {
+                "intent": "homework",
+                "purpose": "submit homework"
+              }
+            ],
+            "specialist": [
+              {
+                "intent": "review",
+                "purpose": "review submissions"
+              },
+              {
+                "intent": "grading",
+                "purpose": "grade and comment"
+              }
+            ],
+            "manager": [
+              {
+                "intent": "deadlines",
+                "purpose": "monitor overdue homework"
+              },
+              {
+                "intent": "progress",
+                "purpose": "review progress and payments"
+              }
+            ]
+          }
+        }
+      },
+      "expected_roles": [
+        "client",
+        "specialist",
+        "manager"
+      ],
+      "expected_routes": [
+        {
+          "role": "client",
+          "min_count": 2,
+          "intents": [
+            "lessons",
+            "homework"
+          ]
+        },
+        {
+          "role": "specialist",
+          "min_count": 2,
+          "intents": [
+            "review",
+            "grading"
+          ]
+        },
+        {
+          "role": "manager",
+          "min_count": 2,
+          "intents": [
+            "deadlines",
+            "progress"
+          ]
+        }
+      ],
+      "expected_api": [
+        {
+          "method": "GET",
+          "path": "/api/homeworks",
+          "resource": "homework"
+        },
+        {
+          "method": "POST",
+          "path": "/api/homeworks",
+          "resource": "homework"
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/homeworks/{id}",
+          "resource": "homework"
+        }
+      ],
+      "expected_persistence_markers": [
+        "subject",
+        "student_name",
+        "lesson_date",
+        "homework_title",
+        "due_date",
+        "score",
+        "status"
+      ],
+      "visual_mobile_thresholds": {
+        "min_mobile_width": 390,
+        "max_horizontal_overflow_px": 0,
+        "max_critical_overlaps": 0,
+        "required_viewports": [
+          "390x844"
+        ],
+        "required_role_screenshots": true
+      },
+      "suite_tags": [
+        "extended",
+        "school",
+        "education"
+      ],
+      "golden_tier": "extended",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "lessons",
+        "homework",
+        "review",
+        "grading",
+        "deadlines",
+        "progress"
+      ]
+    },
+    {
+      "id": "property-maintenance-requests",
+      "title": "Property maintenance requests",
+      "domain": "property",
+      "generation_mode": "quality",
+      "prompt": "Создай Telegram mini-app управляющей компании: житель оставляет заявку по квартире; техник берет в работу и обновляет статус; менеджер видит SLA, просрочки, приоритеты и нагрузку.",
+      "expected_skill_ids": [
+        "manager-dashboard"
+      ],
+      "expected_contract": {
+        "resource_hint": "request",
+        "required_resource_hints": [
+          "request",
+          "property",
+          "tenant",
+          "technician"
+        ],
+        "required_fields": [
+          "property",
+          "unit",
+          "tenant_name",
+          "phone",
+          "issue_type",
+          "priority",
+          "assignee",
+          "status"
+        ],
+        "source_roles": [
+          "client"
+        ],
+        "update_roles": [
+          "specialist",
+          "manager"
+        ],
+        "observer_roles": [
+          "manager"
+        ],
+        "status_values": [
+          "new",
+          "assigned",
+          "in progress",
+          "waiting parts",
+          "done",
+          "canceled"
+        ],
+        "min_role_routes": {
+          "client": 2,
+          "specialist": 2,
+          "manager": 2
+        },
+        "required_step_kinds": [
+          "prompt_state_source",
+          "prompt_state_update",
+          "mobile_layout"
+        ]
+      },
+      "readiness_required_checks": [
+        "api",
+        "persistence",
+        "ui",
+        "roles",
+        "mobile",
+        "tests",
+        "apply_guardian"
+      ],
+      "prompt_analysis": {
+        "prompt_summary": "Property maintenance request workflow with tenant issue intake, technician work status, and manager SLA dashboard.",
+        "resource_hint": "request",
+        "resource_hints": [
+          "request",
+          "property",
+          "tenant",
+          "technician"
+        ],
+        "field_hints": [
+          "property",
+          "unit",
+          "tenant_name",
+          "phone",
+          "issue_type",
+          "priority",
+          "assignee",
+          "status"
+        ],
+        "business_capabilities": [
+          "request intake",
+          "technician assignment",
+          "SLA tracking",
+          "priority queue"
+        ],
+        "role_action_prompts": {
+          "client": [
+            "submit maintenance request",
+            "attach issue details",
+            "track status"
+          ],
+          "specialist": [
+            "accept request",
+            "update repair status",
+            "request parts"
+          ],
+          "manager": [
+            "monitor SLA",
+            "prioritize requests",
+            "balance technician load"
+          ]
+        },
+        "role_field_hints": {
+          "client": [
+            "property",
+            "unit",
+            "tenant_name",
+            "phone",
+            "issue_type",
+            "priority"
+          ],
+          "specialist": [
+            "assignee",
+            "status",
+            "parts_needed",
+            "notes"
+          ],
+          "manager": [
+            "sla",
+            "overdue",
+            "priority",
+            "technician_load"
+          ]
+        },
+        "role_state_contract": {
+          "source_roles": [
+            "client"
+          ],
+          "update_roles": [
+            "specialist",
+            "manager"
+          ],
+          "observer_roles": [
+            "manager"
+          ],
+          "status_values": [
+            "new",
+            "assigned",
+            "in progress",
+            "waiting parts",
+            "done",
+            "canceled"
+          ]
+        },
+        "routeable_screen_plan": {
+          "multi_page_recommended": true,
+          "roles": {
+            "client": [
+              {
+                "intent": "request",
+                "purpose": "submit issue request"
+              },
+              {
+                "intent": "status",
+                "purpose": "track repair status"
+              }
+            ],
+            "specialist": [
+              {
+                "intent": "queue",
+                "purpose": "manage assigned requests"
+              },
+              {
+                "intent": "worklog",
+                "purpose": "update work status"
+              }
+            ],
+            "manager": [
+              {
+                "intent": "sla",
+                "purpose": "monitor SLA"
+              },
+              {
+                "intent": "priorities",
+                "purpose": "manage priorities and load"
+              }
+            ]
+          }
+        }
+      },
+      "expected_roles": [
+        "client",
+        "specialist",
+        "manager"
+      ],
+      "expected_routes": [
+        {
+          "role": "client",
+          "min_count": 2,
+          "intents": [
+            "request",
+            "status"
+          ]
+        },
+        {
+          "role": "specialist",
+          "min_count": 2,
+          "intents": [
+            "queue",
+            "worklog"
+          ]
+        },
+        {
+          "role": "manager",
+          "min_count": 2,
+          "intents": [
+            "sla",
+            "priorities"
+          ]
+        }
+      ],
+      "expected_api": [
+        {
+          "method": "GET",
+          "path": "/api/requests",
+          "resource": "request"
+        },
+        {
+          "method": "POST",
+          "path": "/api/requests",
+          "resource": "request"
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/requests/{id}",
+          "resource": "request"
+        }
+      ],
+      "expected_persistence_markers": [
+        "property",
+        "unit",
+        "tenant_name",
+        "phone",
+        "issue_type",
+        "priority",
+        "assignee",
+        "status"
+      ],
+      "visual_mobile_thresholds": {
+        "min_mobile_width": 390,
+        "max_horizontal_overflow_px": 0,
+        "max_critical_overlaps": 0,
+        "required_viewports": [
+          "390x844"
+        ],
+        "required_role_screenshots": true
+      },
+      "suite_tags": [
+        "extended",
+        "crm",
+        "property"
+      ],
+      "golden_tier": "extended",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "request",
+        "status",
+        "queue",
+        "worklog",
+        "sla",
+        "priorities"
+      ]
+    },
+    {
+      "id": "rental-equipment-orders",
+      "title": "Rental equipment orders",
+      "domain": "rental",
+      "generation_mode": "quality",
+      "prompt": "Создай Telegram mini-app аренды оборудования: клиент выбирает товар и даты аренды; специалист выдает и принимает возврат; менеджер управляет остатками, просрочками и депозитами.",
+      "expected_skill_ids": [
+        "shop-catalog"
+      ],
+      "expected_contract": {
+        "resource_hint": "rental_order",
+        "required_resource_hints": [
+          "equipment",
+          "rental_order",
+          "stock",
+          "return"
+        ],
+        "required_fields": [
+          "equipment",
+          "category",
+          "start_date",
+          "end_date",
+          "quantity",
+          "customer_name",
+          "deposit",
+          "status"
+        ],
+        "source_roles": [
+          "client"
+        ],
+        "update_roles": [
+          "specialist",
+          "manager"
+        ],
+        "observer_roles": [
+          "manager"
+        ],
+        "status_values": [
+          "new",
+          "reserved",
+          "issued",
+          "returned",
+          "overdue",
+          "canceled"
+        ],
+        "min_role_routes": {
+          "client": 2,
+          "specialist": 2,
+          "manager": 2
+        },
+        "required_step_kinds": [
+          "prompt_state_source",
+          "prompt_state_update",
+          "mobile_layout"
+        ]
+      },
+      "readiness_required_checks": [
+        "api",
+        "persistence",
+        "ui",
+        "roles",
+        "mobile",
+        "tests",
+        "apply_guardian"
+      ],
+      "prompt_analysis": {
+        "prompt_summary": "Equipment rental app with catalog reservation, issue/return workflow, stock and deposit management.",
+        "resource_hint": "rental_order",
+        "resource_hints": [
+          "equipment",
+          "rental_order",
+          "stock",
+          "return"
+        ],
+        "field_hints": [
+          "equipment",
+          "category",
+          "start_date",
+          "end_date",
+          "quantity",
+          "customer_name",
+          "deposit",
+          "status"
+        ],
+        "business_capabilities": [
+          "equipment catalog",
+          "rental reservation",
+          "return tracking",
+          "stock control"
+        ],
+        "role_action_prompts": {
+          "client": [
+            "browse equipment",
+            "reserve rental dates",
+            "view rental status"
+          ],
+          "specialist": [
+            "issue equipment",
+            "record return",
+            "mark overdue"
+          ],
+          "manager": [
+            "manage stock",
+            "track deposits",
+            "monitor overdue rentals"
+          ]
+        },
+        "role_field_hints": {
+          "client": [
+            "equipment",
+            "category",
+            "start_date",
+            "end_date",
+            "quantity",
+            "customer_name"
+          ],
+          "specialist": [
+            "equipment",
+            "issue_date",
+            "return_date",
+            "status"
+          ],
+          "manager": [
+            "stock",
+            "deposit",
+            "overdue",
+            "utilization"
+          ]
+        },
+        "role_state_contract": {
+          "source_roles": [
+            "client"
+          ],
+          "update_roles": [
+            "specialist",
+            "manager"
+          ],
+          "observer_roles": [
+            "manager"
+          ],
+          "status_values": [
+            "new",
+            "reserved",
+            "issued",
+            "returned",
+            "overdue",
+            "canceled"
+          ]
+        },
+        "routeable_screen_plan": {
+          "multi_page_recommended": true,
+          "roles": {
+            "client": [
+              {
+                "intent": "catalog",
+                "purpose": "browse equipment"
+              },
+              {
+                "intent": "rental",
+                "purpose": "reserve dates"
+              }
+            ],
+            "specialist": [
+              {
+                "intent": "issue",
+                "purpose": "issue equipment"
+              },
+              {
+                "intent": "returns",
+                "purpose": "process returns"
+              }
+            ],
+            "manager": [
+              {
+                "intent": "stock",
+                "purpose": "manage stock"
+              },
+              {
+                "intent": "overdue",
+                "purpose": "monitor overdue and deposits"
+              }
+            ]
+          }
+        }
+      },
+      "expected_roles": [
+        "client",
+        "specialist",
+        "manager"
+      ],
+      "expected_routes": [
+        {
+          "role": "client",
+          "min_count": 2,
+          "intents": [
+            "catalog",
+            "rental"
+          ]
+        },
+        {
+          "role": "specialist",
+          "min_count": 2,
+          "intents": [
+            "issue",
+            "returns"
+          ]
+        },
+        {
+          "role": "manager",
+          "min_count": 2,
+          "intents": [
+            "stock",
+            "overdue"
+          ]
+        }
+      ],
+      "expected_api": [
+        {
+          "method": "GET",
+          "path": "/api/rental_orders",
+          "resource": "rental_order"
+        },
+        {
+          "method": "POST",
+          "path": "/api/rental_orders",
+          "resource": "rental_order"
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/rental_orders/{id}",
+          "resource": "rental_order"
+        }
+      ],
+      "expected_persistence_markers": [
+        "equipment",
+        "category",
+        "start_date",
+        "end_date",
+        "quantity",
+        "customer_name",
+        "deposit",
+        "status"
+      ],
+      "visual_mobile_thresholds": {
+        "min_mobile_width": 390,
+        "max_horizontal_overflow_px": 0,
+        "max_critical_overlaps": 0,
+        "required_viewports": [
+          "390x844"
+        ],
+        "required_role_screenshots": true
+      },
+      "suite_tags": [
+        "extended",
+        "shop",
+        "rental"
+      ],
+      "golden_tier": "extended",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "catalog",
+        "rental",
+        "issue",
+        "returns",
+        "stock",
+        "overdue"
+      ]
+    },
+    {
+      "id": "travel-tour-booking",
+      "title": "Travel tour booking",
+      "domain": "travel",
+      "generation_mode": "quality",
+      "prompt": "Создай Telegram mini-app турагентства: клиент выбирает тур и дату, бронирует места; агент подтверждает оплату и документы; менеджер видит загрузку туров, оплаты и отмены.",
+      "expected_skill_ids": [
+        "manager-dashboard"
+      ],
+      "expected_contract": {
+        "resource_hint": "tour_booking",
+        "required_resource_hints": [
+          "tour",
+          "tour_booking",
+          "traveler",
+          "slot"
+        ],
+        "required_fields": [
+          "tour",
+          "date",
+          "traveler_name",
+          "phone",
+          "party_size",
+          "passport_note",
+          "payment_status",
+          "status"
+        ],
+        "source_roles": [
+          "client"
+        ],
+        "update_roles": [
+          "specialist",
+          "manager"
+        ],
+        "observer_roles": [
+          "manager"
+        ],
+        "status_values": [
+          "new",
+          "reserved",
+          "paid",
+          "confirmed",
+          "completed",
+          "canceled"
+        ],
+        "min_role_routes": {
+          "client": 2,
+          "specialist": 2,
+          "manager": 2
+        },
+        "required_step_kinds": [
+          "prompt_state_source",
+          "prompt_state_update",
+          "mobile_layout"
+        ]
+      },
+      "readiness_required_checks": [
+        "api",
+        "persistence",
+        "ui",
+        "roles",
+        "mobile",
+        "tests",
+        "apply_guardian"
+      ],
+      "prompt_analysis": {
+        "prompt_summary": "Travel tour booking with traveler reservation, agent document/payment confirmation, and manager tour load analytics.",
+        "resource_hint": "tour_booking",
+        "resource_hints": [
+          "tour",
+          "tour_booking",
+          "traveler",
+          "slot"
+        ],
+        "field_hints": [
+          "tour",
+          "date",
+          "traveler_name",
+          "phone",
+          "party_size",
+          "passport_note",
+          "payment_status",
+          "status"
+        ],
+        "business_capabilities": [
+          "tour browsing",
+          "booking",
+          "payment confirmation",
+          "tour load analytics"
+        ],
+        "role_action_prompts": {
+          "client": [
+            "choose tour",
+            "reserve seats",
+            "view payment status"
+          ],
+          "specialist": [
+            "confirm payment",
+            "check documents",
+            "update booking status"
+          ],
+          "manager": [
+            "monitor tour load",
+            "review payments",
+            "handle cancellations"
+          ]
+        },
+        "role_field_hints": {
+          "client": [
+            "tour",
+            "date",
+            "traveler_name",
+            "phone",
+            "party_size"
+          ],
+          "specialist": [
+            "payment_status",
+            "passport_note",
+            "status",
+            "documents"
+          ],
+          "manager": [
+            "tour_load",
+            "payments",
+            "cancellations"
+          ]
+        },
+        "role_state_contract": {
+          "source_roles": [
+            "client"
+          ],
+          "update_roles": [
+            "specialist",
+            "manager"
+          ],
+          "observer_roles": [
+            "manager"
+          ],
+          "status_values": [
+            "new",
+            "reserved",
+            "paid",
+            "confirmed",
+            "completed",
+            "canceled"
+          ]
+        },
+        "routeable_screen_plan": {
+          "multi_page_recommended": true,
+          "roles": {
+            "client": [
+              {
+                "intent": "tours",
+                "purpose": "browse tours"
+              },
+              {
+                "intent": "booking",
+                "purpose": "book tour seats"
+              }
+            ],
+            "specialist": [
+              {
+                "intent": "documents",
+                "purpose": "confirm documents"
+              },
+              {
+                "intent": "payments",
+                "purpose": "update payment status"
+              }
+            ],
+            "manager": [
+              {
+                "intent": "load",
+                "purpose": "monitor tour load"
+              },
+              {
+                "intent": "finance",
+                "purpose": "review payments and cancellations"
+              }
+            ]
+          }
+        }
+      },
+      "expected_roles": [
+        "client",
+        "specialist",
+        "manager"
+      ],
+      "expected_routes": [
+        {
+          "role": "client",
+          "min_count": 2,
+          "intents": [
+            "tours",
+            "booking"
+          ]
+        },
+        {
+          "role": "specialist",
+          "min_count": 2,
+          "intents": [
+            "documents",
+            "payments"
+          ]
+        },
+        {
+          "role": "manager",
+          "min_count": 2,
+          "intents": [
+            "load",
+            "finance"
+          ]
+        }
+      ],
+      "expected_api": [
+        {
+          "method": "GET",
+          "path": "/api/tour_bookings",
+          "resource": "tour_booking"
+        },
+        {
+          "method": "POST",
+          "path": "/api/tour_bookings",
+          "resource": "tour_booking"
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/tour_bookings/{id}",
+          "resource": "tour_booking"
+        }
+      ],
+      "expected_persistence_markers": [
+        "tour",
+        "date",
+        "traveler_name",
+        "phone",
+        "party_size",
+        "passport_note",
+        "payment_status",
+        "status"
+      ],
+      "visual_mobile_thresholds": {
+        "min_mobile_width": 390,
+        "max_horizontal_overflow_px": 0,
+        "max_critical_overlaps": 0,
+        "required_viewports": [
+          "390x844"
+        ],
+        "required_role_screenshots": true
+      },
+      "suite_tags": [
+        "extended",
+        "booking",
+        "travel"
+      ],
+      "golden_tier": "extended",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "tours",
+        "booking",
+        "documents",
+        "payments",
+        "load",
+        "finance"
+      ]
+    },
+    {
+      "id": "subscription-support-portal",
+      "title": "Subscription support portal",
+      "domain": "support",
+      "generation_mode": "quality",
+      "prompt": "Создай Telegram mini-app поддержки подписок: клиент создает тикет по тарифу; специалист ведет переписку и статус; менеджер контролирует SLA, причины обращений и нагрузку команды.",
+      "expected_skill_ids": [
+        "manager-dashboard"
+      ],
+      "expected_contract": {
+        "resource_hint": "ticket",
+        "required_resource_hints": [
+          "ticket",
+          "subscription",
+          "customer",
+          "sla"
+        ],
+        "required_fields": [
+          "customer_name",
+          "phone",
+          "subscription_plan",
+          "issue",
+          "priority",
+          "assignee",
+          "sla_due",
+          "status"
+        ],
+        "source_roles": [
+          "client"
+        ],
+        "update_roles": [
+          "specialist",
+          "manager"
+        ],
+        "observer_roles": [
+          "manager"
+        ],
+        "status_values": [
+          "new",
+          "triaged",
+          "in progress",
+          "waiting customer",
+          "resolved",
+          "closed"
+        ],
+        "min_role_routes": {
+          "client": 2,
+          "specialist": 2,
+          "manager": 2
+        },
+        "required_step_kinds": [
+          "prompt_state_source",
+          "prompt_state_update",
+          "mobile_layout"
+        ]
+      },
+      "readiness_required_checks": [
+        "api",
+        "persistence",
+        "ui",
+        "roles",
+        "mobile",
+        "tests",
+        "apply_guardian"
+      ],
+      "prompt_analysis": {
+        "prompt_summary": "Subscription support portal with customer tickets, specialist status updates, and manager SLA analytics.",
+        "resource_hint": "ticket",
+        "resource_hints": [
+          "ticket",
+          "subscription",
+          "customer",
+          "sla"
+        ],
+        "field_hints": [
+          "customer_name",
+          "phone",
+          "subscription_plan",
+          "issue",
+          "priority",
+          "assignee",
+          "sla_due",
+          "status"
+        ],
+        "business_capabilities": [
+          "ticket intake",
+          "subscription support",
+          "SLA control",
+          "support analytics"
+        ],
+        "role_action_prompts": {
+          "client": [
+            "create support ticket",
+            "describe subscription issue",
+            "track ticket status"
+          ],
+          "specialist": [
+            "triage ticket",
+            "update status",
+            "request customer info"
+          ],
+          "manager": [
+            "monitor SLA",
+            "analyze issue reasons",
+            "balance team load"
+          ]
+        },
+        "role_field_hints": {
+          "client": [
+            "customer_name",
+            "phone",
+            "subscription_plan",
+            "issue",
+            "priority"
+          ],
+          "specialist": [
+            "assignee",
+            "status",
+            "sla_due",
+            "reply"
+          ],
+          "manager": [
+            "sla",
+            "issue_reason",
+            "team_load"
+          ]
+        },
+        "role_state_contract": {
+          "source_roles": [
+            "client"
+          ],
+          "update_roles": [
+            "specialist",
+            "manager"
+          ],
+          "observer_roles": [
+            "manager"
+          ],
+          "status_values": [
+            "new",
+            "triaged",
+            "in progress",
+            "waiting customer",
+            "resolved",
+            "closed"
+          ]
+        },
+        "routeable_screen_plan": {
+          "multi_page_recommended": true,
+          "roles": {
+            "client": [
+              {
+                "intent": "ticket",
+                "purpose": "create support ticket"
+              },
+              {
+                "intent": "status",
+                "purpose": "track ticket status"
+              }
+            ],
+            "specialist": [
+              {
+                "intent": "inbox",
+                "purpose": "triage support tickets"
+              },
+              {
+                "intent": "reply",
+                "purpose": "update ticket and reply"
+              }
+            ],
+            "manager": [
+              {
+                "intent": "sla",
+                "purpose": "monitor SLA"
+              },
+              {
+                "intent": "analytics",
+                "purpose": "analyze reasons and load"
+              }
+            ]
+          }
+        }
+      },
+      "expected_roles": [
+        "client",
+        "specialist",
+        "manager"
+      ],
+      "expected_routes": [
+        {
+          "role": "client",
+          "min_count": 2,
+          "intents": [
+            "ticket",
+            "status"
+          ]
+        },
+        {
+          "role": "specialist",
+          "min_count": 2,
+          "intents": [
+            "inbox",
+            "reply"
+          ]
+        },
+        {
+          "role": "manager",
+          "min_count": 2,
+          "intents": [
+            "sla",
+            "analytics"
+          ]
+        }
+      ],
+      "expected_api": [
+        {
+          "method": "GET",
+          "path": "/api/tickets",
+          "resource": "ticket"
+        },
+        {
+          "method": "POST",
+          "path": "/api/tickets",
+          "resource": "ticket"
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/tickets/{id}",
+          "resource": "ticket"
+        }
+      ],
+      "expected_persistence_markers": [
+        "customer_name",
+        "phone",
+        "subscription_plan",
+        "issue",
+        "priority",
+        "assignee",
+        "sla_due",
+        "status"
+      ],
+      "visual_mobile_thresholds": {
+        "min_mobile_width": 390,
+        "max_horizontal_overflow_px": 0,
+        "max_critical_overlaps": 0,
+        "required_viewports": [
+          "390x844"
+        ],
+        "required_role_screenshots": true
+      },
+      "suite_tags": [
+        "extended",
+        "crm",
+        "support"
+      ],
+      "golden_tier": "extended",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "ticket",
+        "status",
+        "inbox",
+        "reply",
+        "sla",
+        "analytics"
+      ]
+    },
+    {
+      "id": "warehouse-stock-transfer",
+      "title": "Warehouse stock transfer",
+      "domain": "warehouse",
+      "generation_mode": "quality",
+      "prompt": "Создай Telegram mini-app склада: сотрудник запрашивает перемещение товара между складами; кладовщик собирает и меняет статус; менеджер видит остатки, дефицит и просрочки перемещений.",
+      "expected_skill_ids": [
+        "shop-catalog"
+      ],
+      "expected_contract": {
+        "resource_hint": "transfer",
+        "required_resource_hints": [
+          "transfer",
+          "warehouse",
+          "stock",
+          "sku"
+        ],
+        "required_fields": [
+          "sku",
+          "product",
+          "from_warehouse",
+          "to_warehouse",
+          "quantity",
+          "requested_by",
+          "assignee",
+          "status"
+        ],
+        "source_roles": [
+          "client"
+        ],
+        "update_roles": [
+          "specialist",
+          "manager"
+        ],
+        "observer_roles": [
+          "manager"
+        ],
+        "status_values": [
+          "new",
+          "approved",
+          "picking",
+          "in transit",
+          "received",
+          "canceled"
+        ],
+        "min_role_routes": {
+          "client": 2,
+          "specialist": 2,
+          "manager": 2
+        },
+        "required_step_kinds": [
+          "prompt_state_source",
+          "prompt_state_update",
+          "mobile_layout"
+        ]
+      },
+      "readiness_required_checks": [
+        "api",
+        "persistence",
+        "ui",
+        "roles",
+        "mobile",
+        "tests",
+        "apply_guardian"
+      ],
+      "prompt_analysis": {
+        "prompt_summary": "Warehouse transfer workflow with stock request, picker status updates, and manager inventory shortage dashboard.",
+        "resource_hint": "transfer",
+        "resource_hints": [
+          "transfer",
+          "warehouse",
+          "stock",
+          "sku"
+        ],
+        "field_hints": [
+          "sku",
+          "product",
+          "from_warehouse",
+          "to_warehouse",
+          "quantity",
+          "requested_by",
+          "assignee",
+          "status"
+        ],
+        "business_capabilities": [
+          "stock transfer",
+          "picking",
+          "inventory control",
+          "shortage analytics"
+        ],
+        "role_action_prompts": {
+          "client": [
+            "request stock transfer",
+            "choose SKU and warehouses",
+            "track transfer status"
+          ],
+          "specialist": [
+            "pick transfer items",
+            "update transit status",
+            "confirm receipt"
+          ],
+          "manager": [
+            "monitor stock",
+            "identify shortages",
+            "review overdue transfers"
+          ]
+        },
+        "role_field_hints": {
+          "client": [
+            "sku",
+            "product",
+            "from_warehouse",
+            "to_warehouse",
+            "quantity"
+          ],
+          "specialist": [
+            "assignee",
+            "status",
+            "picked_quantity",
+            "receipt"
+          ],
+          "manager": [
+            "stock",
+            "shortage",
+            "overdue",
+            "warehouse_load"
+          ]
+        },
+        "role_state_contract": {
+          "source_roles": [
+            "client"
+          ],
+          "update_roles": [
+            "specialist",
+            "manager"
+          ],
+          "observer_roles": [
+            "manager"
+          ],
+          "status_values": [
+            "new",
+            "approved",
+            "picking",
+            "in transit",
+            "received",
+            "canceled"
+          ]
+        },
+        "routeable_screen_plan": {
+          "multi_page_recommended": true,
+          "roles": {
+            "client": [
+              {
+                "intent": "request",
+                "purpose": "create transfer request"
+              },
+              {
+                "intent": "status",
+                "purpose": "track transfer"
+              }
+            ],
+            "specialist": [
+              {
+                "intent": "picking",
+                "purpose": "pick transfer items"
+              },
+              {
+                "intent": "transit",
+                "purpose": "update transit and receipt"
+              }
+            ],
+            "manager": [
+              {
+                "intent": "stock",
+                "purpose": "monitor stock"
+              },
+              {
+                "intent": "shortages",
+                "purpose": "review shortages and overdue transfers"
+              }
+            ]
+          }
+        }
+      },
+      "expected_roles": [
+        "client",
+        "specialist",
+        "manager"
+      ],
+      "expected_routes": [
+        {
+          "role": "client",
+          "min_count": 2,
+          "intents": [
+            "request",
+            "status"
+          ]
+        },
+        {
+          "role": "specialist",
+          "min_count": 2,
+          "intents": [
+            "picking",
+            "transit"
+          ]
+        },
+        {
+          "role": "manager",
+          "min_count": 2,
+          "intents": [
+            "stock",
+            "shortages"
+          ]
+        }
+      ],
+      "expected_api": [
+        {
+          "method": "GET",
+          "path": "/api/transfers",
+          "resource": "transfer"
+        },
+        {
+          "method": "POST",
+          "path": "/api/transfers",
+          "resource": "transfer"
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/transfers/{id}",
+          "resource": "transfer"
+        }
+      ],
+      "expected_persistence_markers": [
+        "sku",
+        "product",
+        "from_warehouse",
+        "to_warehouse",
+        "quantity",
+        "requested_by",
+        "assignee",
+        "status"
+      ],
+      "visual_mobile_thresholds": {
+        "min_mobile_width": 390,
+        "max_horizontal_overflow_px": 0,
+        "max_critical_overlaps": 0,
+        "required_viewports": [
+          "390x844"
+        ],
+        "required_role_screenshots": true
+      },
+      "suite_tags": [
+        "extended",
+        "shop",
+        "warehouse"
+      ],
+      "golden_tier": "extended",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "request",
+        "status",
+        "picking",
+        "transit",
+        "stock",
+        "shortages"
+      ]
+    },
+    {
+      "id": "hotel-room-service",
+      "title": "Hotel room service",
+      "domain": "hotel",
+      "generation_mode": "quality",
+      "prompt": "Создай Telegram mini-app отеля: гость заказывает room service из меню; сотрудник кухни готовит и доставляет; менеджер видит заказы, время доставки, отмены и популярные позиции.",
+      "expected_skill_ids": [
+        "delivery-orders"
+      ],
+      "expected_contract": {
+        "resource_hint": "room_order",
+        "required_resource_hints": [
+          "room_order",
+          "room",
+          "menu_item",
+          "guest"
+        ],
+        "required_fields": [
+          "room",
+          "guest_name",
+          "phone",
+          "menu_item",
+          "quantity",
+          "delivery_time",
+          "payment_status",
+          "status"
+        ],
+        "source_roles": [
+          "client"
+        ],
+        "update_roles": [
+          "specialist",
+          "manager"
+        ],
+        "observer_roles": [
+          "manager"
+        ],
+        "status_values": [
+          "new",
+          "accepted",
+          "preparing",
+          "delivering",
+          "delivered",
+          "canceled"
+        ],
+        "min_role_routes": {
+          "client": 2,
+          "specialist": 2,
+          "manager": 2
+        },
+        "required_step_kinds": [
+          "prompt_state_source",
+          "prompt_state_update",
+          "mobile_layout"
+        ]
+      },
+      "readiness_required_checks": [
+        "api",
+        "persistence",
+        "ui",
+        "roles",
+        "mobile",
+        "tests",
+        "apply_guardian"
+      ],
+      "prompt_analysis": {
+        "prompt_summary": "Hotel room service with guest menu order, staff preparation/delivery status, and manager delivery analytics.",
+        "resource_hint": "room_order",
+        "resource_hints": [
+          "room_order",
+          "room",
+          "menu_item",
+          "guest"
+        ],
+        "field_hints": [
+          "room",
+          "guest_name",
+          "phone",
+          "menu_item",
+          "quantity",
+          "delivery_time",
+          "payment_status",
+          "status"
+        ],
+        "business_capabilities": [
+          "menu order",
+          "room delivery",
+          "preparation tracking",
+          "popular items analytics"
+        ],
+        "role_action_prompts": {
+          "client": [
+            "browse menu",
+            "order room service",
+            "track delivery"
+          ],
+          "specialist": [
+            "prepare order",
+            "update delivery status",
+            "mark delivered"
+          ],
+          "manager": [
+            "monitor delivery time",
+            "review cancellations",
+            "track popular items"
+          ]
+        },
+        "role_field_hints": {
+          "client": [
+            "room",
+            "guest_name",
+            "menu_item",
+            "quantity",
+            "delivery_time"
+          ],
+          "specialist": [
+            "room_order",
+            "status",
+            "delivery_time",
+            "notes"
+          ],
+          "manager": [
+            "delivery_time",
+            "cancellations",
+            "popular_items"
+          ]
+        },
+        "role_state_contract": {
+          "source_roles": [
+            "client"
+          ],
+          "update_roles": [
+            "specialist",
+            "manager"
+          ],
+          "observer_roles": [
+            "manager"
+          ],
+          "status_values": [
+            "new",
+            "accepted",
+            "preparing",
+            "delivering",
+            "delivered",
+            "canceled"
+          ]
+        },
+        "routeable_screen_plan": {
+          "multi_page_recommended": true,
+          "roles": {
+            "client": [
+              {
+                "intent": "menu",
+                "purpose": "browse room service menu"
+              },
+              {
+                "intent": "order",
+                "purpose": "place room order"
+              }
+            ],
+            "specialist": [
+              {
+                "intent": "kitchen",
+                "purpose": "prepare active orders"
+              },
+              {
+                "intent": "delivery",
+                "purpose": "update delivery status"
+              }
+            ],
+            "manager": [
+              {
+                "intent": "orders",
+                "purpose": "monitor orders"
+              },
+              {
+                "intent": "analytics",
+                "purpose": "track delivery and popular items"
+              }
+            ]
+          }
+        }
+      },
+      "expected_roles": [
+        "client",
+        "specialist",
+        "manager"
+      ],
+      "expected_routes": [
+        {
+          "role": "client",
+          "min_count": 2,
+          "intents": [
+            "menu",
+            "order"
+          ]
+        },
+        {
+          "role": "specialist",
+          "min_count": 2,
+          "intents": [
+            "kitchen",
+            "delivery"
+          ]
+        },
+        {
+          "role": "manager",
+          "min_count": 2,
+          "intents": [
+            "orders",
+            "analytics"
+          ]
+        }
+      ],
+      "expected_api": [
+        {
+          "method": "GET",
+          "path": "/api/room_orders",
+          "resource": "room_order"
+        },
+        {
+          "method": "POST",
+          "path": "/api/room_orders",
+          "resource": "room_order"
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/room_orders/{id}",
+          "resource": "room_order"
+        }
+      ],
+      "expected_persistence_markers": [
+        "room",
+        "guest_name",
+        "phone",
+        "menu_item",
+        "quantity",
+        "delivery_time",
+        "payment_status",
+        "status"
+      ],
+      "visual_mobile_thresholds": {
+        "min_mobile_width": 390,
+        "max_horizontal_overflow_px": 0,
+        "max_critical_overlaps": 0,
+        "required_viewports": [
+          "390x844"
+        ],
+        "required_role_screenshots": true
+      },
+      "suite_tags": [
+        "extended",
+        "delivery",
+        "hotel"
+      ],
+      "golden_tier": "extended",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "menu",
+        "order",
+        "kitchen",
+        "delivery",
+        "orders",
+        "analytics"
+      ]
+    },
+    {
+      "id": "clinic-lab-results",
+      "title": "Clinic lab results",
+      "domain": "clinic",
+      "generation_mode": "quality",
+      "prompt": "Создай Telegram mini-app лаборатории: пациент заказывает анализ и видит статус; специалист отмечает забор и готовность результата; менеджер следит за очередью, срочными анализами и сроками.",
+      "expected_skill_ids": [
+        "manager-dashboard"
+      ],
+      "expected_contract": {
+        "resource_hint": "lab_order",
+        "required_resource_hints": [
+          "lab_order",
+          "patient",
+          "analysis",
+          "result"
+        ],
+        "required_fields": [
+          "analysis_type",
+          "patient_name",
+          "phone",
+          "sample_date",
+          "result_status",
+          "doctor_comment",
+          "priority",
+          "status"
+        ],
+        "source_roles": [
+          "client"
+        ],
+        "update_roles": [
+          "specialist",
+          "manager"
+        ],
+        "observer_roles": [
+          "manager"
+        ],
+        "status_values": [
+          "new",
+          "sample taken",
+          "processing",
+          "ready",
+          "reviewed",
+          "canceled"
+        ],
+        "min_role_routes": {
+          "client": 2,
+          "specialist": 2,
+          "manager": 2
+        },
+        "required_step_kinds": [
+          "prompt_state_source",
+          "prompt_state_update",
+          "mobile_layout"
+        ]
+      },
+      "readiness_required_checks": [
+        "api",
+        "persistence",
+        "ui",
+        "roles",
+        "mobile",
+        "tests",
+        "apply_guardian"
+      ],
+      "prompt_analysis": {
+        "prompt_summary": "Lab order workflow with patient analysis request, specialist sample/result status, and manager queue deadlines.",
+        "resource_hint": "lab_order",
+        "resource_hints": [
+          "lab_order",
+          "patient",
+          "analysis",
+          "result"
+        ],
+        "field_hints": [
+          "analysis_type",
+          "patient_name",
+          "phone",
+          "sample_date",
+          "result_status",
+          "doctor_comment",
+          "priority",
+          "status"
+        ],
+        "business_capabilities": [
+          "analysis order",
+          "sample tracking",
+          "result readiness",
+          "deadline monitoring"
+        ],
+        "role_action_prompts": {
+          "client": [
+            "choose analysis",
+            "create lab order",
+            "view result status"
+          ],
+          "specialist": [
+            "mark sample taken",
+            "update result status",
+            "add doctor comment"
+          ],
+          "manager": [
+            "monitor queue",
+            "track urgent analyses",
+            "control deadlines"
+          ]
+        },
+        "role_field_hints": {
+          "client": [
+            "analysis_type",
+            "patient_name",
+            "phone",
+            "sample_date"
+          ],
+          "specialist": [
+            "result_status",
+            "doctor_comment",
+            "priority",
+            "status"
+          ],
+          "manager": [
+            "queue_length",
+            "urgent_count",
+            "deadline_risk"
+          ]
+        },
+        "role_state_contract": {
+          "source_roles": [
+            "client"
+          ],
+          "update_roles": [
+            "specialist",
+            "manager"
+          ],
+          "observer_roles": [
+            "manager"
+          ],
+          "status_values": [
+            "new",
+            "sample taken",
+            "processing",
+            "ready",
+            "reviewed",
+            "canceled"
+          ]
+        },
+        "routeable_screen_plan": {
+          "multi_page_recommended": true,
+          "roles": {
+            "client": [
+              {
+                "intent": "analyses",
+                "purpose": "choose analysis"
+              },
+              {
+                "intent": "order",
+                "purpose": "create lab order"
+              }
+            ],
+            "specialist": [
+              {
+                "intent": "samples",
+                "purpose": "mark sample status"
+              },
+              {
+                "intent": "results",
+                "purpose": "publish result status"
+              }
+            ],
+            "manager": [
+              {
+                "intent": "queue",
+                "purpose": "monitor lab queue"
+              },
+              {
+                "intent": "urgent",
+                "purpose": "track urgent and deadlines"
+              }
+            ]
+          }
+        }
+      },
+      "expected_roles": [
+        "client",
+        "specialist",
+        "manager"
+      ],
+      "expected_routes": [
+        {
+          "role": "client",
+          "min_count": 2,
+          "intents": [
+            "analyses",
+            "order"
+          ]
+        },
+        {
+          "role": "specialist",
+          "min_count": 2,
+          "intents": [
+            "samples",
+            "results"
+          ]
+        },
+        {
+          "role": "manager",
+          "min_count": 2,
+          "intents": [
+            "queue",
+            "urgent"
+          ]
+        }
+      ],
+      "expected_api": [
+        {
+          "method": "GET",
+          "path": "/api/lab_orders",
+          "resource": "lab_order"
+        },
+        {
+          "method": "POST",
+          "path": "/api/lab_orders",
+          "resource": "lab_order"
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/lab_orders/{id}",
+          "resource": "lab_order"
+        }
+      ],
+      "expected_persistence_markers": [
+        "analysis_type",
+        "patient_name",
+        "phone",
+        "sample_date",
+        "result_status",
+        "doctor_comment",
+        "priority",
+        "status"
+      ],
+      "visual_mobile_thresholds": {
+        "min_mobile_width": 390,
+        "max_horizontal_overflow_px": 0,
+        "max_critical_overlaps": 0,
+        "required_viewports": [
+          "390x844"
+        ],
+        "required_role_screenshots": true
+      },
+      "suite_tags": [
+        "extended",
+        "booking",
+        "clinic"
+      ],
+      "golden_tier": "extended",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "analyses",
+        "order",
+        "samples",
+        "results",
+        "queue",
+        "urgent"
+      ]
+    },
+    {
+      "id": "repair-home-service",
+      "title": "Home repair service",
+      "domain": "home_service",
+      "generation_mode": "quality",
+      "prompt": "Создай Telegram mini-app сервиса ремонта на дому: клиент выбирает услугу и время; мастер ведет выезд и смету; менеджер видит заявки, выручку, отмены и занятость мастеров.",
+      "expected_skill_ids": [
+        "services-masters"
+      ],
+      "expected_contract": {
+        "resource_hint": "service_request",
+        "required_resource_hints": [
+          "service_request",
+          "master",
+          "address",
+          "estimate"
+        ],
+        "required_fields": [
+          "service",
+          "address",
+          "client_name",
+          "phone",
+          "preferred_time",
+          "estimate",
+          "master",
+          "status"
+        ],
+        "source_roles": [
+          "client"
+        ],
+        "update_roles": [
+          "specialist",
+          "manager"
+        ],
+        "observer_roles": [
+          "manager"
+        ],
+        "status_values": [
+          "new",
+          "scheduled",
+          "in work",
+          "waiting approval",
+          "done",
+          "canceled"
+        ],
+        "min_role_routes": {
+          "client": 2,
+          "specialist": 2,
+          "manager": 2
+        },
+        "required_step_kinds": [
+          "prompt_state_source",
+          "prompt_state_update",
+          "mobile_layout"
+        ]
+      },
+      "readiness_required_checks": [
+        "api",
+        "persistence",
+        "ui",
+        "roles",
+        "mobile",
+        "tests",
+        "apply_guardian"
+      ],
+      "prompt_analysis": {
+        "prompt_summary": "Home repair service with client booking, master estimate/status, and manager revenue/load analytics.",
+        "resource_hint": "service_request",
+        "resource_hints": [
+          "service_request",
+          "master",
+          "address",
+          "estimate"
+        ],
+        "field_hints": [
+          "service",
+          "address",
+          "client_name",
+          "phone",
+          "preferred_time",
+          "estimate",
+          "master",
+          "status"
+        ],
+        "business_capabilities": [
+          "service request",
+          "master dispatch",
+          "estimate approval",
+          "revenue analytics"
+        ],
+        "role_action_prompts": {
+          "client": [
+            "choose repair service",
+            "book preferred time",
+            "approve estimate"
+          ],
+          "specialist": [
+            "manage visit",
+            "prepare estimate",
+            "update job status"
+          ],
+          "manager": [
+            "monitor requests",
+            "track revenue",
+            "balance master load"
+          ]
+        },
+        "role_field_hints": {
+          "client": [
+            "service",
+            "address",
+            "client_name",
+            "phone",
+            "preferred_time"
+          ],
+          "specialist": [
+            "estimate",
+            "master",
+            "status",
+            "notes"
+          ],
+          "manager": [
+            "revenue",
+            "cancellations",
+            "master_load"
+          ]
+        },
+        "role_state_contract": {
+          "source_roles": [
+            "client"
+          ],
+          "update_roles": [
+            "specialist",
+            "manager"
+          ],
+          "observer_roles": [
+            "manager"
+          ],
+          "status_values": [
+            "new",
+            "scheduled",
+            "in work",
+            "waiting approval",
+            "done",
+            "canceled"
+          ]
+        },
+        "routeable_screen_plan": {
+          "multi_page_recommended": true,
+          "roles": {
+            "client": [
+              {
+                "intent": "services",
+                "purpose": "choose home repair service"
+              },
+              {
+                "intent": "request",
+                "purpose": "book visit and approve estimate"
+              }
+            ],
+            "specialist": [
+              {
+                "intent": "visits",
+                "purpose": "manage assigned visits"
+              },
+              {
+                "intent": "estimate",
+                "purpose": "create estimate and status"
+              }
+            ],
+            "manager": [
+              {
+                "intent": "requests",
+                "purpose": "monitor requests"
+              },
+              {
+                "intent": "analytics",
+                "purpose": "track revenue and load"
+              }
+            ]
+          }
+        }
+      },
+      "expected_roles": [
+        "client",
+        "specialist",
+        "manager"
+      ],
+      "expected_routes": [
+        {
+          "role": "client",
+          "min_count": 2,
+          "intents": [
+            "services",
+            "request"
+          ]
+        },
+        {
+          "role": "specialist",
+          "min_count": 2,
+          "intents": [
+            "visits",
+            "estimate"
+          ]
+        },
+        {
+          "role": "manager",
+          "min_count": 2,
+          "intents": [
+            "requests",
+            "analytics"
+          ]
+        }
+      ],
+      "expected_api": [
+        {
+          "method": "GET",
+          "path": "/api/service_requests",
+          "resource": "service_request"
+        },
+        {
+          "method": "POST",
+          "path": "/api/service_requests",
+          "resource": "service_request"
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/service_requests/{id}",
+          "resource": "service_request"
+        }
+      ],
+      "expected_persistence_markers": [
+        "service",
+        "address",
+        "client_name",
+        "phone",
+        "preferred_time",
+        "estimate",
+        "master",
+        "status"
+      ],
+      "visual_mobile_thresholds": {
+        "min_mobile_width": 390,
+        "max_horizontal_overflow_px": 0,
+        "max_critical_overlaps": 0,
+        "required_viewports": [
+          "390x844"
+        ],
+        "required_role_screenshots": true
+      },
+      "suite_tags": [
+        "extended",
+        "booking",
+        "home_service"
+      ],
+      "golden_tier": "extended",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "services",
+        "request",
+        "visits",
+        "estimate",
+        "requests",
+        "analytics"
+      ]
+    },
+    {
+      "id": "donation-campaigns",
+      "title": "Donation campaigns",
+      "domain": "nonprofit",
+      "generation_mode": "quality",
+      "prompt": "Создай Telegram mini-app благотворительного фонда: донор выбирает кампанию и оставляет пожертвование; волонтер подтверждает связь и благодарность; менеджер видит сборы, цели и активность кампаний.",
+      "expected_skill_ids": [
+        "manager-dashboard"
+      ],
+      "expected_contract": {
+        "resource_hint": "donation",
+        "required_resource_hints": [
+          "campaign",
+          "donation",
+          "donor",
+          "volunteer"
+        ],
+        "required_fields": [
+          "campaign",
+          "donor_name",
+          "phone",
+          "amount",
+          "payment_status",
+          "volunteer",
+          "status"
+        ],
+        "source_roles": [
+          "client"
+        ],
+        "update_roles": [
+          "specialist",
+          "manager"
+        ],
+        "observer_roles": [
+          "manager"
+        ],
+        "status_values": [
+          "pledged",
+          "paid",
+          "confirmed",
+          "thanked",
+          "canceled"
+        ],
+        "min_role_routes": {
+          "client": 2,
+          "specialist": 2,
+          "manager": 2
+        },
+        "required_step_kinds": [
+          "prompt_state_source",
+          "prompt_state_update",
+          "mobile_layout"
+        ]
+      },
+      "readiness_required_checks": [
+        "api",
+        "persistence",
+        "ui",
+        "roles",
+        "mobile",
+        "tests",
+        "apply_guardian"
+      ],
+      "prompt_analysis": {
+        "prompt_summary": "Donation campaign app with donor pledge, volunteer follow-up, and manager campaign fundraising dashboard.",
+        "resource_hint": "donation",
+        "resource_hints": [
+          "campaign",
+          "donation",
+          "donor",
+          "volunteer"
+        ],
+        "field_hints": [
+          "campaign",
+          "donor_name",
+          "phone",
+          "amount",
+          "payment_status",
+          "volunteer",
+          "status"
+        ],
+        "business_capabilities": [
+          "campaign browsing",
+          "donation pledge",
+          "volunteer follow-up",
+          "fundraising analytics"
+        ],
+        "role_action_prompts": {
+          "client": [
+            "choose campaign",
+            "submit donation pledge",
+            "view payment status"
+          ],
+          "specialist": [
+            "confirm donor contact",
+            "mark thanked",
+            "update donation status"
+          ],
+          "manager": [
+            "monitor fundraising",
+            "track goals",
+            "review campaign activity"
+          ]
+        },
+        "role_field_hints": {
+          "client": [
+            "campaign",
+            "donor_name",
+            "phone",
+            "amount"
+          ],
+          "specialist": [
+            "volunteer",
+            "status",
+            "thank_you",
+            "payment_status"
+          ],
+          "manager": [
+            "campaign_goal",
+            "collected",
+            "activity"
+          ]
+        },
+        "role_state_contract": {
+          "source_roles": [
+            "client"
+          ],
+          "update_roles": [
+            "specialist",
+            "manager"
+          ],
+          "observer_roles": [
+            "manager"
+          ],
+          "status_values": [
+            "pledged",
+            "paid",
+            "confirmed",
+            "thanked",
+            "canceled"
+          ]
+        },
+        "routeable_screen_plan": {
+          "multi_page_recommended": true,
+          "roles": {
+            "client": [
+              {
+                "intent": "campaigns",
+                "purpose": "browse campaigns"
+              },
+              {
+                "intent": "donation",
+                "purpose": "submit donation"
+              }
+            ],
+            "specialist": [
+              {
+                "intent": "follow-up",
+                "purpose": "confirm donor follow-up"
+              },
+              {
+                "intent": "thanks",
+                "purpose": "mark thanks and status"
+              }
+            ],
+            "manager": [
+              {
+                "intent": "fundraising",
+                "purpose": "monitor fundraising"
+              },
+              {
+                "intent": "campaigns",
+                "purpose": "review campaign goals"
+              }
+            ]
+          }
+        }
+      },
+      "expected_roles": [
+        "client",
+        "specialist",
+        "manager"
+      ],
+      "expected_routes": [
+        {
+          "role": "client",
+          "min_count": 2,
+          "intents": [
+            "campaigns",
+            "donation"
+          ]
+        },
+        {
+          "role": "specialist",
+          "min_count": 2,
+          "intents": [
+            "follow-up",
+            "thanks"
+          ]
+        },
+        {
+          "role": "manager",
+          "min_count": 2,
+          "intents": [
+            "fundraising",
+            "campaigns"
+          ]
+        }
+      ],
+      "expected_api": [
+        {
+          "method": "GET",
+          "path": "/api/donations",
+          "resource": "donation"
+        },
+        {
+          "method": "POST",
+          "path": "/api/donations",
+          "resource": "donation"
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/donations/{id}",
+          "resource": "donation"
+        }
+      ],
+      "expected_persistence_markers": [
+        "campaign",
+        "donor_name",
+        "phone",
+        "amount",
+        "payment_status",
+        "volunteer",
+        "status"
+      ],
+      "visual_mobile_thresholds": {
+        "min_mobile_width": 390,
+        "max_horizontal_overflow_px": 0,
+        "max_critical_overlaps": 0,
+        "required_viewports": [
+          "390x844"
+        ],
+        "required_role_screenshots": true
+      },
+      "suite_tags": [
+        "extended",
+        "crm",
+        "nonprofit"
+      ],
+      "golden_tier": "extended",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "campaigns",
+        "donation",
+        "follow-up",
+        "thanks",
+        "fundraising"
+      ]
+    },
+    {
+      "id": "admin-analytics-incident-board",
+      "title": "Admin analytics incident board",
+      "domain": "admin",
+      "generation_mode": "quality",
+      "prompt": "Создай Telegram mini-app операционного дашборда: сотрудник заводит инцидент по метрике; ответственный обновляет статус и runbook; менеджер видит SLA, severity, нагрузку и динамику инцидентов.",
+      "expected_skill_ids": [
+        "manager-dashboard"
+      ],
+      "expected_contract": {
+        "resource_hint": "incident",
+        "required_resource_hints": [
+          "incident",
+          "metric",
+          "owner",
+          "runbook"
+        ],
+        "required_fields": [
+          "incident_title",
+          "severity",
+          "owner",
+          "metric",
+          "started_at",
+          "sla_due",
+          "runbook",
+          "status"
+        ],
+        "source_roles": [
+          "client"
+        ],
+        "update_roles": [
+          "specialist",
+          "manager"
+        ],
+        "observer_roles": [
+          "manager"
+        ],
+        "status_values": [
+          "open",
+          "investigating",
+          "mitigated",
+          "resolved",
+          "postmortem"
+        ],
+        "min_role_routes": {
+          "client": 2,
+          "specialist": 2,
+          "manager": 2
+        },
+        "required_step_kinds": [
+          "prompt_state_source",
+          "prompt_state_update",
+          "mobile_layout"
+        ]
+      },
+      "readiness_required_checks": [
+        "api",
+        "persistence",
+        "ui",
+        "roles",
+        "mobile",
+        "tests",
+        "apply_guardian"
+      ],
+      "prompt_analysis": {
+        "prompt_summary": "Admin incident board with incident intake, owner runbook/status, and manager SLA/severity analytics.",
+        "resource_hint": "incident",
+        "resource_hints": [
+          "incident",
+          "metric",
+          "owner",
+          "runbook"
+        ],
+        "field_hints": [
+          "incident_title",
+          "severity",
+          "owner",
+          "metric",
+          "started_at",
+          "sla_due",
+          "runbook",
+          "status"
+        ],
+        "business_capabilities": [
+          "incident intake",
+          "runbook tracking",
+          "SLA monitoring",
+          "severity analytics"
+        ],
+        "role_action_prompts": {
+          "client": [
+            "create incident",
+            "select metric and severity",
+            "track incident status"
+          ],
+          "specialist": [
+            "own incident",
+            "update runbook",
+            "mitigate status"
+          ],
+          "manager": [
+            "monitor SLA",
+            "review severity",
+            "track incident trends"
+          ]
+        },
+        "role_field_hints": {
+          "client": [
+            "incident_title",
+            "severity",
+            "metric",
+            "started_at"
+          ],
+          "specialist": [
+            "owner",
+            "runbook",
+            "status",
+            "sla_due"
+          ],
+          "manager": [
+            "sla",
+            "severity",
+            "incident_count",
+            "owner_load"
+          ]
+        },
+        "role_state_contract": {
+          "source_roles": [
+            "client"
+          ],
+          "update_roles": [
+            "specialist",
+            "manager"
+          ],
+          "observer_roles": [
+            "manager"
+          ],
+          "status_values": [
+            "open",
+            "investigating",
+            "mitigated",
+            "resolved",
+            "postmortem"
+          ]
+        },
+        "routeable_screen_plan": {
+          "multi_page_recommended": true,
+          "roles": {
+            "client": [
+              {
+                "intent": "incident",
+                "purpose": "create incident"
+              },
+              {
+                "intent": "status",
+                "purpose": "track incident"
+              }
+            ],
+            "specialist": [
+              {
+                "intent": "owned",
+                "purpose": "manage owned incidents"
+              },
+              {
+                "intent": "runbook",
+                "purpose": "update runbook status"
+              }
+            ],
+            "manager": [
+              {
+                "intent": "sla",
+                "purpose": "monitor SLA"
+              },
+              {
+                "intent": "analytics",
+                "purpose": "review incident trends"
+              }
+            ]
+          }
+        }
+      },
+      "expected_roles": [
+        "client",
+        "specialist",
+        "manager"
+      ],
+      "expected_routes": [
+        {
+          "role": "client",
+          "min_count": 2,
+          "intents": [
+            "incident",
+            "status"
+          ]
+        },
+        {
+          "role": "specialist",
+          "min_count": 2,
+          "intents": [
+            "owned",
+            "runbook"
+          ]
+        },
+        {
+          "role": "manager",
+          "min_count": 2,
+          "intents": [
+            "sla",
+            "analytics"
+          ]
+        }
+      ],
+      "expected_api": [
+        {
+          "method": "GET",
+          "path": "/api/incidents",
+          "resource": "incident"
+        },
+        {
+          "method": "POST",
+          "path": "/api/incidents",
+          "resource": "incident"
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/incidents/{id}",
+          "resource": "incident"
+        }
+      ],
+      "expected_persistence_markers": [
+        "incident_title",
+        "severity",
+        "owner",
+        "metric",
+        "started_at",
+        "sla_due",
+        "runbook",
+        "status"
+      ],
+      "visual_mobile_thresholds": {
+        "min_mobile_width": 390,
+        "max_horizontal_overflow_px": 0,
+        "max_critical_overlaps": 0,
+        "required_viewports": [
+          "390x844"
+        ],
+        "required_role_screenshots": true
+      },
+      "suite_tags": [
+        "core",
+        "dashboard",
+        "admin"
+      ],
+      "golden_tier": "core",
+      "regression_profile": "contract_smoke",
+      "acceptance_focus": [
+        "incident",
+        "status",
+        "owned",
+        "runbook",
+        "sla",
+        "analytics"
+      ]
     }
   ]
 }

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from app.models.artifacts import ApplyPatchResult, PatchEnvelope, PatchOperationModel
+from app.services.patch_validator import PatchGrammarValidator
 from app.services.workspace.service import WorkspaceService
 
 
@@ -35,6 +36,18 @@ class PatchService:
                     "current_revision_id": workspace.current_revision_id,
                 }
             )
+        validation_report = PatchGrammarValidator.validate_operations(patch_actions)
+        for issue in validation_report.get("issues") or []:
+            if isinstance(issue, dict):
+                conflicts.append(
+                    {
+                        "code": issue.get("code"),
+                        "message": issue.get("message"),
+                        "path": issue.get("path"),
+                        "operation_id": issue.get("operation_id"),
+                        "evidence": issue.get("evidence") or {},
+                    }
+                )
         for operation in patch_actions:
             normalized = str(operation.file_path or "").strip().replace("\\", "/")
             while normalized.startswith("./"):
@@ -103,6 +116,16 @@ class PatchService:
             "conflicts": conflicts,
             "files": files,
             "sandbox_report": sandbox_report,
+            "patch_sha256": validation_report.get("patch_sha256"),
+            "validation_report": validation_report,
+            "conflict_packet": PatchGrammarValidator.conflict_packet(
+                workspace_id=workspace_id,
+                run_id=run_id,
+                validation_report=validation_report,
+                conflict_reason=conflicts[0]["message"] if conflicts else None,
+            )
+            if conflicts
+            else None,
             "deterministic": True,
             "validation_before_apply": True,
         }

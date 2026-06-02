@@ -21,13 +21,18 @@ class SkillDependency(SkillApiModel):
 
 
 class SkillFrontmatter(SkillApiModel):
+    metadata_schema: str = "grounded.skill.v2"
     description: str | None = None
     whenToUse: list[str] = Field(default_factory=list)
+    trigger_rules: list[str] = Field(default_factory=list)
     paths: list[str] = Field(default_factory=list)
     allowedTools: list[str] = Field(default_factory=list)
     model: str = ""
     effort: str = ""
     validation: list[str] = Field(default_factory=list)
+    required_proof: list[str] = Field(default_factory=list)
+    incompatible_skills: list[str] = Field(default_factory=list)
+    output_expectations: list[str] = Field(default_factory=list)
     dependencies: list[SkillDependency] = Field(default_factory=list)
     invocationPolicy: SkillInvocationPolicy | None = None
 
@@ -50,13 +55,18 @@ class SkillDefinition(SkillApiModel):
     source: str
     activation: str = "skill_match"
     invocationPolicy: SkillInvocationPolicy = "explicit"
+    metadata_schema: str = "grounded.skill.v2"
     whenToUse: list[str] = Field(default_factory=list)
+    trigger_rules: list[str] = Field(default_factory=list)
     paths: list[str] = Field(default_factory=list)
     allowedTools: list[str] = Field(default_factory=list)
     model: str = ""
     effort: str = ""
     validation: list[str] = Field(default_factory=list)
     validation_hints: list[str] = Field(default_factory=list)
+    required_proof: list[str] = Field(default_factory=list)
+    incompatible_skills: list[str] = Field(default_factory=list)
+    output_expectations: list[str] = Field(default_factory=list)
     dependencies: list[SkillDependency] = Field(default_factory=list)
     constraints: list[str] = Field(default_factory=list)
     body: str = ""
@@ -73,6 +83,7 @@ class SkillSelection(SkillDefinition):
     explicit: bool = False
     dependency: bool = False
     body_budget_chars: int = 0
+    ranking: dict[str, Any] = Field(default_factory=dict)
 
 
 class SkillRegistryManifest(SkillApiModel):

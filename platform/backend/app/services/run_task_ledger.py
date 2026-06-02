@@ -148,13 +148,14 @@ class RunTaskLedger:
         blocker = cls._matching_blocker(task_id=task_id, item=item, issues=issues)
         proof = cls._proof_for_checks(proof_checks, by_check)
         explicit_status = cls._normalize_status(str(item.get("status") or ""))
-        status = explicit_status or cls._derived_status(
+        derived_status = cls._derived_status(
             run_status=run_status,
             current_stage=current_stage,
             proof_checks=proof_checks,
             proof=proof,
             blocker=blocker,
         )
+        status = derived_status if explicit_status == "planned" and derived_status == "completed" else explicit_status or derived_status
         title = str(
             item.get("title")
             or item.get("content")

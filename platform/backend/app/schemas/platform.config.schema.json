@@ -1,0 +1,567 @@
+{
+  "$defs": {
+    "BrowserProofConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "default": true,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "required_modes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Required Modes",
+          "type": "array"
+        },
+        "screenshot_modes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Screenshot Modes",
+          "type": "array"
+        },
+        "require_ui_steps_modes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Require Ui Steps Modes",
+          "type": "array"
+        },
+        "require_persisted_marker_modes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Require Persisted Marker Modes",
+          "type": "array"
+        },
+        "replay_artifacts": {
+          "default": true,
+          "title": "Replay Artifacts",
+          "type": "boolean"
+        },
+        "default_mobile_viewport": {
+          "$ref": "#/$defs/BrowserViewportConfig"
+        }
+      },
+      "title": "BrowserProofConfig",
+      "type": "object"
+    },
+    "BrowserViewportConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "width": {
+          "default": 390,
+          "minimum": 1,
+          "title": "Width",
+          "type": "integer"
+        },
+        "height": {
+          "default": 844,
+          "minimum": 1,
+          "title": "Height",
+          "type": "integer"
+        }
+      },
+      "title": "BrowserViewportConfig",
+      "type": "object"
+    },
+    "CheckConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "label": {
+          "title": "Label",
+          "type": "string"
+        },
+        "category": {
+          "enum": [
+            "static",
+            "api",
+            "browser",
+            "tests",
+            "visual",
+            "security",
+            "docs",
+            "export",
+            "observability",
+            "audit"
+          ],
+          "title": "Category",
+          "type": "string"
+        },
+        "blocking": {
+          "default": true,
+          "title": "Blocking",
+          "type": "boolean"
+        },
+        "proof_kind": {
+          "default": "",
+          "title": "Proof Kind",
+          "type": "string"
+        },
+        "required_for_modes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Required For Modes",
+          "type": "array"
+        },
+        "diagnostic_contract": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Diagnostic Contract",
+          "type": "array"
+        },
+        "repair_hint": {
+          "default": "",
+          "title": "Repair Hint",
+          "type": "string"
+        }
+      },
+      "required": [
+        "label",
+        "category"
+      ],
+      "title": "CheckConfig",
+      "type": "object"
+    },
+    "CompletionBudgetConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "time_limit_ms": {
+          "minimum": 1,
+          "title": "Time Limit Ms",
+          "type": "integer"
+        },
+        "token_limit": {
+          "minimum": 1,
+          "title": "Token Limit",
+          "type": "integer"
+        },
+        "turn_budget_cap": {
+          "minimum": 1,
+          "title": "Turn Budget Cap",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "time_limit_ms",
+        "token_limit",
+        "turn_budget_cap"
+      ],
+      "title": "CompletionBudgetConfig",
+      "type": "object"
+    },
+    "GenerationModeConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "default": true,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "label": {
+          "title": "Label",
+          "type": "string"
+        },
+        "objective": {
+          "title": "Objective",
+          "type": "string"
+        },
+        "required_checks": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Required Checks",
+          "type": "array"
+        },
+        "optional_checks": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Optional Checks",
+          "type": "array"
+        },
+        "proof_requirements": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Proof Requirements",
+          "type": "array"
+        },
+        "final_gate": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Final Gate",
+          "type": "array"
+        },
+        "context_policy": {
+          "default": "standard",
+          "title": "Context Policy",
+          "type": "string"
+        },
+        "worker_policy": {
+          "default": "serial",
+          "title": "Worker Policy",
+          "type": "string"
+        },
+        "max_repair_attempts": {
+          "default": 1,
+          "minimum": 0,
+          "title": "Max Repair Attempts",
+          "type": "integer"
+        },
+        "audit_level": {
+          "default": "light",
+          "enum": [
+            "none",
+            "light",
+            "standard",
+            "deep",
+            "release"
+          ],
+          "title": "Audit Level",
+          "type": "string"
+        },
+        "output_style": {
+          "default": "concise",
+          "title": "Output Style",
+          "type": "string"
+        },
+        "completion_budget": {
+          "$ref": "#/$defs/CompletionBudgetConfig"
+        }
+      },
+      "required": [
+        "label",
+        "objective",
+        "completion_budget"
+      ],
+      "title": "GenerationModeConfig",
+      "type": "object"
+    },
+    "ModelCapabilityConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "provider": {
+          "default": "openai",
+          "title": "Provider",
+          "type": "string"
+        },
+        "context_window": {
+          "default": 128000,
+          "minimum": 1,
+          "title": "Context Window",
+          "type": "integer"
+        },
+        "supports_tools": {
+          "default": true,
+          "title": "Supports Tools",
+          "type": "boolean"
+        },
+        "supports_structured_output": {
+          "default": true,
+          "title": "Supports Structured Output",
+          "type": "boolean"
+        },
+        "supports_reasoning": {
+          "default": false,
+          "title": "Supports Reasoning",
+          "type": "boolean"
+        },
+        "cost_tier": {
+          "default": "unknown",
+          "title": "Cost Tier",
+          "type": "string"
+        },
+        "roles": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Roles",
+          "type": "array"
+        }
+      },
+      "title": "ModelCapabilityConfig",
+      "type": "object"
+    },
+    "ModelProfileConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "label": {
+          "title": "Label",
+          "type": "string"
+        },
+        "provider": {
+          "default": "openai",
+          "title": "Provider",
+          "type": "string"
+        },
+        "description": {
+          "default": "",
+          "title": "Description",
+          "type": "string"
+        },
+        "routing": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Routing",
+          "type": "object"
+        },
+        "default": {
+          "type": "boolean",
+          "default": false,
+          "title": "Default"
+        },
+        "fallbacks": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "title": "Fallbacks",
+          "type": "object"
+        }
+      },
+      "required": [
+        "label"
+      ],
+      "title": "ModelProfileConfig",
+      "type": "object"
+    },
+    "ModelProviderConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "label": {
+          "default": "",
+          "title": "Label",
+          "type": "string"
+        },
+        "enabled_env": {
+          "title": "Enabled Env",
+          "type": "string"
+        },
+        "base_url_env": {
+          "default": "",
+          "title": "Base Url Env",
+          "type": "string"
+        },
+        "default_base_url": {
+          "default": "",
+          "title": "Default Base Url",
+          "type": "string"
+        },
+        "models": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Models",
+          "type": "array"
+        }
+      },
+      "required": [
+        "enabled_env"
+      ],
+      "title": "ModelProviderConfig",
+      "type": "object"
+    },
+    "SkillActivationConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "default": true,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "roots": {
+          "$ref": "#/$defs/SkillRootConfig"
+        },
+        "max_selected_by_mode": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "title": "Max Selected By Mode",
+          "type": "object"
+        },
+        "required_skills_by_mode": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "title": "Required Skills By Mode",
+          "type": "object"
+        },
+        "activation_budget_by_mode": {
+          "additionalProperties": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object"
+          },
+          "title": "Activation Budget By Mode",
+          "type": "object"
+        }
+      },
+      "title": "SkillActivationConfig",
+      "type": "object"
+    },
+    "SkillRootConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "system": {
+          "default": true,
+          "title": "System",
+          "type": "boolean"
+        },
+        "repo": {
+          "default": true,
+          "title": "Repo",
+          "type": "boolean"
+        },
+        "plugin": {
+          "default": true,
+          "title": "Plugin",
+          "type": "boolean"
+        },
+        "user": {
+          "default": true,
+          "title": "User",
+          "type": "boolean"
+        }
+      },
+      "title": "SkillRootConfig",
+      "type": "object"
+    },
+    "SlaConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "default_mode": {
+          "default": "balanced",
+          "title": "Default Mode",
+          "type": "string"
+        },
+        "full_audit_modes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Full Audit Modes",
+          "type": "array"
+        },
+        "visual_snapshot_modes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Visual Snapshot Modes",
+          "type": "array"
+        },
+        "quality_like_modes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Quality Like Modes",
+          "type": "array"
+        },
+        "second_queue": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Second Queue",
+          "type": "array"
+        },
+        "compatibility": {
+          "additionalProperties": true,
+          "title": "Compatibility",
+          "type": "object"
+        }
+      },
+      "title": "SlaConfig",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "default": "grounded.platform_config.v1",
+      "title": "Schema",
+      "type": "string"
+    },
+    "version": {
+      "default": 1,
+      "title": "Version",
+      "type": "integer"
+    },
+    "generation_modes": {
+      "additionalProperties": {
+        "$ref": "#/$defs/GenerationModeConfig"
+      },
+      "title": "Generation Modes",
+      "type": "object"
+    },
+    "checks": {
+      "additionalProperties": {
+        "$ref": "#/$defs/CheckConfig"
+      },
+      "title": "Checks",
+      "type": "object"
+    },
+    "providers": {
+      "additionalProperties": {
+        "$ref": "#/$defs/ModelProviderConfig"
+      },
+      "title": "Providers",
+      "type": "object"
+    },
+    "model_capabilities": {
+      "additionalProperties": {
+        "$ref": "#/$defs/ModelCapabilityConfig"
+      },
+      "title": "Model Capabilities",
+      "type": "object"
+    },
+    "model_profiles": {
+      "additionalProperties": {
+        "$ref": "#/$defs/ModelProfileConfig"
+      },
+      "title": "Model Profiles",
+      "type": "object"
+    },
+    "default_profile_by_mode": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "title": "Default Profile By Mode",
+      "type": "object"
+    },
+    "skill_activation": {
+      "$ref": "#/$defs/SkillActivationConfig"
+    },
+    "browser_proof": {
+      "$ref": "#/$defs/BrowserProofConfig"
+    },
+    "sla": {
+      "$ref": "#/$defs/SlaConfig"
+    }
+  },
+  "required": [
+    "generation_modes",
+    "checks",
+    "providers",
+    "model_capabilities",
+    "model_profiles",
+    "default_profile_by_mode",
+    "skill_activation",
+    "browser_proof",
+    "sla"
+  ],
+  "title": "Grounded Platform Product Configuration",
+  "type": "object",
+  "$id": "https://grounded.local/schemas/platform.config.schema.json"
+}

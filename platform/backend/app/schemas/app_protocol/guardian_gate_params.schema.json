@@ -1,0 +1,28 @@
+{
+  "$id": "https://grounded.local/schemas/app_protocol/guardian_gate_params.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "semantic_override": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Semantic Override"
+    }
+  },
+  "required": [
+    "run_id"
+  ],
+  "title": "GuardianGateParams",
+  "type": "object"
+}

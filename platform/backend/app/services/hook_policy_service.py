@@ -24,14 +24,28 @@ from app.repositories.state_store import StateStore
 
 
 SUPPORTED_HOOKS = [
+    "session_start",
+    "user_prompt_submit",
+    "before_run",
+    "after_run",
     "pre_tool_use",
     "post_tool_use",
     "post_tool_use_failure",
+    "permission_request",
+    "stop",
     "before_apply",
+    "after_apply",
+    "before_checks",
     "after_checks",
     "on_check_failed",
+    "pre_apply_patch",
+    "post_apply_patch",
+    "post_browser_verify",
+    "after_gate",
+    "on_memory_update",
+    "on_export",
 ]
-SUPPORTED_ACTIONS = ["block", "add_context", "tag"]
+SUPPORTED_ACTIONS = ["block", "add_context", "tag", "request_permission"]
 SUPPORTED_CONDITIONS = [
     "hook",
     "tool",
@@ -59,6 +73,29 @@ SECRET_VALUE_PATTERNS = (
     re.compile(r"\bghp_[A-Za-z0-9_]{30,}\b"),
     re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{20,}\b"),
 )
+
+HOOK_PAYLOAD_SCHEMAS: dict[str, dict[str, Any]] = {
+    "session_start": {"required": ["workspace_id", "run_id"], "properties": {"workspace_id": {"type": "string"}, "run_id": {"type": "string"}}},
+    "user_prompt_submit": {"required": ["prompt"], "properties": {"prompt": {"type": "string"}, "mode": {"type": "string"}, "generation_mode": {"type": "string"}}},
+    "pre_tool_use": {"required": ["tool", "risk"], "properties": {"tool": {"type": "string"}, "model_tool": {"type": "string"}, "risk": {"type": "string"}, "input": {"type": "object"}}},
+    "post_tool_use": {"required": ["tool", "status"], "properties": {"tool": {"type": "string"}, "status": {"type": "string"}}},
+    "permission_request": {"required": ["reason"], "properties": {"reason": {"type": "string"}, "tool": {"type": "string"}, "risk": {"type": "string"}}},
+    "stop": {"required": ["reason"], "properties": {"reason": {"type": "string"}, "status": {"type": "string"}}},
+}
+HOOK_OUTPUT_SCHEMA: dict[str, Any] = {
+    "schema": "grounded.hook_output.schema.v1",
+    "type": "object",
+    "properties": {
+        "schema": {"const": "grounded.hook_output.v1"},
+        "should_block": {"type": "boolean"},
+        "block_reason": {"type": "string"},
+        "added_contexts": {"type": "array", "items": {"type": "object"}},
+        "additional_contexts": {"type": "array", "items": {"type": "string"}},
+        "tags": {"type": "object"},
+        "permission_request": {"type": "object"},
+        "metadata": {"type": "object"},
+    },
+}
 
 
 class HookPolicyService:
@@ -115,6 +152,17 @@ class HookPolicyService:
             "supported_actions": SUPPORTED_ACTIONS,
             "supported_conditions": SUPPORTED_CONDITIONS,
             "caps": self.caps,
+            "runtime": {
+                "schema": "grounded.hook_runtime_manifest.v1",
+                "payload_schema_version": "grounded.hook_payload.v1",
+                "output_schema": HOOK_OUTPUT_SCHEMA,
+                "payload_schemas": HOOK_PAYLOAD_SCHEMAS,
+                "context_injection": {
+                    "field": "added_contexts",
+                    "targets": ["next_turn", "repair_turn", "system_context"],
+                    "max_context_chars": MAX_CONTEXT_CHARS,
+                },
+            },
             "builtin_policy": self._builtin_policy.model_dump(mode="json", by_alias=True),
             "project_policy_path": str(self.project_policy_path) if self.project_policy_path else None,
             "project_policy": project_policy.model_dump(mode="json", by_alias=True),
@@ -186,6 +234,8 @@ class HookPolicyService:
                         )
                     elif action.kind == "tag":
                         tags[rule.rule_id] = dict(action.metadata or {})
+                    elif action.kind == "request_permission":
+                        tags[rule.rule_id] = {"permission_request": dict(action.metadata or {}), "reason": action.reason}
         contexts = sorted(contexts, key=lambda item: item.priority, reverse=True)[:20]
         return HookEvaluation(
             trace_id=f"hook_eval_{uuid4().hex}",
@@ -327,6 +377,8 @@ class HookPolicyService:
                 issues.append(HookValidationIssue(source=rule.source, rule_id=rule.rule_id, code="block_reason_missing", message="Block actions require a reason."))
             if action.kind == "add_context" and not (action.text or "").strip():
                 issues.append(HookValidationIssue(source=rule.source, rule_id=rule.rule_id, code="context_missing", message="add_context actions require text."))
+            if action.kind == "request_permission" and not (action.reason or action.metadata):
+                issues.append(HookValidationIssue(source=rule.source, rule_id=rule.rule_id, code="permission_request_missing", message="request_permission actions require a reason or metadata."))
             if action.reason and len(action.reason) > MAX_REASON_CHARS:
                 issues.append(HookValidationIssue(source=rule.source, rule_id=rule.rule_id, code="reason_too_large", message="Block reason exceeds hook cap."))
             if action.text and len(action.text) > MAX_CONTEXT_CHARS:

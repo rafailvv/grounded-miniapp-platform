@@ -58,6 +58,9 @@ class ApplyPatchResult(StrictModel):
     base_revision_id: str | None = None
     status: Literal["applied", "conflict", "blocked", "failed"] = "blocked"
     conflict_reason: str | None = None
+    patch_sha256: str | None = None
+    validation_report: dict[str, Any] | None = None
+    conflict_packet: dict[str, Any] | None = None
     changed_files: list[str] = Field(default_factory=list)
     revision_id: str | None = None
     applied_at: datetime = Field(default_factory=utc_now)

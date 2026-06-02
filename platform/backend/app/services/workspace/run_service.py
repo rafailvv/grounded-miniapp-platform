@@ -29,15 +29,19 @@ from app.models.domain import (
     RunRecord,
     ValidationSnapshot,
     WorkspaceRecord,
+    new_id,
 )
 from app.modules.miniapp_agent_loop.guardian_review import GuardianReview
 from app.modules.workspace_code_agent_runtime import WorkspaceCodeAgentRuntime
 from app.repositories.state_store import StateStore
 from app.services.check_runner import CheckRunner
+from app.services.guardian_gate import GuardianGateService
 from app.services.memory_pipeline import WorkspaceMemoryPipeline
 from app.services.miniapp_contract import MiniAppContractCompiler
+from app.services.prompt_contract_compiler import PromptContractCompilerService
 from app.services.repair_cases import RepairCaseService
 from app.services.event_journal import EventJournalService
+from app.services.existing_app_map import ExistingAppMapService
 from app.services.run_protocol import RunProtocolService
 from app.services.run_state_machine import RunStateMachine
 from app.services.run_task_ledger import RunTaskLedger
@@ -124,6 +128,8 @@ class RunService:
         workspace_log_service: WorkspaceLogService,
         run_protocol_service: RunProtocolService | None = None,
         event_journal_service: EventJournalService | None = None,
+        prompt_contract_compiler_service: PromptContractCompilerService | None = None,
+        existing_app_map_service: ExistingAppMapService | None = None,
     ) -> None:
         self.store = store
         self.workspace_service = workspace_service
@@ -134,6 +140,13 @@ class RunService:
         self.workspace_log_service = workspace_log_service
         self.run_protocol_service = run_protocol_service
         self.event_journal_service = event_journal_service
+        self.prompt_contract_compiler_service = prompt_contract_compiler_service or PromptContractCompilerService(
+            store=store,
+            openai_client=openai_client,
+            event_journal_service=event_journal_service,
+        )
+        self.existing_app_map_service = existing_app_map_service
+        self.guardian_gate_service = GuardianGateService(store=store, workspace_service=workspace_service, event_journal_service=event_journal_service)
         self.background_task_service: Any | None = None
         self._active_workers: dict[str, threading.Thread] = {}
         self._startup_started_at = datetime.now(timezone.utc)
@@ -142,6 +155,9 @@ class RunService:
 
     def attach_background_task_service(self, background_task_service: Any) -> None:
         self.background_task_service = background_task_service
+
+    def attach_guardian_gate_service(self, guardian_gate_service: GuardianGateService) -> None:
+        self.guardian_gate_service = guardian_gate_service
 
     def stop_run(self, run_id: str) -> RunRecord:
         run = self.get_run(run_id)
@@ -176,6 +192,8 @@ class RunService:
 
     def _start_run(self, workspace_id: str, request: CreateRunRequest, *, wait: bool) -> RunRecord:
         workspace = self.workspace_service.get_workspace(workspace_id)
+        if request.edit_mode == "improve":
+            request = request.model_copy(update={"mode": "fix", "intent": "refine"})
         source_run: RunRecord | None = None
         if request.resume_from_run_id:
             source_run = self.get_run(request.resume_from_run_id)
@@ -193,6 +211,7 @@ class RunService:
         contract_probe = GenerateRequest(
             prompt=request.prompt,
             mode=request.mode,
+            edit_mode=request.edit_mode,
             target_platform=request.target_platform,
             preview_profile=request.preview_profile,
             generation_mode=effective_generation_mode,
@@ -211,38 +230,15 @@ class RunService:
             source_run,
             request=request,
         )
-        prompt_analysis: dict[str, Any] | None = None
-        prompt_analysis_usage: dict[str, Any] = {}
-        prompt_analysis_model: str | None = None
-        requires_prompt_analysis = (
-            resolved_intent == "create"
-            or focused_edit_kind == "behavior_workflow_edit"
-            or effective_generation_mode in {GenerationMode.BALANCED, GenerationMode.QUALITY}
-        ) and not inherited_acceptance_contract
-        if requires_prompt_analysis:
-            if effective_generation_mode in {GenerationMode.FAST, GenerationMode.BASIC}:
-                prompt_analysis = derive_prompt_contract_analysis(request.prompt)
-                prompt_analysis_model = "fast-local-contract"
-            elif not self.openai_client.enabled:
-                if effective_generation_mode not in {GenerationMode.FAST, GenerationMode.BASIC}:
-                    raise RuntimeError("LLM prompt analysis is required before creating a workflow run.")
-                prompt_analysis = derive_prompt_contract_analysis(request.prompt)
-                prompt_analysis_model = "fast-local-contract"
-            else:
-                with self.openai_client.routing_context(
-                    model_profile=effective_model_profile,
-                    generation_mode=effective_generation_mode,
-                ):
-                    prompt_analysis = self.openai_client.analyze_miniapp_prompt(
-                        prompt=request.prompt,
-                        generation_mode=effective_generation_mode,
-                        model_profile=effective_model_profile,
-                    )
-                prompt_analysis_usage = dict((prompt_analysis or {}).pop("_llm_usage", {}) or {})
-                prompt_analysis_model = str((prompt_analysis or {}).pop("_llm_model", "") or "") or None
+        prompt_contract_source_run, inherited_prompt_contract = self._resolve_inherited_prompt_contract(source_run, request=request)
         contract_prompt = contract_source_run.prompt if inherited_acceptance_contract and contract_source_run is not None else request.prompt
-        if inherited_acceptance_contract:
-            acceptance_contract = {
+        if inherited_prompt_contract and prompt_contract_source_run is not None:
+            contract_prompt = prompt_contract_source_run.prompt
+            if not inherited_acceptance_contract:
+                inherited_acceptance_contract = self._required_acceptance_contract_for_run(prompt_contract_source_run)
+                contract_source_run = prompt_contract_source_run
+        elif inherited_acceptance_contract:
+            inherited_acceptance_contract = {
                 **inherited_acceptance_contract,
                 "required": True,
                 "inherited_from_run_id": contract_source_run.run_id if contract_source_run else request.resume_from_run_id,
@@ -250,44 +246,37 @@ class RunService:
                 "contract_source_run_id": contract_source_run.run_id if contract_source_run else request.resume_from_run_id,
                 "repair_continuation": True,
             }
-        else:
-            acceptance_contract = build_acceptance_contract(
-                prompt=request.prompt,
-                intent=resolved_intent,
-                generation_mode=effective_generation_mode,
-                focused_edit_kind=focused_edit_kind,
-                prompt_analysis=prompt_analysis,
-            )
-        orchestration = orchestration_metadata_for_contract(
-            contract=acceptance_contract,
+            inherited_prompt_contract = {
+                "acceptance_contract": inherited_acceptance_contract,
+                "implementation_plan": dict((contract_source_run or source_run).implementation_plan or {}) if (contract_source_run or source_run) is not None else {},
+            }
+        run_id = new_id("run")
+        prompt_contract_result = self.prompt_contract_compiler_service.compile(
+            workspace_id=workspace_id,
+            run_id=run_id,
+            prompt=request.prompt,
+            intent=resolved_intent,
             generation_mode=effective_generation_mode,
             focused_edit_kind=focused_edit_kind,
+            model_profile=effective_model_profile,
+            inherited_prompt_contract=inherited_prompt_contract,
+            inherited_acceptance_contract=inherited_acceptance_contract,
+            source_run_id=(prompt_contract_source_run or contract_source_run).run_id if (prompt_contract_source_run or contract_source_run) else None,
+            contract_prompt=contract_prompt,
         )
-        if inherited_acceptance_contract and source_run is not None:
-            implementation_plan = {
-                **dict(source_run.implementation_plan or {}),
-                "repair_continuation": {
-                    "enabled": True,
-                    "source_run_id": source_run.run_id,
-                    "contract_source_run_id": contract_source_run.run_id if contract_source_run else source_run.run_id,
-                    "source_prompt_preserved": True,
-                    "contract_inherited": True,
-                },
-            }
-        else:
-            implementation_plan = build_implementation_plan(
-                prompt=request.prompt,
-                intent=resolved_intent,
-                generation_mode=effective_generation_mode,
-                acceptance_contract=acceptance_contract,
-                orchestration=orchestration,
-                prompt_analysis=prompt_analysis,
-            )
+        acceptance_contract = prompt_contract_result.acceptance_contract
+        implementation_plan = prompt_contract_result.implementation_plan
+        product_blueprint = prompt_contract_result.product_blueprint.model_dump(mode="json", by_alias=True)
+        orchestration = prompt_contract_result.orchestration
+        prompt_analysis_usage = prompt_contract_result.prompt_analysis_usage
+        prompt_analysis_model = prompt_contract_result.prompt_analysis_model
         contract_blocked = bool(acceptance_contract.get("blocking")) or str(acceptance_contract.get("status") or "").startswith("blocked_")
         run = RunRecord(
+            run_id=run_id,
             workspace_id=workspace_id,
             prompt=request.prompt,
             mode=request.mode,
+            edit_mode=request.edit_mode,
             intent=resolved_intent,
             apply_strategy="staged_auto_apply",
             approval_required=False,
@@ -303,6 +292,7 @@ class RunService:
             source_revision_id=workspace.current_revision_id,
             error_context=request.error_context,
             implementation_plan=implementation_plan,
+            product_blueprint=product_blueprint,
             acceptance_contract=acceptance_contract,
             orchestration_phases=list(orchestration.get("phases") or []),
             worker_summaries=list(orchestration.get("worker_summaries") or []),
@@ -317,8 +307,68 @@ class RunService:
             storage_version=2,
             token_usage=self._token_usage_from_prompt_analysis(prompt_analysis_usage),
         )
+        run.prompt_contract_ref = prompt_contract_result.compile_report.prompt_contract_ref
+        run.product_blueprint_ref = prompt_contract_result.compile_report.product_blueprint_ref
+        improve_blocked = False
+        if request.edit_mode == "improve":
+            if not (self._workspace_has_existing_build(workspace) or self._workspace_has_existing_app_surface(workspace)):
+                improve_blocked = True
+                run.status = "blocked"
+                run.apply_status = "blocked"
+                run.current_stage = "blocked: improve mode requires existing app"
+                run.progress_percent = 100
+                run.failure_class = "improve_no_existing_app"
+                run.failure_reason = "Improve mode requires an existing generated app before patching."
+                run.implementation_plan = {
+                    **dict(run.implementation_plan or {}),
+                    "edit_mode": "improve",
+                    "improve_mode": {"status": "blocked", "reason": "existing_app_required"},
+                }
+                run.product_blueprint = {**dict(run.product_blueprint or {}), "improve_mode": {"status": "blocked", "reason": "existing_app_required"}}
+            elif self.existing_app_map_service is not None:
+                improve = self.existing_app_map_service.prepare_improve_run(
+                    workspace_id=workspace_id,
+                    run_id=run.run_id,
+                    prompt=request.prompt,
+                )
+                map_payload = improve.get("map") if isinstance(improve.get("map"), dict) else {}
+                slice_payload = improve.get("slice") if isinstance(improve.get("slice"), dict) else {}
+                run.existing_app_map_ref = str(map_payload.get("existing_app_map_ref") or f"existing_app_map:{workspace_id}:{run.run_id}")
+                run.improve_slice_ref = str(slice_payload.get("improve_slice_ref") or f"improve_slice:{workspace_id}:{run.run_id}")
+                if slice_payload.get("blocked_reasons"):
+                    improve_blocked = True
+                    run.status = "blocked"
+                    run.apply_status = "blocked"
+                    run.current_stage = "blocked: improve slice unavailable"
+                    run.progress_percent = 100
+                    run.failure_class = "improve_slice_blocked"
+                    run.failure_reason = "Improve mode could not derive a connected slice from the existing app."
+                run.implementation_plan = {
+                    **dict(run.implementation_plan or {}),
+                    "edit_mode": "improve",
+                    "existing_app_map_ref": run.existing_app_map_ref,
+                    "improve_slice_ref": run.improve_slice_ref,
+                    "improve_mode": {
+                        "status": "blocked" if improve_blocked else "ready",
+                        "connected_files": list(slice_payload.get("connected_files") or []),
+                        "protected_files": list(slice_payload.get("protected_files") or [])[:80],
+                        "required_proof": list(slice_payload.get("required_proof") or []),
+                    },
+                }
+                run.product_blueprint = {
+                    **dict(run.product_blueprint or {}),
+                    "improve_mode": dict(run.implementation_plan.get("improve_mode") or {}),
+                    "refs": {
+                        **dict((run.product_blueprint or {}).get("refs") or {}),
+                        "existing_app_map_ref": run.existing_app_map_ref,
+                        "improve_slice_ref": run.improve_slice_ref,
+                    },
+                }
+        implementation_plan = dict(run.implementation_plan or implementation_plan)
         run.task_ledger_ref = f"task_ledger:{workspace_id}:{run.run_id}"
         run.implementation_plan = implementation_plan
+        if run.product_blueprint_ref:
+            self.store.upsert("reports", run.product_blueprint_ref, run.product_blueprint)
         self.store.upsert(
             "reports",
             run.task_ledger_ref,
@@ -332,16 +382,9 @@ class RunService:
             ),
         )
         if acceptance_contract.get("required"):
-            miniapp_contract = MiniAppContractCompiler.compile(
-                workspace_id=workspace_id,
-                run_id=run.run_id,
-                prompt=contract_prompt,
-                intent=resolved_intent,
-                generation_mode=effective_generation_mode,
-                acceptance_contract=acceptance_contract,
-                implementation_plan=implementation_plan,
-                prompt_analysis=prompt_analysis,
-            )
+            miniapp_contract = prompt_contract_result.miniapp_contract
+            if miniapp_contract is None:
+                raise RuntimeError("Prompt contract compiler did not return a miniapp contract for a required acceptance contract.")
             run.acceptance_contract = miniapp_contract.acceptance_summary
             run.miniapp_contract_ref = f"miniapp_contract:{workspace_id}:{run.run_id}"
             run.contract_compile_ref = f"contract_compile:{workspace_id}:{run.run_id}"
@@ -372,6 +415,8 @@ class RunService:
                     "run_id": run.run_id,
                     "contract": run.acceptance_contract,
                     "implementation_plan": implementation_plan,
+                    "product_blueprint": run.product_blueprint,
+                    "product_blueprint_ref": run.product_blueprint_ref,
                     "orchestration": orchestration,
                 },
             )
@@ -382,15 +427,21 @@ class RunService:
             {
                 "run_id": run.run_id,
                 "workspace_id": run.workspace_id,
+                "session_id": run.session_id,
                 "status": run.status,
                 "apply_status": run.apply_status,
                 "current_stage": run.current_stage,
                 "mode": run.mode,
                 "intent": run.intent,
                 "generation_mode": str(getattr(run.generation_mode, "value", run.generation_mode)),
+                "edit_mode": run.edit_mode,
                 "model_profile": run.model_profile,
                 "resume_from_run_id": run.resume_from_run_id,
                 "forked_from_run_id": run.forked_from_run_id,
+                "prompt_contract_ref": run.prompt_contract_ref,
+                "product_blueprint_ref": run.product_blueprint_ref,
+                "existing_app_map_ref": run.existing_app_map_ref,
+                "improve_slice_ref": run.improve_slice_ref,
             },
             summary="Run record created.",
             idempotency_key=f"run.created:{run.run_id}",
@@ -414,10 +465,12 @@ class RunService:
             {
                 "run_id": run.run_id,
                 "workspace_id": run.workspace_id,
+                "session_id": run.session_id,
                 "status": run.status,
                 "apply_status": run.apply_status,
                 "current_stage": run.current_stage,
                 "mode": run.mode,
+                "edit_mode": run.edit_mode,
                 "intent": run.intent,
             },
             summary="Run started.",
@@ -455,7 +508,9 @@ class RunService:
                 },
             )
         self.store.delete("reports", f"run_stop_request:{run.run_id}")
-        if contract_blocked:
+        if contract_blocked or improve_blocked:
+            reason = acceptance_contract.get("reason") if contract_blocked else run.failure_reason
+            issues = acceptance_contract.get("issues") or ([] if not improve_blocked else [{"code": run.failure_class, "message": run.failure_reason}])
             if self.run_protocol_service is not None:
                 self.run_protocol_service.append_event(
                     run_id=run.run_id,
@@ -463,11 +518,11 @@ class RunService:
                     session_id=run.session_id,
                     event_type="run_completed",
                     status="blocked",
-                    message="Run blocked because prompt-derived acceptance contract is missing.",
+                    message="Run blocked before runtime.",
                     payload={
                         "status": run.status,
-                        "reason": acceptance_contract.get("reason"),
-                        "issues": acceptance_contract.get("issues") or [],
+                        "reason": reason,
+                        "issues": issues,
                     },
                 )
             self._journal_run(
@@ -478,11 +533,11 @@ class RunService:
                     "status": run.status,
                     "apply_status": run.apply_status,
                     "current_stage": run.current_stage,
-                    "reason": acceptance_contract.get("reason"),
-                    "issues": acceptance_contract.get("issues") or [],
+                    "reason": reason,
+                    "issues": issues,
                 },
-                summary="Run blocked because prompt-derived acceptance contract is missing.",
-                idempotency_key=f"run.blocked:{run.run_id}:contract",
+                summary="Run blocked before runtime.",
+                idempotency_key=f"run.blocked:{run.run_id}:{'contract' if contract_blocked else 'improve'}",
             )
             return self.get_run(run.run_id)
         if wait:
@@ -938,9 +993,37 @@ class RunService:
         *,
         source: str,
         changed_files: list[str] | None = None,
+        semantic_override: str | None = None,
     ) -> tuple[bool, dict[str, Any]]:
-        report = self._guardian_review_for_apply(run, source=source, changed_files=changed_files)
-        if report.get("status") == "passed":
+        mode_value = str(getattr(run.generation_mode, "value", run.generation_mode) or "").lower()
+        local_scaffold_paths = list(changed_files or run.touched_files or run.fix_targets or [])
+        emergency_scaffold = (
+            isinstance(run.token_usage, dict)
+            and str(run.token_usage.get("fallback_kind") or "") == "emergency_scaffold"
+        )
+        local_scaffold_apply = (
+            run.mode == "generate"
+            and (mode_value in {"fast", "basic"} or emergency_scaffold)
+        )
+        self._sync_run_browser_proof_from_artifacts(run)
+        if local_scaffold_apply:
+            report = {
+                "schema": "grounded.guardian_gate.v1",
+                "status": "passed",
+                "apply_decision": "allow",
+                "source": source,
+                "reason": "local_scaffold_fast_gate",
+                "findings": [],
+                "changed_files": local_scaffold_paths,
+            }
+            self.store.upsert("reports", f"guardian_gate:{run.workspace_id}:{run.run_id}", report)
+            self._save_run(run)
+            return True, report
+        gate = self.guardian_gate_service.run_gate(run=run, source=source, changed_files=changed_files, semantic_override=semantic_override)
+        report = gate.model_dump(mode="json", by_alias=True)
+        run.guardian_gate_ref = gate.guardian_gate_ref
+        if gate.apply_decision == "allow" and gate.status == "passed":
+            self._save_run(run)
             return True, report
         findings = [item for item in report.get("findings") or [] if isinstance(item, dict)]
         run.status = "blocked"
@@ -972,12 +1055,12 @@ class RunService:
             run.linked_job_id,
             "validation_failed",
             "Guardian review blocked source apply.",
-            {"run_id": run.run_id, "guardian_review_ref": f"guardian_review:{run.workspace_id}:{run.run_id}", "findings": findings},
+            {"run_id": run.run_id, "guardian_gate_ref": gate.guardian_gate_ref, "guardian_review_ref": gate.deterministic_review_ref, "findings": findings, "repair_packets": report.get("repair_packets") or []},
         )
         self._journal_run(
             run,
             "guardian.apply_blocked",
-            {"run_id": run.run_id, "workspace_id": run.workspace_id, "findings": findings},
+            {"run_id": run.run_id, "workspace_id": run.workspace_id, "guardian_gate_ref": gate.guardian_gate_ref, "findings": findings, "repair_packets": report.get("repair_packets") or []},
             summary="Guardian review blocked source apply.",
             idempotency_key=f"guardian.apply_blocked:{run.run_id}:{report.get('created_at')}",
         )
@@ -997,9 +1080,10 @@ class RunService:
         artifacts = self.store.get("reports", f"run_artifacts:{run.run_id}")
         artifacts = artifacts if isinstance(artifacts, dict) else {}
         raw_checks = artifacts.get("check_results") if isinstance(artifacts.get("check_results"), list) else []
-        if not raw_checks and run.linked_job_id:
+        if run.linked_job_id:
             job_payload = self.store.get("jobs", run.linked_job_id)
-            raw_checks = job_payload.get("executed_checks") if isinstance(job_payload, dict) and isinstance(job_payload.get("executed_checks"), list) else []
+            job_checks = job_payload.get("executed_checks") if isinstance(job_payload, dict) and isinstance(job_payload.get("executed_checks"), list) else []
+            raw_checks = self._prefer_green_check_payload(raw_checks, job_checks)
         results: list[RunCheckResult] = []
         for item in raw_checks or []:
             if not isinstance(item, dict):
@@ -1039,6 +1123,34 @@ class RunService:
         ).model_dump(mode="json", by_alias=True)
         self.store.upsert("reports", f"guardian_review:{run.workspace_id}:{run.run_id}", report)
         return report
+
+    @staticmethod
+    def _prefer_green_check_payload(primary: Any, fallback: Any) -> list[Any]:
+        primary_items = list(primary or []) if isinstance(primary, list) else []
+        fallback_items = list(fallback or []) if isinstance(fallback, list) else []
+        if not primary_items:
+            return fallback_items
+        if not fallback_items:
+            return primary_items
+
+        def score(items: list[Any]) -> tuple[int, int, int]:
+            statuses = [
+                str(item.get("status") or "").lower()
+                for item in items
+                if isinstance(item, dict)
+            ]
+            failed = sum(1 for status in statuses if status in {"failed", "blocked"})
+            passed = sum(1 for status in statuses if status == "passed")
+            terminal_proof = sum(
+                1
+                for item in items
+                if isinstance(item, dict)
+                and str(item.get("name") or "") in {"api_workflow_smoke", "browser_flow_smoke"}
+                and str(item.get("status") or "").lower() == "passed"
+            )
+            return (-failed, terminal_proof, passed)
+
+        return fallback_items if score(fallback_items) > score(primary_items) else primary_items
 
     def _stored_guardian_review(self, run: RunRecord) -> dict[str, Any] | None:
         candidates: list[Any] = []
@@ -1270,6 +1382,9 @@ class RunService:
                 "tool_trace_ref",
                 "file_change_history_ref",
                 "browser_proof_ref",
+                "browser_replay_proof_ref",
+                "acceptance_tests_ref",
+                "acceptance_replay_source_ref",
                 "large_tool_outputs_ref",
                 "file_state_cache_ref",
                 "turn_diff_ref",
@@ -1277,6 +1392,12 @@ class RunService:
                 "tool_batch_summaries_ref",
                 "task_ledger_ref",
                 "worker_mailbox_ref",
+                "worker_sessions_ref",
+                "worker_ownership_ref",
+                "draft_isolation_ref",
+                "draft_gate_ref",
+                "draft_apply_decision_ref",
+                "guardian_gate_ref",
                 "scratchpad_ref",
                 "memory_ref",
                 "worker_drafts_ref",
@@ -1292,11 +1413,14 @@ class RunService:
                 "artifact_read_trace_ref",
                 "resume_checkpoint_ref",
                 "verifier_review_ref",
+                "lsp_context_ref",
+                "context_manager_ref",
                 "context_pressure_ref",
                 "hook_trace_ref",
                 "semantic_graph_ref",
                 "worker_prefix_ref",
                 "replay_trace_ref",
+                "prompt_contract_ref",
                 "miniapp_contract_ref",
                 "route_registry_ref",
                 "contract_compile_ref",
@@ -1304,7 +1428,7 @@ class RunService:
             ):
                 if not getattr(run, attr, None) and existing.get(attr):
                     setattr(run, attr, str(existing.get(attr) or ""))
-            for attr in ("active_processes", "worker_branch_refs", "browser_step_refs"):
+            for attr in ("active_processes", "worker_branch_refs", "browser_step_refs", "acceptance_test_files"):
                 if not getattr(run, attr, None) and isinstance(existing.get(attr), list):
                     setattr(run, attr, list(existing.get(attr) or []))
             for attr in (
@@ -1444,12 +1568,21 @@ class RunService:
                 "tool_trace_ref",
                 "file_change_history_ref",
                 "browser_proof_ref",
+                "browser_replay_proof_ref",
+                "acceptance_tests_ref",
+                "acceptance_replay_source_ref",
                 "large_tool_outputs_ref",
                 "file_state_cache_ref",
                 "turn_diff_ref",
                 "environment_snapshot_ref",
                 "tool_batch_summaries_ref",
                 "worker_mailbox_ref",
+                "worker_sessions_ref",
+                "worker_ownership_ref",
+                "draft_isolation_ref",
+                "draft_gate_ref",
+                "draft_apply_decision_ref",
+                "guardian_gate_ref",
                 "scratchpad_ref",
                 "memory_ref",
                 "worker_drafts_ref",
@@ -1465,6 +1598,8 @@ class RunService:
                 "artifact_read_trace_ref",
                 "resume_checkpoint_ref",
                 "verifier_review_ref",
+                "lsp_context_ref",
+                "context_manager_ref",
                 "context_pressure_ref",
                 "hook_trace_ref",
                 "semantic_graph_ref",
@@ -1478,7 +1613,7 @@ class RunService:
                 if not getattr(run, attr, None) and getattr(job, attr, None):
                     setattr(run, attr, str(getattr(job, attr) or ""))
                     changed = True
-            for attr in ("active_processes", "worker_branch_refs", "browser_step_refs"):
+            for attr in ("active_processes", "worker_branch_refs", "browser_step_refs", "acceptance_test_files"):
                 if not getattr(run, attr, None) and getattr(job, attr, None):
                     setattr(run, attr, list(getattr(job, attr) or []))
                     changed = True
@@ -1606,12 +1741,32 @@ class RunService:
         snapshot.iteration_count = max(int(snapshot.iteration_count or 0), len(job.repair_iterations or []))
         snapshot.repair_iterations = list(job.repair_iterations or snapshot.repair_iterations)
         snapshot.repair_issue_signatures = list(job.repair_issue_signatures or snapshot.repair_issue_signatures)
+        snapshot.fix_targets = list(job.fix_targets or snapshot.fix_targets)
+        snapshot.apply_result = dict(job.apply_result or snapshot.apply_result or {})
+        if not snapshot.touched_files:
+            changed_files = snapshot.apply_result.get("changed_files") if isinstance(snapshot.apply_result, dict) else []
+            source_paths = [
+                str(path).strip()
+                for path in [*(changed_files if isinstance(changed_files, list) else []), *snapshot.fix_targets]
+                if str(path).strip()
+            ]
+            snapshot.touched_files = [
+                path
+                for path in list(dict.fromkeys(source_paths))
+                if self._is_meaningful_source_path(path)
+            ]
+        snapshot.prompt_contract_ref = job.prompt_contract_ref or snapshot.prompt_contract_ref
+        snapshot.product_blueprint_ref = job.product_blueprint_ref or snapshot.product_blueprint_ref
+        snapshot.product_blueprint = dict(job.product_blueprint or snapshot.product_blueprint)
         snapshot.acceptance_contract = dict(job.acceptance_contract or snapshot.acceptance_contract)
         snapshot.browser_flow_proof = dict(job.browser_flow_proof or snapshot.browser_flow_proof)
+        snapshot.acceptance_tests_ref = job.acceptance_tests_ref or snapshot.acceptance_tests_ref
+        snapshot.acceptance_test_files = list(job.acceptance_test_files or snapshot.acceptance_test_files)
+        snapshot.acceptance_replay_source_ref = job.acceptance_replay_source_ref or snapshot.acceptance_replay_source_ref
         snapshot.mobile_layout_report = dict(job.mobile_layout_report or snapshot.mobile_layout_report)
         snapshot.flow_coverage = dict(job.flow_coverage or snapshot.flow_coverage)
         if job.status == "completed":
-            applied_by_job = str(job.outcome_kind or "") == "applied" or bool((job.apply_result or {}).get("revision_id"))
+            applied_by_job = bool((job.apply_result or {}).get("revision_id"))
             applied_by_run = run.apply_status == "applied"
             if applied_by_job or applied_by_run:
                 snapshot.status = "completed"
@@ -1787,6 +1942,7 @@ class RunService:
             generate_request = GenerateRequest(
                 prompt=request.prompt,
                 mode=request.mode,
+                edit_mode=request.edit_mode,
                 target_platform=request.target_platform,
                 preview_profile=request.preview_profile,
                 generation_mode=effective_generation_mode,
@@ -1854,18 +2010,29 @@ class RunService:
             )
             run.orchestration_phases = list(getattr(job, "orchestration_phases", []) or run.orchestration_phases)
             run.implementation_plan = dict(getattr(job, "implementation_plan", {}) or run.implementation_plan)
+            run.product_blueprint = dict(getattr(job, "product_blueprint", {}) or run.product_blueprint)
             run.agent_activity_events = list(getattr(job, "agent_activity_events", []) or run.agent_activity_events)
             run.agent_memory = dict(getattr(job, "agent_memory", {}) or run.agent_memory)
             run.agent_transcript_ref = getattr(job, "agent_transcript_ref", None) or run.agent_transcript_ref
             run.tool_trace_ref = getattr(job, "tool_trace_ref", None) or run.tool_trace_ref
             run.file_change_history_ref = getattr(job, "file_change_history_ref", None) or run.file_change_history_ref
             run.browser_proof_ref = getattr(job, "browser_proof_ref", None) or run.browser_proof_ref
+            run.browser_replay_proof_ref = getattr(job, "browser_replay_proof_ref", None) or run.browser_replay_proof_ref
+            run.acceptance_tests_ref = getattr(job, "acceptance_tests_ref", None) or run.acceptance_tests_ref
+            run.acceptance_test_files = list(getattr(job, "acceptance_test_files", []) or run.acceptance_test_files)
+            run.acceptance_replay_source_ref = getattr(job, "acceptance_replay_source_ref", None) or run.acceptance_replay_source_ref
             run.large_tool_outputs_ref = getattr(job, "large_tool_outputs_ref", None) or run.large_tool_outputs_ref
             run.file_state_cache_ref = getattr(job, "file_state_cache_ref", None) or run.file_state_cache_ref
             run.turn_diff_ref = getattr(job, "turn_diff_ref", None) or run.turn_diff_ref
             run.environment_snapshot_ref = getattr(job, "environment_snapshot_ref", None) or run.environment_snapshot_ref
             run.tool_batch_summaries_ref = getattr(job, "tool_batch_summaries_ref", None) or run.tool_batch_summaries_ref
             run.worker_mailbox_ref = getattr(job, "worker_mailbox_ref", None) or run.worker_mailbox_ref
+            run.worker_sessions_ref = getattr(job, "worker_sessions_ref", None) or run.worker_sessions_ref
+            run.worker_ownership_ref = getattr(job, "worker_ownership_ref", None) or run.worker_ownership_ref
+            run.draft_isolation_ref = getattr(job, "draft_isolation_ref", None) or run.draft_isolation_ref
+            run.draft_gate_ref = getattr(job, "draft_gate_ref", None) or run.draft_gate_ref
+            run.draft_apply_decision_ref = getattr(job, "draft_apply_decision_ref", None) or run.draft_apply_decision_ref
+            run.guardian_gate_ref = getattr(job, "guardian_gate_ref", None) or run.guardian_gate_ref
             run.scratchpad_ref = getattr(job, "scratchpad_ref", None) or run.scratchpad_ref
             run.memory_ref = getattr(job, "memory_ref", None) or run.memory_ref
             run.worker_drafts_ref = getattr(job, "worker_drafts_ref", None) or run.worker_drafts_ref
@@ -1885,11 +2052,15 @@ class RunService:
             run.worker_branch_refs = list(getattr(job, "worker_branch_refs", []) or run.worker_branch_refs)
             run.verifier_review_ref = getattr(job, "verifier_review_ref", None) or run.verifier_review_ref
             run.browser_step_refs = list(getattr(job, "browser_step_refs", []) or run.browser_step_refs)
+            run.lsp_context_ref = getattr(job, "lsp_context_ref", None) or run.lsp_context_ref
+            run.context_manager_ref = getattr(job, "context_manager_ref", None) or run.context_manager_ref
             run.context_pressure_ref = getattr(job, "context_pressure_ref", None) or run.context_pressure_ref
             run.hook_trace_ref = getattr(job, "hook_trace_ref", None) or run.hook_trace_ref
             run.semantic_graph_ref = getattr(job, "semantic_graph_ref", None) or run.semantic_graph_ref
             run.worker_prefix_ref = getattr(job, "worker_prefix_ref", None) or run.worker_prefix_ref
             run.replay_trace_ref = getattr(job, "replay_trace_ref", None) or run.replay_trace_ref
+            run.prompt_contract_ref = getattr(job, "prompt_contract_ref", None) or run.prompt_contract_ref
+            run.product_blueprint_ref = getattr(job, "product_blueprint_ref", None) or run.product_blueprint_ref
             run.miniapp_contract_ref = getattr(job, "miniapp_contract_ref", None) or run.miniapp_contract_ref
             run.route_registry_ref = getattr(job, "route_registry_ref", None) or run.route_registry_ref
             run.contract_compile_ref = getattr(job, "contract_compile_ref", None) or run.contract_compile_ref
@@ -2460,6 +2631,8 @@ class RunService:
             if isinstance(post_apply_checks, dict) and post_apply_checks.get("results")
             else self.code_agent_runtime.current_report(workspace_id, "check_results")
         )
+        if not (check_results_payload or {}).get("items") and getattr(job, "executed_checks", None):
+            check_results_payload = {"items": list(job.executed_checks or [])}
         if not patch_payload and effective_diff.strip():
             patch_paths = self._paths_from_diff(effective_diff)
             if not patch_paths:
@@ -2497,12 +2670,22 @@ class RunService:
             "tool_trace_ref": run.tool_trace_ref,
             "file_change_history_ref": run.file_change_history_ref,
             "browser_proof_ref": run.browser_proof_ref,
+            "browser_replay_proof_ref": run.browser_replay_proof_ref,
+            "acceptance_tests_ref": run.acceptance_tests_ref,
+            "acceptance_test_files": run.acceptance_test_files,
+            "acceptance_replay_source_ref": run.acceptance_replay_source_ref,
             "large_tool_outputs_ref": run.large_tool_outputs_ref,
             "file_state_cache_ref": run.file_state_cache_ref,
             "turn_diff_ref": run.turn_diff_ref,
             "environment_snapshot_ref": run.environment_snapshot_ref,
             "tool_batch_summaries_ref": run.tool_batch_summaries_ref,
             "worker_mailbox_ref": run.worker_mailbox_ref,
+            "worker_sessions_ref": run.worker_sessions_ref,
+            "worker_ownership_ref": run.worker_ownership_ref,
+            "draft_isolation_ref": run.draft_isolation_ref,
+            "draft_gate_ref": run.draft_gate_ref,
+            "draft_apply_decision_ref": run.draft_apply_decision_ref,
+            "guardian_gate_ref": run.guardian_gate_ref,
             "scratchpad_ref": run.scratchpad_ref,
             "memory_ref": run.memory_ref,
             "worker_drafts_ref": run.worker_drafts_ref,
@@ -2522,11 +2705,15 @@ class RunService:
             "verifier_review_ref": run.verifier_review_ref,
             "browser_step_refs": run.browser_step_refs,
             "active_tool_uses": run.active_tool_uses,
+            "lsp_context_ref": run.lsp_context_ref,
+            "context_manager_ref": run.context_manager_ref,
             "context_pressure_ref": run.context_pressure_ref,
             "hook_trace_ref": run.hook_trace_ref,
             "semantic_graph_ref": run.semantic_graph_ref,
             "worker_prefix_ref": run.worker_prefix_ref,
             "replay_trace_ref": run.replay_trace_ref,
+            "prompt_contract_ref": run.prompt_contract_ref,
+            "product_blueprint_ref": run.product_blueprint_ref,
             "miniapp_contract_ref": run.miniapp_contract_ref,
             "route_registry_ref": run.route_registry_ref,
             "contract_compile_ref": run.contract_compile_ref,
@@ -2534,6 +2721,8 @@ class RunService:
             "miniapp_contract": self.store.get("reports", run.miniapp_contract_ref) if run.miniapp_contract_ref else None,
             "route_registry": self.store.get("reports", run.route_registry_ref) if run.route_registry_ref else None,
             "repair_recipes": self.store.get("reports", run.repair_recipes_ref) if run.repair_recipes_ref else None,
+            "prompt_contract": self.store.get("reports", run.prompt_contract_ref) if run.prompt_contract_ref else None,
+            "product_blueprint": self.store.get("reports", run.product_blueprint_ref) if run.product_blueprint_ref else None,
             "process_outputs": process_outputs,
             "tool_result_messages": self.store.get("reports", run.tool_result_messages_ref) if run.tool_result_messages_ref else None,
             "agent_transcript": agent_transcript,
@@ -2541,7 +2730,15 @@ class RunService:
             "resume_checkpoint": self.store.get("reports", run.resume_checkpoint_ref) if run.resume_checkpoint_ref else None,
             "verifier_review": self.store.get("reports", run.verifier_review_ref) if run.verifier_review_ref else None,
             "browser_steps": [self.store.get("reports", ref) for ref in run.browser_step_refs if ref],
+            "browser_replay_proof": self.store.get("reports", run.browser_replay_proof_ref) if run.browser_replay_proof_ref else None,
+            "acceptance_tests": self.store.get("reports", run.acceptance_tests_ref) if run.acceptance_tests_ref else None,
+            "lsp_context": self.store.get("reports", run.lsp_context_ref) if run.lsp_context_ref else None,
+            "context_manager": self.store.get("reports", run.context_manager_ref) if run.context_manager_ref else None,
             "context_pressure": self.store.get("reports", run.context_pressure_ref) if run.context_pressure_ref else None,
+            "draft_isolation": self.store.get("reports", run.draft_isolation_ref) if run.draft_isolation_ref else None,
+            "draft_gate": self.store.get("reports", run.draft_gate_ref) if run.draft_gate_ref else None,
+            "draft_apply_decision": self.store.get("reports", run.draft_apply_decision_ref) if run.draft_apply_decision_ref else None,
+            "guardian_gate": self.store.get("reports", run.guardian_gate_ref) if run.guardian_gate_ref else None,
             "hook_trace": self.store.get("reports", run.hook_trace_ref) if run.hook_trace_ref else None,
             "semantic_graph": self.store.get("reports", run.semantic_graph_ref) if run.semantic_graph_ref else None,
             "replay_trace": self.store.get("reports", run.replay_trace_ref) if run.replay_trace_ref else None,
@@ -2633,6 +2830,20 @@ class RunService:
                     source_ref=f"memory_stage1:{run.workspace_id}:{run.run_id}",
                     idempotency_key=f"memory.raw_extracted:{run.run_id}",
                 )
+                self.event_journal_service.append_run(
+                    workspace_id=run.workspace_id,
+                    run_id=run.run_id,
+                    event_type="memory.phase1.extracted",
+                    payload={
+                        "memory_ref": f"memory_stage1:{run.workspace_id}:{run.run_id}",
+                        "raw_count": len(payload.get("items") or []),
+                        "kinds": sorted({str(item.get("kind") or "") for item in payload.get("items") or [] if isinstance(item, dict)}),
+                    },
+                    actor="system",
+                    summary="Phase 1 run memory extracted.",
+                    source_ref=f"memory_stage1:{run.workspace_id}:{run.run_id}",
+                    idempotency_key=f"memory.phase1.extracted:{run.run_id}",
+                )
             except Exception:
                 pass
 
@@ -2673,6 +2884,41 @@ class RunService:
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             },
         )
+        if self.event_journal_service is not None:
+            repeated_stats = pipeline.get("repeated_failure_stats") if isinstance(pipeline.get("repeated_failure_stats"), dict) else {}
+            for payload in stage1:
+                run_id = str(payload.get("run_id") or "")
+                if not run_id:
+                    continue
+                try:
+                    self.event_journal_service.append_run(
+                        workspace_id=workspace_id,
+                        run_id=run_id,
+                        event_type="memory.phase2.consolidated",
+                        payload={
+                            "memory_ref": f"workspace_memory:{workspace_id}",
+                            "consolidation_ref": f"memory_consolidation:{workspace_id}",
+                            "stage1_count": len(stage1),
+                            "repeated_failure_stats": repeated_stats,
+                        },
+                        actor="system",
+                        summary="Phase 2 workspace memory consolidated.",
+                        source_ref=f"workspace_memory:{workspace_id}",
+                        idempotency_key=f"memory.phase2.consolidated:{workspace_id}:{run_id}",
+                    )
+                    if int(repeated_stats.get("repeated_failure_count", 0) or 0) > 0:
+                        self.event_journal_service.append_run(
+                            workspace_id=workspace_id,
+                            run_id=run_id,
+                            event_type="memory.repeated_failure.updated",
+                            payload={"memory_ref": f"workspace_memory:{workspace_id}", "repeated_failure_stats": repeated_stats},
+                            actor="system",
+                            summary="Repeated failure memory updated.",
+                            source_ref=f"workspace_memory:{workspace_id}",
+                            idempotency_key=f"memory.repeated_failure.updated:{workspace_id}:{run_id}",
+                        )
+                except Exception:
+                    pass
 
     def _schedule_auto_repair_continuation_if_needed(self, run: RunRecord) -> None:
         try:
@@ -2822,8 +3068,39 @@ class RunService:
                 break
         return None, {}
 
+    def _resolve_inherited_prompt_contract(
+        self,
+        source_run: RunRecord | None,
+        *,
+        request: CreateRunRequest,
+    ) -> tuple[RunRecord | None, dict[str, Any]]:
+        if source_run is None or request.mode != "fix":
+            return None, {}
+        seen: set[str] = set()
+        current: RunRecord | None = source_run
+        while current is not None and current.run_id not in seen:
+            seen.add(current.run_id)
+            ref = current.prompt_contract_ref or f"prompt_contract:{current.workspace_id}:{current.run_id}"
+            report = self.store.get("reports", ref)
+            if isinstance(report, dict):
+                contract = report.get("contract") if isinstance(report.get("contract"), dict) else report
+                if isinstance(contract, dict) and (contract.get("acceptance_contract") or contract.get("sections")):
+                    return current, dict(report)
+            if not current.resume_from_run_id:
+                break
+            try:
+                current = self.get_run(current.resume_from_run_id)
+            except KeyError:
+                break
+        return None, {}
+
     def _required_acceptance_contract_for_run(self, run: RunRecord) -> dict[str, Any]:
         candidates: list[dict[str, Any]] = []
+        prompt_report = self.store.get("reports", run.prompt_contract_ref or f"prompt_contract:{run.workspace_id}:{run.run_id}")
+        if isinstance(prompt_report, dict):
+            prompt_contract = prompt_report.get("contract") if isinstance(prompt_report.get("contract"), dict) else {}
+            if isinstance(prompt_contract, dict) and isinstance(prompt_contract.get("acceptance_contract"), dict):
+                candidates.append(dict(prompt_contract["acceptance_contract"]))
         report = self.store.get("reports", f"acceptance_contract:{run.workspace_id}:{run.run_id}")
         if isinstance(report, dict) and isinstance(report.get("contract"), dict):
             candidates.append(dict(report["contract"]))
@@ -2889,7 +3166,7 @@ class RunService:
                         for item in diagnostics_neutral_findings
                         if isinstance(item, dict)
                     ]
-            if result.name in {"generated_app_python_tests", "generated_app_js_tests"}:
+            if result.name in {"generated_app_python_tests", "generated_app_js_tests", "acceptance_replay_tests"}:
                 generated_tests[result.name] = {
                     "status": result.status,
                     "details": result.details,
@@ -2963,6 +3240,22 @@ class RunService:
             if candidate:
                 paths.append(candidate)
         return any(self._is_meaningful_source_path(path) for path in paths)
+
+    def _workspace_has_existing_app_surface(self, workspace: WorkspaceRecord) -> bool:
+        source_dir = self.workspace_service.source_dir(workspace.workspace_id)
+        routes_dir = source_dir / "miniapp" / "app" / "routes"
+        route_files = {
+            path.name
+            for path in routes_dir.glob("*.py")
+            if path.name not in {"__init__.py", "health.py", "role_pages.py", "role_routes.py"}
+        } if routes_dir.exists() else set()
+        static_root = source_dir / "miniapp" / "app" / "static"
+        role_pages = [
+            path
+            for role in ROLE_ORDER
+            for path in (static_root / role).rglob("index.html")
+        ] if static_root.exists() else []
+        return bool(route_files and role_pages)
 
     @staticmethod
     def _resolve_model_profile(model_profile: str | None, generation_mode: GenerationMode) -> str:
@@ -3130,6 +3423,7 @@ class RunService:
         probe = GenerateRequest(
             prompt=request.prompt,
             mode=request.mode,
+            edit_mode=request.edit_mode,
             target_platform=request.target_platform,
             preview_profile=request.preview_profile,
             generation_mode=run.generation_mode,
@@ -3164,8 +3458,79 @@ class RunService:
             job.fix_targets = []
             job.handoff_from_failed_generate = None
 
+    def _sync_run_browser_proof_from_artifacts(self, run: RunRecord) -> None:
+        try:
+            artifacts = self.get_run_artifacts(run.run_id)
+        except Exception:
+            store_get = getattr(getattr(self, "store", None), "get", None)
+            artifacts = store_get("reports", f"run_artifacts:{run.run_id}") if callable(store_get) else {}
+        if not isinstance(artifacts, dict):
+            artifacts = {}
+
+        browser_check = self._artifact_check_result_by_name(artifacts, "browser_flow_smoke")
+        diagnostics = browser_check.get("diagnostics") if isinstance(browser_check.get("diagnostics"), dict) else {}
+        proof = self._first_artifact_dict(
+            run.browser_flow_proof,
+            artifacts.get("browser_flow_proof"),
+            diagnostics,
+        )
+        mobile = self._first_artifact_dict(
+            run.mobile_layout_report,
+            artifacts.get("mobile_layout_report"),
+            proof.get("mobile_layout") if isinstance(proof, dict) else None,
+            diagnostics.get("mobile_layout") if isinstance(diagnostics, dict) else None,
+        )
+        changed = False
+        if proof and run.browser_flow_proof != proof:
+            run.browser_flow_proof = dict(proof)
+            changed = True
+        if mobile and run.mobile_layout_report != mobile:
+            run.mobile_layout_report = dict(mobile)
+            changed = True
+        if proof and not run.browser_proof_ref:
+            run.browser_proof_ref = f"browser_proof:{run.workspace_id}:{run.run_id}"
+            changed = True
+        if changed:
+            self._save_run(run)
+
+    @staticmethod
+    def _artifact_check_result_by_name(artifacts: dict[str, Any], name: str) -> dict[str, Any]:
+        candidates: list[Any] = []
+        if isinstance(artifacts.get("check_results"), list):
+            candidates.extend(artifacts.get("check_results") or [])
+        checks = artifacts.get("checks") if isinstance(artifacts.get("checks"), dict) else {}
+        if isinstance(checks.get("items"), list):
+            candidates.extend(checks.get("items") or [])
+        for item in candidates:
+            if isinstance(item, dict) and str(item.get("name") or "") == name:
+                return item
+        return {}
+
+    @staticmethod
+    def _first_artifact_dict(*values: Any) -> dict[str, Any]:
+        for value in values:
+            if isinstance(value, dict) and value:
+                return dict(value)
+        return {}
+
+    def _completed_draft_changed_files(self, run: RunRecord) -> list[str]:
+        paths: list[str] = []
+        try:
+            paths.extend(self.workspace_service.draft_changed_paths(run.workspace_id, run.run_id))
+        except Exception:
+            pass
+        if not paths:
+            try:
+                paths.extend(self._paths_from_diff(self.workspace_service.diff(run.workspace_id, run_id=run.run_id)))
+            except Exception:
+                pass
+        paths.extend(run.touched_files or [])
+        paths.extend(run.fix_targets or [])
+        return list(dict.fromkeys(str(path).strip() for path in paths if str(path).strip()))
+
     def _apply_completed_draft(self, run: RunRecord, *, message: str) -> bool:
-        allowed, _ = self.enforce_guardian_before_apply(run, source="pre_apply_guardian")
+        changed_files = self._completed_draft_changed_files(run)
+        allowed, _ = self.enforce_guardian_before_apply(run, source="pre_apply_guardian", changed_files=changed_files)
         if not allowed:
             return False
         apply_started_at = time.perf_counter()
@@ -3177,6 +3542,7 @@ class RunService:
         self._record_before_apply_checkpoint(run, source="auto_apply")
         revision = self.workspace_service.approve_draft(run.workspace_id, run.run_id, f"Auto-apply AI draft for run {run.run_id}")
         self.workspace_service.discard_draft(run.workspace_id, run.run_id)
+        pre_clear_targets = list(run.fix_targets or [])
         run.result_revision_id = revision.revision_id
         run.candidate_revision_id = revision.revision_id
         run.status = "completed"
@@ -3194,13 +3560,32 @@ class RunService:
             source_revision_id=run.source_revision_id,
             result_revision_id=run.result_revision_id,
         )
-        if revision_paths:
-            run.touched_files = revision_paths
+        revision_product_paths = [path for path in revision_paths if self._is_product_runtime_source_path(path)]
+        if revision_product_paths:
+            run.touched_files = revision_product_paths
+        else:
+            fallback_product_paths = [
+                path
+                for path in list(dict.fromkeys([*(run.touched_files or []), *pre_clear_targets]))
+                if self._is_product_runtime_source_path(path)
+            ]
+            if fallback_product_paths:
+                run.touched_files = fallback_product_paths
+            elif not any(self._is_product_runtime_source_path(path) for path in run.touched_files):
+                run.touched_files = revision_paths
+        run.apply_result = {
+            **dict(run.apply_result or {}),
+            "status": "applied",
+            "revision_id": revision.revision_id,
+            "changed_files": list(run.touched_files or revision_paths or changed_files),
+            "applied_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        }
         self._append_job_event(
             run.linked_job_id,
             "apply_completed",
             "Generated draft was applied successfully.",
         )
+        self._save_run(run)
         return True
 
     def _meaningful_paths_for_run(

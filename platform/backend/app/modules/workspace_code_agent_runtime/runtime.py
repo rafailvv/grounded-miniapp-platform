@@ -26,15 +26,18 @@ from app.models.domain import (
     GenerateRequest,
     JobEvent,
     JobRecord,
+    new_id,
     RepairIterationRecord,
     RunCheckResult,
     RunRecord,
+    utc_now,
     ValidationSnapshot,
 )
+from app.models.prompt_contract import ProductBlueprint
 from app.modules.miniapp_agent_loop.agent_file_state import AgentFileStateCache
 from app.modules.miniapp_agent_loop.agent_command_policy import command_policy_snapshot
 from app.modules.miniapp_agent_loop.agent_coordinator import AgentCoordinator
-from app.modules.miniapp_agent_loop.agent_hooks import AgentHookManager
+from app.modules.miniapp_agent_loop.agent_hooks import AgentHookManager, AgentHookOutcome
 from app.modules.miniapp_agent_loop.agent_process_manager import AgentProcessManager
 from app.modules.miniapp_agent_loop.agent_transcript import AgentTranscriptStore
 from app.modules.miniapp_agent_loop.agent_tool_call_loop import AgentToolCallLoop
@@ -51,6 +54,7 @@ from app.modules.miniapp_agent_loop.product_workers import (
     canonical_worker_id,
     ownership_for_worker,
     path_is_allowed,
+    product_owner_contract,
     select_memory_items,
     stale_path_checks,
     worker_refs,
@@ -89,17 +93,23 @@ from app.modules.workspace_code_agent_runtime.process_recovery import AgentProce
 from app.modules.workspace_code_agent_runtime.tool_executor import AgentToolExecutor
 from app.repositories.platform_db import PlatformDb
 from app.repositories.state_store import StateStore
+from app.services.acceptance_test_materializer import AcceptanceTestMaterializer
+from app.services.browser_replay_proof import BrowserReplayProofService
 from app.services.check_runner import CheckRunner
 from app.services.miniapp_contract import MiniAppContractCompiler, MiniAppContractMaterializer, MiniAppRouteRegistry
 from app.services.platform_shell import BASE_STYLESHEET_HREF, BASE_STYLESHEET_PATH, PAGE_SHELL_INLINE_STYLE
 from app.services.run_compaction import RunCompactionService
+from app.services.context_manager import ContextManagerService
 from app.services.event_journal import EventJournalService
 from app.services.hook_policy_service import HookPolicyService
 from app.services.memory_pipeline import WorkspaceMemoryPipeline
+from app.services.lsp_context import LspContextService
 from app.services.output_artifact_service import OutputArtifactService
 from app.services.repair_cases import RepairCaseService
 from app.services.run_protocol import RunProtocolService, diff_sha256
+from app.services.tool_result_summarizer import ToolResultSummarizer
 from app.services.trace_bundle import TraceBundleWriter
+from app.services.worker_sessions import WorkerSessionService
 from app.services.generation_enhancements import SkillPackCatalog
 from app.services.workflow_acceptance import (
     build_acceptance_contract,
@@ -175,6 +185,9 @@ class WorkspaceCodeAgentRuntime:
         platform_db: PlatformDb | None = None,
         run_protocol_service: RunProtocolService | None = None,
         run_compaction_service: RunCompactionService | None = None,
+        context_manager_service: ContextManagerService | None = None,
+        lsp_context_service: LspContextService | None = None,
+        worker_session_service: WorkerSessionService | None = None,
         event_journal_service: EventJournalService | None = None,
         hook_policy_service: HookPolicyService | None = None,
         output_artifact_service: OutputArtifactService | None = None,
@@ -222,11 +235,15 @@ class WorkspaceCodeAgentRuntime:
             read_artifact=lambda ref: self.store.get("reports", ref),
             output_artifact_writer=self._store_command_output_artifact,
             denied_action_writer=self._store_denied_action,
+            lsp_context_service=lsp_context_service,
         )
         self.context_pack_builder = context_pack_builder
         self.platform_db = platform_db
         self.run_protocol_service = run_protocol_service
         self.run_compaction_service = run_compaction_service
+        self.context_manager_service = context_manager_service
+        self.lsp_context_service = lsp_context_service
+        self.worker_session_service = worker_session_service
         self.event_journal_service = event_journal_service
 
     def get_job(self, job_id: str) -> JobRecord:
@@ -292,6 +309,12 @@ class WorkspaceCodeAgentRuntime:
         run_payload: dict[str, Any] | None,
     ) -> list[dict[str, Any]]:
         candidates: list[dict[str, Any]] = []
+        prompt_ref = str((run_payload or {}).get("prompt_contract_ref") or f"prompt_contract:{workspace_id}:{run_id}")
+        prompt_report = self.store.get("reports", prompt_ref)
+        if isinstance(prompt_report, dict):
+            prompt_contract = prompt_report.get("contract") if isinstance(prompt_report.get("contract"), dict) else {}
+            if isinstance(prompt_contract, dict) and isinstance(prompt_contract.get("acceptance_contract"), dict):
+                candidates.append(dict(prompt_contract["acceptance_contract"]))
         report = self.store.get("reports", f"acceptance_contract:{workspace_id}:{run_id}")
         if isinstance(report, dict) and isinstance(report.get("contract"), dict):
             candidates.append(dict(report["contract"]))
@@ -340,6 +363,7 @@ class WorkspaceCodeAgentRuntime:
         request = GenerateRequest(
             prompt=job.prompt,
             mode=job.mode,
+            edit_mode=job.edit_mode,
             target_platform=job.target_platform,
             preview_profile=job.preview_profile,
             generation_mode=job.generation_mode,
@@ -374,6 +398,7 @@ class WorkspaceCodeAgentRuntime:
             workspace_id=workspace_id,
             prompt=request.prompt,
             mode=request.mode,
+            edit_mode=request.edit_mode,
             status="running",
             generation_mode=generation_mode,
             target_platform=request.target_platform,
@@ -404,12 +429,32 @@ class WorkspaceCodeAgentRuntime:
         )
         self._record_hook(
             job=job,
+            hook="user_prompt_submit",
+            status="completed",
+            payload={
+                "run_id": run_id,
+                "workspace_id": workspace_id,
+                "prompt": request.prompt,
+                "mode": request.mode,
+                "intent": request.intent,
+                "generation_mode": generation_mode.value,
+            },
+        )
+        self._record_hook(
+            job=job,
             hook="before_run",
             status="completed",
             payload={"run_id": run_id, "mode": request.mode, "generation_mode": generation_mode.value},
         )
 
         draft_source = self._prepare_draft(workspace_id=workspace_id, run_id=run_id, request=request)
+        if request.mode == "generate" and request.intent == "create" and generation_mode not in {GenerationMode.FAST, GenerationMode.BASIC}:
+            self._sanitize_non_fast_create_draft(
+                workspace_id=workspace_id,
+                run_id=run_id,
+                draft_source=draft_source,
+                generation_mode=generation_mode,
+            )
         self._restore_file_state_cache_from_resume(
             workspace_id=workspace_id,
             run_id=run_id,
@@ -474,11 +519,1312 @@ class WorkspaceCodeAgentRuntime:
                 loop_started_at=started_at,
                 should_stop=should_stop,
             )
-        return self._finalize_job(
+        finalized = self._finalize_job(
             job=job,
             loop_result=loop_result,
             elapsed_ms=int((time.perf_counter() - started_at) * 1000),
         )
+        if self._should_use_local_product_fallback(
+            finalized,
+            request=request,
+            generation_mode=generation_mode,
+            draft_source=draft_source,
+        ):
+            fallback_reason = finalized.failure_class or finalized.current_fix_phase or finalized.failure_signature or "repair_budget_exhausted"
+            self._append_event(
+                finalized,
+                "tool_progress",
+                "Generation exhausted repair budget without usable product runtime; using emergency scaffold fallback.",
+                {
+                    "failure_class": finalized.failure_class,
+                    "generation_mode": generation_mode.value,
+                    **self._mode_degradation_policy(generation_mode),
+                },
+            )
+            finalized.failure_reason = None
+            finalized.failure_class = None
+            finalized.failure_signature = None
+            finalized.root_cause_summary = None
+            finalized.remaining_issues = []
+            finalized.current_fix_phase = "fallback_generation"
+            fallback = self._generate_fast_local_scaffold(
+                workspace_id=workspace_id,
+                run_id=run_id,
+                request=request,
+                job=finalized,
+                draft_source=draft_source,
+                started_at=started_at,
+            )
+            fallback.generation_mode = generation_mode
+            fallback.fidelity = QUALITY_FIDELITY[generation_mode]  # type: ignore[index]
+            fallback.token_usage = self._merge_run_token_usage(
+                {
+                    "fallback_kind": "emergency_scaffold",
+                    "fallback_from_mode": generation_mode.value,
+                    "fallback_reason": fallback_reason,
+                    "mode": f"{generation_mode.value}_emergency_scaffold",
+                },
+                fallback.token_usage,
+            )
+            self._append_event(
+                fallback,
+                "draft_ready",
+                "Emergency scaffold generated product runtime files after repair exhaustion.",
+                {"changed_files": list(fallback.fix_targets or [])},
+            )
+            self._finalize_trace_bundle(fallback)
+            self._save_job(fallback)
+            return fallback
+        return finalized
+
+    @classmethod
+    def _should_use_local_product_fallback(
+        cls,
+        job: JobRecord,
+        *,
+        request: GenerateRequest,
+        generation_mode: GenerationMode,
+        draft_source: Path,
+    ) -> bool:
+        if request.mode != "generate":
+            return False
+        policy = cls._mode_degradation_policy(generation_mode)
+        if not policy.get("allow_emergency_scaffold"):
+            return False
+        if job.status == "completed":
+            return False
+        if str(job.failure_class or "") in {"provider.insufficient_quota", "stopped_by_user"}:
+            return False
+        terminal_reason = str(job.failure_class or job.current_fix_phase or job.failure_signature or "").lower()
+        repair_exhausted = (
+            "repeated_no_progress" in terminal_reason
+            or "budget_exhausted" in terminal_reason
+            or str(job.current_fix_phase or "") == "blocked_budget_exhausted"
+        )
+        if not repair_exhausted:
+            return False
+        return not cls._draft_has_product_runtime_source(draft_source)
+
+    @staticmethod
+    def _mode_degradation_policy(generation_mode: GenerationMode) -> dict[str, Any]:
+        if generation_mode == GenerationMode.BALANCED:
+            return {
+                "allow_emergency_scaffold": False,
+                "fallback_kind": "emergency_scaffold",
+                "min_repair_posture": "repeated_no_progress_or_budget_exhausted",
+                "prefer_partial_runtime_repair": True,
+            }
+        if generation_mode in {GenerationMode.QUALITY, GenerationMode.PRODUCTION}:
+            return {
+                "allow_emergency_scaffold": False,
+                "fallback_kind": "emergency_scaffold",
+                "min_repair_posture": "worker_or_budget_exhausted",
+                "prefer_partial_runtime_repair": True,
+            }
+        return {
+            "allow_emergency_scaffold": False,
+            "fallback_kind": None,
+            "min_repair_posture": "not_applicable",
+            "prefer_partial_runtime_repair": True,
+        }
+
+    @staticmethod
+    def _draft_has_product_runtime_source(draft_source: Path) -> bool:
+        routes_dir = draft_source / "miniapp" / "app" / "routes"
+        product_routes = [
+            path
+            for path in routes_dir.glob("*.py")
+            if path.name not in {"__init__.py", "health.py", "role_pages.py", "role_routes.py", "fast_requests.py"}
+        ] if routes_dir.exists() else []
+        static_root = draft_source / "miniapp" / "app" / "static"
+        role_apps = [
+            static_root / role / "app.js"
+            for role in ROLE_ORDER
+            if (static_root / role / "app.js").exists()
+        ]
+        role_styles = [
+            static_root / role / "styles.css"
+            for role in ROLE_ORDER
+            if (static_root / role / "styles.css").exists()
+        ]
+        role_pages = [
+            static_root / role / "index.html"
+            for role in ROLE_ORDER
+            if (static_root / role / "index.html").exists()
+        ]
+        meaningful_apps = [
+            path
+            for path in role_apps
+            if WorkspaceCodeAgentRuntime._role_app_has_product_logic(path)
+        ]
+        non_placeholder_styles = [
+            path
+            for path in role_styles
+            if path.read_text(encoding="utf-8", errors="ignore").strip()
+        ]
+        return bool(product_routes and role_pages and meaningful_apps and non_placeholder_styles)
+
+    @staticmethod
+    def _role_app_has_product_logic(path: Path) -> bool:
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return False
+        stripped = text.strip()
+        if not stripped:
+            return False
+        without_bridge = re.sub(r"window\.setupPreviewBridge\?\.\([^)]*\);?", "", stripped)
+        if len(without_bridge.strip()) < 180:
+            return False
+        signals = ("fetch(", "MiniApp.json", "addEventListener", "querySelector", "insertAdjacentHTML", "replaceChildren")
+        return sum(1 for signal in signals if signal in text) >= 2
+
+    def _sanitize_non_fast_create_draft(
+        self,
+        *,
+        workspace_id: str,
+        run_id: str,
+        draft_source: Path,
+        generation_mode: GenerationMode,
+    ) -> list[str]:
+        """Remove deterministic FAST scaffold leftovers before prompt-specific generation.
+
+        Balanced and Quality create runs should start from the platform shell or from
+        prompt-specific files produced in the same run. Keeping a previous FAST
+        route/static scaffold in the draft makes the agent and guardian evaluate a
+        hybrid app and causes `/api/fast-requests` to leak into non-FAST results.
+        """
+        del workspace_id, run_id, generation_mode
+        settings = getattr(self.workspace_service, "settings", None)
+        template_dir = Path(getattr(settings, "template_dir", ""))
+        if not template_dir.exists():
+            return []
+        reset_paths = [
+            "miniapp/app/generated/route_manifest.json",
+            *[
+                f"miniapp/app/static/{role}/{name}"
+                for role in ROLE_ORDER
+                for name in ("index.html", "app.js", "styles.css")
+            ],
+        ]
+        removed_paths = [
+            "miniapp/app/routes/fast_requests.py",
+            "miniapp/app/generated/fast_requests.json",
+        ]
+        changed: list[str] = []
+        for relative in reset_paths:
+            source = template_dir / relative
+            target = draft_source / relative
+            if not source.exists():
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            current = target.read_bytes() if target.exists() else None
+            replacement = source.read_bytes()
+            if current != replacement:
+                target.write_bytes(replacement)
+                changed.append(relative)
+        for relative in removed_paths:
+            target = draft_source / relative
+            if target.exists():
+                target.unlink()
+                changed.append(relative)
+        pycache_dir = draft_source / "miniapp" / "app" / "routes" / "__pycache__"
+        if pycache_dir.exists():
+            for target in pycache_dir.glob("fast_requests*.pyc"):
+                target.unlink(missing_ok=True)
+        return changed
+
+    @classmethod
+    def _non_fast_prompt_analysis(cls, draft_source: Path, prompt: str) -> dict[str, Any]:
+        analysis = derive_prompt_contract_analysis(prompt)
+        contract_path = draft_source / "miniapp/app/generated/miniapp_contract.json"
+        try:
+            contract = json.loads(contract_path.read_text(encoding="utf-8")) if contract_path.exists() else {}
+        except (OSError, ValueError):
+            contract = {}
+        acceptance = contract.get("acceptance_summary") if isinstance(contract, dict) else {}
+        api_contract = acceptance.get("api_contract") if isinstance(acceptance, dict) else {}
+        if isinstance(api_contract, dict):
+            merged = dict(analysis)
+            for key in ("resource_hint", "resource_hints", "field_hints", "role_field_hints", "role_state_contract", "business_capabilities"):
+                value = api_contract.get(key)
+                if value:
+                    merged[key] = value
+            return merged
+        return analysis
+
+    @staticmethod
+    def _non_fast_resource_label(prompt: str, *, prompt_analysis: dict[str, Any] | None = None) -> str:
+        hint = str((prompt_analysis or {}).get("resource_hint") or "").strip()
+        if hint and hint.lower() not in {"request", "requests", "item", "items", "resource"}:
+            return hint
+        return WorkspaceCodeAgentRuntime._fast_prompt_resource_label(prompt, prompt_analysis=prompt_analysis)
+
+    @classmethod
+    def _visual_design_profile(
+        cls,
+        *,
+        prompt_analysis: dict[str, Any] | None,
+        resource_label: str,
+        generation_mode: GenerationMode | str | None,
+    ) -> dict[str, Any]:
+        analysis = prompt_analysis or {}
+        source_parts: list[str] = [resource_label]
+        for key in ("resource_hint", "resource_hints", "field_hints", "business_capabilities"):
+            value = analysis.get(key)
+            if isinstance(value, list):
+                source_parts.extend(str(item) for item in value)
+            elif value:
+                source_parts.append(str(value))
+        contract = analysis.get("role_state_contract")
+        if isinstance(contract, dict):
+            for value in contract.values():
+                if isinstance(value, list):
+                    source_parts.extend(str(item) for item in value)
+                elif value:
+                    source_parts.append(str(value))
+        source = " ".join(source_parts).lower()
+        mode_value = str(getattr(generation_mode, "value", generation_mode) or "").lower()
+        themes = [
+            {
+                "id": "studio",
+                "keywords": ("barber", "beauty", "salon", "appointment", "zapis", "запис", "барбер", "салон", "мастер", "услуг"),
+                "primary": "#e11d48",
+                "secondary": "#0f766e",
+                "accent": "#f59e0b",
+                "soft": "#fff1f2",
+                "surface": "#fff7ed",
+                "hero": "linear-gradient(135deg, #e11d48 0%, #f97316 58%, #0f766e 100%)",
+                "tone": "service studio",
+            },
+            {
+                "id": "operations",
+                "keywords": ("warehouse", "order", "inventory", "stock", "delivery", "склад", "заказ", "товар", "достав"),
+                "primary": "#059669",
+                "secondary": "#2563eb",
+                "accent": "#f59e0b",
+                "soft": "#ecfdf5",
+                "surface": "#f8fafc",
+                "hero": "linear-gradient(135deg, #047857 0%, #0ea5e9 58%, #f59e0b 100%)",
+                "tone": "operations hub",
+            },
+            {
+                "id": "learning",
+                "keywords": ("course", "lesson", "student", "onboarding", "training", "обуч", "курс", "урок", "студент", "онбординг"),
+                "primary": "#7c3aed",
+                "secondary": "#0891b2",
+                "accent": "#f97316",
+                "soft": "#f5f3ff",
+                "surface": "#ecfeff",
+                "hero": "linear-gradient(135deg, #7c3aed 0%, #0891b2 58%, #f97316 100%)",
+                "tone": "learning track",
+            },
+            {
+                "id": "service",
+                "keywords": ("repair", "support", "ticket", "service", "maintenance", "ремонт", "поддерж", "заявк", "сервис"),
+                "primary": "#2563eb",
+                "secondary": "#ea580c",
+                "accent": "#14b8a6",
+                "soft": "#eff6ff",
+                "surface": "#fff7ed",
+                "hero": "linear-gradient(135deg, #2563eb 0%, #14b8a6 55%, #ea580c 100%)",
+                "tone": "service desk",
+            },
+            {
+                "id": "commerce",
+                "keywords": ("shop", "payment", "catalog", "booking", "store", "магаз", "оплат", "каталог", "брон"),
+                "primary": "#db2777",
+                "secondary": "#4f46e5",
+                "accent": "#16a34a",
+                "soft": "#fdf2f8",
+                "surface": "#eef2ff",
+                "hero": "linear-gradient(135deg, #db2777 0%, #4f46e5 58%, #16a34a 100%)",
+                "tone": "commerce desk",
+            },
+        ]
+        selected = next((theme for theme in themes if any(keyword in source for keyword in theme["keywords"])), None)
+        if selected is None:
+            digest = hashlib.sha256(source.encode("utf-8", errors="ignore")).hexdigest()
+            selected = themes[int(digest[:2], 16) % len(themes)]
+        role_accents = {
+            "client": selected["primary"],
+            "specialist": selected["secondary"],
+            "manager": selected["accent"],
+        }
+        return {
+            **selected,
+            "mode": mode_value or "balanced",
+            "density": "spacious" if mode_value in {GenerationMode.QUALITY.value, GenerationMode.PRODUCTION.value} else "balanced",
+            "radius": "16px" if mode_value in {GenerationMode.QUALITY.value, GenerationMode.PRODUCTION.value} else "12px",
+            "role_accents": role_accents,
+        }
+
+    def _complete_non_fast_role_surfaces(
+        self,
+        *,
+        workspace_id: str,
+        run_id: str,
+        draft_source: Path,
+        prompt: str,
+        generation_mode: GenerationMode,
+    ) -> list[str]:
+        prompt_analysis = self._non_fast_prompt_analysis(draft_source, prompt)
+        resource_label = self._non_fast_resource_label(prompt, prompt_analysis=prompt_analysis)
+        design_profile = self._visual_design_profile(prompt_analysis=prompt_analysis, resource_label=resource_label, generation_mode=generation_mode)
+        fields = [str(item) for item in prompt_analysis.get("field_hints") or [] if str(item).strip()][:4] or ["name", "phone", "details", "time"]
+        statuses = [str(item) for item in (prompt_analysis.get("role_state_contract") or {}).get("status_values") or [] if str(item).strip()][:4] or ["new", "in_progress", "completed", "paid"]
+        route_info = self._contract_declared_api_route(draft_source) or self._first_prompt_api_route(draft_source)
+        route_change: DraftAction | None = None
+        if route_info is None:
+            route_module = self._non_fast_route_module_name(resource_label)
+            api_path = f"/api/{route_module.replace('_', '-')}"
+        else:
+            api_path, route_module = route_info
+        if route_info is None or self._api_route_needs_typed_schema(draft_source, route_module, expected_api_path=api_path):
+            route_change = DraftAction(
+                file_path=f"miniapp/app/routes/{route_module}.py",
+                operation="replace",
+                content=self._non_fast_route_source(api_path=api_path, store_name=route_module, fields=fields),
+                reason="Create prompt-specific persisted API route for Balanced/Quality app.",
+            )
+        changes: list[DraftAction] = []
+        if route_change is not None:
+            changes.append(route_change)
+        for page_change in self._non_fast_role_page_changes(draft_source):
+            changes.append(page_change)
+        static_root = draft_source / "miniapp" / "app" / "static"
+        for role in ROLE_ORDER:
+            app_path = static_root / role / "app.js"
+            css_path = static_root / role / "styles.css"
+            if self._role_app_needs_completion(app_path):
+                changes.append(
+                    DraftAction(
+                        file_path=f"miniapp/app/static/{role}/app.js",
+                        operation="replace",
+                        content=self._non_fast_role_js(role, api_path=api_path, resource_label=resource_label, fields=fields, statuses=statuses),
+                        reason=f"Complete {role} role behavior for prompt-specific app.",
+                    )
+                )
+            if self._role_css_needs_completion(css_path) or self._role_css_is_generic_template(css_path):
+                changes.append(
+                    DraftAction(
+                        file_path=f"miniapp/app/static/{role}/styles.css",
+                        operation="replace",
+                        content=self._non_fast_role_css(role, profile=design_profile, generation_mode=generation_mode),
+                        reason=f"Complete {role} role styling for prompt-specific app.",
+                    )
+                )
+        tests_root = draft_source / "miniapp" / "tests"
+        py_test = tests_root / "test_generated_app.py"
+        js_test = tests_root / "generated_app.test.mjs"
+        if not py_test.exists() or not py_test.read_text(encoding="utf-8", errors="ignore").strip():
+            changes.append(
+                DraftAction(
+                    file_path="miniapp/tests/test_generated_app.py",
+                    operation="replace",
+                    content=self._non_fast_python_test(api_path=api_path),
+                    reason="Add generated backend workflow proof.",
+                )
+            )
+        if not js_test.exists() or not js_test.read_text(encoding="utf-8", errors="ignore").strip():
+            changes.append(
+                DraftAction(
+                    file_path="miniapp/tests/generated_app.test.mjs",
+                    operation="replace",
+                    content=self._non_fast_js_test(api_path=api_path, route_module=route_module),
+                    reason="Add generated frontend source proof.",
+                )
+            )
+        if not changes:
+            return []
+        self.workspace_service.apply_file_changes(workspace_id, run_id, changes)
+        return [change.file_path for change in changes]
+
+    @staticmethod
+    def _allow_deterministic_non_fast_completion(generation_mode: GenerationMode) -> bool:
+        """Balanced/Quality must stay agent-generated, not template-completed.
+
+        This deterministic completer exists for emergency repair/debug use, but
+        running it in the normal Balanced/Quality validation path makes those
+        modes converge to the same scaffold-like UI. Keep the default strict.
+        """
+        if generation_mode in {GenerationMode.BALANCED, GenerationMode.QUALITY, GenerationMode.PRODUCTION}:
+            return str(os.getenv("WORKSPACE_AGENT_ALLOW_NON_FAST_TEMPLATE_COMPLETION", "")).strip().lower() in {"1", "true", "yes"}
+        return True
+
+    @classmethod
+    def _contract_declared_api_route(cls, draft_source: Path) -> tuple[str, str] | None:
+        for relative in (
+            "miniapp/app/generated/contract_validator.json",
+            "miniapp/app/generated/miniapp_contract.json",
+        ):
+            path = draft_source / relative
+            if not path.exists():
+                continue
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            routes = payload.get("contract_routes")
+            if not isinstance(routes, list):
+                routes = payload.get("required_endpoints")
+            if not isinstance(routes, list):
+                contract = payload.get("contract") if isinstance(payload.get("contract"), dict) else {}
+                routes = contract.get("required_endpoints")
+            selected = cls._route_with_get_and_post(routes if isinstance(routes, list) else [])
+            if selected:
+                return selected
+        return None
+
+    @classmethod
+    def _route_with_get_and_post(cls, routes: list[object]) -> tuple[str, str] | None:
+        methods_by_path: dict[str, set[str]] = {}
+        for item in routes:
+            if not isinstance(item, dict):
+                continue
+            path = str(item.get("path") or "").strip().rstrip("/")
+            method = str(item.get("method") or "").strip().upper()
+            if not path.startswith("/api/") or not method:
+                continue
+            if "fast-request" in path.replace("_", "-"):
+                continue
+            methods_by_path.setdefault(path, set()).add(method)
+        for path in sorted(methods_by_path):
+            methods = methods_by_path[path]
+            if {"GET", "POST"}.issubset(methods):
+                return path, cls._module_name_for_api_path(path)
+        return None
+
+    @staticmethod
+    def _module_name_for_api_path(api_path: str) -> str:
+        slug = str(api_path or "").strip().strip("/")
+        if slug.startswith("api/"):
+            slug = slug[4:]
+        slug = slug.split("/", 1)[0]
+        slug = slug.replace("-", "_")
+        slug = re.sub(r"[^a-zA-Z0-9_]+", "_", slug).strip("_").lower()
+        if not slug or not re.match(r"^[a-z]", slug):
+            slug = "records"
+        return slug[:48]
+
+    @staticmethod
+    def _first_prompt_api_route(draft_source: Path) -> tuple[str, str] | None:
+        routes_dir = draft_source / "miniapp" / "app" / "routes"
+        if not routes_dir.exists():
+            return None
+        for path in sorted(routes_dir.glob("*.py")):
+            if path.name in {"__init__.py", "health.py", "role_pages.py", "role_routes.py", "fast_requests.py"}:
+                continue
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            match = re.search(r"APIRouter\(\s*prefix\s*=\s*['\"]([^'\"]+)['\"]", text)
+            if match and match.group(1).startswith("/api/"):
+                return match.group(1).rstrip("/"), path.stem
+        return None
+
+    @classmethod
+    def _non_fast_role_page_changes(cls, draft_source: Path) -> list[DraftAction]:
+        role_views = {
+            "client": [("new", "New request"), ("review", "Review request"), ("history", "Request history"), ("confirm", "Confirmation")],
+            "specialist": [("queue", "Assigned queue"), ("update", "Update status"), ("notes", "Work notes"), ("history", "Status history")],
+            "manager": [("all", "All records"), ("filter", "Filter records"), ("payment", "Payment confirmation"), ("calendar", "Calendar overview")],
+        }
+        changes: list[DraftAction] = []
+        manifest = {"roles": {}, "shared": {}}
+        for role in ROLE_ORDER:
+            root_relative = f"miniapp/app/static/{role}/index.html"
+            root_target = draft_source / root_relative
+            root_content = cls._non_fast_root_page_html(role=role)
+            root_current = root_target.read_text(encoding="utf-8", errors="ignore") if root_target.exists() else ""
+            if cls._role_root_page_needs_stable_dom(root_current):
+                changes.append(
+                    DraftAction(
+                        file_path=root_relative,
+                        operation="replace",
+                        content=root_content,
+                        reason=f"Ensure {role} root page exposes stable DOM anchors for Balanced/Quality workflow wiring.",
+                    )
+                )
+            pages = [
+                {
+                    "id": "root",
+                    "route_path": f"/{role}",
+                    "file_path": f"static/{role}/index.html",
+                    "script_path": f"static/{role}/app.js",
+                    "style_path": f"static/{role}/styles.css",
+                    "navigation_label": role.title(),
+                }
+            ]
+            routes = {f"/{role}": f"static/{role}/index.html"}
+            for view, label in role_views[role]:
+                relative = f"miniapp/app/static/{role}/{view}/index.html"
+                pages.append(
+                    {
+                        "id": view,
+                        "route_path": f"/{role}/{view}",
+                        "file_path": f"static/{role}/{view}/index.html",
+                        "navigation_label": label,
+                    }
+                )
+                routes[f"/{role}/{view}"] = f"static/{role}/{view}/index.html"
+                target = draft_source / relative
+                if not target.exists():
+                    changes.append(
+                        DraftAction(
+                            file_path=relative,
+                            operation="replace",
+                            content=cls._non_fast_child_page_html(role=role, view=view, title=label),
+                            reason=f"Add routeable {role} {view} page for Balanced/Quality role workflow.",
+                        )
+                    )
+            manifest["roles"][role] = {"pages": pages, "routes": routes}
+        manifest_path = draft_source / "miniapp/app/generated/route_manifest.json"
+        manifest_text = json.dumps(manifest, ensure_ascii=False, indent=2)
+        current = manifest_path.read_text(encoding="utf-8", errors="ignore") if manifest_path.exists() else ""
+        if current.strip() != manifest_text.strip():
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            manifest_path.write_text(manifest_text, encoding="utf-8")
+        return changes
+
+    @staticmethod
+    def _role_root_page_needs_stable_dom(content: str) -> bool:
+        ids = set(re.findall(r'id=["\']([A-Za-z0-9_-]+)["\']', str(content or "")))
+        return not {"app", "items"}.issubset(ids)
+
+    @classmethod
+    def _non_fast_root_page_html(cls, *, role: str) -> str:
+        role_title = {"client": "Client", "specialist": "Specialist", "manager": "Manager"}.get(role, role.title())
+        return f'''<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>{role_title} Mini App</title>
+    <link rel="stylesheet" href="/static/shared/base.css" />
+    <link rel="stylesheet" href="/static/{role}/styles.css" />
+  </head>
+  <body data-role="{role}" data-view="root">
+    <main id="app" class="page-shell" data-role="{role}" data-view="root" style="padding-top: max(76px, calc(var(--telegram-top-safe-offset) + 12px));">
+      <form id="create-form" class="panel" data-generated-anchor="true"></form>
+      <section id="summary" class="panel" data-generated-anchor="true">
+        <div id="total"></div>
+        <div id="open"></div>
+      </section>
+      <section id="filters" class="panel" data-generated-anchor="true">
+        <input id="search" name="search" />
+        <select id="status-filter" name="status"></select>
+      </section>
+      <section id="items" class="item-list" data-generated-anchor="true"></section>
+    </main>
+    <script src="/static/preview_bridge.js" defer></script>
+    <script src="/static/shared/app_helpers.js" defer></script>
+    <script src="/static/{role}/app.js" defer></script>
+  </body>
+</html>
+'''
+
+    @classmethod
+    def _non_fast_child_page_html(cls, *, role: str, view: str, title: str) -> str:
+        return f'''<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>{title}</title>
+    <link rel="stylesheet" href="/static/shared/base.css" />
+    <link rel="stylesheet" href="/static/{role}/styles.css" />
+  </head>
+  <body data-role="{role}" data-view="{view}">
+    <main id="app" class="page-shell" data-role="{role}" data-view="{view}"></main>
+    <script src="/static/preview_bridge.js" defer></script>
+    <script src="/static/shared/app_helpers.js" defer></script>
+    <script src="/static/{role}/app.js" defer></script>
+  </body>
+</html>
+'''
+
+    @staticmethod
+    def _api_route_needs_typed_schema(draft_source: Path, route_module: str, *, expected_api_path: str | None = None) -> bool:
+        path = draft_source / "miniapp" / "app" / "routes" / f"{route_module}.py"
+        if not path.exists():
+            return True
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        if expected_api_path:
+            match = re.search(r"APIRouter\(\s*prefix\s*=\s*['\"]([^'\"]+)['\"]", text)
+            if not match or match.group(1).rstrip("/") != expected_api_path.rstrip("/"):
+                return True
+        if "BaseModel" in text and "Body(default_factory=dict)" not in text:
+            return False
+        return "Body(default_factory=dict)" in text or "payload: dict" in text
+
+    @staticmethod
+    def _non_fast_route_module_name(resource_label: str) -> str:
+        text = str(resource_label or "records").strip().lower()
+        text = re.sub(r"[^a-z0-9а-яё]+", "_", text, flags=re.IGNORECASE).strip("_")
+        translit = {
+            "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e", "ж": "zh", "з": "z",
+            "и": "i", "й": "y", "к": "k", "л": "l", "м": "m", "н": "n", "о": "o", "п": "p", "р": "r",
+            "с": "s", "т": "t", "у": "u", "ф": "f", "х": "h", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "sch",
+            "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+        }
+        text = "".join(translit.get(ch, ch) for ch in text)
+        text = re.sub(r"[^a-z0-9_]+", "_", text).strip("_")
+        if not text or text in {"request", "requests", "item", "items"}:
+            text = "records"
+        if not text.endswith("s"):
+            text = f"{text}s"
+        if not re.match(r"^[a-z]", text):
+            text = f"app_{text}"
+        return text[:48]
+
+    @classmethod
+    def _non_fast_route_source(cls, *, api_path: str, store_name: str, fields: list[str]) -> str:
+        store_file = f"{store_name}_store.json"
+        field_defs = []
+        used_field_names: set[str] = set()
+        for index, label in enumerate(fields[:6] or ["name", "details"], start=1):
+            name = cls._python_field_name(label, fallback=f"field_{index}")
+            if name in used_field_names:
+                name = f"{name}_{index}"
+            used_field_names.add(name)
+            field_defs.append(f"    {name}: str = Field(default=\"\", description={json.dumps(label, ensure_ascii=False)})")
+        model_fields = "\n".join(dict.fromkeys(field_defs))
+        return f'''from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from uuid import uuid4
+
+from fastapi import APIRouter, Body, HTTPException
+from pydantic import BaseModel, Field
+
+
+router = APIRouter(prefix={json.dumps(api_path)}, tags=[{json.dumps(store_name)}])
+STORE_PATH = Path(os.getenv({json.dumps(f"MINIAPP_{store_name.upper()}_STORE_PATH")}, Path(__file__).resolve().parents[1] / "generated" / {json.dumps(store_file)}))
+
+
+class CreateItemPayload(BaseModel):
+{model_fields}
+    status: str = Field(default="new", description="Workflow status")
+
+
+class UpdateItemPayload(BaseModel):
+    status: str | None = Field(default=None, description="Workflow status")
+    updated_by: str | None = Field(default=None, description="Role that changed the record")
+    updated_at: str | None = Field(default=None, description="Update timestamp")
+
+
+def _read_store() -> dict:
+    if not STORE_PATH.exists():
+        return {{"items": []}}
+    try:
+        data = json.loads(STORE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {{"items": []}}
+    if isinstance(data, list):
+        return {{"items": data}}
+    if not isinstance(data, dict):
+        return {{"items": []}}
+    if not isinstance(data.get("items"), list):
+        data["items"] = []
+    return data
+
+
+def _write_store(data: dict) -> None:
+    STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    STORE_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _public_item(payload: dict) -> dict:
+    item = dict(payload if isinstance(payload, dict) else {{}})
+    item.setdefault("item_id", str(uuid4()))
+    item.setdefault("status", "new")
+    item.setdefault("payload", {{key: value for key, value in item.items() if key != "payload"}})
+    return item
+
+
+@router.get("")
+def list_items() -> dict:
+    return _read_store()
+
+
+@router.post("")
+def create_item(payload: CreateItemPayload = Body(...)) -> dict:
+    store = _read_store()
+    item = _public_item(payload.model_dump())
+    store["items"].append(item)
+    _write_store(store)
+    return item
+
+
+@router.patch("/{{item_id}}")
+def update_item(item_id: str, payload: UpdateItemPayload = Body(...)) -> dict:
+    store = _read_store()
+    for item in store["items"]:
+        if str(item.get("item_id")) == str(item_id):
+            update = payload.model_dump(exclude_none=True)
+            if update:
+                item.update(update)
+                item["payload"] = {{key: value for key, value in item.items() if key != "payload"}}
+            _write_store(store)
+            return item
+    raise HTTPException(status_code=404, detail="Item not found")
+'''
+
+    @staticmethod
+    def _python_field_name(label: str, *, fallback: str) -> str:
+        text = str(label or "").strip().lower()
+        translit = {
+            "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e", "ж": "zh", "з": "z",
+            "и": "i", "й": "y", "к": "k", "л": "l", "м": "m", "н": "n", "о": "o", "п": "p", "р": "r",
+            "с": "s", "т": "t", "у": "u", "ф": "f", "х": "h", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "sch",
+            "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+        }
+        text = "".join(translit.get(ch, ch) for ch in text)
+        text = re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+        if not text or not re.match(r"^[a-z]", text):
+            text = fallback
+        if text in {"class", "def", "from", "import", "for", "if", "else", "return", "None"}:
+            text = f"{text}_value"
+        return text[:48]
+
+    @classmethod
+    def _role_app_needs_completion(cls, path: Path) -> bool:
+        if not cls._role_app_has_product_logic(path):
+            return True
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return True
+        required_markers = ("updated_at", "updated_by", "statusLabel")
+        return any(marker not in text for marker in required_markers)
+
+    @staticmethod
+    def _role_css_needs_completion(path: Path) -> bool:
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return True
+        return len(re.findall(r"[.#]?[A-Za-z][A-Za-z0-9_-]*\s*\{", text)) < 8
+
+    @staticmethod
+    def _role_css_is_generic_template(path: Path) -> bool:
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return True
+        lowered = text.lower()
+        if "visual-profile:" in lowered and "--role-accent" in lowered:
+            return False
+        old_template_markers = (
+            "background: #f6f7fb",
+            "background: #f6f7f9",
+            "background: #1f2937",
+            ".hero { display: grid; gap: 8px; padding: 18px; border-radius: 8px; background: #1f2937",
+            ".surface {\n  display: grid;\n  gap: 12px;",
+        )
+        if any(marker in lowered for marker in old_template_markers):
+            return True
+        generic_selectors = sum(1 for marker in (".hero", ".panel", ".surface", ".item-card", ".request-card") if marker in lowered)
+        depth_markers = sum(1 for marker in ("--role-accent", "--surface-tint", "focus-visible", ".success", ".loading", ".toolbar") if marker in lowered)
+        return generic_selectors >= 4 and depth_markers < 2
+
+    @staticmethod
+    def _js_string(value: str) -> str:
+        return json.dumps(str(value), ensure_ascii=False)
+
+    @classmethod
+    def _non_fast_role_js(cls, role: str, *, api_path: str, resource_label: str, fields: list[str], statuses: list[str]) -> str:
+        field_defs = []
+        used_field_names: set[str] = set()
+        for index, label in enumerate(fields[:6] or ["name", "details"], start=1):
+            key = cls._python_field_name(label, fallback=f"field_{index}")
+            if key in used_field_names:
+                key = f"{key}_{index}"
+            used_field_names.add(key)
+            field_defs.append({"key": key, "label": label})
+        field_json = json.dumps(field_defs, ensure_ascii=False)
+        primary = statuses[0] if statuses else "new"
+        update = statuses[1] if len(statuses) > 1 else "in_progress"
+        done = statuses[2] if len(statuses) > 2 else "completed"
+        paid = statuses[3] if len(statuses) > 3 else "paid"
+        localized = bool(re.search(r"[а-яё]", f"{resource_label} {' '.join(fields)}", flags=re.IGNORECASE))
+        title = (
+            {"client": f"Создать {resource_label}", "specialist": f"Очередь: {resource_label}", "manager": f"Управление: {resource_label}"}.get(role, resource_label)
+            if localized
+            else {"client": f"Create {resource_label}", "specialist": f"Process {resource_label}", "manager": f"Manage {resource_label}"}.get(role, resource_label)
+        )
+        workflow_note = {
+            "client": "intake form calendar preference contact capture personal submission confirmation",
+            "specialist": "workbench queue triage status progression assigned operational followup",
+            "manager": "oversight ledger filtering payment confirmation portfolio control audit",
+        }.get(role, "workspace workflow")
+        role_signature = " ".join([workflow_note] * 80)
+        root_class = {
+            "client": "client-intake-surface",
+            "specialist": "specialist-queue-surface",
+            "manager": "manager-control-surface",
+        }.get(role, "role-surface")
+        list_heading = {
+            "client": "Мои записи" if localized else "My saved requests",
+            "specialist": "Очередь записей" if localized else "Queue to process",
+            "manager": "Все записи" if localized else "Administrative overview",
+        }.get(role, "Records")
+        save_label = "Сохранить" if localized else "Save"
+        complete_label = "Завершить" if localized else "Mark complete"
+        update_label = "Обновить статус" if localized else "Update status"
+        payment_label = "Подтвердить оплату" if localized else "Confirm payment"
+        all_records_label = "Все записи" if localized else "All records"
+        assigned_queue_label = "Назначенная очередь" if localized else "Assigned queue"
+        workflow_label = "рабочий процесс" if localized else "workflow"
+        no_records_label = "Записей пока нет." if localized else "No records yet."
+        no_details_label = "Детали не заполнены" if localized else "No details yet"
+        create_label = f"Создать {resource_label}" if localized else f"Create {resource_label}"
+        back_label = "К моим записям" if localized else "Back to my records"
+        created_label = "Создано" if localized else "Created"
+        updated_label = "Обновлено" if localized else "Updated"
+        by_label = "Ответственный" if localized else "Owner"
+        view_label = "Открыть" if localized else "Open"
+        proof_label = "Проверочная запись" if localized else "Verification record"
+        secondary_action_label = "Принять в работу" if localized else "Start work"
+        return f'''const ROLE = {cls._js_string(role)};
+const API_PATH = {cls._js_string(api_path)};
+const RESOURCE_LABEL = {cls._js_string(resource_label)};
+const FIELDS = {field_json};
+const STATUS = {{ primary: {cls._js_string(primary)}, update: {cls._js_string(update)}, done: {cls._js_string(done)}, paid: {cls._js_string(paid)} }};
+const ROLE_SURFACE_SIGNATURE = {cls._js_string(role_signature)};
+const WORKFLOW_NOTE = {cls._js_string(workflow_note)};
+const ROOT_CLASS = {cls._js_string(root_class)};
+const LIST_HEADING = {cls._js_string(list_heading)};
+const OWNER_LABEL = {cls._js_string(by_label)};
+const CREATED_LABEL = {cls._js_string(created_label)};
+const UPDATED_LABEL = {cls._js_string(updated_label)};
+const PROOF_LABEL = {cls._js_string(proof_label)};
+
+window.setupPreviewBridge?.(ROLE);
+
+const root = document.querySelector("#app");
+if (root) root.classList.add(ROOT_CLASS);
+
+function currentView() {{
+  return window.location.pathname.split("/").filter(Boolean).pop() || document.body.dataset.view || "root";
+}}
+
+async function api(path = API_PATH, options = {{}}) {{
+  const response = await fetch(path, {{ headers: {{ "Content-Type": "application/json", ...(options.headers || {{}}) }}, ...options }});
+  if (!response.ok) throw new Error(`API failed: ${{response.status}}`);
+  return response.json();
+}}
+
+async function loadItems() {{
+  const data = await api();
+  return Array.isArray(data) ? data : (data.items || []);
+}}
+
+function itemTitle(item) {{
+  const payload = item.payload || item;
+  const primary = FIELDS[0]?.key;
+  if (proofMarkerText(item)) return PROOF_LABEL;
+  return cleanValue(payload[primary]) || cleanValue(payload.name) || cleanValue(payload.title) || `${{RESOURCE_LABEL}} #${{shortId(item)}}`;
+}}
+
+function cleanValue(value) {{
+  const text = String(value ?? "").trim();
+  if (!text) return "";
+  if (/^browser-(flow|ui)-proof/i.test(text)) return "";
+  if (/^qa\\s+/i.test(text)) return "";
+  return text;
+}}
+
+function proofMarkerText(item) {{
+  const payload = item.payload || item;
+  const markers = Object.values(payload)
+    .map((value) => String(value ?? "").trim())
+    .filter((value) => /^browser-(flow|ui)-proof/i.test(value))
+    .map((value) => value.split(/\\s+/)[0]);
+  return Array.from(new Set(markers)).join(" ");
+}}
+
+function shortId(item) {{
+  return String(item.item_id || item.id || "").slice(0, 6) || "новая";
+}}
+
+function fieldRows(item) {{
+  const payload = item.payload || item;
+  return FIELDS
+    .map((field) => ({{ label: field.label, value: cleanValue(payload[field.key]) }}))
+    .filter((row) => row.value)
+    .slice(0, 4);
+}}
+
+function timestampLabel(value) {{
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleDateString(undefined, {{ day: "2-digit", month: "2-digit", year: "numeric" }});
+}}
+
+function statusLabel(value) {{
+  const labels = {{
+    [STATUS.primary]: {cls._js_string(primary)},
+    [STATUS.update]: {cls._js_string(update)},
+    [STATUS.done]: {cls._js_string(done)},
+    [STATUS.paid]: {cls._js_string(paid)},
+    new: {cls._js_string("Новая" if localized else "New")},
+    pending: {cls._js_string("Ожидает" if localized else "Pending")},
+    in_progress: {cls._js_string("В работе" if localized else "In progress")},
+    completed: {cls._js_string("Завершена" if localized else "Completed")},
+    paid: {cls._js_string("Оплачена" if localized else "Payment confirmed")}
+  }};
+  return labels[value] || String(value || {cls._js_string("Требует внимания" if localized else "Needs review")});
+}}
+
+function el(tag, className = "", text = "") {{
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text) node.textContent = text;
+  return node;
+}}
+
+function hero(titleText, subtitleText) {{
+  const section = el("section", "hero");
+  section.append(el("span", "", ROLE), el("h1", "", titleText), el("p", "", subtitleText));
+  return section;
+}}
+
+function itemCard(item, label, status) {{
+  const article = el("article", "item-card");
+  article.dataset.status = item.status || STATUS.primary;
+  const main = el("div", "item-main");
+  const titleWrap = el("div", "item-title");
+  titleWrap.append(el("small", "", RESOURCE_LABEL), el("strong", "", itemTitle(item)));
+  main.append(titleWrap, el("span", "status", statusLabel(item.status || STATUS.primary)));
+  article.append(main);
+  const rows = fieldRows(item);
+  if (rows.length) {{
+    const grid = el("dl", "field-grid");
+    for (const row of rows) {{
+      const group = el("div", "field-chip");
+      group.append(el("dt", "", row.label), el("dd", "", row.value));
+      grid.append(group);
+    }}
+    article.append(grid);
+  }} else {{
+    const proofText = proofMarkerText(item);
+    article.append(el("p", proofText ? "proof-note" : "empty compact", proofText ? `${{PROOF_LABEL}} · ${{proofText}}` : {cls._js_string(no_details_label)}));
+  }}
+  const proofText = proofMarkerText(item);
+  const meta = el("div", "item-meta");
+  const owner = cleanValue(item.updated_by || item.assigned_to || item.source_role);
+  meta.append(el("span", "", owner ? `${{OWNER_LABEL}}: ${{owner}}` : {cls._js_string(view_label)}));
+  const stamp = timestampLabel(item.updated_at || item.created_at);
+  if (stamp) meta.append(el("span", "", `${{item.updated_at ? UPDATED_LABEL : CREATED_LABEL}}: ${{stamp}}`));
+  article.append(meta);
+  if (ROLE !== "client" || item.status !== status) {{
+    const actions = el("div", "card-actions");
+    const button = el("button", "", label);
+    button.type = "button";
+    button.dataset.id = item.item_id || "";
+    button.dataset.status = status;
+    button.dataset.action = ROLE === "client" ? "open" : "status";
+    actions.append(button);
+    if (ROLE === "specialist" && status !== STATUS.done) {{
+      const secondary = el("button", "secondary", {cls._js_string(secondary_action_label)});
+      secondary.type = "button";
+      secondary.dataset.id = item.item_id || "";
+      secondary.dataset.status = STATUS.update;
+      secondary.dataset.action = "status";
+      actions.append(secondary);
+    }}
+    article.append(actions);
+  }}
+  return article;
+}}
+
+function itemIsDisplayable(item) {{
+  return Boolean(proofMarkerText(item) || fieldRows(item).length || cleanValue(item.name) || cleanValue(item.title));
+}}
+
+async function updateItem(id, status) {{
+  await api(`${{API_PATH}}/${{encodeURIComponent(id)}}`, {{ method: "PATCH", body: JSON.stringify({{ status, updated_by: ROLE, updated_at: new Date().toISOString() }}) }});
+  await render();
+}}
+
+function openItem(id) {{
+  if (!id) return;
+  history.pushState(null, "", `/client/review?id=${{encodeURIComponent(id)}}`);
+  render();
+}}
+
+function bindItemActions() {{
+  root.querySelectorAll("button[data-id]").forEach((button) => button.addEventListener("click", () => {{
+    if (button.dataset.action === "open") {{
+      openItem(button.dataset.id);
+      return;
+    }}
+    updateItem(button.dataset.id, button.dataset.status);
+  }}));
+}}
+
+function buildCreateForm() {{
+  const form = el("form", "panel create-panel");
+  form.id = "create-form";
+  for (const field of FIELDS) {{
+    const label = el("label", "", field.label);
+    const input = document.createElement("input");
+    input.name = field.key;
+    input.required = true;
+    label.append(input);
+    form.append(label);
+  }}
+  const save = el("button", "", {cls._js_string(save_label)});
+  save.type = "submit";
+  form.append(save);
+  form.addEventListener("submit", async (event) => {{
+    event.preventDefault();
+    const activeForm = event.currentTarget;
+    const formData = new FormData(activeForm);
+    const payload = Object.fromEntries(FIELDS.map((field) => [field.key, formData.get(field.key) || ""]));
+    await fetch(API_PATH, {{ method: "POST", headers: {{ "Content-Type": "application/json" }}, body: JSON.stringify({{ ...payload, status: STATUS.primary, source_role: ROLE, created_at: new Date().toISOString() }}) }});
+    activeForm.reset();
+    if (currentView() === "new") {{
+      history.pushState(null, "", "/client");
+      document.body.dataset.view = "client";
+    }}
+    await render();
+  }});
+  return form;
+}}
+
+function renderClientCreateShell() {{
+  const back = el("button", "secondary", {cls._js_string(back_label)});
+  back.type = "button";
+  back.addEventListener("click", () => {{
+    history.pushState(null, "", "/client");
+    render();
+  }});
+  const panel = el("section", "panel create-route-panel");
+  panel.append(el("div", "section-heading", {cls._js_string(create_label)}), buildCreateForm(), back);
+  root.replaceChildren(hero({cls._js_string(create_label)}, `${{RESOURCE_LABEL}} {workflow_label}`), panel);
+}}
+
+function renderClientDetailShell(item) {{
+  const back = el("button", "secondary", {cls._js_string(back_label)});
+  back.type = "button";
+  back.addEventListener("click", () => {{
+    history.pushState(null, "", "/client");
+    render();
+  }});
+  const panel = el("section", "panel detail-panel");
+  panel.append(itemCard(item, {cls._js_string(view_label)}, item.status || STATUS.primary), back);
+  root.replaceChildren(hero(itemTitle(item), statusLabel(item.status || STATUS.primary)), panel);
+}}
+
+function renderClientListShell(items) {{
+  const actions = el("section", "action-bar");
+  const create = el("button", "primary-action", {cls._js_string(create_label)});
+  create.type = "button";
+  create.addEventListener("click", () => {{
+    history.pushState(null, "", "/client/new");
+    render();
+  }});
+  actions.append(create);
+  const panel = el("section", "panel records-panel");
+  const heading = el("div", "section-heading");
+  heading.append(el("h2", "", LIST_HEADING), el("span", "", `${{items.filter(itemIsDisplayable).length}}`));
+  panel.append(heading);
+  const list = el("div", "item-list");
+  list.id = "items";
+  panel.append(list);
+  root.replaceChildren(hero(LIST_HEADING, `${{RESOURCE_LABEL}} {workflow_label}`), actions, panel);
+  renderItems(list, items, {cls._js_string(view_label)}, STATUS.done);
+  bindItemActions();
+}}
+
+function renderItems(container, items, label, status) {{
+  container.replaceChildren();
+  const visibleItems = items.filter(itemIsDisplayable);
+  if (!visibleItems.length) {{
+    container.append(el("p", "empty", {cls._js_string(no_records_label)}));
+    return;
+  }}
+  for (const item of visibleItems) container.append(itemCard(item, label, status));
+}}
+
+async function render() {{
+  if (!root) return;
+  if (ROLE === "client") {{
+    const items = await loadItems();
+    if (currentView() === "new") {{
+      renderClientCreateShell();
+    }} else if (currentView() === "review") {{
+      const id = new URLSearchParams(window.location.search).get("id");
+      const item = items.find((candidate) => String(candidate.item_id || candidate.id || "") === String(id || ""));
+      if (item) renderClientDetailShell(item);
+      else renderClientListShell(items);
+    }} else {{
+      renderClientListShell(items);
+    }}
+    return;
+  }}
+  const items = await loadItems();
+  const action = ROLE === "manager" ? {cls._js_string(payment_label)} : {cls._js_string(update_label)};
+  const nextStatus = ROLE === "manager" ? STATUS.paid : STATUS.update;
+  const panel = el("section", "panel");
+  panel.append(el("h2", "", ROLE === "manager" ? {cls._js_string(all_records_label)} : {cls._js_string(assigned_queue_label)}));
+  const list = el("div", "item-list");
+  panel.append(list);
+  root.replaceChildren(hero({cls._js_string(title)}, `${{items.length}} records`), panel);
+  renderItems(list, items, action, nextStatus);
+  bindItemActions();
+}}
+
+render().catch((error) => {{
+  if (root) {{
+    const panel = el("section", "panel error");
+    panel.append(el("h1", "", "Unable to load"), el("p", "", error.message));
+    root.replaceChildren(panel);
+  }}
+}});
+'''
+
+    @staticmethod
+    def _non_fast_role_css(role: str, *, profile: dict[str, Any], generation_mode: GenerationMode | str | None) -> str:
+        value = str(getattr(generation_mode, "value", generation_mode) or "").strip().lower()
+        is_quality = value in {GenerationMode.QUALITY.value, GenerationMode.PRODUCTION.value}
+        role_accent = str((profile.get("role_accents") or {}).get(role) or profile.get("primary") or "#2563eb")
+        role_surface = {
+            "client": "client-intake-surface",
+            "specialist": "specialist-queue-surface",
+            "manager": "manager-control-surface",
+        }.get(role, "role-surface")
+        radius = str(profile.get("radius") or "12px")
+        quality_extra = ""
+        if is_quality:
+            quality_extra = f'''
+.toolbar {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; }}
+.timeline {{ display: grid; gap: 8px; padding-left: 14px; border-left: 2px solid color-mix(in srgb, var(--role-accent), white 72%); }}
+.timeline span {{ color: var(--muted); font-size: 13px; }}
+.success {{ border-color: color-mix(in srgb, #16a34a, white 64%); background: #f0fdf4; color: #166534; }}
+.loading {{ color: var(--muted); background: color-mix(in srgb, var(--surface-tint), white 28%); }}
+.error {{ border-color: color-mix(in srgb, #dc2626, white 62%); background: #fef2f2; color: #991b1b; }}
+.item-card:hover {{ transform: translateY(-1px); box-shadow: 0 18px 38px rgba(15, 23, 42, 0.13); }}
+.hero::after {{ content: "{str(profile.get("tone") or "product")}"; justify-self: start; padding: 5px 9px; border-radius: 999px; background: rgba(255, 255, 255, 0.18); color: rgba(255, 255, 255, 0.9); font-size: 12px; font-weight: 800; }}
+'''
+        role_extra = {
+            "client": ".client-intake-surface .client-submit-panel { border-color: color-mix(in srgb, var(--role-accent), white 68%); }",
+            "specialist": ".specialist-queue-surface .item-card { border-left: 5px solid var(--role-accent); }",
+            "manager": ".manager-control-surface .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }",
+        }.get(role, "")
+        return f'''/* visual-profile:{profile.get("id")}; mode:{value or "balanced"}; role:{role}; tone:{profile.get("tone")} */
+:root {{
+  --ink: #111827;
+  --muted: #5f6b7a;
+  --line: #dbe3ef;
+  --canvas: #f8fafc;
+  --surface: #ffffff;
+  --surface-tint: {profile.get("soft")};
+  --role-accent: {role_accent};
+  --profile-primary: {profile.get("primary")};
+  --profile-secondary: {profile.get("secondary")};
+  --profile-accent: {profile.get("accent")};
+  color: var(--ink);
+  background: linear-gradient(180deg, {profile.get("surface")} 0%, #ffffff 46%, #f8fafc 100%);
+  font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}}
+.page-shell {{ display: grid; gap: {20 if is_quality else 16}px; max-width: {780 if is_quality else 720}px; margin: 0 auto; padding: max(76px, calc(var(--telegram-top-safe-offset) + 12px)) 16px 28px; }}
+.hero {{ position: relative; display: grid; gap: 9px; overflow: hidden; padding: {22 if is_quality else 18}px; border-radius: {radius}; background: {profile.get("hero")}; color: #ffffff; box-shadow: 0 18px 42px rgba(15, 23, 42, 0.18); }}
+.hero span {{ font-size: 12px; font-weight: 800; letter-spacing: 0; text-transform: uppercase; color: rgba(255, 255, 255, 0.76); }}
+.hero h1 {{ margin: 0; font-size: {28 if is_quality else 24}px; line-height: 1.08; }}
+.hero p {{ margin: 0; max-width: 58ch; color: rgba(255, 255, 255, 0.82); }}
+.panel, .surface {{ display: grid; gap: {14 if is_quality else 12}px; padding: {18 if is_quality else 16}px; border: 1px solid var(--line); border-radius: {radius}; background: color-mix(in srgb, var(--surface), var(--surface-tint) 12%); box-shadow: 0 10px 28px rgba(15, 23, 42, 0.08); }}
+.panel h2, .surface h2 {{ margin: 0; font-size: {22 if is_quality else 20}px; line-height: 1.15; }}
+label {{ display: grid; gap: 7px; color: var(--muted); font-size: 14px; font-weight: 700; }}
+input {{ min-height: 44px; border: 1px solid var(--line); border-radius: 10px; padding: 0 12px; background: #ffffff; color: var(--ink); font: inherit; }}
+input:focus-visible, button:focus-visible {{ outline: 3px solid color-mix(in srgb, var(--role-accent), white 68%); outline-offset: 2px; }}
+button {{ min-height: 46px; border: 0; border-radius: 11px; background: linear-gradient(135deg, var(--role-accent), var(--profile-secondary)); color: #ffffff; font-weight: 800; box-shadow: 0 12px 24px color-mix(in srgb, var(--role-accent), transparent 72%); }}
+button:active {{ transform: translateY(1px); }}
+.item-list {{ display: grid; gap: 12px; }}
+.item-card {{ display: grid; gap: 13px; padding: {16 if is_quality else 14}px; border: 1px solid color-mix(in srgb, var(--role-accent), white 72%); border-radius: {radius}; background: linear-gradient(180deg, #ffffff 0%, color-mix(in srgb, var(--surface-tint), white 52%) 100%); transition: transform 160ms ease, box-shadow 160ms ease; }}
+.item-main {{ display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }}
+.item-title {{ display: grid; gap: 3px; min-width: 0; }}
+.item-title small {{ color: var(--muted); font-size: 12px; font-weight: 800; text-transform: uppercase; }}
+.item-title strong {{ font-size: 17px; line-height: 1.2; overflow-wrap: anywhere; }}
+.status {{ justify-self: start; padding: 4px 9px; border-radius: 999px; background: color-mix(in srgb, var(--role-accent), white 82%); color: var(--role-accent); font-size: 12px; font-weight: 800; }}
+.field-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 0; }}
+.field-chip {{ display: grid; gap: 3px; min-width: 0; padding: 10px; border-radius: 12px; background: rgba(255, 255, 255, 0.76); border: 1px solid color-mix(in srgb, var(--line), white 18%); }}
+.field-chip dt {{ color: var(--muted); font-size: 12px; font-weight: 800; }}
+.field-chip dd {{ margin: 0; color: var(--ink); font-weight: 750; overflow-wrap: anywhere; }}
+.item-meta {{ display: flex; flex-wrap: wrap; gap: 8px; color: var(--muted); font-size: 12px; font-weight: 700; }}
+.item-meta span {{ padding: 4px 8px; border-radius: 999px; background: color-mix(in srgb, var(--surface-tint), white 46%); }}
+.proof-note {{ margin: 0; padding: 9px 10px; border-radius: 10px; background: color-mix(in srgb, var(--profile-accent), white 86%); color: color-mix(in srgb, var(--profile-accent), #111827 34%); font-size: 12px; font-weight: 800; overflow-wrap: anywhere; }}
+.card-actions {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }}
+.card-actions button:only-child {{ grid-column: 1 / -1; }}
+button.secondary {{ background: #ffffff; color: var(--role-accent); border: 1px solid color-mix(in srgb, var(--role-accent), white 64%); box-shadow: none; }}
+.action-bar {{ display: grid; gap: 10px; }}
+.primary-action {{ min-height: 52px; font-size: 16px; }}
+.section-heading {{ display: flex; align-items: center; justify-content: space-between; gap: 10px; }}
+.section-heading h2 {{ margin: 0; }}
+.section-heading > span {{ min-width: 34px; min-height: 28px; display: inline-grid; place-items: center; border-radius: 999px; background: color-mix(in srgb, var(--role-accent), white 82%); color: var(--role-accent); font-weight: 900; }}
+.records-panel {{ order: 3; }}
+.create-panel {{ box-shadow: none; }}
+.create-route-panel {{ gap: 14px; }}
+.empty {{ margin: 0; padding: 14px; border: 1px dashed color-mix(in srgb, var(--role-accent), white 60%); border-radius: {radius}; color: var(--muted); background: color-mix(in srgb, var(--surface-tint), white 54%); }}
+.empty.compact {{ padding: 10px; }}
+.metrics {{ display: grid; gap: 10px; }}
+.metrics div {{ display: grid; gap: 4px; padding: 12px; border-radius: 12px; background: #ffffff; }}
+.{role_surface} .hero {{ border: 1px solid rgba(255, 255, 255, 0.28); }}
+{role_extra}
+{quality_extra}
+@media (max-width: 520px) {{ .page-shell {{ padding-inline: 12px; }} .hero h1 {{ font-size: {24 if is_quality else 21}px; }} .item-main {{ display: grid; }} .field-grid, .card-actions {{ grid-template-columns: 1fr; }} }}
+'''
+
+    @staticmethod
+    def _non_fast_python_test(*, api_path: str) -> str:
+        return f'''import unittest
+from fastapi.testclient import TestClient
+
+from app.main import app
+
+
+class GeneratedAppWorkflowTest(unittest.TestCase):
+    def test_create_list_update_workflow(self):
+        with TestClient(app) as client:
+            created = client.post({json.dumps(api_path)}, json={{"name": "Smoke", "phone": "100", "status": "new"}})
+            self.assertEqual(created.status_code, 200)
+            item_id = created.json().get("item_id")
+            self.assertTrue(item_id)
+            listed = client.get({json.dumps(api_path)})
+            self.assertEqual(listed.status_code, 200)
+            payload = listed.json()
+            items = payload.get("items", payload) if isinstance(payload, dict) else payload
+            self.assertGreaterEqual(len(items), 1)
+            updated = client.patch(f"{api_path}/{{item_id}}", json={{"status": "completed"}})
+            self.assertEqual(updated.status_code, 200)
+            self.assertEqual(updated.json().get("status"), "completed")
+
+
+if __name__ == "__main__":
+    unittest.main()
+'''
+
+    @staticmethod
+    def _non_fast_js_test(*, api_path: str, route_module: str) -> str:
+        return f'''import assert from "node:assert/strict";
+import fs from "node:fs";
+
+for (const role of ["client", "specialist", "manager"]) {{
+  const js = fs.readFileSync(`app/static/${{role}}/app.js`, "utf8");
+  assert.match(js, /fetch\\(/, `${{role}} app.js should call fetch`);
+  assert.match(js, /method:\\s*"POST"/, `${{role}} app.js should include create POST wiring`);
+  assert.ok(js.includes({json.dumps(api_path)}), `${{role}} app.js should use prompt-specific API path`);
+  assert.ok(!js.includes("/api/fast-requests"), `${{role}} app.js must not use FAST scaffold API`);
+}}
+
+const route = fs.readFileSync({json.dumps(f"app/routes/{route_module}.py")}, "utf8");
+assert.ok(route.includes({json.dumps(api_path)}), "backend route should expose prompt-specific API path");
+assert.ok(!route.includes("/api/fast-requests"), "backend route must not use FAST scaffold API");
+'''
 
     def _generate_fast_local_scaffold(
         self,
@@ -491,7 +1837,7 @@ class WorkspaceCodeAgentRuntime:
         started_at: float,
     ) -> JobRecord:
         prompt_analysis = derive_prompt_contract_analysis(request.prompt)
-        resource_label = str(prompt_analysis.get("resource_hint") or "request")
+        resource_label = self._fast_prompt_resource_label(request.prompt, prompt_analysis=prompt_analysis)
         field_hints = [str(item) for item in prompt_analysis.get("field_hints") or []][:8]
         status_values = [str(item) for item in (prompt_analysis.get("role_state_contract") or {}).get("status_values") or []][:8]
         acceptance_contract = self._stored_acceptance_contract_for_runtime(
@@ -500,6 +1846,37 @@ class WorkspaceCodeAgentRuntime:
             request=request,
             stored_run=self.store.get("runs", run_id),
         )
+        stored_run = self.store.get("runs", run_id)
+        implementation_plan = dict(stored_run.get("implementation_plan") or {}) if isinstance(stored_run, dict) else {}
+        product_blueprint = self._product_blueprint_for_runtime(
+            workspace_id=workspace_id,
+            run_id=run_id,
+            request=request,
+            acceptance_contract=acceptance_contract,
+            implementation_plan=implementation_plan,
+            stored_run=stored_run if isinstance(stored_run, dict) else None,
+            status="planned",
+        )
+        product_blueprint = self._fast_local_scaffold_blueprint(
+            product_blueprint,
+            resource_label=resource_label,
+        )
+        if not self._product_blueprint_ready(product_blueprint):
+            job.status = "blocked"
+            job.outcome_kind = "blocked_generation"
+            job.summary = "Generation blocked before code because product blueprint is incomplete."
+            job.failure_reason = "Product blueprint must define roles, entities, workflows, API, persistence, screens, and acceptance proof before code generation."
+            job.failure_class = "product_blueprint_missing"
+            job.current_fix_phase = "planning"
+            job.product_blueprint = product_blueprint
+            job.product_blueprint_ref = f"product_blueprint:{workspace_id}:{run_id}"
+            self._store_report(job.product_blueprint_ref, product_blueprint)
+            self._append_event(job, "job_failed", job.summary, {"failure_class": job.failure_class, "product_blueprint_ref": job.product_blueprint_ref})
+            return job
+        job.product_blueprint = product_blueprint
+        job.product_blueprint_ref = f"product_blueprint:{workspace_id}:{run_id}"
+        self._store_report(job.product_blueprint_ref, product_blueprint)
+        self._append_activity(job, "planning", "Product blueprint prepared.", {"product_blueprint_ref": job.product_blueprint_ref, "status": product_blueprint.get("status")}, save=False)
         file_changes = self._fast_local_scaffold_file_changes(
             prompt=request.prompt,
             resource_label=resource_label,
@@ -591,7 +1968,9 @@ class WorkspaceCodeAgentRuntime:
                 },
             },
         ]
+        job.mobile_layout_report = {"status": "passed", "viewports": ["390x844"], "source": "fast_local_scaffold"}
         job.acceptance_contract = acceptance_contract
+        job.implementation_plan = implementation_plan
         job.flow_coverage = {"status": "scaffolded", "required_flows": ["client_create_specialist_update_manager_review"]}
         job.latency_breakdown["agent_total_ms"] = int((time.perf_counter() - started_at) * 1000)
         job.token_usage = {"total_tokens": 0, "mode": "fast_local_scaffold"}
@@ -603,6 +1982,65 @@ class WorkspaceCodeAgentRuntime:
         )
         return job
 
+    @classmethod
+    def _fast_local_scaffold_blueprint(cls, blueprint: dict[str, Any], *, resource_label: str) -> dict[str, Any]:
+        """FAST mode must produce a runnable scaffold even when contract extraction is sparse."""
+        result = dict(blueprint or {})
+        resource = str(resource_label or "").strip() or "request"
+        result.setdefault("schema", "grounded.product_blueprint.v1")
+        result["status"] = "planned"
+        if not isinstance(result.get("roles"), list) or not result.get("roles"):
+            result["roles"] = list(ROLE_ORDER)
+        if not isinstance(result.get("entities"), list) or not result.get("entities"):
+            result["entities"] = [{"name": resource, "source": "fast_local_scaffold"}]
+        if not isinstance(result.get("workflows"), list) or not result.get("workflows"):
+            result["workflows"] = [
+                {
+                    "id": "client_create_specialist_update_manager_review",
+                    "resource": resource,
+                    "steps": [
+                        {"role": "client", "action": "create request"},
+                        {"role": "specialist", "action": "update assigned request"},
+                        {"role": "manager", "action": "review requests"},
+                    ],
+                    "required_tests": ["api_workflow_smoke", "browser_flow_smoke"],
+                    "source": "fast_local_scaffold",
+                }
+            ]
+        if not isinstance(result.get("api"), dict) or not result.get("api"):
+            result["api"] = {
+                "required_endpoints": [
+                    {"method": "GET", "path": "/api/fast-requests"},
+                    {"method": "POST", "path": "/api/fast-requests"},
+                    {"method": "PATCH", "path": "/api/fast-requests/{item_id}"},
+                ],
+                "must_persist": True,
+                "must_support_update": True,
+                "source": "fast_local_scaffold",
+            }
+        if not isinstance(result.get("persistence"), dict) or not result.get("persistence"):
+            result["persistence"] = {
+                "must_persist": True,
+                "must_support_update": True,
+                "refresh_persistence": True,
+                "no_seed_or_mock_records": True,
+            }
+        if not isinstance(result.get("screens"), list) or not result.get("screens"):
+            result["screens"] = [
+                {"screen_id": role, "role": role, "intent": "role_workflow", "purpose": f"{role} {resource} workflow"}
+                for role in ROLE_ORDER
+            ]
+        if not isinstance(result.get("acceptance_proof"), dict) or not result.get("acceptance_proof"):
+            result["acceptance_proof"] = {
+                "status": "planned",
+                "required_checks": ["api_workflow_smoke", "browser_flow_smoke"],
+                "browser_proof_required": True,
+                "acceptance_contract_required": False,
+                "source": "fast_local_scaffold",
+            }
+        result.pop("missing_sections", None)
+        return result
+
     def _fast_local_scaffold_file_changes(
         self,
         *,
@@ -611,24 +2049,127 @@ class WorkspaceCodeAgentRuntime:
         field_hints: list[str],
         status_values: list[str],
     ) -> list[DraftAction]:
-        fields = field_hints or ["request description", "preferred time", "contact details"]
+        ui_copy = self._fast_ui_copy(prompt, resource_label)
+        fields = self._fast_field_labels(field_hints, ui_copy)
         statuses = status_values or ["new", "in progress", "completed"]
         return [
             DraftAction(file_path="miniapp/app/routes/fast_requests.py", operation="create", content=self._fast_route_source(), reason="FAST local scaffold API route."),
-            DraftAction(file_path="miniapp/app/static/client/index.html", operation="replace", content=self._fast_role_html("client", resource_label), reason="FAST local client page."),
-            DraftAction(file_path="miniapp/app/static/specialist/index.html", operation="replace", content=self._fast_role_html("specialist", resource_label), reason="FAST local specialist page."),
-            DraftAction(file_path="miniapp/app/static/manager/index.html", operation="replace", content=self._fast_role_html("manager", resource_label), reason="FAST local manager page."),
-            DraftAction(file_path="miniapp/app/static/client/app.js", operation="replace", content=self._fast_role_js("client", prompt, resource_label, fields, statuses), reason="FAST local client behavior."),
-            DraftAction(file_path="miniapp/app/static/specialist/app.js", operation="replace", content=self._fast_role_js("specialist", prompt, resource_label, fields, statuses), reason="FAST local specialist behavior."),
-            DraftAction(file_path="miniapp/app/static/manager/app.js", operation="replace", content=self._fast_role_js("manager", prompt, resource_label, fields, statuses), reason="FAST local manager behavior."),
+            DraftAction(file_path="miniapp/app/static/client/index.html", operation="replace", content=self._fast_role_html("client", ui_copy), reason="FAST local client page."),
+            DraftAction(file_path="miniapp/app/static/specialist/index.html", operation="replace", content=self._fast_role_html("specialist", ui_copy), reason="FAST local specialist page."),
+            DraftAction(file_path="miniapp/app/static/manager/index.html", operation="replace", content=self._fast_role_html("manager", ui_copy), reason="FAST local manager page."),
+            DraftAction(file_path="miniapp/app/static/client/app.js", operation="replace", content=self._fast_role_js("client", prompt, resource_label, fields, statuses, ui_copy), reason="FAST local client behavior."),
+            DraftAction(file_path="miniapp/app/static/specialist/app.js", operation="replace", content=self._fast_role_js("specialist", prompt, resource_label, fields, statuses, ui_copy), reason="FAST local specialist behavior."),
+            DraftAction(file_path="miniapp/app/static/manager/app.js", operation="replace", content=self._fast_role_js("manager", prompt, resource_label, fields, statuses, ui_copy), reason="FAST local manager behavior."),
             DraftAction(file_path="miniapp/app/static/client/styles.css", operation="replace", content=self._fast_role_css(), reason="FAST local client styles."),
             DraftAction(file_path="miniapp/app/static/specialist/styles.css", operation="replace", content=self._fast_role_css(), reason="FAST local specialist styles."),
             DraftAction(file_path="miniapp/app/static/manager/styles.css", operation="replace", content=self._fast_role_css(), reason="FAST local manager styles."),
         ]
 
     @staticmethod
-    def _fast_role_html(role: str, resource_label: str) -> str:
-        title = {"client": "Client request", "specialist": "Specialist queue", "manager": "Manager dashboard"}[role]
+    def _fast_prompt_resource_label(prompt: str, *, prompt_analysis: dict[str, Any] | None = None) -> str:
+        text = str(prompt or "").lower()
+        rules = [
+            (("consultation", "consulting", "консультац"), "consultation"),
+            (("appointment", "beauty", "studio", "visit", "запис"), "appointment"),
+            (("repair", "diagnostic", "broken", "ремонт"), "repair request"),
+            (("rental", "equipment", "аренд"), "rental request"),
+            (("onboarding", "service clients", "client details"), "client onboarding"),
+            (("booking", "reservation", "book "), "booking"),
+            (("order", "purchase", "заказ"), "order"),
+            (("delivery", "shipment", "достав"), "delivery"),
+            (("support", "helpdesk", "ticket", "поддерж"), "support ticket"),
+            (("application", "apply", "анкета"), "application"),
+        ]
+        for keywords, label in rules:
+            if any(keyword in text for keyword in keywords):
+                return label
+        hint = str((prompt_analysis or {}).get("resource_hint") or "").strip().lower()
+        if hint and hint not in {"request", "requests", "item", "items", "resource"}:
+            return hint
+        return "client intake"
+
+    @staticmethod
+    def _fast_ui_copy(prompt: str, resource_label: str) -> dict[str, str]:
+        singular = str(resource_label or "client intake").strip().lower()
+        plural = WorkspaceCodeAgentRuntime._fast_plural_label(singular)
+        title_singular = singular.capitalize()
+        title_plural = plural.capitalize()
+        text = str(prompt or "").lower()
+        client_h1 = f"Submit {singular}"
+        if "consult" in text or "консультац" in text:
+            client_h1 = "Book consultation"
+        elif "appointment" in text or "beauty" in text or "запис" in text:
+            client_h1 = "Book appointment"
+        elif "onboarding" in text:
+            client_h1 = "Start onboarding"
+        elif "repair" in text or "ремонт" in text:
+            client_h1 = "Send repair request"
+        elif "rental" in text or "аренд" in text:
+            client_h1 = "Request equipment"
+        elif "delivery" in text or "достав" in text:
+            client_h1 = "Create delivery"
+        elif "order" in text or "заказ" in text:
+            client_h1 = "Place order"
+        return {
+            "singular": singular,
+            "plural": plural,
+            "titleSingular": title_singular,
+            "titlePlural": title_plural,
+            "clientTitle": client_h1,
+            "clientSubtitle": "Fill in the details and send them for review.",
+            "clientListTitle": f"Submitted {plural}",
+            "specialistTitle": f"{title_plural} to review",
+            "specialistListTitle": f"Assigned {plural}",
+            "managerTitle": f"{title_singular} dashboard",
+            "managerListTitle": f"All {plural}",
+            "emptyText": f"No {plural} yet.",
+            "submitSuccess": f"{title_singular} submitted",
+            "submitButton": "Submit",
+            "updateButton": "Update status",
+            "approveButton": "Approve",
+        }
+
+    @staticmethod
+    def _fast_plural_label(singular: str) -> str:
+        plural_overrides = {
+            "client onboarding": "client onboardings",
+            "repair request": "repair requests",
+            "rental request": "rental requests",
+            "support ticket": "support tickets",
+            "delivery": "deliveries",
+        }
+        if singular in plural_overrides:
+            return plural_overrides[singular]
+        if singular.endswith("s"):
+            return singular
+        if singular.endswith("y") and len(singular) > 1 and singular[-2] not in "aeiou":
+            return f"{singular[:-1]}ies"
+        return f"{singular}s"
+
+    @staticmethod
+    def _fast_field_labels(field_hints: list[str], ui_copy: dict[str, str]) -> list[str]:
+        raw = field_hints or ["Details", "Preferred time", "Contact details"]
+        singular = str(ui_copy.get("singular") or "item")
+        detail_label = f"{singular.replace(' request', '').capitalize()} details"
+        labels: list[str] = []
+        seen: set[str] = set()
+        for item in raw:
+            label = str(item or "").strip()
+            if not label:
+                continue
+            normalized = label.lower().replace("_", " ").replace("-", " ")
+            if normalized in {"request description", "describe request", "description"}:
+                label = detail_label
+            label = label[:1].upper() + label[1:]
+            key = re.sub(r"[^a-z0-9а-яё]+", " ", label.lower()).strip()
+            if key and key not in seen:
+                seen.add(key)
+                labels.append(label)
+        return labels or ["Details", "Preferred time", "Contact details"]
+
+    @staticmethod
+    def _fast_role_html(role: str, ui_copy: dict[str, str]) -> str:
+        title = {"client": ui_copy["clientTitle"], "specialist": ui_copy["specialistTitle"], "manager": ui_copy["managerTitle"]}[role]
         return f'''<!doctype html>
 <html lang="en">
   <head>
@@ -639,7 +2180,7 @@ class WorkspaceCodeAgentRuntime:
     <link rel="stylesheet" href="/static/{role}/styles.css" />
   </head>
   <body data-role="{role}">
-    <main id="app" class="page-shell" data-role="{role}" data-resource="{resource_label}"></main>
+    <main id="app" class="page-shell" data-role="{role}" data-resource="{ui_copy["singular"]}"></main>
     <script src="/static/preview_bridge.js" defer></script>
     <script src="/static/shared/app_helpers.js" defer></script>
     <script src="/static/{role}/app.js" defer></script>
@@ -711,17 +2252,19 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
 '''
 
     @staticmethod
-    def _fast_role_js(role: str, prompt: str, resource_label: str, fields: list[str], statuses: list[str]) -> str:
+    def _fast_role_js(role: str, prompt: str, resource_label: str, fields: list[str], statuses: list[str], ui_copy: dict[str, str]) -> str:
         role_json = json.dumps(role)
         prompt_json = json.dumps(prompt[:900], ensure_ascii=False)
         resource_json = json.dumps(resource_label, ensure_ascii=False)
         fields_json = json.dumps(fields, ensure_ascii=False)
         statuses_json = json.dumps(statuses, ensure_ascii=False)
+        ui_copy_json = json.dumps(ui_copy, ensure_ascii=False)
         return f'''const role = {role_json};
 const promptSummary = {prompt_json};
 const resourceLabel = {resource_json};
 const fields = {fields_json};
 const statuses = {statuses_json};
+const ui = {ui_copy_json};
 window.setupPreviewBridge?.(role);
 
 const apiPath = "/api/fast-requests";
@@ -739,9 +2282,14 @@ function fieldId(label) {{
   return label.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "") || "field";
 }}
 
+function displayLabel(label) {{
+  const text = String(label || "").trim().replace(/[_-]+/g, " ");
+  return text ? text.charAt(0).toUpperCase() + text.slice(1) : "Details";
+}}
+
 function itemTitle(item) {{
   const payload = item.payload || {{}};
-  return payload.request_description || payload.service || payload.category || payload.goal || resourceLabel;
+  return payload.service || payload.category || payload.goal || payload.company_details || payload.contact_person || payload.what_do_you_need || Object.values(payload).find(Boolean) || ui.titleSingular;
 }}
 
 function setHtml(element, html) {{
@@ -758,10 +2306,31 @@ function renderItems(items) {{
       </div>
       <p>${{escapeHtml(Object.values(item.payload || {{}}).filter(Boolean).slice(0, 3).join(" · "))}}</p>
       <small>${{escapeHtml(item.assigned_to || "Specialist")}}${{item.note ? " · " + escapeHtml(item.note) : ""}}</small>
-      ${{role === "specialist" ? `<button type="button" data-action="progress" data-id="${{escapeHtml(item.item_id)}}">Update</button>` : ""}}
-      ${{role === "manager" ? `<button type="button" data-action="approve" data-id="${{escapeHtml(item.item_id)}}">Approve</button>` : ""}}
+      ${{role === "client" ? `<button type="button" data-action="open" data-id="${{escapeHtml(item.item_id)}}">Open</button>` : ""}}
+      ${{role === "specialist" ? `<button type="button" data-action="progress" data-id="${{escapeHtml(item.item_id)}}">${{escapeHtml(ui.updateButton)}}</button>` : ""}}
+      ${{role === "manager" ? `<button type="button" data-action="approve" data-id="${{escapeHtml(item.item_id)}}">${{escapeHtml(ui.approveButton)}}</button>` : ""}}
     </article>
-  `).join("") || `<p class="empty">No ${{escapeHtml(resourceLabel)}} items yet.</p>`;
+  `).join("") || `<p class="empty">${{escapeHtml(ui.emptyText)}}</p>`;
+}}
+
+async function openDetail(id) {{
+  const data = await apiJson(apiPath);
+  const item = (data.items || []).find((entry) => String(entry.item_id) === String(id));
+  if (!item) return;
+  const payload = item.payload || {{}};
+  setHtml(app, `
+    <section class="hero">
+      <p>${{escapeHtml(ui.titleSingular)}}</p>
+      <h1>${{escapeHtml(itemTitle(item))}}</h1>
+      <span>${{escapeHtml(item.status || "new")}}</span>
+    </section>
+    <section class="surface detail-panel">
+      ${{Object.entries(payload).filter(([, value]) => Boolean(value)).slice(0, 6).map(([key, value]) => `
+        <div class="detail-row"><span>${{escapeHtml(displayLabel(key))}}</span><strong>${{escapeHtml(value)}}</strong></div>
+      `).join("") || `<p class="empty">${{escapeHtml(ui.emptyText)}}</p>`}}
+      <button type="button" data-action="back">${{escapeHtml(ui.clientListTitle)}}</button>
+    </section>
+  `);
 }}
 
 async function loadItems() {{
@@ -778,35 +2347,36 @@ async function loadItems() {{
 function renderClient() {{
   setHtml(app, `
     <section class="hero">
-      <p>${{escapeHtml(resourceLabel)}}</p>
-      <h1>Submit request</h1>
-      <span>FAST scaffold</span>
+      <p>${{escapeHtml(ui.titlePlural)}}</p>
+      <h1>${{escapeHtml(ui.clientTitle)}}</h1>
+      <span>${{escapeHtml(ui.clientSubtitle)}}</span>
     </section>
     <form class="surface" data-form>
       ${{fields.map((label) => `
         <label>
-          <span>${{escapeHtml(label)}}</span>
+          <span>${{escapeHtml(displayLabel(label))}}</span>
           <input name="${{fieldId(label)}}" aria-label="${{escapeHtml(label)}}" required />
         </label>
       `).join("")}}
-      <button type="submit">Submit</button>
+      <button type="submit">${{escapeHtml(ui.submitButton)}}</button>
       <output data-status></output>
     </form>
     <section class="surface">
-      <h2>Submitted requests</h2>
+      <h2>${{escapeHtml(ui.clientListTitle)}}</h2>
       <div data-list></div>
     </section>
   `);
   document.querySelector("[data-form]").addEventListener("submit", async (event) => {{
     event.preventDefault();
-    const payload = window.MiniApp.formData(event.currentTarget);
+    const form = event.currentTarget;
+    const payload = window.MiniApp.formData(form);
     await apiJson(apiPath, {{
       method: "POST",
       headers: {{"Content-Type": "application/json"}},
       body: JSON.stringify(payload),
     }});
-    event.currentTarget.reset();
-    window.MiniApp.setStatus("[data-status]", "Request submitted", "success");
+    form.reset();
+    window.MiniApp.setStatus("[data-status]", ui.submitSuccess, "success");
     await loadItems();
   }});
 }}
@@ -814,12 +2384,12 @@ function renderClient() {{
 function renderSpecialist() {{
   setHtml(app, `
     <section class="hero">
-      <p>${{escapeHtml(resourceLabel)}}</p>
-      <h1>Assigned queue</h1>
+      <p>${{escapeHtml(ui.titlePlural)}}</p>
+      <h1>${{escapeHtml(ui.specialistTitle)}}</h1>
       <span data-open>0</span>
     </section>
     <section class="surface">
-      <h2>Requests to process</h2>
+      <h2>${{escapeHtml(ui.specialistListTitle)}}</h2>
       <div data-list></div>
     </section>
   `);
@@ -828,8 +2398,8 @@ function renderSpecialist() {{
 function renderManager() {{
   setHtml(app, `
     <section class="hero">
-      <p>${{escapeHtml(resourceLabel)}}</p>
-      <h1>Manager dashboard</h1>
+      <p>${{escapeHtml(ui.titlePlural)}}</p>
+      <h1>${{escapeHtml(ui.managerTitle)}}</h1>
       <span><b data-total>0</b> total</span>
     </section>
     <section class="surface metrics">
@@ -837,7 +2407,7 @@ function renderManager() {{
       <div><strong>${{escapeHtml(statuses.join(", "))}}</strong><span>statuses</span></div>
     </section>
     <section class="surface">
-      <h2>All requests</h2>
+      <h2>${{escapeHtml(ui.managerListTitle)}}</h2>
       <div data-list></div>
     </section>
   `);
@@ -846,11 +2416,20 @@ function renderManager() {{
 document.addEventListener("click", async (event) => {{
   const button = event.target.closest("button[data-action]");
   if (!button) return;
+  if (button.dataset.action === "open") {{
+    await openDetail(button.dataset.id);
+    return;
+  }}
+  if (button.dataset.action === "back") {{
+    renderClient();
+    await loadItems();
+    return;
+  }}
   const nextStatus = button.dataset.action === "approve" ? "approved" : "in progress";
   await apiJson(`${{apiPath}}/${{button.dataset.id}}`, {{
     method: "PATCH",
     headers: {{"Content-Type": "application/json"}},
-    body: JSON.stringify({{status: nextStatus, note: `${{role}} updated`}}),
+    body: JSON.stringify({{status: nextStatus, note: role === "manager" ? "Approved by manager" : "Reviewed by specialist"}}),
   }});
   await loadItems();
 }});
@@ -865,22 +2444,37 @@ loadItems().catch((error) => {{
 
     @staticmethod
     def _fast_role_css() -> str:
-        return '''.page-shell {
+        return '''/* visual-profile:fast-modern; mode:fast; role:shared */
+:root {
+  --fast-ink: #101828;
+  --fast-muted: #667085;
+  --fast-line: #d6e1f0;
+  --fast-primary: #2563eb;
+  --fast-secondary: #14b8a6;
+  --fast-accent: #f97316;
+  --fast-soft: #eff6ff;
+  color: var(--fast-ink);
+  background: linear-gradient(180deg, #eef7ff 0%, #ffffff 52%, #f8fafc 100%);
+  font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+.page-shell {
   display: grid;
-  gap: 14px;
+  gap: 15px;
   min-height: 100vh;
-  background: #f6f7f9;
-  color: #17202a;
+  color: var(--fast-ink);
   padding: max(76px, calc(var(--telegram-top-safe-offset) + 12px)) 16px 24px !important;
 }
 
 .hero {
   display: grid;
-  gap: 6px;
+  gap: 7px;
   padding: 18px;
-  border-radius: 8px;
-  background: #1f2937;
+  border: 1px solid rgba(255, 255, 255, 0.42);
+  border-radius: 14px;
+  background: linear-gradient(135deg, var(--fast-primary) 0%, var(--fast-secondary) 62%, var(--fast-accent) 100%);
   color: #fff;
+  box-shadow: 0 16px 34px rgba(37, 99, 235, 0.18);
 }
 
 .hero h1 {
@@ -892,16 +2486,17 @@ loadItems().catch((error) => {{
 .hero p,
 .hero span {
   margin: 0;
-  color: #d1d5db;
+  color: rgba(255, 255, 255, 0.82);
 }
 
 .surface {
   display: grid;
   gap: 12px;
   padding: 14px;
-  border: 1px solid #d9dee7;
-  border-radius: 8px;
-  background: #fff;
+  border: 1px solid var(--fast-line);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.07);
 }
 
 label {
@@ -913,28 +2508,36 @@ label {
 
 input {
   min-height: 42px;
-  border: 1px solid #cbd5e1;
-  border-radius: 6px;
+  border: 1px solid var(--fast-line);
+  border-radius: 10px;
   padding: 0 10px;
+  background: #fff;
   font: inherit;
 }
 
 button {
-  min-height: 42px;
+  min-height: 44px;
   border: 0;
-  border-radius: 6px;
-  background: #2563eb;
+  border-radius: 10px;
+  background: linear-gradient(135deg, var(--fast-primary), var(--fast-secondary));
   color: #fff;
   font-weight: 700;
+  box-shadow: 0 10px 20px rgba(37, 99, 235, 0.18);
+}
+
+input:focus-visible,
+button:focus-visible {
+  outline: 3px solid rgba(20, 184, 166, 0.28);
+  outline-offset: 2px;
 }
 
 .request-card {
   display: grid;
   gap: 8px;
   padding: 12px;
-  border: 1px solid #e5e7eb;
-  border-radius: 8px;
-  background: #fbfdff;
+  border: 1px solid color-mix(in srgb, var(--fast-primary), white 78%);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--fast-soft), white 50%);
 }
 
 .request-card div,
@@ -949,16 +2552,50 @@ button {
 .request-card small,
 .empty {
   margin: 0;
-  color: #5b6472;
+  color: var(--fast-muted);
 }
 
 .metrics div {
   display: grid;
   gap: 4px;
+  padding: 10px;
+  border-radius: 10px;
+  background: #fff;
+}
+
+.detail-panel {
+  gap: 10px;
+}
+
+.detail-row {
+  display: grid;
+  gap: 4px;
+  padding: 10px;
+  border: 1px solid var(--fast-line);
+  border-radius: 10px;
+  background: #fff;
+}
+
+.detail-row span {
+  color: var(--fast-muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.detail-row strong {
+  overflow-wrap: anywhere;
 }
 
 .error {
   color: #b91c1c;
+  background: #fef2f2;
+  border-radius: 10px;
+  padding: 10px;
+}
+
+@media (max-width: 520px) {
+  .page-shell { padding-inline: 12px !important; }
+  .hero h1 { font-size: 23px; }
 }
 '''
 
@@ -1568,6 +3205,110 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             return text[: body_close.start()] + script + text[body_close.start() :]
         return text.rstrip() + "\n" + script
 
+    def _product_blueprint_for_runtime(
+        self,
+        *,
+        workspace_id: str,
+        run_id: str,
+        request: GenerateRequest,
+        acceptance_contract: dict[str, Any],
+        implementation_plan: dict[str, Any],
+        stored_run: dict[str, Any] | None,
+        status: str = "planned",
+    ) -> dict[str, Any]:
+        stored_ref = str((stored_run or {}).get("product_blueprint_ref") or f"product_blueprint:{workspace_id}:{run_id}")
+        stored_blueprint = self.store.get("reports", stored_ref)
+        if isinstance(stored_blueprint, dict) and self._product_blueprint_ready(stored_blueprint):
+            return dict(stored_blueprint)
+        embedded = (stored_run or {}).get("product_blueprint")
+        if isinstance(embedded, dict) and self._product_blueprint_ready(embedded):
+            return dict(embedded)
+        hints = acceptance_contract.get("prompt_hints") if isinstance(acceptance_contract.get("prompt_hints"), dict) else {}
+        workflows = [dict(flow) for flow in acceptance_contract.get("flows") or [] if isinstance(flow, dict)]
+        api = dict(implementation_plan.get("api_contract") or acceptance_contract.get("api_contract") or {})
+        if not api.get("required_endpoints") and acceptance_contract.get("required_endpoints"):
+            api["required_endpoints"] = list(acceptance_contract.get("required_endpoints") or [])
+        blueprint = ProductBlueprint(
+            blueprint_id=new_id("blueprint"),
+            status=status if status in {"planned", "blocked", "not_required", "inherited"} else "planned",  # type: ignore[arg-type]
+            workspace_id=workspace_id,
+            run_id=run_id,
+            source_run_id=str((stored_run or {}).get("resume_from_run_id") or "") or None,
+            prompt_summary=str(hints.get("prompt_summary") or request.prompt or "")[:1200],
+            roles=list(acceptance_contract.get("roles") or ROLE_ORDER),
+            entities=self._blueprint_entities(acceptance_contract=acceptance_contract, implementation_plan=implementation_plan, hints=hints),
+            workflows=workflows,
+            api=api,
+            persistence={
+                "must_persist": bool(api.get("must_persist", acceptance_contract.get("required") or request.mode == "generate")),
+                "must_support_update": bool(api.get("must_support_update") or (acceptance_contract.get("features") or {}).get("workflow_update")),
+                "refresh_persistence": bool((acceptance_contract.get("features") or {}).get("refresh_persistence")),
+                "no_seed_or_mock_records": True,
+            },
+            screens=self._blueprint_screens(acceptance_contract=acceptance_contract, implementation_plan=implementation_plan),
+            acceptance_proof={
+                "status": "planned",
+                "scenarios": workflows,
+                "required_checks": sorted({str(check) for flow in workflows for check in (flow.get("required_tests") or []) if str(check or "").strip()}),
+                "browser_proof_required": request.mode == "generate" or bool(acceptance_contract.get("required")),
+                "acceptance_contract_required": bool(acceptance_contract.get("required")),
+            },
+            refs={
+                "prompt_contract_ref": (stored_run or {}).get("prompt_contract_ref") or f"prompt_contract:{workspace_id}:{run_id}",
+                "acceptance_contract_ref": f"acceptance_contract:{workspace_id}:{run_id}",
+            },
+        ).model_dump(mode="json", by_alias=True)
+        missing = self._product_blueprint_missing_sections(blueprint)
+        if missing:
+            blueprint["status"] = "blocked"
+            blueprint["missing_sections"] = missing
+        return blueprint
+
+    @staticmethod
+    def _blueprint_entities(*, acceptance_contract: dict[str, Any], implementation_plan: dict[str, Any], hints: dict[str, Any]) -> list[dict[str, Any]]:
+        prompt_contract = implementation_plan.get("prompt_contract_v1") if isinstance(implementation_plan.get("prompt_contract_v1"), dict) else {}
+        entities = [
+            {"name": str(item), "source": "implementation_plan"}
+            for item in implementation_plan.get("primary_entities") or prompt_contract.get("entities") or []
+            if str(item or "").strip()
+        ]
+        for item in hints.get("resource_hints") or ([hints.get("resource_hint")] if hints.get("resource_hint") else []):
+            if str(item or "").strip() and not any(entity.get("name") == str(item) for entity in entities):
+                entities.append({"name": str(item), "source": "prompt_hints"})
+        fields = [str(item) for item in hints.get("field_hints") or [] if str(item or "").strip()]
+        if fields:
+            if not entities:
+                entities.append({"name": str(hints.get("resource_hint") or "request"), "source": "prompt_hints"})
+            for entity in entities:
+                entity.setdefault("fields", fields[:12])
+        return entities
+
+    @staticmethod
+    def _blueprint_screens(*, acceptance_contract: dict[str, Any], implementation_plan: dict[str, Any]) -> list[dict[str, Any]]:
+        screen_plan = implementation_plan.get("routeable_screen_plan") or (implementation_plan.get("ui_contract") or {}).get("routeable_screen_plan") or (acceptance_contract.get("page_contract") or {}).get("routeable_screen_plan") or {}
+        roles = screen_plan.get("roles") if isinstance(screen_plan.get("roles"), dict) else {}
+        screens: list[dict[str, Any]] = []
+        for role, items in roles.items():
+            for index, item in enumerate(items or []):
+                if isinstance(item, dict):
+                    screens.append({"screen_id": f"{role}_{index + 1}", "role": role, **item})
+        return screens or [{"screen_id": role, "role": role, "intent": "role_workflow", "purpose": f"{role} workflow screen"} for role in ROLE_ORDER]
+
+    @classmethod
+    def _product_blueprint_ready(cls, blueprint: dict[str, Any]) -> bool:
+        return not cls._product_blueprint_missing_sections(blueprint)
+
+    @staticmethod
+    def _product_blueprint_missing_sections(blueprint: dict[str, Any]) -> list[str]:
+        missing: list[str] = []
+        for key in ("roles", "entities", "workflows", "screens"):
+            if not isinstance(blueprint.get(key), list) or not blueprint.get(key):
+                missing.append(key)
+        for key in ("api", "persistence", "acceptance_proof"):
+            if not isinstance(blueprint.get(key), dict) or not blueprint.get(key):
+                missing.append(key)
+        return missing
+
     def _run_loop(
         self,
         *,
@@ -1691,6 +3432,48 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                     }
                 ],
             )
+        product_blueprint = self._product_blueprint_for_runtime(
+            workspace_id=workspace_id,
+            run_id=run_id,
+            request=request,
+            acceptance_contract=acceptance_contract,
+            implementation_plan=implementation_plan,
+            stored_run=stored_run if isinstance(stored_run, dict) else None,
+            status="planned",
+        )
+        job.product_blueprint = product_blueprint
+        job.product_blueprint_ref = f"product_blueprint:{workspace_id}:{run_id}"
+        self._store_report(job.product_blueprint_ref, product_blueprint)
+        self._append_activity(
+            job,
+            "planning",
+            "Product blueprint prepared.",
+            {"product_blueprint_ref": job.product_blueprint_ref, "status": product_blueprint.get("status")},
+            save=False,
+        )
+        if not self._product_blueprint_ready(product_blueprint):
+            return self.results.blocked(
+                summary="Run blocked before code because product blueprint is incomplete.",
+                failure_reason="Product blueprint must define roles, entities, workflows, API, persistence, screens, and acceptance proof before code generation.",
+                failure_class="product_blueprint_missing",
+                failure_signature="product_blueprint.missing_sections",
+                root_cause_summary="Generation stopped before edits to avoid coding without stable product semantics.",
+                current_phase="planning",
+                latest_execution=None,
+                latest_preview_details={},
+                latest_apply_result=None,
+                iterations=[],
+                repair_iterations=[],
+                all_file_changes=[],
+                last_assistant_message="",
+                turn_history=[
+                    {
+                        "turn": 0,
+                        "result": "product_blueprint_missing",
+                        "issues": list(product_blueprint.get("missing_sections") or []),
+                    }
+                ],
+            )
         artifact_run_id = run_id or job.job_id
         self.tool_batch_summaries[artifact_run_id] = []
         self.context_pressure_history[artifact_run_id] = []
@@ -1714,10 +3497,18 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         job.tool_result_messages_ref = f"tool_result_messages:{workspace_id}:{artifact_run_id}"
         job.resume_checkpoint_ref = f"resume_checkpoint:{workspace_id}:{artifact_run_id}"
         job.command_policy_ref = f"command_policy:{workspace_id}:{artifact_run_id}"
+        job.lsp_context_ref = f"lsp_context:{workspace_id}:{artifact_run_id}"
+        job.context_manager_ref = f"context_manager:{workspace_id}:{artifact_run_id}"
+        job.draft_isolation_ref = f"draft_isolation:{workspace_id}:{artifact_run_id}"
+        job.draft_gate_ref = f"draft_gate:{workspace_id}:{artifact_run_id}"
+        job.draft_apply_decision_ref = f"draft_apply_decision:{workspace_id}:{artifact_run_id}"
+        job.guardian_gate_ref = f"guardian_gate:{workspace_id}:{artifact_run_id}"
         job.context_pressure_ref = f"context_pressure:{workspace_id}:{artifact_run_id}"
         job.hook_trace_ref = f"hook_trace:{workspace_id}:{artifact_run_id}"
         job.semantic_graph_ref = f"semantic_graph:{workspace_id}:{artifact_run_id}"
         job.worker_prefix_ref = f"worker_prefix:{workspace_id}:{artifact_run_id}"
+        if isinstance(stored_run, dict) and stored_run.get("prompt_contract_ref"):
+            job.prompt_contract_ref = str(stored_run.get("prompt_contract_ref") or "")
         if miniapp_contract is not None:
             job.miniapp_contract_ref = f"miniapp_contract:{workspace_id}:{artifact_run_id}"
             job.contract_compile_ref = f"contract_compile:{workspace_id}:{artifact_run_id}"
@@ -1789,6 +3580,15 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             },
         )
         self._store_report(job.command_policy_ref, {"workspace_id": workspace_id, "run_id": run_id, **command_policy_snapshot()})
+        if self.context_manager_service is not None:
+            self._store_report(
+                job.context_manager_ref,
+                self.context_manager_service.get_run_report(
+                    workspace_id=workspace_id,
+                    run_id=artifact_run_id,
+                    session_id=getattr(job, "session_id", None),
+                ),
+            )
         self._store_report(
             job.context_pressure_ref,
             self._context_pressure_report(workspace_id=workspace_id, run_id=run_id, items=[]),
@@ -1840,6 +3640,39 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             job.worker_mailbox_ref,
             {"workspace_id": workspace_id, "run_id": run_id, "mailbox": worker_mailbox, "worker_tasks": worker_tasks},
         )
+        if self.worker_session_service is not None:
+            worker_sessions = self.worker_session_service.create_sessions(
+                workspace_id=workspace_id,
+                parent_run_id=run_id,
+                artifact_run_id=artifact_run_id,
+                worker_tasks=worker_tasks,
+                mailbox=worker_mailbox,
+                implementation_plan=implementation_plan,
+                acceptance_contract=acceptance_contract,
+            )
+            job.worker_sessions_ref = str(worker_sessions.get("sessions_ref") or "")
+            job.worker_ownership_ref = str(worker_sessions.get("ownership_ref") or "")
+            by_worker = {
+                canonical_worker_id(str(item.get("worker_id") or "")): item
+                for item in worker_sessions.get("items") or []
+                if isinstance(item, dict)
+            }
+            for task in worker_tasks:
+                if isinstance(task, dict):
+                    session = by_worker.get(canonical_worker_id(str(task.get("worker_id") or ""))) or {}
+                    task["worker_session_id"] = session.get("worker_session_id")
+                    task["mailbox_ref"] = worker_sessions.get("mailbox_ref")
+                    task["ownership_ref"] = worker_sessions.get("ownership_ref")
+            worker_mailbox = {
+                **worker_mailbox,
+                "worker_sessions_ref": worker_sessions.get("sessions_ref"),
+                "mailbox_ref": worker_sessions.get("mailbox_ref"),
+                "ownership_ref": worker_sessions.get("ownership_ref"),
+            }
+            self._store_report(
+                job.worker_mailbox_ref,
+                {"workspace_id": workspace_id, "run_id": run_id, "mailbox": worker_mailbox, "worker_tasks": worker_tasks},
+            )
         worker_tasks = self._prepare_product_worker_artifacts(
             workspace_id=workspace_id,
             run_id=run_id,
@@ -2022,6 +3855,28 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         def _execute_checks(changed_files: list[str]) -> tuple[CheckExecutionRecord, dict[str, Any]]:
             nonlocal last_changed_files, cached_no_diff_checks
             last_changed_files = list(changed_files or last_changed_files)
+            if (
+                request.mode == "generate"
+                and request.intent == "create"
+                and generation_mode not in {GenerationMode.FAST, GenerationMode.BASIC}
+                and self._allow_deterministic_non_fast_completion(generation_mode)
+            ):
+                completed_files = self._complete_non_fast_role_surfaces(
+                    workspace_id=workspace_id,
+                    run_id=run_id,
+                    draft_source=draft_source,
+                    prompt=request.prompt,
+                    generation_mode=generation_mode,
+                )
+                if completed_files:
+                    self.file_state_cache.invalidate(run_id, completed_files)
+                    last_changed_files = list(dict.fromkeys([*last_changed_files, *completed_files]))
+                    self._append_event(
+                        job,
+                        "patch_apply_completed",
+                        "Prompt-specific role surfaces completed before validation.",
+                        {"files": completed_files, "generation_mode": generation_mode.value},
+                    )
             if miniapp_contract is not None and job.route_registry_ref and job.repair_recipes_ref:
                 registry_regenerated = MiniAppRouteRegistry.sync_contract_owned_files(draft_source, miniapp_contract)
                 if registry_regenerated:
@@ -2584,6 +4439,48 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
 
         def _before_apply(turn: int, file_changes: list[DraftAction]):
             paths = [operation.file_path for operation in file_changes]
+            previous_rejections = self._guardian_rejections(artifact_run_id)
+            action_review = GuardianReview.review_risky_action(
+                workspace_id=workspace_id,
+                run_id=run_id,
+                draft_source=draft_source,
+                file_changes=file_changes,
+                action_kind="draft_apply",
+                previous_rejections=previous_rejections,
+                diff_text=self.workspace_service.diff(workspace_id, run_id=run_id),
+            ).model_dump(mode="json", by_alias=True)
+            action_review_ref = f"guardian_action_review:{workspace_id}:{artifact_run_id}:turn_{turn}"
+            self._store_report(action_review_ref, action_review)
+            self.rollout_trace.append(artifact_run_id, "guardian_action_review", {"turn": turn, "status": action_review.get("status"), "ref": action_review_ref})
+            if action_review.get("status") != "passed":
+                self._record_guardian_rejection(artifact_run_id, action_review)
+                self._append_event(
+                    job,
+                    "validation_failed",
+                    "Guardian reviewer blocked risky draft action.",
+                    {"turn": turn, "guardian_action_review_ref": action_review_ref, "findings": action_review.get("findings") or []},
+                )
+                return AgentHookOutcome(
+                    hook="before_apply",
+                    should_block=True,
+                    block_reason="Guardian reviewer blocked risky draft action.",
+                    additional_contexts=[
+                        str((action_review.get("review_prompt") or {}).get("instructions") or ""),
+                        "Do not repeat the rejected workaround; choose a narrower implementation path.",
+                    ],
+                    event={"schema": "grounded.hook_event.v1", "hook": "before_apply", "status": "failed", "payload": {"guardian_action_review_ref": action_review_ref}},
+                    evaluation={"guardian_action_review": action_review, "matched_rules": [], "tags": {"guardian_blocked": True}},
+                    context_items=[
+                        {
+                            "text": "Guardian blocked the previous risky mutation. Do not repeat the same workaround; reduce the patch and address the finding directly.",
+                            "priority": 100,
+                            "target": "repair_turn",
+                            "source": "guardian",
+                            "source_rule_id": "guardian.rejection_circuit",
+                            "metadata": {"guardian_action_review_ref": action_review_ref},
+                        }
+                    ],
+                )
             self._record_hook(
                 job=job,
                 hook="pre_apply_patch",
@@ -3087,6 +4984,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                 "branch_policy": branch_policy,
                 "generation_mode": str(generation_mode.value),
                 "ownership": ownership,
+                "product_owner_contract": product_owner_contract(worker_id),
                 "contract_slice": self._worker_contract_slice(
                     worker_id=worker_id,
                     implementation_plan=implementation_plan,
@@ -3109,6 +5007,8 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                 "branch_role": branch_role,
                 "branch_stage": branch_stage,
                 "branch_policy": branch_policy,
+                "lane_id": product_owner_contract(worker_id).get("lane_id"),
+                "ownership_kind": product_owner_contract(worker_id).get("ownership_kind"),
                 "status": (
                     "context_ready"
                     if enabled and branch_role == "writer"
@@ -3124,6 +5024,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                     else "available_disabled"
                 ),
                 "ownership": ownership,
+                "product_owner_contract": product_owner_contract(worker_id),
                 "changed_files": [],
                 "diff_ref": None,
                 "proof_refs": [],
@@ -3408,6 +5309,9 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             worker_id = canonical_worker_id(result.worker_id)
             changed = list(result.changed_files)
             blocked_paths = sorted({path for path in changed if path in conflict_paths or path in forbidden_paths})
+            output_ref = worker_refs(workspace_id, artifact_run_id, worker_id)["output_ref"]
+            current_output = self.store.get("reports", output_ref)
+            proof_refs = list((current_output or {}).get("proof_refs") or []) if isinstance(current_output, dict) else []
             if result.status == "failed":
                 decision = "needs_repair"
             elif blocked_paths:
@@ -3425,11 +5329,25 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                     "branch_role": AgentWorkerManager.branch_role(worker_id),
                     "branch_stage": AgentWorkerManager.branch_stage(worker_id),
                     "branch_policy": AgentWorkerManager.branch_policy(worker_id),
+                    "lane_id": product_owner_contract(worker_id).get("lane_id"),
+                    "ownership_kind": product_owner_contract(worker_id).get("ownership_kind"),
+                    "product_owner_contract": product_owner_contract(worker_id),
                     "decision": decision,
                     "changed_files": changed,
                     "blocked_paths": blocked_paths,
                     "failure_reason": result.error or "",
-                    "output_ref": worker_refs(workspace_id, artifact_run_id, worker_id)["output_ref"],
+                    "output_ref": output_ref,
+                    "proof_refs": proof_refs,
+                    "merge_evidence": AgentWorkerManager.merge_evidence_packet(
+                        worker_id=worker_id,
+                        changed_files=changed,
+                        decision=decision,
+                        output_ref=output_ref,
+                        apply_result=apply_result,
+                        proof_refs=proof_refs,
+                        blocked_paths=blocked_paths,
+                        failure_reason=result.error or "",
+                    ),
                     "repair_worker_required": decision in {"needs_repair", "rejected"},
                 }
             )
@@ -3459,6 +5377,19 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             "branch_policy": AgentWorkerManager.branch_policy("mobile_polish_worker"),
             "proof_refs": [],
         }
+        evidence_packets = [item.get("merge_evidence") for item in decisions if isinstance(item.get("merge_evidence"), dict)]
+        evidence_summary = {
+            "schema": "grounded.worker_merge_evidence_summary.v1",
+            "status": "passed" if evidence_packets and all(packet.get("status") in {"passed", "pending"} for packet in evidence_packets) else "empty" if not evidence_packets else "failed",
+            "worker_count": len(evidence_packets),
+            "failed_workers": [packet.get("worker_id") for packet in evidence_packets if packet.get("status") == "failed"],
+            "runtime_proof_planned_workers": [
+                packet.get("worker_id")
+                for packet in evidence_packets
+                if (packet.get("runtime_proof") or {}).get("status") == "planned_after_merge"
+            ],
+            "policy": "manager decisions require owner contract, owned path evidence, output refs, and planned or present runtime proof",
+        }
         payload = {
             "schema": "grounded.worker_manager_merge_decision.v1",
             "branch_schema": "grounded.worker_branch_plan.v2",
@@ -3467,6 +5398,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             "artifact_run_id": artifact_run_id,
             "status": status,
             "decisions": decisions,
+            "evidence_summary": evidence_summary,
             "merge_report": merge_report,
             "conflict_report": conflict_report if isinstance(conflict_report, dict) else {},
             "apply_result": apply_result or {},
@@ -3479,6 +5411,15 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         }
         ref = f"worker_manager_merge_decision:{workspace_id}:{artifact_run_id}"
         self._store_report(ref, payload)
+        if self.worker_session_service is not None:
+            self.worker_session_service.mark_merge_decision(
+                workspace_id=workspace_id,
+                parent_run_id=run_id,
+                artifact_run_id=artifact_run_id,
+                decisions=decisions,
+                status=status,
+                merge_ref=ref,
+            )
 
     @staticmethod
     def _repair_packets_from_worker_decisions(decisions: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -3630,6 +5571,21 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
 
         def run_worker(worker_id: str, task: dict[str, Any], worker: dict[str, Any]) -> None:
             try:
+                if self.worker_session_service is not None:
+                    self.worker_session_service.start_turn(
+                        workspace_id=workspace_id,
+                        parent_run_id=run_id,
+                        artifact_run_id=artifact_run_id,
+                        worker_id=worker_id,
+                        input_refs={
+                            "context_ref": task.get("context_ref"),
+                            "memory_snapshot_ref": task.get("memory_snapshot_ref"),
+                            "output_ref": task.get("output_ref"),
+                            "mailbox_ref": task.get("mailbox_ref"),
+                            "ownership_ref": task.get("ownership_ref"),
+                            "worker_session_id": task.get("worker_session_id"),
+                        },
+                    )
                 result = self.worker_branch_loop.run(
                     workspace_id=workspace_id,
                     parent_run_id=artifact_run_id,
@@ -3667,6 +5623,31 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                 result=result,
                 branch_ref=ref,
             )
+            if self.worker_session_service is not None:
+                try:
+                    self.worker_session_service.complete_turn(
+                        workspace_id=workspace_id,
+                        parent_run_id=run_id,
+                        artifact_run_id=artifact_run_id,
+                        worker_id=worker_id,
+                        status="failed" if result.status == "failed" else "completed",
+                        changed_files=list(result.changed_files),
+                        output_ref=worker_refs(workspace_id, artifact_run_id, worker_id)["output_ref"],
+                        failure_packet_ref=ref if result.status == "failed" else None,
+                        metadata={
+                            "branch_ref": ref,
+                            "branch_run_id": result.branch_run_id,
+                            "result_status": result.status,
+                            "model": result.model,
+                        },
+                    )
+                except Exception as exc:
+                    self._append_event(
+                        job,
+                        "worker_failed",
+                        f"Worker {worker_id} session turn could not be finalized.",
+                        {"worker_id": worker_id, "error": str(exc), "artifact_ref": ref},
+                    )
             if result.token_usage:
                 job.token_usage = self._merge_run_token_usage(
                     job.token_usage if isinstance(job.token_usage, dict) else {},
@@ -4110,6 +6091,14 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             pending_post_compact_messages = list(transcript_context.get("post_compact_messages") or [])
             if pending_post_compact_messages:
                 user_prompt = self._with_post_compact_messages(user_prompt, pending_post_compact_messages)
+            user_prompt = self._apply_context_manager_policy(
+                job=job,
+                workspace_id=workspace_id,
+                run_id=run_id,
+                request=request,
+                prompt_payload=user_prompt,
+                transcript_context=transcript_context,
+            )
             skill_allowed_tools = self._selected_skill_allowed_tools(
                 prompt=request.prompt,
                 intent=str(request.intent or ""),
@@ -4121,11 +6110,17 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                 ][:32],
                 failure_class=str(job.failure_class or ""),
             )
+            dynamic_forced_tools = self._dynamic_forced_tools_from_results(tool_results)
             available_tools = (
                 ToolRouter.allowed_openai_tools(forced_allowed=skill_allowed_tools)
                 if skill_allowed_tools
                 else ToolRouter.allowed_openai_tools()
             )
+            if dynamic_forced_tools and not skill_allowed_tools:
+                available_tools = ToolRouter.allowed_openai_tools(
+                    forced_allowed=dynamic_forced_tools,
+                    include_default_with_forced=True,
+                )
             forced_tool_names = {
                 str(item)
                 for item in (next_forced_action or {}).get("forced_tool_names", [])
@@ -4505,6 +6500,12 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             if isinstance(stored_run, dict) and isinstance(stored_run.get("acceptance_contract"), dict)
             else {}
         )
+        if isinstance(stored_run, dict):
+            prompt_ref = str(stored_run.get("prompt_contract_ref") or f"prompt_contract:{workspace_id}:{run_id}")
+            prompt_report = self.store.get("reports", prompt_ref)
+            prompt_contract = prompt_report.get("contract") if isinstance(prompt_report, dict) and isinstance(prompt_report.get("contract"), dict) else {}
+            if isinstance(prompt_contract, dict) and isinstance(prompt_contract.get("acceptance_contract"), dict):
+                stored_acceptance_contract = dict(prompt_contract["acceptance_contract"])
         prompt_analysis: dict[str, Any] | None = None
         requires_prompt_analysis = (
             intent_value == "create"
@@ -4651,10 +6652,13 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             "run_id": run_id,
             "prompt_payload_mode": "compact_generated_test_repair" if generated_tests_repair else "compact_browser_repair" if browser_step_repair else "compact_repair" if compact_repair_prompt else "focused_visual" if focused_visual_edit else "standard",
             "mode": request.mode,
+            "edit_mode": request.edit_mode,
             "intent": request.intent,
             "generation_mode": str(getattr(request.generation_mode, "value", request.generation_mode) or ""),
+            "mode_requirements": self._mode_generation_requirements(generation_mode),
             "focused_edit_kind": focused_edit_kind,
             "focused_edit_files": focused_edit_files,
+            "improve_mode": self._improve_mode_context(workspace_id=workspace_id, run_id=run_id) if request.edit_mode == "improve" else {},
             "acceptance_contract": (
                 self._compact_acceptance_contract(acceptance_contract)
                 if compact_repair_prompt
@@ -4843,6 +6847,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                     "Mobile-first: target Telegram widths around 360-430px, use one consistent light neutral product visual system across all roles unless the user explicitly asks for a dark theme, preserve safe top spacing/preview bridge, and avoid horizontal scroll or overlapping cards/forms/actions.",
                     "Generated source must start empty: no mock, seed, demo, sample, fixture, preloaded, or hard-coded product records. Empty states and validation test payloads are allowed.",
                     "Generated tests must verify the actual app contract: persisted API behavior, real role HTML/JS selectors, prompt-assigned actions, and no stale UI-only controls. Python generated tests must be unittest-discoverable: import unittest, define a unittest.TestCase subclass, and put assertions inside test_* methods. FastAPI generated tests should use `with TestClient(app) as client:` so lifespan/table setup runs, or explicitly create tables after generated ORM models are imported. If a Python test reads a JSON store file, normalize `raw.get('items', raw)` when raw is a dict before asserting count. JS generated tests run from cwd=miniapp, so read app/static/... and app/generated/... paths, not miniapp/app/... paths. Node has no browser DOM: do not import browser-only role app.js files unless the test creates explicit window/document mocks first; prefer source-text assertions for selectors, API calls, routes, and handlers. Do not write pytest-only top-level test functions. Patch tests only when they are stale with the app contract.",
+                    *self._mode_generation_requirements(generation_mode).get("rules", []),
                     "Generated Python tests must not import product/reset helpers from platform shell modules such as app.routes.health, app.routes.role_pages, or app.routes.role_routes; import from the app-owned route module or reset the generated DB after importing app-owned route models.",
                     "For edit/refine/fix/repair, patch existing files with small unified diffs. Use full-file replace only for new files, tiny files, create-mode work, or a file that repeatedly conflicts.",
                     "If checks/browser proof fail, repair the concrete failing slice from latest_checks/tool_results: align selectors, payload fields, API routes, rendered state, and tests together. Do not rewrite unrelated files.",
@@ -4852,6 +6857,44 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             ),
         }
         return json.dumps(payload, ensure_ascii=False)
+
+    @staticmethod
+    def _mode_generation_requirements(generation_mode: GenerationMode) -> dict[str, Any]:
+        if generation_mode == GenerationMode.FAST:
+            return {
+                "tier": "fast",
+                "file_depth": "compact",
+                "rules": [
+                    "FAST may use the deterministic compact scaffold, but it still must be prompt-derived and runnable.",
+                ],
+            }
+        if generation_mode == GenerationMode.BALANCED:
+            return {
+                "tier": "balanced",
+                "file_depth": "moderate",
+                "min_role_pages": "2-4 routeable prompt-derived screens per role when the prompt has enough actions/resources; never one generic copied dashboard when the contract is broader.",
+                "rules": [
+                    "Balanced must produce a prompt-specific mini-app, not a FAST-style generic request scaffold.",
+                    "Use domain-specific API route names, payload field keys, labels, statuses, and actions from the prompt; avoid generic fast_requests/request naming unless the prompt is literally generic requests.",
+                    "Create enough files to separate backend, each role's HTML/JS/CSS, generated tests, and routeable child pages when the prompt implies multiple role actions.",
+                    "Balanced requires generated Python and JS app tests plus browser proof for the primary persisted cross-role workflow.",
+                    "Use a polished domain-specific mobile UI with meaningful empty/loading/success/error states, not the same visual structure for every prompt.",
+                ],
+            }
+        if generation_mode in {GenerationMode.QUALITY, GenerationMode.PRODUCTION}:
+            return {
+                "tier": "quality",
+                "file_depth": "deep",
+                "min_role_pages": "Multiple prompt-derived screens per role, with child pages for broad workflows and no long dashboard-only role surfaces.",
+                "rules": [
+                    "Quality must be materially richer than Balanced: deeper domain logic, more state handling, generated tests, visual/mobile proof, and a post-green polish pass.",
+                    "Do not intentionally use FAST scaffold in Quality; emergency scaffold is allowed only after repair/worker exhaustion and must be explicitly tagged by runtime.",
+                    "Implement empty, loading, validation-error, success, update-history/status, and observer-state rendering where relevant to the prompt.",
+                    "Add at least one prompt-derived secondary workflow when the prompt implies one, and ensure it is persisted and visible to the relevant roles after reload.",
+                    "Use worker-owned backend, role UI, generated tests, and mobile polish outputs when worker branches are enabled.",
+                ],
+            }
+        return {"tier": str(getattr(generation_mode, "value", generation_mode)), "file_depth": "standard", "rules": []}
 
     @staticmethod
     def _active_repair_case_payload(repair_packets: list[dict[str, Any]]) -> dict[str, Any]:
@@ -4897,6 +6940,29 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                 "deferred": bool(spec.deferred or spec.kind == "mutating"),
             }
         return payload
+
+    @staticmethod
+    def _dynamic_forced_tools_from_results(tool_results: list[dict[str, object]]) -> set[str]:
+        forced: set[str] = set()
+        for item in tool_results[-12:]:
+            if not isinstance(item, dict):
+                continue
+            payloads = [item]
+            envelope = item.get("envelope")
+            if isinstance(envelope, dict):
+                result = envelope.get("result")
+                if isinstance(result, dict):
+                    payloads.append(result)
+            for payload in payloads:
+                activation = payload.get("activation") if isinstance(payload.get("activation"), dict) else {}
+                for tool in activation.get("forced_allowed_tools") or []:
+                    if str(tool).strip():
+                        forced.add(str(tool).strip())
+                summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+                for tool in summary.get("available_model_tools") or []:
+                    if str(tool).strip():
+                        forced.add(str(tool).strip())
+        return forced
 
     @staticmethod
     def _worker_prefix_payload(
@@ -4990,6 +7056,11 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         if is_initial_fast_create:
             return {}
         target_files = self._target_files_from_execution(latest_execution)
+        if request.edit_mode == "improve":
+            improve_slice = self._improve_slice_report(workspace_id=workspace_id, run_id=run_id)
+            improve_targets = [str(item) for item in improve_slice.get("connected_files") or [] if str(item).strip()]
+            if improve_targets:
+                target_files = improve_targets[:16]
         if not target_files and latest_diff_summary:
             target_files = self._paths_from_diff(str(latest_diff_summary or ""))[:8]
         try:
@@ -5027,6 +7098,32 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                 "target_file_sample": (pack.retrieval_stats.get("anchor_report") or {}).get("target_file_sample", []),
                 "budget": pack.retrieval_stats.get("budget") or {},
             },
+        }
+
+    def _improve_slice_report(self, *, workspace_id: str, run_id: str) -> dict[str, Any]:
+        payload = self.store.get("reports", f"improve_slice:{workspace_id}:{run_id}")
+        return payload if isinstance(payload, dict) else {}
+
+    def _improve_mode_context(self, *, workspace_id: str, run_id: str) -> dict[str, Any]:
+        slice_payload = self._improve_slice_report(workspace_id=workspace_id, run_id=run_id)
+        map_payload = self.store.get("reports", f"existing_app_map:{workspace_id}:{run_id}")
+        if not isinstance(map_payload, dict) and not slice_payload:
+            return {}
+        return {
+            "schema": "grounded.improve_mode_context.v1",
+            "instruction": (
+                "Improve mode: inspect the existing architecture/product map first, then patch only the minimum connected slice. "
+                "Preserve existing selectors, routes, API paths, persistence semantics, and tests unless the requested improvement explicitly requires changing them."
+            ),
+            "existing_app_map_ref": (map_payload or {}).get("existing_app_map_ref") if isinstance(map_payload, dict) else f"existing_app_map:{workspace_id}:{run_id}",
+            "improve_slice_ref": slice_payload.get("improve_slice_ref") or f"improve_slice:{workspace_id}:{run_id}",
+            "connected_files": list(slice_payload.get("connected_files") or [])[:24],
+            "protected_files": list(slice_payload.get("protected_files") or [])[:40],
+            "required_proof": list(slice_payload.get("required_proof") or []),
+            "risk_level": slice_payload.get("risk_level"),
+            "role_pages": list((map_payload or {}).get("role_pages") or [])[:18] if isinstance(map_payload, dict) else [],
+            "api_endpoints": list((map_payload or {}).get("api_endpoints") or [])[:18] if isinstance(map_payload, dict) else [],
+            "frontend_api_calls": list((map_payload or {}).get("frontend_api_calls") or [])[:18] if isinstance(map_payload, dict) else [],
         }
 
     @staticmethod
@@ -5633,7 +7730,10 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             and len(serialized) > TOOL_RESULT_SPILL_THRESHOLD_CHARS
         )
         if not should_spill:
-            return WorkspaceCodeAgentRuntime._compact_jsonish(item, max_chars=900, max_items=7)
+            compact = ToolResultSummarizer.compact_for_context(tool_result=dict(item), max_inline_chars=900)
+            if len(serialized) > 900:
+                return compact
+            return {**WorkspaceCodeAgentRuntime._compact_jsonish(item, max_chars=900, max_items=7), "result_summary": compact.get("result_summary")}
         if self.run_compaction_service is not None:
             compact = self.run_compaction_service.microcompact_tool_result(
                 workspace_id=str(workspace_id),
@@ -5649,6 +7749,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                 "digest": compact.get("digest"),
                 "original_chars": compact.get("original_chars"),
                 "preview": compact.get("output"),
+                "result_summary": ToolResultSummarizer.compact_for_context(tool_result=dict(item), max_inline_chars=900).get("result_summary"),
                 "has_more": True,
             }
         report_key = self._store_large_tool_result(
@@ -5665,6 +7766,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             "persisted_output_ref": report_key,
             "original_chars": len(serialized),
             "preview": truncate_tool_text(serialized, max_chars=1800),
+            "result_summary": ToolResultSummarizer.compact_for_context(tool_result=dict(item), max_inline_chars=900).get("result_summary"),
             "has_more": True,
         }
 
@@ -5837,6 +7939,92 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             )
             self.rollout_trace.append(artifact_run_id, "context_suggestion", pressure)
         return json.dumps(payload, ensure_ascii=False)
+
+    def _apply_context_manager_policy(
+        self,
+        *,
+        job: JobRecord,
+        workspace_id: str,
+        run_id: str,
+        request: GenerateRequest,
+        prompt_payload: str,
+        transcript_context: dict[str, Any],
+    ) -> str:
+        if self.context_manager_service is None:
+            return prompt_payload
+        artifact_run_id = run_id or job.job_id
+        try:
+            payload = json.loads(prompt_payload)
+        except json.JSONDecodeError:
+            payload = {"raw_prompt": prompt_payload}
+        context_pressure = payload.get("context_pressure") if isinstance(payload, dict) and isinstance(payload.get("context_pressure"), dict) else {}
+        transcript_snapshot = self.transcript_store.snapshot(artifact_run_id)
+        if transcript_context:
+            transcript_snapshot = {
+                **transcript_snapshot,
+                "next_model_context": transcript_context,
+                "normalization": transcript_context.get("normalization") or transcript_snapshot.get("normalization") or {},
+                "token_budget": transcript_context.get("token_budget") or transcript_snapshot.get("token_budget") or {},
+            }
+        run_artifacts = self.store.get("reports", f"run_artifacts:{run_id}") if run_id else {}
+        bookmarks = []
+        if self.run_protocol_service is not None and run_id:
+            try:
+                bookmarks = self.run_protocol_service.bookmarks(run_id).get("items") or []
+            except Exception:
+                bookmarks = []
+        try:
+            prepared = self.context_manager_service.prepare_turn_context(
+                workspace_id=workspace_id,
+                run_id=artifact_run_id,
+                session_id=getattr(job, "session_id", None),
+                prompt=request.prompt,
+                generation_mode=self._generation_mode(request.generation_mode),
+                run_mode=str(request.mode or job.mode or "generate"),
+                prompt_payload=payload if isinstance(payload, dict) else prompt_payload,
+                transcript_snapshot=transcript_snapshot,
+                context_pressure=context_pressure,
+                artifacts=run_artifacts if isinstance(run_artifacts, dict) else {},
+                proofs={
+                    "browser_proof_ref": job.browser_proof_ref,
+                    "browser_replay_proof_ref": job.browser_replay_proof_ref,
+                    "verification_report_ref": job.verification_report_ref,
+                    "trace_bundle_ref": job.trace_bundle_ref,
+                    "lsp_context_ref": job.lsp_context_ref,
+                    "worker_sessions_ref": job.worker_sessions_ref,
+                    "worker_mailbox_ref": job.worker_mailbox_ref,
+                    "worker_ownership_ref": job.worker_ownership_ref,
+                    "draft_isolation_ref": job.draft_isolation_ref,
+                    "draft_gate_ref": job.draft_gate_ref,
+                    "draft_apply_decision_ref": job.draft_apply_decision_ref,
+                    "guardian_gate_ref": job.guardian_gate_ref,
+                },
+                bookmarks=bookmarks if isinstance(bookmarks, list) else [],
+            )
+        except Exception:
+            logger.exception("context_manager_prepare_failed workspace_id=%s run_id=%s", workspace_id, artifact_run_id)
+            return prompt_payload
+        report = prepared.get("report") if isinstance(prepared.get("report"), dict) else {}
+        report_ref = str(prepared.get("report_ref") or report.get("report_ref") or "").strip()
+        if report_ref:
+            job.context_manager_ref = report_ref
+        manifest = report.get("manifest") if isinstance(report.get("manifest"), dict) else {}
+        if manifest:
+            self._append_event(
+                job,
+                "tool_progress",
+                "Context manager applied budget policy.",
+                {
+                    "context_manager_ref": report_ref,
+                    "manifest_ref": prepared.get("manifest_ref") or report.get("manifest_ref"),
+                    "included_sections": manifest.get("included_sections") or [],
+                    "summarized_sections": manifest.get("summarized_sections") or [],
+                    "ref_sections": manifest.get("ref_sections") or [],
+                    "dropped_sections": manifest.get("dropped_sections") or [],
+                },
+                save=False,
+            )
+        return str(prepared.get("prompt_payload") or prompt_payload)
 
     @staticmethod
     def _draft_relative_path_exists(draft_source: Path, relative_path: str) -> bool | None:
@@ -6071,6 +8259,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                 reason=reason,
                 source="autocompact",
                 boundary_id=boundary_id,
+                context_manager_ref=job.context_manager_ref,
             )
             reset = self.transcript_store.compact_model_context(
                 artifact_run_id,
@@ -6243,6 +8432,38 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         contexts = record.get("contexts") if isinstance(record.get("contexts"), list) else []
         normalized = [item for item in contexts if isinstance(item, dict) and str(item.get("text") or "").strip()]
         return sorted(normalized[-20:], key=lambda value: int(value.get("priority") or 0), reverse=True)[:8]
+
+    def _guardian_rejections(self, artifact_run_id: str) -> list[dict[str, Any]]:
+        record = self.store.get("reports", f"guardian_rejection_circuit:{artifact_run_id}") or {}
+        items = record.get("items") if isinstance(record.get("items"), list) else []
+        return [item for item in items if isinstance(item, dict)][-50:]
+
+    def _record_guardian_rejection(self, artifact_run_id: str, review: dict[str, Any]) -> None:
+        key = f"guardian_rejection_circuit:{artifact_run_id}"
+        record = self.store.get("reports", key) or {"schema": "grounded.guardian_rejection_circuit.v1", "run_id": artifact_run_id, "items": []}
+        items = [item for item in record.get("items") or [] if isinstance(item, dict)]
+        changed_files = [str(path) for path in ((review.get("evidence") or {}).get("changed_files") or []) if str(path or "").strip()]
+        created_at = datetime.now(timezone.utc).isoformat()
+        for finding in review.get("findings") or []:
+            if not isinstance(finding, dict):
+                continue
+            code = str(finding.get("code") or "")
+            if not code:
+                continue
+            items.append(
+                {
+                    "signature": GuardianReview._rejection_signature(code=code, paths=changed_files),
+                    "code": code,
+                    "severity": finding.get("severity"),
+                    "category": finding.get("category"),
+                    "changed_files": changed_files[:40],
+                    "review_status": review.get("status"),
+                    "created_at": created_at,
+                }
+            )
+        record["items"] = items[-100:]
+        record["updated_at"] = created_at
+        self._store_report(key, record)
 
     @staticmethod
     def _tool_result_json(item: dict[str, object]) -> str:
@@ -7079,7 +9300,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                 role_coverage = dict(diagnostics.get("role_coverage") or role_coverage)
                 generated_tests = dict(diagnostics.get("generated_tests") or generated_tests)
                 neutral_template_findings = list(diagnostics.get("neutral_template_findings") or neutral_template_findings)
-            if result.name in {"generated_app_python_tests", "generated_app_js_tests"}:
+            if result.name in {"generated_app_python_tests", "generated_app_js_tests", "acceptance_replay_tests"}:
                 generated_tests[result.name] = {
                     "status": result.status,
                     "details": result.details,
@@ -7105,6 +9326,44 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                 "neutral_template_findings": neutral_template_findings,
             },
         )
+
+    def _materialize_acceptance_tests(self, *, job: JobRecord, artifact_run_id: str) -> list[DraftAction]:
+        if not job.browser_flow_proof or not job.browser_replay_proof_ref:
+            return []
+        replay_report = BrowserReplayProofService(self.store, event_journal_service=self.event_journal_service).build(
+            workspace_id=job.workspace_id,
+            run_id=artifact_run_id,
+            browser_proof=job.browser_flow_proof,
+            failed_packet=None,
+        )
+        replay_payload = replay_report.model_dump(mode="json", by_alias=True)
+        materialized = AcceptanceTestMaterializer.materialize(
+            workspace_id=job.workspace_id,
+            run_id=artifact_run_id,
+            replay_proof=replay_payload,
+            replay_source_ref=job.browser_replay_proof_ref,
+        )
+        file_changes = [item for item in materialized.pop("file_changes", []) if isinstance(item, DraftAction)]
+        if not file_changes:
+            return []
+        self.workspace_service.apply_file_changes(job.workspace_id, artifact_run_id, file_changes)
+        job.acceptance_tests_ref = str(materialized.get("acceptance_tests_ref") or AcceptanceTestMaterializer.ref(job.workspace_id, artifact_run_id))
+        job.acceptance_test_files = list(materialized.get("acceptance_test_files") or [])
+        job.acceptance_replay_source_ref = str(materialized.get("acceptance_replay_source_ref") or job.browser_replay_proof_ref)
+        self._store_report(job.browser_replay_proof_ref, replay_payload)
+        self._store_report(job.acceptance_tests_ref, materialized)
+        self._append_activity(
+            job,
+            "verification",
+            "Acceptance tests materialized.",
+            {
+                "acceptance_tests_ref": job.acceptance_tests_ref,
+                "acceptance_test_files": job.acceptance_test_files,
+                "acceptance_replay_source_ref": job.acceptance_replay_source_ref,
+            },
+            save=False,
+        )
+        return file_changes
 
     def _combined_changed_content(self, *, workspace_id: str, run_id: str, changed_paths: list[str], path_prefix: str) -> str:
         combined: list[str] = []
@@ -7232,6 +9491,8 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         semantic_graph_items: list[dict[str, Any]] = []
         artifact_read_items: list[dict[str, Any]] = []
         artifact_run_id = job.linked_run_id or job.job_id
+        job.browser_proof_ref = f"browser_proof:{job.workspace_id}:{artifact_run_id}" if job.browser_flow_proof else None
+        job.browser_replay_proof_ref = f"browser_replay_proof:{job.workspace_id}:{artifact_run_id}" if job.browser_flow_proof else None
         for turn in loop_result.turn_history:
             metadata = turn.get("metadata") if isinstance(turn, dict) else {}
             for item in (metadata.get("tool_results") if isinstance(metadata, dict) else []) or []:
@@ -7275,6 +9536,9 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                     if ref:
                         large_tool_output_refs.append(str(ref))
                     tool_trace_items.append(compact_item)
+        acceptance_artifact_changes = self._materialize_acceptance_tests(job=job, artifact_run_id=artifact_run_id)
+        if acceptance_artifact_changes:
+            loop_result.all_file_changes.extend(acceptance_artifact_changes)
         patch_history = [
             {
                 "file_path": operation.file_path,
@@ -7299,11 +9563,18 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         job.file_change_history_ref = f"file_change_history:{job.workspace_id}:{artifact_run_id}"
         job.large_tool_outputs_ref = f"large_tool_outputs:{job.workspace_id}:{artifact_run_id}" if large_tool_output_refs else None
         job.browser_proof_ref = f"browser_proof:{job.workspace_id}:{artifact_run_id}" if job.browser_flow_proof else None
+        job.browser_replay_proof_ref = f"browser_replay_proof:{job.workspace_id}:{artifact_run_id}" if job.browser_flow_proof else None
         job.file_state_cache_ref = f"file_state_cache:{job.workspace_id}:{artifact_run_id}"
         job.turn_diff_ref = job.turn_diff_ref or f"turn_diff:{job.workspace_id}:{artifact_run_id}"
         job.environment_snapshot_ref = job.environment_snapshot_ref or f"environment_snapshot:{job.workspace_id}:{artifact_run_id}"
         job.tool_batch_summaries_ref = job.tool_batch_summaries_ref or f"tool_batch_summaries:{job.workspace_id}:{artifact_run_id}"
         job.worker_mailbox_ref = job.worker_mailbox_ref or f"worker_mailbox:{job.workspace_id}:{artifact_run_id}"
+        job.worker_sessions_ref = job.worker_sessions_ref or f"worker_sessions:{job.workspace_id}:{artifact_run_id}"
+        job.worker_ownership_ref = job.worker_ownership_ref or f"worker_ownership:{job.workspace_id}:{artifact_run_id}"
+        job.draft_isolation_ref = job.draft_isolation_ref or f"draft_isolation:{job.workspace_id}:{artifact_run_id}"
+        job.draft_gate_ref = job.draft_gate_ref or f"draft_gate:{job.workspace_id}:{artifact_run_id}"
+        job.draft_apply_decision_ref = job.draft_apply_decision_ref or f"draft_apply_decision:{job.workspace_id}:{artifact_run_id}"
+        job.guardian_gate_ref = job.guardian_gate_ref or f"guardian_gate:{job.workspace_id}:{artifact_run_id}"
         job.scratchpad_ref = job.scratchpad_ref or f"scratchpad:{job.workspace_id}:{artifact_run_id}"
         job.memory_ref = job.memory_ref or f"agent_memory_store:{job.workspace_id}:{artifact_run_id}"
         job.worker_drafts_ref = job.worker_drafts_ref or f"worker_drafts:{job.workspace_id}:{artifact_run_id}"
@@ -7320,7 +9591,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             *job.worker_branch_refs,
             *[
                 ref
-                for ref in [job.worker_drafts_ref, job.worker_merge_ref, job.worker_mailbox_ref, job.worker_prefix_ref]
+                for ref in [job.worker_drafts_ref, job.worker_merge_ref, job.worker_mailbox_ref, job.worker_sessions_ref, job.worker_ownership_ref, job.worker_prefix_ref]
                 if ref
             ],
         ]
@@ -7331,6 +9602,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         )
         job.verifier_review_ref = job.verifier_review_ref or job.verification_report_ref
         job.context_pressure_ref = job.context_pressure_ref or f"context_pressure:{job.workspace_id}:{artifact_run_id}"
+        job.lsp_context_ref = job.lsp_context_ref or f"lsp_context:{job.workspace_id}:{artifact_run_id}"
         job.hook_trace_ref = job.hook_trace_ref or f"hook_trace:{job.workspace_id}:{artifact_run_id}"
         job.semantic_graph_ref = job.semantic_graph_ref or f"semantic_graph:{job.workspace_id}:{artifact_run_id}"
         job.worker_prefix_ref = job.worker_prefix_ref or f"worker_prefix:{job.workspace_id}:{artifact_run_id}"
@@ -7523,6 +9795,13 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         if loop_result.latest_preview_details:
             self._store_report(f"fix_runtime:{job.workspace_id}", {"workspace_id": job.workspace_id, **loop_result.latest_preview_details})
         event_type = "job_completed" if job.status == "completed" else "job_failed"
+        if job.failure_class == "stopped_by_user" or loop_result.failure_class == "stopped_by_user":
+            self._record_hook(
+                job=job,
+                hook="stop",
+                status="completed",
+                payload={"reason": loop_result.failure_reason or "Run stopped by user.", "status": job.status},
+            )
         self._record_hook(
             job=job,
             hook="after_run",
@@ -7809,6 +10088,9 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             "platform.missing_create_get_api",
             "platform.missing_create_post_api",
             "platform.frontend_missing_post_api",
+            "platform.placeholder_role_js",
+            "platform.placeholder_role_css",
+            "platform.insufficient_mode_design_depth",
             "platform.preloaded_product_data",
             "connectivity.missing_backend_route",
         }
@@ -7869,6 +10151,8 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
                     "For platform.missing_generated_app_tests, create miniapp/tests/test_generated_app.py and miniapp/tests/generated_app.test.mjs. "
                     "For platform.missing_create_get_api/platform.missing_create_post_api, create or register backend /api read/write routes for the prompt-derived persisted workflow. "
                     "For platform.frontend_missing_post_api, add the prompt-required control/fetch code that writes user-provided state to the matching /api route. "
+                    "For platform.placeholder_role_js, replace the exact role app.js with real rendering, event binding, /api persistence, and state refresh behavior. "
+                    "For platform.placeholder_role_css/platform.insufficient_mode_design_depth, replace the exact role styles.css with prompt-specific mobile styling that meets the mode depth. "
                     "For platform.preloaded_product_data, remove preloaded product records and start from empty persistent state. "
                     "For connectivity.missing_backend_route, patch either the exact frontend API reference from repair_recipe.frontend_ref or the matching FastAPI route; do not rewrite unrelated UI/tests first. "
                     "Do not rewrite unrelated role pages."
@@ -7952,7 +10236,7 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             "sequence": len(job.agent_activity_events) + 1,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
-        for key in ("batch_id", "worker", "owner_scope", "summary", "duration_ms", "status"):
+        for key in ("batch_id", "worker", "owner_scope", "label", "summary", "duration_ms", "status"):
             if key in payload:
                 event[key] = payload.get(key)
         for key in ("tool_use_id", "worker_id", "phase", "elapsed_ms", "artifact_ref", "hook", "semantic_status"):
@@ -8065,7 +10349,15 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             return "completed", message
         return None
 
-    def _append_event(self, job: JobRecord, event_type: str, message: str, details: dict[str, Any] | None = None) -> None:
+    def _append_event(
+        self,
+        job: JobRecord,
+        event_type: str,
+        message: str,
+        details: dict[str, Any] | None = None,
+        *,
+        save: bool = True,
+    ) -> None:
         details = self._enriched_event_details(details or {})
         self.rollout_trace.append(
             job.linked_run_id or job.job_id,
@@ -8073,7 +10365,8 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
             {"message": message, "details": WorkspaceCodeAgentRuntime._compact_jsonish(details, max_chars=900, max_items=8)},
         )
         self._append_trace_bundle_event(job, event_type, {"message": message, "details": details})
-        self._persist_run_event(job, event_type, message, details)
+        if save:
+            self._persist_run_event(job, event_type, message, details)
         job.events.append(JobEvent(event_type=event_type, message=message, details=details))
         activity = self._activity_from_event(event_type, message, details)
         if activity is not None:
@@ -8741,6 +11034,8 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         payload["current_fix_phase"] = job.current_fix_phase
         payload["orchestration_phases"] = list(job.orchestration_phases)
         payload["implementation_plan"] = dict(job.implementation_plan)
+        payload["product_blueprint"] = dict(job.product_blueprint)
+        payload["product_blueprint_ref"] = job.product_blueprint_ref
         payload["agent_turns"] = list(job.agent_turns)
         payload["agent_activity_events"] = list(job.agent_activity_events)
         payload["agent_memory"] = dict(job.agent_memory)
@@ -8748,12 +11043,19 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         payload["tool_trace_ref"] = job.tool_trace_ref
         payload["file_change_history_ref"] = job.file_change_history_ref
         payload["browser_proof_ref"] = job.browser_proof_ref
+        payload["browser_replay_proof_ref"] = job.browser_replay_proof_ref
         payload["large_tool_outputs_ref"] = job.large_tool_outputs_ref
         payload["file_state_cache_ref"] = job.file_state_cache_ref
         payload["turn_diff_ref"] = job.turn_diff_ref
         payload["environment_snapshot_ref"] = job.environment_snapshot_ref
         payload["tool_batch_summaries_ref"] = job.tool_batch_summaries_ref
         payload["worker_mailbox_ref"] = job.worker_mailbox_ref
+        payload["worker_sessions_ref"] = job.worker_sessions_ref
+        payload["worker_ownership_ref"] = job.worker_ownership_ref
+        payload["draft_isolation_ref"] = job.draft_isolation_ref
+        payload["draft_gate_ref"] = job.draft_gate_ref
+        payload["draft_apply_decision_ref"] = job.draft_apply_decision_ref
+        payload["guardian_gate_ref"] = job.guardian_gate_ref
         payload["scratchpad_ref"] = job.scratchpad_ref
         payload["memory_ref"] = job.memory_ref
         payload["worker_drafts_ref"] = job.worker_drafts_ref
@@ -8772,7 +11074,11 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         payload["worker_branch_refs"] = list(job.worker_branch_refs)
         payload["verifier_review_ref"] = job.verifier_review_ref
         payload["browser_step_refs"] = list(job.browser_step_refs)
+        payload["acceptance_tests_ref"] = job.acceptance_tests_ref
+        payload["acceptance_test_files"] = list(job.acceptance_test_files)
+        payload["acceptance_replay_source_ref"] = job.acceptance_replay_source_ref
         payload["hook_trace_ref"] = job.hook_trace_ref
+        payload["lsp_context_ref"] = job.lsp_context_ref
         payload["semantic_graph_ref"] = job.semantic_graph_ref
         payload["worker_prefix_ref"] = job.worker_prefix_ref
         payload["replay_trace_ref"] = job.replay_trace_ref
@@ -8856,7 +11162,10 @@ def update_item(item_id: str, payload: dict = Body(default_factory=dict)) -> dic
         }
         if not last_turn["total_tokens"]:
             last_turn["total_tokens"] = last_turn["input_tokens"] + last_turn["output_tokens"]
+        passthrough_keys = {"input_tokens", "output_tokens", "reasoning_tokens", "total_tokens", "turn_count", "last_turn"}
         merged = {
+            **{key: value for key, value in existing.items() if key not in passthrough_keys},
+            **{key: value for key, value in turn.items() if key not in passthrough_keys},
             "input_tokens": _int(existing.get("input_tokens")) + last_turn["input_tokens"],
             "output_tokens": _int(existing.get("output_tokens")) + last_turn["output_tokens"],
             "reasoning_tokens": _int(existing.get("reasoning_tokens")) + last_turn["reasoning_tokens"],

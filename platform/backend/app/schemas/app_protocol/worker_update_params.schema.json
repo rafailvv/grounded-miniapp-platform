@@ -1,0 +1,38 @@
+{
+  "$id": "https://grounded.local/schemas/app_protocol/worker_update_params.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "after_sequence": {
+      "default": 0,
+      "title": "After Sequence",
+      "type": "integer"
+    },
+    "limit": {
+      "default": 500,
+      "title": "Limit",
+      "type": "integer"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "worker_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Worker Id"
+    }
+  },
+  "required": [
+    "run_id"
+  ],
+  "title": "WorkerUpdateParams",
+  "type": "object"
+}

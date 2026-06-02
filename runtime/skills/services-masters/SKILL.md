@@ -1,4 +1,5 @@
 ---
+metadata_schema: grounded.skill.v2
 description: Services, specialists, masters, and provider marketplace workflow pack.
 whenToUse:
   - услуги
@@ -24,11 +25,19 @@ allowedTools:
   - browser_verify
 model: default
 effort: high
+triggerRules:
+  - Match prompts using this skill domain and path scope.
 validation:
   - services_workflow
   - persisted_workflow
   - role_coverage
   - browser_flow_smoke
+requiredProof:
+  - Final readiness proof covers this skill.
+incompatibleSkills:
+  - ""
+outputExpectations:
+  - Produce working product changes and cite proof artifacts.
 ---
 # Services / Masters
 

@@ -13,6 +13,7 @@ from app.modules.miniapp_agent_loop.product_workers import (
     canonical_worker_id,
     ownership_for_worker,
     path_is_allowed,
+    product_owner_contract,
     role_for_worker,
 )
 
@@ -166,23 +167,28 @@ class AgentWorkerManager:
     def _mailbox_worker_payload(cls, *, worker_id: str, enabled: bool, disabled_reason: str, status: str) -> dict[str, Any]:
         role = role_for_worker(worker_id)
         ownership = ownership_for_worker(worker_id)
+        owner_contract = product_owner_contract(worker_id)
         canonical = canonical_worker_id(worker_id)
         return {
             "worker": canonical,
             "worker_id": canonical,
             "worker_type": canonical,
-            "alias_ids": [],
+            "alias_ids": list(owner_contract.get("alias_ids") or []),
+            "lane_id": owner_contract.get("lane_id"),
+            "ownership_kind": owner_contract.get("ownership_kind"),
             "branch_role": cls.branch_role(canonical),
             "branch_stage": cls.branch_stage(canonical),
             "branch_policy": cls.branch_policy(canonical),
             "owner_scope": role.owner_scope if role else canonical,
             "path_prefixes": list(ownership.get("allowed_paths") or []),
             "ownership": ownership,
+            "product_owner_contract": owner_contract,
             "tool_allowlist": SubagentForkContract.tool_allowlist_for_worker(canonical),
             "status": status,
             "badge": status,
             "disabled_reason": disabled_reason if not enabled else "",
             "expected_proof": list(ownership.get("expected_proof") or []),
+            "merge_evidence": list(ownership.get("merge_evidence") or []),
         }
 
     @staticmethod
@@ -305,6 +311,65 @@ class AgentWorkerManager:
             "per_worker": list(per_worker.values()),
             "conflicts": ownership.get("conflicts") or [],
             "forbidden": ownership.get("forbidden") or [],
+        }
+
+    @classmethod
+    def merge_evidence_packet(
+        cls,
+        *,
+        worker_id: str,
+        changed_files: list[str],
+        decision: str,
+        output_ref: str | None = None,
+        apply_result: dict[str, Any] | None = None,
+        proof_refs: list[str] | None = None,
+        blocked_paths: list[str] | None = None,
+        failure_reason: str | None = None,
+    ) -> dict[str, Any]:
+        canonical = canonical_worker_id(worker_id)
+        contract = product_owner_contract(canonical)
+        changed = [str(path) for path in changed_files if str(path or "").strip()]
+        blocked = [str(path) for path in blocked_paths or [] if str(path or "").strip()]
+        proof = [str(ref) for ref in proof_refs or [] if str(ref or "").strip()]
+        apply_status = str((apply_result or {}).get("status") or "")
+        owned_paths_only = all(path_is_allowed(canonical, path) for path in changed) if changed else True
+        structural_checks = [
+            {
+                "check": "owned_paths_only",
+                "status": "passed" if owned_paths_only and not blocked else "failed",
+                "evidence": {"changed_files": changed, "blocked_paths": blocked},
+            },
+            {
+                "check": "apply_result",
+                "status": "passed" if apply_status in {"applied", "skipped", ""} and decision in {"accepted", "deferred"} else "failed" if decision == "accepted" else "skipped",
+                "evidence": {"apply_status": apply_status or "not_yet_applied"},
+            },
+            {
+                "check": "worker_output_ref",
+                "status": "passed" if output_ref else "missing",
+                "evidence": {"output_ref": output_ref},
+            },
+        ]
+        runtime_proof_status = "passed" if proof else "planned_after_merge" if decision in {"accepted", "deferred"} else "blocked"
+        structural_ok = all(item["status"] in {"passed", "skipped"} for item in structural_checks)
+        status = "passed" if structural_ok and decision in {"accepted", "deferred"} else "failed" if decision in {"rejected", "needs_repair"} or not structural_ok else "pending"
+        return {
+            "schema": "grounded.worker_merge_evidence.v1",
+            "worker_id": canonical,
+            "lane_id": contract.get("lane_id"),
+            "ownership_kind": contract.get("ownership_kind"),
+            "decision": decision,
+            "status": status,
+            "structural_checks": structural_checks,
+            "runtime_proof": {
+                "status": runtime_proof_status,
+                "expected": list(contract.get("expected_proof") or []),
+                "proof_refs": proof,
+                "policy": "runtime/browser proof may be planned at merge time, but must be present before final readiness",
+            },
+            "required_evidence": list(contract.get("merge_evidence") or []),
+            "product_owner_contract": contract,
+            "failure_reason": failure_reason or "",
         }
 
     @classmethod

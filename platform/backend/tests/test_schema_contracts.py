@@ -8,8 +8,10 @@ from fastapi.testclient import TestClient
 
 from app.main import create_app
 from app.openapi_export import export_openapi
+from app.models.platform_config import PlatformConfig
 from app.models.protocol import ProtocolEnvelopeV1, ProtocolEnvelopeV2
 from app.services.app_protocol import APP_PROTOCOL_SCHEMA_ROOT, app_protocol_json_schemas, app_protocol_manifest
+from app.services.platform_config import default_platform_config_path, platform_config, platform_config_schema
 from app.services.rpc_protocol import RPC_PARAM_MODELS, rpc_protocol_manifest
 
 
@@ -44,12 +46,14 @@ def test_openapi_keeps_typed_workbench_response_models(tmp_path: Path) -> None:
         ("/threads/{thread_id}/events-v2", "get"): "EventJournalPage",
         ("/threads/{thread_id}/journal/state", "get"): "ThreadJournalState",
         ("/event-payloads/{payload_ref}", "get"): "EventJournalPayload",
+        ("/runs/{run_id}/context-manager", "get"): "ContextManagerReport",
         ("/runs/{run_id}/context-pressure", "get"): "ContextPressureReport",
         ("/runs/{run_id}/output-artifacts", "get"): "OutputArtifactIndex",
         ("/runs/{run_id}/prompt-suggestions", "get"): "PromptSuggestionsReport",
         ("/runs/{run_id}/completion-audit", "get"): "PromptCompletionAuditReport",
         ("/runs/{run_id}/visual-regression", "get"): "VisualRegressionReport",
         ("/system/generation-modes", "get"): "GenerationModeSlaManifest",
+        ("/system/platform-config", "get"): "PlatformConfig",
         ("/workspaces/{workspace_id}/memory/retrieve", "post"): "MemoryRetrievalResult",
         ("/workspaces/{workspace_id}/memory/summary", "get"): "MemorySummaryReport",
         ("/system/schema", "get"): "SystemSchemaManifest",
@@ -97,15 +101,64 @@ def test_schema_manifest_and_generated_types_contract_stay_in_sync(tmp_path: Pat
         "EventJournalPage",
         "RunJournalState",
         "ThreadJournalState",
+        "ContextManagerReport",
         "ContextPressureReport",
             "PromptSuggestionsReport",
             "PromptCompletionAuditReport",
             "VisualRegressionReport",
             "GenerationModeSlaManifest",
+            "PlatformConfig",
             "MemorySummaryReport",
         }:
         assert model_name in manifest_names
         assert model_name in component_names
+
+
+def test_platform_config_schema_fixture_matches_generated_model_and_default_config() -> None:
+    fixture = Path("platform/backend/app/schemas/platform.config.schema.json")
+    default_config = default_platform_config_path()
+
+    assert fixture.exists()
+    assert default_config.exists()
+    assert json.loads(fixture.read_text(encoding="utf-8")) == platform_config_schema()
+
+    config = PlatformConfig.model_validate_json(default_config.read_text(encoding="utf-8"))
+    assert config.schema_ == "grounded.platform_config.v1"
+    assert {"fast", "balanced", "quality", "production", "basic"} <= set(config.generation_modes)
+    assert {"api_workflow_smoke", "browser_flow_smoke"} <= set(config.checks)
+    assert {"openai_code_fast", "research_balanced", "openai_code_quality"} <= set(config.model_profiles)
+    assert "browser_flow_smoke" in config.generation_modes["fast"].required_checks
+    assert "fast" in config.browser_proof.required_modes
+
+
+def test_platform_config_path_override_loads_without_python_changes(tmp_path: Path, monkeypatch) -> None:
+    payload = json.loads(default_platform_config_path().read_text(encoding="utf-8"))
+    payload["generation_modes"]["balanced"]["label"] = "Balanced from override"
+    override = tmp_path / "platform.config.json"
+    override.write_text(json.dumps(payload), encoding="utf-8")
+
+    monkeypatch.setenv("PLATFORM_CONFIG_PATH", str(override))
+    loaded = platform_config(reload=True)
+
+    assert loaded.generation_modes["balanced"].label == "Balanced from override"
+
+
+def test_platform_config_endpoint_exposes_product_contract(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+
+    config = client.get("/system/platform-config").json()
+    manifest = client.get("/system/platform-config/manifest").json()
+    schema = client.get("/system/platform-config/schema").json()
+
+    assert config["schema"] == "grounded.platform_config.v1"
+    assert config["generation_modes"]["balanced"]["audit_level"] == "standard"
+    assert config["checks"]["api_workflow_smoke"]["proof_kind"] == "persistence"
+    assert config["default_profile_by_mode"]["quality"] == "openai_code_quality"
+    assert manifest["schema"] == "grounded.platform_config_manifest.v1"
+    assert "generation_modes" in manifest
+    assert schema["$id"] == "https://grounded.local/schemas/platform.config.schema.json"
+    assert schema["properties"]["browser_proof"]["$ref"] == "#/$defs/BrowserProofConfig"
 
 
 def test_app_protocol_manifest_covers_core_subjects_and_legacy_endpoints(tmp_path: Path) -> None:
@@ -118,13 +171,26 @@ def test_app_protocol_manifest_covers_core_subjects_and_legacy_endpoints(tmp_pat
     assert protocol["endpoint_refs"]["openapi"] == "/openapi.json"
 
     subjects = {item["subject"]: item for item in protocol["subjects"]}
-    assert set(subjects) == {"run", "turn", "tool_call", "approval", "event", "worker_update"}
+    assert set(subjects) == {"workbench", "run", "turn", "tool_call", "approval", "event", "worker_update", "browser_proof"}
+    assert subjects["workbench"]["v2_payload_model"] == "ProtocolWorkbenchState"
+    assert subjects["browser_proof"]["v2_payload_model"] == "ProtocolBrowserProofState"
+    assert "/runs/{run_id}/browser-proof" in subjects["browser_proof"]["legacy_endpoints"]
     assert "/runs/{run_id}/protocol" in subjects["run"]["legacy_endpoints"]
     assert "/threads/{thread_id}" in subjects["turn"]["legacy_endpoints"]
     assert "/runs/{run_id}/tool-events" in subjects["tool_call"]["legacy_endpoints"]
     assert "/runs/{run_id}/approvals" in subjects["approval"]["legacy_endpoints"]
     assert "/runs/{run_id}/events-v2" in subjects["event"]["legacy_endpoints"]
     assert "/runs/{run_id}/workers" in subjects["worker_update"]["legacy_endpoints"]
+    assert {
+        "WorkbenchEventResponse",
+        "RunEventsResponse",
+        "WorkerUpdateResponse",
+        "BrowserProofResponse",
+        "WorkbenchNotification",
+        "RunNotification",
+        "WorkerUpdateNotification",
+        "BrowserProofNotification",
+    }.issubset(set(protocol["rpc_method_models"]))
 
 
 def test_app_protocol_schema_fixtures_match_generated_models() -> None:
@@ -167,6 +233,10 @@ def test_typed_rpc_protocol_declares_models_idempotency_and_cursors(tmp_path: Pa
     assert set(RPC_PARAM_MODELS) <= set(methods)
     assert methods["thread/list"]["cursor"]["cursor_kind"] == "opaque_cursor"
     assert methods["run/replay"]["cursor"]["cursor_kind"] == "sequence_cursor"
+    assert methods["run/events"]["result_model"] == "RunEventsResponse"
+    assert methods["worker/updates"]["result_model"] == "WorkerUpdateResponse"
+    assert methods["browser/proof"]["result_model"] == "BrowserProofResponse"
+    assert methods["workbench/events"]["result_model"] == "WorkbenchEventResponse"
     assert methods["thread/list"]["idempotent"] is True
     assert methods["thread/start"]["idempotency"]["mode"] == "recommended"
     assert methods["command/exec"]["stability"] == "experimental"

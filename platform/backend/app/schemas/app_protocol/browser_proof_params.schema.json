@@ -1,0 +1,31 @@
+{
+  "$id": "https://grounded.local/schemas/app_protocol/browser_proof_params.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "after_sequence": {
+      "default": 0,
+      "title": "After Sequence",
+      "type": "integer"
+    },
+    "build": {
+      "default": false,
+      "title": "Build",
+      "type": "boolean"
+    },
+    "limit": {
+      "default": 500,
+      "title": "Limit",
+      "type": "integer"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "run_id"
+  ],
+  "title": "BrowserProofParams",
+  "type": "object"
+}

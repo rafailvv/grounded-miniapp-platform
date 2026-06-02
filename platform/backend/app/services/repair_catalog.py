@@ -6,6 +6,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.services.command_canonicalizer import CommandCanonicalizer
 from app.services.repair_classifier import RepairClassifier
 
 
@@ -975,9 +976,13 @@ def _known_fix_recipes(
     likely_files: list[str],
     post_fix_proof: dict[str, Any],
     classification: dict[str, Any] | None = None,
+    command_canonical: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     issue_code = str(packet.get("issue_code") or packet.get("code") or "repair_case")
     recipe = classification.get("recipe") if isinstance(classification, dict) and isinstance(classification.get("recipe"), dict) else {}
+    command_recipe = _command_retry_recipe(command_canonical or {})
+    if command_recipe:
+        return [command_recipe]
     if recipe:
         compatible_recipe = dict(recipe)
         compatible_recipe["classifier_recipe_id"] = compatible_recipe.get("recipe_id")
@@ -1048,6 +1053,55 @@ def _retry_strategy(packet: dict[str, Any], broken_surface: dict[str, Any], post
     return strategy
 
 
+def _command_canonical(packet: dict[str, Any]) -> dict[str, Any]:
+    candidates = [
+        packet.get("command_canonical"),
+        (packet.get("diagnostics") or {}).get("command_canonical") if isinstance(packet.get("diagnostics"), dict) else None,
+        (packet.get("evidence") or {}).get("command_canonical") if isinstance(packet.get("evidence"), dict) else None,
+    ]
+    for candidate in candidates:
+        if isinstance(candidate, dict) and candidate.get("command_family"):
+            return candidate
+    command = str(packet.get("command") or packet.get("verification_command") or "").strip()
+    if not command:
+        return {}
+    status = str(packet.get("semantic_status") or packet.get("status_taxonomy") or "").strip() or None
+    return CommandCanonicalizer.canonicalize(command, status_taxonomy=status)
+
+
+def _command_retry_recipe(command_canonical: dict[str, Any]) -> dict[str, Any]:
+    family = str(command_canonical.get("command_family") or "")
+    if not family:
+        return {}
+    recipe_id = str(command_canonical.get("retry_recipe_id") or CommandCanonicalizer.retry_recipe_for(command_family=family))
+    status = str(command_canonical.get("status_taxonomy") or "unknown_failure")
+    target_args = [str(item) for item in command_canonical.get("target_args") or [] if str(item or "").strip()]
+    steps_by_family = {
+        "python.pytest": ["Read the failing pytest node/traceback.", "Patch the smallest product/test contract mismatch.", "Rerun the focused pytest target before broad checks."],
+        "python.unittest": ["Read the failing unittest case and traceback.", "Patch product behavior unless the generated test is stale.", "Rerun the exact unittest command."],
+        "node.test": ["Read the TAP/Jest/Vitest failure output.", "Patch selectors, API calls, or stale expectations with contract evidence.", "Rerun the focused JS test command."],
+        "python.uvicorn": ["Inspect import path, app object, env, and startup traceback.", "Fix boot-time imports/routes/dependencies before browser proof.", "Rerun the server boot check."],
+        "docker.compose": ["Check daemon availability, compose file, service logs, and health status.", "Avoid destructive volume/reset commands.", "Rerun the narrow compose command after fixing config."],
+        "playwright.test": ["Use browser replay proof, failed step, DOM, console, and network refs.", "Patch the exact route/selector/API edge.", "Rerun the focused Playwright scenario/spec."],
+        "node.build": ["Read the build error and target source file.", "Patch compile/import/type issues without changing product behavior.", "Rerun the build command."],
+    }
+    steps = steps_by_family.get(family)
+    if not steps:
+        return {}
+    return {
+        "recipe_id": recipe_id,
+        "signature": f"command.{family}.{status}",
+        "title": f"{family} retry recipe",
+        "failure_type": status,
+        "command_family": family,
+        "normalized_family_command": command_canonical.get("normalized_family_command"),
+        "target_args": target_args[:12],
+        "steps": steps,
+        "target_files": [item for item in target_args if item.startswith("miniapp/")][:12],
+        "verification": {"command_family": family, "retry_recipe_id": recipe_id},
+    }
+
+
 def _product_guardrails(packet: dict[str, Any], likely_files: list[str]) -> dict[str, Any]:
     return {
         "do_not_redesign_product": True,
@@ -1099,6 +1153,7 @@ class RepairCatalog:
         probable_files = _probable_files(enriched, broken_surface, likely_files)
         post_fix_proof = _post_fix_proof(enriched, failed_check, broken_surface)
         signature_normalization = _normalize_error_signature(enriched, failed_check)
+        command_canonical = _command_canonical(enriched)
         classification = RepairClassifier.classify(
             {
                 **enriched,
@@ -1115,8 +1170,16 @@ class RepairCatalog:
             likely_files=likely_files,
             post_fix_proof=post_fix_proof,
             classification=classification,
+            command_canonical=command_canonical,
         )
         retry_strategy = _retry_strategy(enriched, broken_surface, post_fix_proof)
+        if command_canonical:
+            retry_strategy = {
+                **retry_strategy,
+                "command_canonical": command_canonical,
+                "command_family": command_canonical.get("command_family"),
+                "retry_recipe_id": command_canonical.get("retry_recipe_id"),
+            }
         if isinstance(classification, dict):
             escalation = classification.get("escalation") if isinstance(classification.get("escalation"), dict) else {}
             relevant_checks = classification.get("relevant_checks") if isinstance(classification.get("relevant_checks"), list) else []
@@ -1156,6 +1219,7 @@ class RepairCatalog:
             "repair_confidence": repair_confidence,
             "post_fix_proof": post_fix_proof,
             "post_repair_proof": post_fix_proof,
+            "command_canonical": command_canonical,
         }
         enriched["failed_check"] = failed_check
         enriched["repair_catalog_version"] = "v2"
@@ -1177,6 +1241,7 @@ class RepairCatalog:
         enriched["repair_confidence"] = repair_confidence
         enriched["post_fix_proof"] = post_fix_proof
         enriched["post_repair_proof"] = post_fix_proof
+        enriched["command_canonical"] = command_canonical
         existing_packet = enriched.get("repair_packet") if isinstance(enriched.get("repair_packet"), dict) else {}
         enriched["repair_packet"] = {**existing_packet, **repair_packet}
         next_action = enriched.get("next_forced_action")

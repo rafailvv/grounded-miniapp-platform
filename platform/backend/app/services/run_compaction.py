@@ -159,6 +159,8 @@ class RunCompactionService:
         reason: str = "manual",
         source: str = "manual",
         boundary_id: str | None = None,
+        context_manager_ref: str | None = None,
+        manifest_ref: str | None = None,
     ) -> dict[str, Any]:
         artifacts = artifacts if isinstance(artifacts, dict) else {}
         checkpoint = checkpoint if isinstance(checkpoint, dict) else {}
@@ -175,6 +177,8 @@ class RunCompactionService:
             "run": run.run_id,
             "resume_checkpoint": run.resume_checkpoint_ref,
             "trace_bundle": run.trace_bundle_ref,
+            "context_manager": context_manager_ref or getattr(run, "context_manager_ref", None),
+            "context_manifest": manifest_ref,
             "context_pressure": run.context_pressure_ref,
             "tool_result_messages": run.tool_result_messages_ref,
             "microcompacts": f"microcompacts:{run.run_id}",

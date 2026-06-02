@@ -7,9 +7,12 @@ from fastapi.testclient import TestClient
 from app.main import create_app
 from app.models.domain import CheckExecutionRecord, CreateRunRequest, RunCheckResult, RunRecord
 from app.services.generation_enhancements import ProjectInstructionBundle, SkillPackCatalog
+from app.services.generation_sla import GenerationSla
 from app.services.skill_registry import SkillRegistryService
 from app.services.memory_pipeline import WorkspaceMemoryPipeline
 from app.services.trace_bundle import TraceBundleWriter
+from app.services.platform_config import platform_config
+from app.ai.model_registry import provider_routing_table
 
 
 def _workspace(client: TestClient) -> dict:
@@ -68,6 +71,7 @@ def test_project_instructions_skills_slash_commands_and_worker_roles(tmp_path: P
         "/fix",
         "/polish",
         "/add-flow",
+        "/improve",
         "/review",
         "/acceptance",
         "/deploy",
@@ -82,8 +86,8 @@ def test_project_instructions_skills_slash_commands_and_worker_roles(tmp_path: P
     assert resolved["ui_action"]["type"] == "execute_workflow"
     assert resolved["ui_action"]["workflow"] == "ui_polish_run"
     assert "Polish the current app visually" in resolved["prompt_template"]
-    assert any(item["worker_id"] == "backend_api_worker" and item["alias_ids"] == [] for item in workers["items"])
-    assert any(item["worker_id"] == "mobile_polish_worker" and item["alias_ids"] == [] for item in workers["items"])
+    assert any(item["worker_id"] == "backend_api_worker" and "backend_worker" in item["alias_ids"] for item in workers["items"])
+    assert any(item["worker_id"] == "mobile_polish_worker" and "visual_verifier_worker" in item["alias_ids"] for item in workers["items"])
     assert subagents["schema"] == "grounded.subagent_fork_contract.v1"
     assert [lane["lane_id"] for lane in subagents["lanes"]] == ["planner", "backend", "frontend-role-ui", "tests", "verifier", "polish", "repair"]
     assert "patch_files" not in next(lane for lane in subagents["lanes"] if lane["lane_id"] == "verifier")["tool_allowlist"]
@@ -156,6 +160,26 @@ def test_domain_product_skills_select_relevant_packs(tmp_path: Path) -> None:
         ).json()
         selected_ids = {item["id"] for item in result["selected"]}
         assert expected_ids.issubset(selected_ids), (prompt, selected_ids)
+
+
+def test_platform_config_drives_sla_skills_and_model_profiles() -> None:
+    config = platform_config()
+    manifest = GenerationSla.manifest()
+    routing = provider_routing_table()
+    skill_budget = SkillRegistryService.activation_budget(
+        generation_mode="quality",
+        max_skills=None,
+        max_body_chars=None,
+        max_total_body_chars=None,
+    )
+
+    assert manifest["platform_config_ref"] == "runtime/platform.config.json"
+    assert manifest["default_mode"] == config.sla.default_mode
+    assert manifest["modes"][0]["required_checks"] == config.generation_modes["fast"].required_checks
+    assert GenerationSla.requires_visual_snapshots("quality") is True
+    assert GenerationSla.requires_visual_snapshots("balanced") is False
+    assert skill_budget == config.skill_activation.activation_budget_by_mode["quality"]
+    assert routing["profiles"]["openai_code_quality"]["routing"] == config.model_profiles["openai_code_quality"].routing
 
 
 def test_slash_generate_execute_starts_real_run_workflow(tmp_path: Path, monkeypatch) -> None:
@@ -371,7 +395,12 @@ def test_memory_pipeline_extracts_consolidates_dedupes_and_rejects_secrets(tmp_p
     assert consolidated["pipeline"]["phase1"]["raw_count"] == len(stage1["items"]) * 2
     assert consolidated["pipeline"]["phase2"]["deduped_count"] == len(stage1["items"])
     assert consolidated["pipeline"]["category_counts"]["known_failure_recipes"] >= 1
+    assert consolidated["pipeline"]["category_counts"]["repeated_failures"] >= 1
+    assert consolidated["pipeline"]["category_counts"]["fix_strategies"] >= 1
+    assert consolidated["pipeline"]["repeated_failure_stats"]["repeated_failure_count"] >= 1
     assert consolidated["known_failure_recipes"]
+    assert consolidated["repeated_failures"]
+    assert consolidated["fix_strategies"]
     assert stale["status"] == "stale"
     assert retrieval["schema"] == "grounded.memory_retrieval.v1"
     assert retrieval["hits"]
@@ -382,6 +411,8 @@ def test_memory_pipeline_extracts_consolidates_dedupes_and_rejects_secrets(tmp_p
     assert summary["always_loaded"] is True
     assert any(section["kind"] == "failure_shield" for section in summary["sections"])
     assert any(section["kind"] == "known_failure_recipe" for section in summary["sections"])
+    assert any(section["kind"] == "repeated_failure" for section in summary["sections"])
+    assert any(section["kind"] == "fix_strategy" for section in summary["sections"])
 
 
 def test_memory_pipeline_extracts_successful_app_patterns() -> None:
@@ -394,6 +425,8 @@ def test_memory_pipeline_extracts_successful_app_patterns() -> None:
         status="completed",
         apply_status="applied",
         touched_files=["miniapp/app/main.py", "miniapp/app/static/styles.css"],
+        failure_signature="preview_boot_failed:NameError",
+        repair_iterations=[{"status": "success", "failure_signature": "preview_boot_failed:NameError", "changed_files": ["miniapp/app/main.py"], "verification": "browser_flow_smoke"}],
         implementation_plan={"primary_entities": ["project", "run"]},
         acceptance_contract={"workflow_kind": "operational_dashboard", "roles": ["client", "manager"]},
     )
@@ -412,10 +445,57 @@ def test_memory_pipeline_extracts_successful_app_patterns() -> None:
     kinds = {item["kind"] for item in stage1["items"]}
     assert "reusable_workflow" in kinds
     assert "successful_app_pattern" in kinds
+    assert "test_or_proof_requirement" in kinds
+    assert "successful_repair" in kinds
     assert consolidated["successful_app_patterns"]
+    assert consolidated["successful_repairs"]
+    assert consolidated["test_or_proof_requirements"]
     assert consolidated["pipeline"]["category_counts"]["successful_app_patterns"] == 1
+    assert consolidated["pipeline"]["category_counts"]["successful_repairs"] >= 1
+    assert consolidated["pipeline"]["category_counts"]["test_or_proof_requirements"] >= 1
     assert consolidated["successful_app_patterns"][0]["payload"]["primary_entities"] == ["project", "run"]
     assert any(item["kind"] == "successful_app_pattern" for item in retrieval["items"])
+
+
+def test_memory_extract_endpoint_journals_two_phase_pipeline(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={"name": "Memory Journal", "target_platform": "telegram_mini_app", "preview_profile": "telegram_mock"},
+    ).json()
+    run = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="My goal is a reliable repair workflow with dense UI.",
+        intent="create",
+        status="failed",
+        apply_status="failed",
+        failure_class="preview_boot_failed",
+        failure_signature="preview_boot_failed:NameError",
+        failure_reason="NameError in preview boot",
+        implementation_plan={"primary_entities": ["repair_request"]},
+        acceptance_contract={"required": True, "roles": ["client"]},
+    )
+    app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+    app.state.container.store.upsert(
+        "reports",
+        f"run_artifacts:{run.run_id}",
+        {"check_results": [{"name": "preview_boot_smoke", "status": "failed", "details": "NameError"}]},
+    )
+
+    extracted = client.post(f"/runs/{run.run_id}/memory/extract").json()
+    pipeline = client.get(f"/workspaces/{workspace['workspace_id']}/memory/pipeline").json()
+    events = client.get(f"/runs/{run.run_id}/events-v2").json()
+
+    assert extracted["schema"] == "grounded.memory_stage1.v1"
+    assert any(item["kind"] == "product_decision" for item in extracted["items"])
+    assert any(item["kind"] == "repeated_failure" for item in extracted["items"])
+    assert pipeline["repeated_failure_stats"]["repeated_failure_count"] >= 1
+    event_types = {item["event_type"] for item in events["items"]}
+    assert "memory.raw_extracted" in event_types
+    assert "memory.phase1.extracted" in event_types
+    assert "memory.phase2.consolidated" in event_types
+    assert "memory.repeated_failure.updated" in event_types
 
 
 def test_memory_summary_hides_stale_items_and_details_can_opt_in(tmp_path: Path) -> None:

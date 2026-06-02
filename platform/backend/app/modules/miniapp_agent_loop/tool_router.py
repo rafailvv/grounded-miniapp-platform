@@ -30,30 +30,18 @@ from app.modules.miniapp_agent_loop.agent_tool_runtime import (
     summarize_read_file_payloads,
 )
 from app.services.tool_protocol import (
-    TOOL_INPUT_SCHEMAS,
     canonical_tool_name,
+    model_tool_for_canonical,
+    model_visible_tool_names,
     structured_tool_error,
     tool_envelope,
+    tool_definition,
     tool_protocol_spec,
 )
+from app.services.tool_result_summarizer import ToolResultSummarizer
+from app.services.lsp_context import LspContextService
 from app.services.workspace.service import WorkspaceService
 
-
-MODEL_TOOL_FOR_CANONICAL: dict[str, str] = {
-    "file.list": "list_files",
-    "file.read": "read_files",
-    "artifact.read": "read_artifact_ref",
-    "search.grep": "search_files",
-    "semantic.scan": "semantic_scan",
-    "tool.search": "tool_search",
-    "diff.inspect": "inspect_diff",
-    "checks.run": "run_checks",
-    "browser.verify": "browser_verify",
-    "shell.exec": "run_command",
-    "patch.apply": "apply_patch_to_draft",
-    "file.write": "write_file",
-    "file.edit": "edit_file_exact",
-}
 
 ROUTING_KEYS = {"tool", "tool_use_id"}
 NORMALIZED_INPUT_KEYS = {
@@ -87,26 +75,11 @@ NORMALIZED_INPUT_KEYS = {
     "contract_id",
     "allowed_file_graph",
 }
-MUTATING_MODEL_TOOLS = {"apply_patch_to_draft", "write_file", "edit_file_exact"}
-EXECUTABLE_MODEL_TOOLS = {
-    "list_files",
-    "read_files",
-    "search_files",
-    "inspect_diff",
-    "read_artifact_ref",
-    "semantic_scan",
-    "tool_search",
-    "lsp_diagnostics",
-    "lsp_symbol_context",
-    "lsp_definition",
-    "lsp_find_references",
-    "lsp_route_graph",
-    "lsp_route_static_context",
-    "run_command",
-    "run_checks",
-    "browser_verify",
-    *MUTATING_MODEL_TOOLS,
-}
+MUTATING_MODEL_TOOLS = frozenset(
+    definition.model_name
+    for definition in (tool_definition(name) for name in model_visible_tool_names(include_dynamic=True))
+    if definition.model_name and definition.kind == "mutating"
+)
 
 
 @dataclass(frozen=True)
@@ -127,6 +100,7 @@ class ToolRouterContext:
     output_spill_writer: Callable[[str, dict[str, Any]], dict[str, Any] | None] | None = None
     output_artifact_writer: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None
     denied_action_writer: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None
+    lsp_context_service: LspContextService | None = None
     max_parallel_read_tools: int = 6
 
 
@@ -226,7 +200,7 @@ class ToolRouter:
         if not raw_tool:
             return None
         canonical = canonical_tool_name(raw_tool)
-        tool = MODEL_TOOL_FOR_CANONICAL.get(canonical, raw_tool)
+        tool = model_tool_for_canonical(canonical)
         use_id = str(item.get("tool_use_id") or "").strip() or f"{tool}_{ordinal or 1}"
         raw_targets = item.get("targets") or []
         if not isinstance(raw_targets, list):
@@ -293,28 +267,26 @@ class ToolRouter:
         *,
         mode: str = "default",
         forced_allowed: set[str] | None = None,
+        include_default_with_forced: bool = False,
     ) -> set[str]:
-        public = {
-            name
-            for name in AgentToolRegistry.names()
-            if "." not in name and name != "browser_verify" and name in EXECUTABLE_MODEL_TOOLS
-        }
         normalized_mode = str(mode or "default").strip().lower()
-        if normalized_mode in {"read_only", "analysis"}:
-            base = {
-                name
-                for name in public
-                if AgentToolRegistry.kind(name) == "read_only"
-            }
-        elif normalized_mode in {"mutation_required", "mutating"}:
-            base = {"apply_patch_to_draft", "write_file", "edit_file_exact"}
-        elif normalized_mode in {"verification", "browser"}:
-            base = {"run_checks"}
-        else:
-            base = set(public)
+        base: set[str] = set()
+        for name in model_visible_tool_names(include_dynamic=True):
+            spec = AgentToolRegistry.spec(name)
+            if spec is None or spec.internal_only:
+                continue
+            if spec.dynamic and not spec.model_visible:
+                continue
+            if normalized_mode in spec.mode_visibility:
+                base.add(name)
         if forced_allowed is not None:
-            requested = {MODEL_TOOL_FOR_CANONICAL.get(canonical_tool_name(name), str(name).strip().lower()) for name in forced_allowed}
-            base = {name for name in requested if AgentToolRegistry.spec(name) is not None or name == "browser_verify"}
+            requested = {model_tool_for_canonical(canonical_tool_name(name)) for name in forced_allowed}
+            forced = {
+                name
+                for name in requested
+                if name and AgentToolRegistry.spec(name) is not None
+            }
+            base = (base | forced) if include_default_with_forced else forced
         return base
 
     @classmethod
@@ -323,9 +295,10 @@ class ToolRouter:
         *,
         mode: str = "default",
         forced_allowed: set[str] | None = None,
+        include_default_with_forced: bool = False,
     ) -> list[dict[str, Any]]:
-        allowed = cls.allowed_tool_names(mode=mode, forced_allowed=forced_allowed)
-        include_dynamic = "browser_verify" in allowed
+        allowed = cls.allowed_tool_names(mode=mode, forced_allowed=forced_allowed, include_default_with_forced=include_default_with_forced)
+        include_dynamic = any((AgentToolRegistry.spec(name) is not None and AgentToolRegistry.spec(name).dynamic) for name in allowed)
         return AgentToolRegistry.openai_tools(allowed, include_dynamic=include_dynamic)
 
     @classmethod
@@ -364,6 +337,10 @@ class ToolRouter:
                     "mode_visibility": list(spec.mode_visibility),
                     "dynamic": bool(contract["dynamic"] or spec.dynamic),
                     "deferred": bool(contract["deferred"] or spec.deferred or spec.kind == "mutating"),
+                    "model_name": contract["model_name"],
+                    "model_visible": contract["model_visible"],
+                    "internal_only": contract["internal_only"],
+                    "argument_progress_fields": contract["argument_progress_fields"],
                     "input_schema": contract["input_schema"],
                     "output_schema": contract["output_schema"],
                 }
@@ -585,6 +562,7 @@ class ToolRouter:
 
     def route_one(self, request: ToolCallRequest) -> ToolRouterResult:
         decision = self._decide(request)
+        self._emit_argument_progress(request, decision)
         orchestrator = ToolOrchestrator(emit_activity=self._emit_activity)
 
         def execute() -> ToolRouterResult:
@@ -664,7 +642,7 @@ class ToolRouter:
         )
 
     def _schema_error(self, request: ToolCallRequest) -> dict[str, Any] | None:
-        schema = TOOL_INPUT_SCHEMAS.get(request.canonical_tool) or {}
+        schema = tool_protocol_spec(request.canonical_tool).input_schema or {}
         if not schema:
             return None
         validation_input = self._protocol_input(request)
@@ -747,6 +725,23 @@ class ToolRouter:
         )
         if self.context.hook_manager is None:
             return None
+        if decision.approval_class in {"policy", "human"}:
+            permission_outcome = self.context.hook_manager.run(
+                self.context.run_id,
+                "permission_request",
+                payload={
+                    **payload,
+                    "reason": f"{request.canonical_tool} requires {decision.approval_class} approval.",
+                    "approval_class": decision.approval_class,
+                },
+            )
+            if permission_outcome.should_block:
+                return structured_tool_error(
+                    code="tool_permission_hook_blocked",
+                    message=permission_outcome.block_reason or "Tool permission request blocked by hook policy.",
+                    retryable=False,
+                    details={"hook": "permission_request", "outcome": permission_outcome.as_dict()},
+                )
         outcome = self.context.hook_manager.run(self.context.run_id, "pre_tool_use", payload=payload)
         if not outcome.should_block:
             return None
@@ -864,55 +859,60 @@ class ToolRouter:
                 if str(item or "").strip() and _is_model_visible_path(_strip_leading_dot_slash(item))
             ]
             effective_targets = files or request_targets
-            result = {
-                **LspToolService.diagnostics(
+            lsp_result = (
+                self.context.lsp_context_service.diagnostics(
+                    workspace_id=self.context.workspace_id,
+                    run_id=self.context.run_id,
+                    files=effective_targets,
+                    changed_only=bool(request.input.get("changed_only")),
+                )
+                if self.context.lsp_context_service is not None
+                else LspToolService.diagnostics(
                     root=self.context.draft_source,
                     targets=effective_targets,
                     changed_files=changed_files,
                     changed_only=bool(request.input.get("changed_only")),
-                ),
-                "reason": request.reason,
-                "tool_use_id": request.tool_call_id,
-                "blocked_targets": blocked_targets,
-            }
+                )
+            )
+            result = {**lsp_result, "reason": request.reason, "tool_use_id": request.tool_call_id, "blocked_targets": blocked_targets}
         elif tool_name in {"lsp.symbol_context", "lsp_symbol_context"}:
             query = str(request.input.get("query") or request.input.get("pattern") or "").strip()
-            result = {
-                **LspToolService.symbol_context(root=self.context.draft_source, query=query, targets=request_targets),
-                "reason": request.reason,
-                "tool_use_id": request.tool_call_id,
-                "blocked_targets": blocked_targets,
-            }
+            lsp_result = (
+                self.context.lsp_context_service.symbol_context(workspace_id=self.context.workspace_id, run_id=self.context.run_id, query=query, targets=request_targets, persist=True)
+                if self.context.lsp_context_service is not None
+                else LspToolService.symbol_context(root=self.context.draft_source, query=query, targets=request_targets)
+            )
+            result = {**lsp_result, "reason": request.reason, "tool_use_id": request.tool_call_id, "blocked_targets": blocked_targets}
         elif tool_name in {"lsp.find_references", "lsp_find_references"}:
             symbol = str(request.input.get("symbol") or request.input.get("query") or request.input.get("pattern") or "").strip()
-            result = {
-                **LspToolService.find_references(root=self.context.draft_source, symbol=symbol, targets=request_targets),
-                "reason": request.reason,
-                "tool_use_id": request.tool_call_id,
-                "blocked_targets": blocked_targets,
-            }
+            lsp_result = (
+                self.context.lsp_context_service.find_references(workspace_id=self.context.workspace_id, run_id=self.context.run_id, symbol=symbol, targets=request_targets)
+                if self.context.lsp_context_service is not None
+                else LspToolService.find_references(root=self.context.draft_source, symbol=symbol, targets=request_targets)
+            )
+            result = {**lsp_result, "reason": request.reason, "tool_use_id": request.tool_call_id, "blocked_targets": blocked_targets}
         elif tool_name in {"lsp.definition", "lsp_definition"}:
             symbol = str(request.input.get("symbol") or request.input.get("query") or request.input.get("pattern") or "").strip()
-            result = {
-                **LspToolService.definition(root=self.context.draft_source, symbol=symbol, targets=request_targets),
-                "reason": request.reason,
-                "tool_use_id": request.tool_call_id,
-                "blocked_targets": blocked_targets,
-            }
+            lsp_result = (
+                self.context.lsp_context_service.definition(workspace_id=self.context.workspace_id, run_id=self.context.run_id, symbol=symbol, targets=request_targets)
+                if self.context.lsp_context_service is not None
+                else LspToolService.definition(root=self.context.draft_source, symbol=symbol, targets=request_targets)
+            )
+            result = {**lsp_result, "reason": request.reason, "tool_use_id": request.tool_call_id, "blocked_targets": blocked_targets}
         elif tool_name in {"lsp.route_graph", "lsp_route_graph"}:
-            result = {
-                **LspToolService.route_graph(root=self.context.draft_source, targets=request_targets),
-                "reason": request.reason,
-                "tool_use_id": request.tool_call_id,
-                "blocked_targets": blocked_targets,
-            }
+            lsp_result = (
+                self.context.lsp_context_service.route_graph(workspace_id=self.context.workspace_id, run_id=self.context.run_id, targets=request_targets, persist=True)
+                if self.context.lsp_context_service is not None
+                else LspToolService.route_graph(root=self.context.draft_source, targets=request_targets)
+            )
+            result = {**lsp_result, "reason": request.reason, "tool_use_id": request.tool_call_id, "blocked_targets": blocked_targets}
         elif tool_name in {"lsp.route_static_context", "lsp_route_static_context"}:
-            result = {
-                **LspToolService.route_static_context(root=self.context.draft_source, targets=request_targets),
-                "reason": request.reason,
-                "tool_use_id": request.tool_call_id,
-                "blocked_targets": blocked_targets,
-            }
+            lsp_result = (
+                self.context.lsp_context_service.route_static_context(workspace_id=self.context.workspace_id, run_id=self.context.run_id, targets=request_targets)
+                if self.context.lsp_context_service is not None
+                else LspToolService.route_static_context(root=self.context.draft_source, targets=request_targets)
+            )
+            result = {**lsp_result, "reason": request.reason, "tool_use_id": request.tool_call_id, "blocked_targets": blocked_targets}
         elif tool_name == "inspect_diff":
             result = {**self._inspect_diff(targets=request_targets), "reason": request.reason, "tool_use_id": request.tool_call_id}
         elif tool_name == "read_artifact_ref":
@@ -1135,6 +1135,7 @@ class ToolRouter:
                 draft_source=self.context.draft_source,
                 command=command,
                 timeout_seconds=decision.timeout_seconds,
+                workspace_id=self.context.workspace_id,
                 max_output_chars=decision.output_cap_chars,
                 progress_callback=command_progress,
                 process_manager=self.context.process_manager,
@@ -1235,9 +1236,7 @@ class ToolRouter:
         loaded_context: dict[str, str] | None = None,
         duration_ms: int | None = None,
     ) -> ToolRouterResult:
-        result_summary = self._result_summary(request, decision, result, status="completed")
-        compacted, truncation, artifacts = self._compact_result(request, decision, result)
-        compacted = {**compacted, "result_summary": result_summary}
+        compacted, truncation, artifacts, result_summary = self._compact_result(request, decision, result)
         envelope = self._make_envelope(
             request,
             decision,
@@ -1317,6 +1316,7 @@ class ToolRouter:
             approval=resolved_approval,
             artifacts=artifacts,
             error=error,
+            progress=self._argument_progress_events(request, decision),
             status=status,
             sandbox_profile=decision.sandbox_profile,
             truncation=truncation,
@@ -1333,6 +1333,36 @@ class ToolRouter:
             failure_class=failure_class,
             failure_signature=failure_signature,
         )
+
+    def _emit_argument_progress(self, request: ToolCallRequest, decision: ToolRouteDecision) -> None:
+        events = self._argument_progress_events(request, decision)
+        if not events:
+            return
+        self._emit_activity(
+            "tool_progress",
+            f"{tool_definition(request.canonical_tool).progress_label}: input prepared",
+            {
+                "tool_use_id": request.tool_call_id,
+                "tool": request.tool,
+                "canonical_tool": request.canonical_tool,
+                "status": "input_prepared",
+                "fields": events,
+            },
+        )
+
+    def _argument_progress_events(self, request: ToolCallRequest, decision: ToolRouteDecision) -> list[dict[str, Any]]:
+        del decision
+        definition = tool_definition(request.canonical_tool)
+        fields = definition.argument_progress_fields or ("command", "targets", "files", "file_path", "diff", "content")
+        events: list[dict[str, Any]] = []
+        for field in fields:
+            if field not in request.input:
+                continue
+            value = request.input.get(field)
+            if value is None or value == "" or value == [] or value == {}:
+                continue
+            events.append(_safe_argument_progress_field(field, value))
+        return events
 
     @staticmethod
     def _approval_payload(decision: ToolRouteDecision, override: dict[str, Any] | None) -> dict[str, Any]:
@@ -1399,6 +1429,10 @@ class ToolRouter:
         if "semantic_status" in result:
             summary["semantic_status"] = result.get("semantic_status")
             summary["exit_code"] = result.get("exit_code")
+        if isinstance(result.get("command_canonical"), dict):
+            summary["command_canonical"] = result.get("command_canonical")
+        if isinstance(result.get("execution_classification"), dict):
+            summary["execution_classification"] = result.get("execution_classification")
         if "failed_checks" in result:
             summary["failed_check_count"] = len(result.get("failed_checks") or [])
         if "workflow_results" in result:
@@ -1426,76 +1460,27 @@ class ToolRouter:
         request: ToolCallRequest,
         decision: ToolRouteDecision,
         result: dict[str, Any],
-    ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
-        encoded = json.dumps(result, ensure_ascii=True, sort_keys=True, default=str)
-        should_truncate = len(encoded) > decision.output_cap_chars
-        should_spill = decision.artifact_spill_policy == "always" or (
-            decision.artifact_spill_policy == "on_truncation" and should_truncate
+    ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+        summarized = ToolResultSummarizer.summarize(
+            workspace_id=self.context.workspace_id,
+            run_id=self.context.run_id,
+            canonical_tool=request.canonical_tool,
+            model_tool=request.tool,
+            tool_call_id=request.tool_call_id,
+            result=result,
+            output_cap_chars=decision.output_cap_chars,
+            artifact_spill_policy=decision.artifact_spill_policy,
+            result_summarization=decision.result_summarization,
+            output_spill_writer=self.context.output_spill_writer,
+            output_artifact_writer=self.context.output_artifact_writer,
         )
-        if decision.artifact_spill_policy == "never" or not should_spill:
-            return result, {"truncated": False}, []
-        digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-        excerpt = encoded[: max(200, decision.output_cap_chars)]
-        artifacts: list[dict[str, Any]] = []
-        if self.context.output_spill_writer is not None:
-            artifact = self.context.output_spill_writer(
-                f"tool-output:{self.context.run_id}:{request.tool_call_id}:{digest[:12]}",
-                {"tool": request.canonical_tool, "sha256": digest, "result": result},
-            )
-            if artifact:
-                artifacts.append(self._tool_result_artifact_ref(artifact))
-        elif self.context.output_artifact_writer is not None:
-            artifact = self.context.output_artifact_writer(
-                {
-                    "process_id": f"tool:{request.tool_call_id}",
-                    "stream": "tool",
-                    "command": f"tool:{request.canonical_tool}",
-                    "content": encoded,
-                    "head_tail": _head_tail_payload(encoded, max_chars=decision.output_cap_chars),
-                    "semantic_status": "completed",
-                    "metadata": {
-                        "source": "tool_result_spill",
-                        "tool": request.canonical_tool,
-                        "model_tool": request.tool,
-                        "tool_call_id": request.tool_call_id,
-                        "sha256": digest,
-                    },
-                }
-            )
-            if artifact:
-                artifacts.append(self._tool_result_artifact_ref(artifact))
-        artifact_ref = str(artifacts[0].get("ref") or "") if artifacts else ""
-        if not should_truncate:
-            enriched = dict(result)
-            enriched["artifact_ref"] = artifact_ref
-            enriched["artifacts"] = artifacts
-            return enriched, {
-                "truncated": False,
-                "sha256": digest,
-                "original_chars": len(encoded),
-                "artifact_ref": artifact_ref,
-                "spilled": bool(artifacts),
-                "spill_policy": decision.artifact_spill_policy,
-            }, artifacts
-        compacted = {
-            "tool": str(result.get("tool") or request.tool),
-            "tool_use_id": request.tool_call_id,
-            "status": str(result.get("status") or "completed"),
-            "excerpt": excerpt,
-            "sha256": digest,
-            "original_chars": len(encoded),
-            "artifact_ref": artifact_ref,
-            "artifacts": artifacts,
-        }
-        return compacted, {
-            "truncated": True,
-            "sha256": digest,
-            "excerpt_chars": len(excerpt),
-            "original_chars": len(encoded),
-            "artifact_ref": artifact_ref,
-            "spilled": bool(artifacts),
-            "spill_policy": decision.artifact_spill_policy,
-        }, artifacts
+        compacted = summarized["result"]
+        summary = dict(summarized["summary"])
+        legacy_summary = self._result_summary(request, decision, result, status=str(summary.get("status") or "completed"))
+        summary = {**legacy_summary, **summary}
+        if isinstance(compacted, dict):
+            compacted["result_summary"] = summary
+        return compacted, summarized["truncation"], summarized["artifacts"], summary
 
     @staticmethod
     def _tool_result_artifact_ref(artifact: dict[str, Any]) -> dict[str, Any]:
@@ -1613,6 +1598,38 @@ def _head_tail_payload(content: str, *, max_chars: int) -> dict[str, Any]:
         "total_chars": len(text),
         "omitted_chars": omitted,
         "chunk_count": 1,
+    }
+
+
+def _safe_argument_progress_field(field: str, value: Any) -> dict[str, Any]:
+    if isinstance(value, list):
+        items = [str(item) for item in value[:8]]
+        return {
+            "field": field,
+            "type": "array",
+            "count": len(value),
+            "items_preview": items,
+            "omitted_count": max(0, len(value) - len(items)),
+        }
+    if isinstance(value, dict):
+        keys = sorted(str(key) for key in value.keys())
+        return {
+            "field": field,
+            "type": "object",
+            "key_count": len(keys),
+            "keys_preview": keys[:8],
+            "omitted_key_count": max(0, len(keys) - 8),
+        }
+    text = str(value)
+    digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+    preview_limit = 120 if field in {"content", "diff", "old_string", "new_string", "command"} else 200
+    return {
+        "field": field,
+        "type": "string",
+        "chars": len(text),
+        "sha256": digest,
+        "preview": text[:preview_limit],
+        "truncated_preview": len(text) > preview_limit,
     }
 
 

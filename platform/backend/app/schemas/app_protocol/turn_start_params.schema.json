@@ -3,6 +3,11 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": true,
   "properties": {
+    "edit_mode": {
+      "default": "default",
+      "title": "Edit Mode",
+      "type": "string"
+    },
     "generation_mode": {
       "default": "balanced",
       "title": "Generation Mode",

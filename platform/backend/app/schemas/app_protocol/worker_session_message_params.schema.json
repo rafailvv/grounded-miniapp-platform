@@ -1,0 +1,48 @@
+{
+  "$id": "https://grounded.local/schemas/app_protocol/worker_session_message_params.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "from_worker": {
+      "default": "coordinator",
+      "title": "From Worker",
+      "type": "string"
+    },
+    "kind": {
+      "default": "manual",
+      "title": "Kind",
+      "type": "string"
+    },
+    "payload": {
+      "additionalProperties": true,
+      "title": "Payload",
+      "type": "object"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "to_worker": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "To Worker"
+    },
+    "worker_session_id": {
+      "title": "Worker Session Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "run_id",
+    "worker_session_id"
+  ],
+  "title": "WorkerSessionMessageParams",
+  "type": "object"
+}

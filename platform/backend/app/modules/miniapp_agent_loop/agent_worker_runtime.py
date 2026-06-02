@@ -9,7 +9,7 @@ from typing import Any
 from app.models.common import GenerationMode
 from app.models.domain import DraftAction
 from app.modules.miniapp_agent_loop.agent_worker_manager import AgentWorkerManager
-from app.modules.miniapp_agent_loop.product_workers import ownership_for_worker
+from app.modules.miniapp_agent_loop.product_workers import ownership_for_worker, product_owner_contract
 
 
 @dataclass
@@ -195,17 +195,26 @@ class AgentWorkerRuntime:
             result = {
                 "run_id": run_id,
                 "worker_id": owner,
+                "lane_id": product_owner_contract(owner).get("lane_id"),
+                "ownership_kind": product_owner_contract(owner).get("ownership_kind"),
                 "status": "branch_diff_ready",
                 "agent_loop": "branch_scoped",
                 "transcript_ref": f"worker_transcript:{run_id}:{owner}",
                 "repair_cycle_ref": f"worker_repair_cycle:{run_id}:{owner}",
                 "file_count": len(changes),
                 "paths": [item.file_path for item in changes],
+                "product_owner_contract": product_owner_contract(owner),
                 "self_check": {
                     "status": "ready_for_merge",
                     "owned_paths_only": all(AgentWorkerManager.owner_for_path(item.file_path) == owner for item in changes),
                     "path_count": len(changes),
                 },
+                "merge_evidence": AgentWorkerManager.merge_evidence_packet(
+                    worker_id=owner,
+                    changed_files=[item.file_path for item in changes],
+                    decision="deferred",
+                    output_ref=f"worker_output:{run_id}:{owner}",
+                ),
                 "summary": f"{owner} branch produced {len(changes)} owned draft change(s).",
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }

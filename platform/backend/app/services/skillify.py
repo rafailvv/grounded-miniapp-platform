@@ -126,9 +126,12 @@ class SkillifyService:
         acceptance = cls._acceptance(evidence)
         frontmatter = [
             "---",
+            "metadata_schema: grounded.skill.v2",
             f"description: {cls._yaml_scalar(title + ' workflow pack generated from a successful run.')}",
             "whenToUse:",
             *[f"  - {cls._yaml_scalar(item)}" for item in when_to_use],
+            "triggerRules:",
+            *[f"  - {cls._yaml_scalar(item)}" for item in cls._trigger_rules(title=title, evidence=evidence)],
             "paths:",
             "  - miniapp/app/static/**",
             "  - miniapp/app/routes/**",
@@ -139,6 +142,12 @@ class SkillifyService:
             "effort: high",
             "validation:",
             *[f"  - {cls._yaml_scalar(item)}" for item in validation],
+            "requiredProof:",
+            *[f"  - {cls._yaml_scalar(item)}" for item in cls._required_proof(evidence)],
+            "incompatibleSkills:",
+            "  - repair-failed-generation",
+            "outputExpectations:",
+            *[f"  - {cls._yaml_scalar(item)}" for item in cls._output_expectations(evidence)],
             "---",
         ]
         body = [
@@ -153,6 +162,22 @@ class SkillifyService:
             "## Acceptance",
             "",
             *[f"- {item}" for item in acceptance],
+            "",
+            "## Trigger Rules",
+            "",
+            *[f"- {item}" for item in cls._trigger_rules(title=title, evidence=evidence)],
+            "",
+            "## Required Proof",
+            "",
+            *[f"- {item}" for item in cls._required_proof(evidence)],
+            "",
+            "## Output Expectations",
+            "",
+            *[f"- {item}" for item in cls._output_expectations(evidence)],
+            "",
+            "## Incompatible Skills",
+            "",
+            "- repair-failed-generation",
             "",
             "## Source Evidence",
             "",
@@ -173,6 +198,37 @@ class SkillifyService:
         for token in re.findall(r"[A-Za-zА-Яа-яЁё0-9]{4,}", prompt)[:10]:
             phrases.append(token.lower())
         return list(dict.fromkeys([item for item in phrases if item]))[:14]
+
+    @staticmethod
+    def _trigger_rules(*, title: str, evidence: dict[str, Any]) -> list[str]:
+        roles = ", ".join(str(role) for role in evidence.get("roles") or [] if str(role).strip())
+        phrases = [
+            f"Use when the prompt matches a {title} style workflow.",
+            "Use when the product needs persisted role workflow state.",
+            "Use when role UI, FastAPI routes, tests, and browser proof should be generated together.",
+        ]
+        if roles:
+            phrases.append(f"Use when these roles are relevant: {roles}.")
+        for flow in evidence.get("flows") or []:
+            if isinstance(flow, dict):
+                name = str(flow.get("name") or flow.get("title") or flow.get("id") or "").strip()
+                if name:
+                    phrases.append(f"Use when flow `{name}` or a similar flow is requested.")
+        return list(dict.fromkeys(phrases))[:10]
+
+    @staticmethod
+    def _required_proof(evidence: dict[str, Any]) -> list[str]:
+        checks = [str(item.get("name")) for item in evidence.get("checks") or [] if isinstance(item, dict) and item.get("status") == "passed" and item.get("name")]
+        return list(dict.fromkeys([*checks, "api_workflow_smoke", "browser_flow_smoke", "generated_app_python_tests", "generated_app_js_tests", "mobile_layout"]))[:12]
+
+    @staticmethod
+    def _output_expectations(evidence: dict[str, Any]) -> list[str]:
+        return [
+            "A complete generated miniapp slice, not documentation-only guidance.",
+            "Prompt-derived FastAPI routes, role UI files, generated tests, and readiness proof.",
+            "Changed files stay inside miniapp/app and miniapp/tests unless the prompt requires otherwise.",
+            "Final response names the proof artifacts and remaining repair targets if any.",
+        ]
 
     @staticmethod
     def _validation(evidence: dict[str, Any]) -> list[str]:

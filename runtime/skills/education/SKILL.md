@@ -1,4 +1,5 @@
 ---
+metadata_schema: grounded.skill.v2
 description: Education, courses, lessons, homework, and progress workflow pack.
 whenToUse:
   - обучение
@@ -26,11 +27,19 @@ allowedTools:
   - browser_verify
 model: default
 effort: high
+triggerRules:
+  - Match prompts using this skill domain and path scope.
 validation:
   - education_workflow
   - persisted_workflow
   - role_coverage
   - browser_flow_smoke
+requiredProof:
+  - Final readiness proof covers this skill.
+incompatibleSkills:
+  - ""
+outputExpectations:
+  - Produce working product changes and cite proof artifacts.
 ---
 # Education
 

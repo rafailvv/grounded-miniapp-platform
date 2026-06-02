@@ -490,6 +490,7 @@ class SlashCommandCatalog:
         {"id": "fix", "name": "/fix", "kind": "workflow", "description": "Repair the latest blocked or failed run from its active repair packet.", "requires": ["workspace", "run"], "workflow": "repair_latest_failure"},
         {"id": "polish", "name": "/polish", "kind": "workflow", "description": "Improve UI polish while preserving product semantics and acceptance proof.", "requires": ["workspace"], "workflow": "ui_polish_run"},
         {"id": "add-flow", "name": "/add-flow", "kind": "workflow", "description": "Add a new end-to-end scenario across API, persistence, UI, roles, mobile, and tests.", "requires": ["workspace", "prompt"], "workflow": "add_product_flow"},
+        {"id": "improve", "name": "/improve", "kind": "workflow", "description": "Improve an existing app by mapping current architecture and patching the smallest connected slice.", "requires": ["workspace", "prompt"], "workflow": "improve_existing_app"},
         {"id": "review", "name": "/review", "kind": "workflow", "description": "Find product risks, proof gaps, stale tests, and apply blockers for a run.", "requires": ["run"], "workflow": "risk_review"},
         {"id": "acceptance", "name": "/acceptance", "kind": "workflow", "description": "Run the acceptance proof loop and refresh readiness evidence.", "requires": ["run"], "workflow": "acceptance_proof"},
         {"id": "deploy", "name": "/deploy", "kind": "workflow", "description": "Prepare deploy artifacts only after the production gate is green.", "requires": ["workspace"], "workflow": "deploy_bundle"},
@@ -552,6 +553,7 @@ class SlashCommandCatalog:
             "fix": {"type": "execute_workflow", "workflow": "repair_latest_failure"},
             "polish": {"type": "execute_workflow", "workflow": "ui_polish_run"},
             "add-flow": {"type": "execute_workflow", "workflow": "add_product_flow"},
+            "improve": {"type": "execute_workflow", "workflow": "improve_existing_app"},
             "review": {"type": "execute_workflow", "workflow": "risk_review", "tab": "review"},
             "acceptance": {"type": "execute_workflow", "workflow": "acceptance_proof", "tab": "checks"},
             "deploy": {"type": "execute_workflow", "workflow": "deploy_bundle"},
@@ -570,6 +572,7 @@ class SlashCommandCatalog:
         templates = {
             "polish": "Polish the current app visually. Preserve existing behavior and tests.",
             "add-flow": f"Add a connected product flow: {detail}".strip(),
+            "improve": f"Improve the existing app with the smallest connected slice: {detail}".strip(),
             "fix": "Analyze the selected run failure and apply the smallest safe fix.",
             "acceptance": "Run the full production acceptance proof loop and report exact blockers.",
             "deploy": "Prepare deploy artifacts after the production readiness gate is green.",
@@ -586,58 +589,36 @@ class SlashCommandCatalog:
 class WorkerRoleCatalog:
     @staticmethod
     def roles() -> dict[str, Any]:
+        from app.modules.miniapp_agent_loop.product_workers import PRODUCT_WORKERS, product_owner_contract
+
         items = [
             {
-                "worker_id": "backend_api_worker",
-                "alias_ids": [],
-                "purpose": "FastAPI routes, schemas, persistence, shared state.",
-                "allowed_paths": ["miniapp/app/**/*.py", "miniapp/requirements.txt"],
-                "handoff": "Owns API/persistence failures.",
-            },
-            {
-                "worker_id": "client_surface_worker",
-                "alias_ids": [],
-                "purpose": "Client role HTML/CSS/JS and client child pages.",
-                "allowed_paths": ["miniapp/app/static/client/**"],
-                "handoff": "Owns client selector and layout failures.",
-            },
-            {
-                "worker_id": "specialist_surface_worker",
-                "alias_ids": [],
-                "purpose": "Specialist role HTML/CSS/JS and child pages.",
-                "allowed_paths": ["miniapp/app/static/specialist/**"],
-                "handoff": "Owns specialist selector and layout failures.",
-            },
-            {
-                "worker_id": "manager_surface_worker",
-                "alias_ids": [],
-                "purpose": "Manager role HTML/CSS/JS and child pages.",
-                "allowed_paths": ["miniapp/app/static/manager/**"],
-                "handoff": "Owns manager selector and layout failures.",
-            },
-            {
-                "worker_id": "test_verifier_worker",
-                "alias_ids": [],
-                "purpose": "Generated Python and JS acceptance tests.",
-                "allowed_paths": ["miniapp/tests/**"],
-                "handoff": "Owns stale or brittle generated tests.",
-            },
-            {
-                "worker_id": "mobile_polish_worker",
-                "alias_ids": [],
-                "purpose": "Independent mobile polish and visual QA after green workflow.",
-                "allowed_paths": ["miniapp/app/static/**"],
-                "handoff": "Owns mobile overflow, spacing, and role-surface polish failures.",
-            },
-            {
-                "worker_id": "repair_worker",
-                "alias_ids": [],
-                "purpose": "Focused owned repair from failure signature or merge decision.",
-                "allowed_paths": ["miniapp/app/**", "miniapp/tests/**"],
-                "handoff": "Runs only from an explicit repair packet.",
-            },
+                **product_owner_contract(role.worker_id),
+                "purpose": role.owner_scope,
+                "allowed_paths": [f"{path}/**" if not path.endswith(".py") and not path.endswith(".txt") else path for path in role.allowed_paths],
+                "handoff": (
+                    "Runs only from an explicit repair packet."
+                    if role.worker_id == "repair_worker"
+                    else "Owns verification findings and repair packets without source writes."
+                    if role.lane_id == "verifier"
+                    else f"Owns {role.ownership_kind} failures."
+                ),
+            }
+            for role in PRODUCT_WORKERS
         ]
-        return {"schema": "grounded.worker_roles.v1", "items": items}
+        return {
+            "schema": "grounded.worker_roles.v1",
+            "ownership_schema": "grounded.product_worker_ownership_contract.v1",
+            "items": items,
+            "lane_groups": {
+                "backend": ["backend_api_worker"],
+                "role_ui": ["client_surface_worker", "specialist_surface_worker", "manager_surface_worker"],
+                "persistence_api": ["backend_api_worker"],
+                "tests": ["test_verifier_worker"],
+                "verifier": ["mobile_polish_worker"],
+                "repair": ["repair_worker"],
+            },
+        }
 
 
 class SubagentForkContract:

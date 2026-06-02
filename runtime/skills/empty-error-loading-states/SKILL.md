@@ -1,4 +1,5 @@
 ---
+metadata_schema: grounded.skill.v2
 description: Empty, error, and loading state quality pack.
 whenToUse:
   - empty state
@@ -24,9 +25,17 @@ allowedTools:
   - browser_verify
 model: default
 effort: medium
+triggerRules:
+  - Match prompts using this skill domain and path scope.
 validation:
   - empty_error_loading_states
   - browser_flow_smoke
+requiredProof:
+  - Final readiness proof covers this skill.
+incompatibleSkills:
+  - ""
+outputExpectations:
+  - Produce working product changes and cite proof artifacts.
 ---
 # Empty / Error / Loading States
 
