@@ -160,18 +160,27 @@
       "enabled_env": "OPENAI_API_KEY",
       "base_url_env": "OPENAI_BASE_URL",
       "default_base_url": "https://api.openai.com/v1",
-      "models": ["gpt-5.4-mini", "text-embedding-3-large"]
+      "models": ["gpt-5.2-codex", "gpt-4.1-mini", "text-embedding-3-large"]
     }
   },
   "model_capabilities": {
-    "gpt-5.4-mini": {
+    "gpt-5.2-codex": {
+      "provider": "openai",
+      "context_window": 400000,
+      "supports_tools": true,
+      "supports_structured_output": true,
+      "supports_reasoning": true,
+      "cost_tier": "high",
+      "roles": ["agent_turn", "code_edit", "repair"]
+    },
+    "gpt-4.1-mini": {
       "provider": "openai",
       "context_window": 1000000,
       "supports_tools": true,
       "supports_structured_output": true,
-      "supports_reasoning": true,
+      "supports_reasoning": false,
       "cost_tier": "low",
-      "roles": ["agent_turn", "code_edit", "repair", "summarize", "cheap_task"]
+      "roles": ["summarize", "cheap_task"]
     },
     "text-embedding-3-large": {
       "provider": "openai",
@@ -189,11 +198,11 @@
       "provider": "openai",
       "description": "Default iterative coding profile tuned for lower cost while keeping solid general coding quality.",
       "routing": {
-        "agent_turn": "gpt-5.4-mini",
-        "code_edit": "gpt-5.4-mini",
-        "repair": "gpt-5.4-mini",
-        "summarize": "gpt-5.4-mini",
-        "cheap_task": "gpt-5.4-mini"
+        "agent_turn": "gpt-5.2-codex",
+        "code_edit": "gpt-5.2-codex",
+        "repair": "gpt-5.2-codex",
+        "summarize": "gpt-4.1-mini",
+        "cheap_task": "gpt-4.1-mini"
       },
       "default": true,
       "fallbacks": {}
@@ -203,28 +212,36 @@
       "provider": "openai",
       "description": "Balanced profile for iterative code-agent generation and repair.",
       "routing": {
-        "agent_turn": "gpt-5.4-mini",
-        "code_edit": "gpt-5.4-mini",
-        "repair": "gpt-5.4-mini",
-        "summarize": "gpt-5.4-mini",
-        "cheap_task": "gpt-5.4-mini"
+        "agent_turn": "gpt-5.2-codex",
+        "code_edit": "gpt-5.2-codex",
+        "repair": "gpt-5.2-codex",
+        "summarize": "gpt-4.1-mini",
+        "cheap_task": "gpt-4.1-mini"
       },
       "default": false,
-      "fallbacks": {}
+      "fallbacks": {
+        "agent_turn": ["gpt-5.2-codex"],
+        "code_edit": ["gpt-5.2-codex"],
+        "repair": ["gpt-5.2-codex"]
+      }
     },
     "openai_code_quality": {
       "label": "OpenAI Code Quality",
       "provider": "openai",
       "description": "Highest-confidence profile for iterative code-agent generation and repair.",
       "routing": {
-        "agent_turn": "gpt-5.4-mini",
-        "code_edit": "gpt-5.4-mini",
-        "repair": "gpt-5.4-mini",
-        "summarize": "gpt-5.4-mini",
-        "cheap_task": "gpt-5.4-mini"
+        "agent_turn": "gpt-5.2-codex",
+        "code_edit": "gpt-5.2-codex",
+        "repair": "gpt-5.2-codex",
+        "summarize": "gpt-4.1-mini",
+        "cheap_task": "gpt-4.1-mini"
       },
       "default": false,
-      "fallbacks": {}
+      "fallbacks": {
+        "agent_turn": ["gpt-5.2-codex"],
+        "code_edit": ["gpt-5.2-codex"],
+        "repair": ["gpt-5.2-codex"]
+      }
     }
   },
   "default_profile_by_mode": {

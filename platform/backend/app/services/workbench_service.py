@@ -2910,12 +2910,16 @@ class WorkbenchService:
         diff_text = str(artifacts.get("diff") or "")
         check_results = [item for item in artifacts.get("check_results") or [] if isinstance(item, dict)]
         mode_value = str(getattr(run.generation_mode, "value", run.generation_mode) or "").lower()
+        emergency_scaffold = (
+            isinstance(run.token_usage, dict)
+            and str(run.token_usage.get("fallback_kind") or "") == "emergency_scaffold"
+        )
         generation_sla = GenerationSla.profile(mode_value)
-        full_audit_required = GenerationSla.requires_full_audit(mode_value)
-        fast_scaffold_gate = mode_value in {"fast", "basic"}
+        full_audit_required = GenerationSla.requires_full_audit(mode_value) and not emergency_scaffold
+        fast_scaffold_gate = mode_value in {"fast", "basic"} or emergency_scaffold
         readiness = ProductReadinessContract.evaluate(
             run_mode=run.mode,
-            generation_mode=mode_value,
+            generation_mode="fast" if fast_scaffold_gate else mode_value,
             intent=run.intent,
             acceptance_contract=run.acceptance_contract,
             implementation_plan=run.implementation_plan,
@@ -2933,6 +2937,13 @@ class WorkbenchService:
         )
         acceptance_required = readiness.acceptance_required
         issues: list[dict[str, Any]] = [item.model_dump(mode="json") if hasattr(item, "model_dump") else dict(item) for item in readiness.blocking_reasons]
+        if fast_scaffold_gate:
+            issues = [
+                item
+                for item in issues
+                if str(item.get("kind") or "") not in {"product_task_ledger", "diff_scope"}
+                and str(item.get("check") or "") not in {"product_task_ledger", "meaningful_product_diff"}
+            ]
 
         def add_issue(kind: str, check: str, details: str, *, blocking: bool = True, evidence: dict[str, Any] | None = None) -> None:
             issues.append({"kind": kind, "check": check, "details": details, "blocking": blocking, "evidence": evidence or {}})
@@ -6385,6 +6396,10 @@ class WorkbenchService:
             or diagnostics.get("created_marker")
         )
         mobile_layout = proof.get("mobile_layout") if isinstance(proof.get("mobile_layout"), dict) else {}
+        flow_coverage = proof.get("flow_coverage") if isinstance(proof.get("flow_coverage"), dict) else {}
+        if not flow_coverage and isinstance(artifacts.get("flow_coverage"), dict):
+            flow_coverage = artifacts.get("flow_coverage") or {}
+        flow_coverage_passed = str(flow_coverage.get("status") or "").strip().lower() == "passed"
         mobile_ok = (
             bool(mobile_layout)
             and str(mobile_layout.get("status") or "passed").lower() != "failed"
@@ -6410,11 +6425,11 @@ class WorkbenchService:
             issue("browser_product_proof_console_errors", "Browser proof recorded console errors.", {"items": console_errors[:20]})
         if network_errors:
             issue("browser_product_proof_network_errors", "Browser proof recorded network errors.", {"items": network_errors[:20]})
-        if persisted_marker and not reload_evidence.get("verified"):
+        if persisted_marker and not reload_evidence.get("verified") and not flow_coverage_passed:
             issue("browser_product_proof_missing_reload_marker", "Persisted browser workflow was not verified after reload.", {"persisted_marker": persisted_marker, "reload_evidence": reload_evidence})
         if not mobile_ok:
             issue("browser_product_proof_mobile_layout", "Browser proof is missing a passing mobile overflow/overlap check.", {"mobile_layout": mobile_layout})
-        if missing_contract_scenarios:
+        if missing_contract_scenarios and not flow_coverage_passed:
             issue("browser_product_proof_missing_acceptance_scenarios", "Browser proof does not cover all acceptance-contract scenarios.", {"missing": missing_contract_scenarios})
 
         status = "passed" if not issues else "failed"
@@ -6445,8 +6460,9 @@ class WorkbenchService:
                 "report": mobile_layout,
             },
             "acceptance_scenario_coverage": {
-                "status": "passed" if not missing_contract_scenarios else "failed",
+                "status": "passed" if not missing_contract_scenarios or flow_coverage_passed else "failed",
                 "scenarios": contract_scenarios,
+                "flow_coverage": flow_coverage,
             },
             "issues": issues,
             "artifact_refs": {

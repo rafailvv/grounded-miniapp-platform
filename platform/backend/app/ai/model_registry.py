@@ -8,7 +8,7 @@ from app.services.platform_config import platform_config
 
 def _configured_model_for_role(profile_name: str, role: str) -> str:
     profile = platform_config().model_profiles.get(profile_name)
-    return str((profile.routing if profile else {}).get(role) or "gpt-5.4-mini")
+    return str((profile.routing if profile else {}).get(role) or "gpt-5.2-codex")
 
 
 CODEX_MINI_MODEL = os.getenv("OPENAI_CODE_MINI_MODEL", _configured_model_for_role("openai_code_fast", "agent_turn"))

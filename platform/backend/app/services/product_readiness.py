@@ -657,6 +657,14 @@ class ProductReadinessContract:
             return True
         if normalized.startswith(("miniapp/tests/", "tests/", "runtime/templates/", "docker/")):
             return True
+        if normalized in {
+            "miniapp/app/generated/miniapp_contract.json",
+            "miniapp/app/generated/contract_validator.json",
+            "miniapp/app/generated/route_manifest.json",
+        }:
+            return True
+        if re.match(r"^miniapp/app/generated/[a-zA-Z0-9_-]+_store\.json$", normalized):
+            return True
         if normalized in {"miniapp/requirements.txt", "miniapp/package.json", "miniapp/package-lock.json", "miniapp/pyproject.toml"}:
             return True
         return False

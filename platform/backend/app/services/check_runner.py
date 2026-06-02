@@ -4667,6 +4667,43 @@ except Exception as exc:
                     )
                 )
                 continue
+            js_text = ""
+            try:
+                js_text = expected_files["js"].read_text(encoding="utf-8")
+            except OSError:
+                js_text = ""
+            js_marker = cls._js_placeholder_marker(js_text)
+            if js_marker:
+                coverage[role] = {
+                    "status": "placeholder_js",
+                    "marker": js_marker,
+                    "route_count": len(role_routes),
+                    "secondary_route_count": len(secondary_routes),
+                    "routes": role_routes,
+                }
+                issues.append(
+                    ValidationIssue(
+                        code="platform.placeholder_role_js",
+                        message=(
+                            f"{role} role JavaScript is still a platform shell placeholder. "
+                            f"Generate static/{role}/app.js with prompt-derived rendering, form handlers, and /api persistence."
+                        ),
+                        severity="high",
+                        location=f"miniapp/app/static/{role}/app.js",
+                        blocking=True,
+                        repair_recipe={
+                            "recipe_id": "frontend.role_app_js_required",
+                            "required_next_tool": "write_file",
+                            "target_files": [f"miniapp/app/static/{role}/app.js"],
+                            "verification_check": "platform_invariants",
+                            "instruction": (
+                                f"Replace miniapp/app/static/{role}/app.js with real role behavior: render prompt-specific UI, "
+                                "bind visible forms/buttons, send user-provided state to the matching /api route, and refresh visible state."
+                            ),
+                        },
+                    )
+                )
+                continue
             css_text = ""
             try:
                 css_text = expected_files["css"].read_text(encoding="utf-8")
@@ -4688,6 +4725,13 @@ except Exception as exc:
                         severity="high",
                         location=f"miniapp/app/static/{role}/styles.css",
                         blocking=True,
+                        repair_recipe={
+                            "recipe_id": "frontend.role_css_required",
+                            "required_next_tool": "write_file",
+                            "target_files": [f"miniapp/app/static/{role}/styles.css"],
+                            "verification_check": "platform_invariants",
+                            "instruction": f"Replace miniapp/app/static/{role}/styles.css with non-placeholder mobile UI styling for this prompt-specific role.",
+                        },
                     )
                 )
                 continue
@@ -5137,8 +5181,32 @@ except Exception as exc:
         del combined
         css_rule_count = len(re.findall(r"[.#]?[a-z][a-z0-9_-]*\s*\{", css))
         min_rules = 12 if value in {GenerationMode.QUALITY.value, GenerationMode.PRODUCTION.value} else 8
-        quality_structure_ok = value not in {GenerationMode.QUALITY.value, GenerationMode.PRODUCTION.value} or ("@media" in css and ("focus-visible" in css or ":focus" in css))
-        rich_quality_css = value in {GenerationMode.QUALITY.value, GenerationMode.PRODUCTION.value} and css_rule_count >= min_rules + 6
+        generic_reason = CheckRunner._generic_role_design_reason(css, value)
+        if generic_reason:
+            return ValidationIssue(
+                code="platform.generic_mode_design_template",
+                message=(
+                    f"{role} role design uses a generic or FAST-like template for {value} mode ({generic_reason}). "
+                    "Balanced/Quality must use prompt-specific visual profile, role accents, and state styling."
+                ),
+                severity="high",
+                location=f"miniapp/app/static/{role}/styles.css",
+                blocking=True,
+                repair_recipe={
+                    "recipe_id": "frontend.generic_mode_design_template",
+                    "required_next_tool": "write_file",
+                    "target_files": [f"miniapp/app/static/{role}/styles.css"],
+                    "verification_check": "platform_invariants",
+                    "instruction": f"Replace generic CSS in miniapp/app/static/{role}/styles.css with a prompt-specific {value} visual system, including visual-profile marker, palette variables, role accent, responsive/focus styles, and visible states.",
+                },
+            )
+        quality_structure_ok = value not in {GenerationMode.QUALITY.value, GenerationMode.PRODUCTION.value} or (
+            "@media" in css
+            and ("focus-visible" in css or ":focus" in css)
+            and all(marker in css for marker in (".success", ".loading", ".error"))
+            and (".toolbar" in css or ".timeline" in css)
+        )
+        rich_quality_css = value in {GenerationMode.QUALITY.value, GenerationMode.PRODUCTION.value} and css_rule_count >= min_rules + 10 and quality_structure_ok
         if css_rule_count >= min_rules and (quality_structure_ok or rich_quality_css):
             return None
         return ValidationIssue(
@@ -5150,7 +5218,49 @@ except Exception as exc:
             severity="high",
             location=f"miniapp/app/static/{role}/styles.css",
             blocking=True,
+            repair_recipe={
+                "recipe_id": "frontend.mode_design_depth",
+                "required_next_tool": "write_file",
+                "target_files": [f"miniapp/app/static/{role}/styles.css"],
+                "verification_check": "platform_invariants",
+                "instruction": f"Expand miniapp/app/static/{role}/styles.css to meet {value} design depth with real selectors, responsive states, and role-specific layout.",
+            },
         )
+
+    @staticmethod
+    def _generic_role_design_reason(css: str, generation_mode_value: str) -> str | None:
+        if "visual-profile:fast-modern" in css:
+            return "fast baseline marker"
+        old_template_markers = (
+            "background: #f6f7fb",
+            "background: #f6f7f9",
+            "background: #1f2937",
+            ".hero { display: grid; gap: 8px; padding: 18px; border-radius: 8px; background: #1f2937",
+        )
+        if any(marker in css for marker in old_template_markers):
+            return "old scaffold colors/layout"
+        has_profile = "visual-profile:" in css
+        has_role_tokens = "--role-accent" in css and "--surface-tint" in css
+        if not has_profile or not has_role_tokens:
+            generic_selectors = sum(1 for marker in (".hero", ".panel", ".surface", ".item-card", ".request-card") if marker in css)
+            domain_depth = sum(1 for marker in ("--profile-primary", "--profile-secondary", ".empty", ".status", "focus-visible", "@media") if marker in css)
+            if generic_selectors >= 3 and domain_depth < 4:
+                return "generic hero/panel/card shell"
+            if generation_mode_value in {GenerationMode.QUALITY.value, GenerationMode.PRODUCTION.value}:
+                return "missing quality visual profile tokens"
+        return None
+
+    @staticmethod
+    def _js_placeholder_marker(content: str) -> str | None:
+        text = str(content or "")
+        lowered = text.lower()
+        stripped = re.sub(r"\s+", "", lowered)
+        if not stripped:
+            return "empty js"
+        if "setuppreviewbridge" in lowered and len(stripped) < 160:
+            return "preview bridge only"
+        behavior_signals = ("fetch(", "addeventlistener", "queryselector", "replacechildren", "insertadjacenthtml", "innerhtml")
+        return None if sum(1 for signal in behavior_signals if signal in lowered) >= 2 else "insufficient role behavior"
 
     @staticmethod
     def _css_placeholder_marker(content: str) -> str | None:
@@ -5525,6 +5635,22 @@ except Exception as exc:
                     severity="medium" if raw_post_present else "high",
                     location="miniapp/app/static",
                     blocking=not raw_post_present,
+                    repair_recipe={
+                        "recipe_id": "frontend.create_post_api_required",
+                        "required_next_tool": "read_files",
+                        "suggested_tool_after_read": "write_file",
+                        "target_files": [
+                            "miniapp/app/static/client/app.js",
+                            "miniapp/app/static/specialist/app.js",
+                            "miniapp/app/static/manager/app.js",
+                        ],
+                        "verification_check": "platform_invariants",
+                        "instruction": (
+                            "At least one role app.js must bind a visible user input form/control and POST user-provided state "
+                            "to the matching prompt-specific /api route. Manager/specialist role scripts should load and update "
+                            "the same persisted resource when the prompt assigns review/update workflows."
+                        ),
+                    },
                 )
             )
         return issues, {

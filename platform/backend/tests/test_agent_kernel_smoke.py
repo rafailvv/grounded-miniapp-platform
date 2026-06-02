@@ -8,6 +8,8 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from app.ai.openai_client import OpenAIClient
 from app.ai.model_registry import CODEX_MINI_MODEL, models_for_role
 from app.models.common import GenerationMode
@@ -57,7 +59,9 @@ from app.services.acceptance_test_materializer import AcceptanceTestMaterializer
 from app.services.command_canonicalizer import CommandCanonicalizer
 from app.services.hook_policy_service import HookPolicyService
 from app.services.miniapp_contract import MiniAppContractCompiler
+from app.services.product_readiness import ProductReadinessContract
 from app.services.repair_catalog import RepairCatalog
+from app.services.run_task_ledger import RunTaskLedger
 from app.services.workspace.run_service import RunService
 from app.services.workflow_acceptance import build_acceptance_contract, build_implementation_plan, extract_prompt_planning_hints
 from app.services.generated_tests_synthesizer import GeneratedTestsSynthesizer
@@ -176,11 +180,17 @@ def _contract_with_analysis(
     )
 
 
-def test_code_agent_defaults_to_mini_for_all_generation_modes() -> None:
-    for mode in (GenerationMode.FAST, GenerationMode.BALANCED, GenerationMode.QUALITY, GenerationMode.PRODUCTION):
-        assert models_for_role("agent_turn", model_profile="", generation_mode=mode) == CODEX_MINI_MODEL
-        assert models_for_role("repair", model_profile="", generation_mode=mode) == CODEX_MINI_MODEL
-        assert models_for_role("summarize", model_profile="", generation_mode=mode) == CODEX_MINI_MODEL
+def test_code_agent_uses_tiered_models_by_generation_mode() -> None:
+    assert CODEX_MINI_MODEL == "gpt-5.2-codex"
+    assert models_for_role("agent_turn", model_profile="", generation_mode=GenerationMode.FAST) == "gpt-5.2-codex"
+    assert models_for_role("repair", model_profile="", generation_mode=GenerationMode.FAST) == "gpt-5.2-codex"
+    assert models_for_role("agent_turn", model_profile="", generation_mode=GenerationMode.BALANCED) == "gpt-5.2-codex"
+    assert models_for_role("repair", model_profile="", generation_mode=GenerationMode.BALANCED) == "gpt-5.2-codex"
+    assert models_for_role("agent_turn", model_profile="", generation_mode=GenerationMode.QUALITY) == "gpt-5.2-codex"
+    assert models_for_role("repair", model_profile="", generation_mode=GenerationMode.QUALITY) == "gpt-5.2-codex"
+    assert models_for_role("summarize", model_profile="", generation_mode=GenerationMode.BALANCED) == "gpt-4.1-mini"
+    assert models_for_role("summarize", model_profile="", generation_mode=GenerationMode.QUALITY) == "gpt-4.1-mini"
+    assert models_for_role("cheap_task", model_profile="", generation_mode=GenerationMode.FAST) == "gpt-4.1-mini"
 
 
 def test_quality_create_prompt_with_error_states_stays_quality_mode() -> None:
@@ -480,6 +490,122 @@ def test_fast_scaffold_ui_copy_uses_prompt_domain_not_internal_labels() -> None:
     assert "Book consultation" in source
     assert "Submitted consultations" in source
     assert "Request submitted" not in source
+
+
+def test_fast_css_uses_modern_visual_baseline() -> None:
+    css = WorkspaceCodeAgentRuntime._fast_role_css().lower()
+
+    assert "visual-profile:fast-modern" in css
+    assert "background: #1f2937" not in css
+    assert "background: #f6f7f9" not in css
+    assert "linear-gradient" in css
+    assert "focus-visible" in css
+
+
+def test_non_fast_visual_profiles_vary_by_domain() -> None:
+    barber = WorkspaceCodeAgentRuntime._visual_design_profile(
+        prompt_analysis={"resource_hint": "запись в барбершоп", "field_hints": ["услуга", "мастер"]},
+        resource_label="запись",
+        generation_mode=GenerationMode.BALANCED,
+    )
+    warehouse = WorkspaceCodeAgentRuntime._visual_design_profile(
+        prompt_analysis={"resource_hint": "складские заказы", "field_hints": ["товар", "доставка"]},
+        resource_label="заказ",
+        generation_mode=GenerationMode.BALANCED,
+    )
+
+    assert barber["id"] != warehouse["id"]
+    assert barber["primary"] != warehouse["primary"]
+
+
+def test_balanced_and_quality_css_are_profiled_and_depth_distinct() -> None:
+    profile = WorkspaceCodeAgentRuntime._visual_design_profile(
+        prompt_analysis={"resource_hint": "курс онбординга", "field_hints": ["урок", "студент"]},
+        resource_label="курс",
+        generation_mode=GenerationMode.BALANCED,
+    )
+    balanced = WorkspaceCodeAgentRuntime._non_fast_role_css("client", profile=profile, generation_mode=GenerationMode.BALANCED).lower()
+    quality = WorkspaceCodeAgentRuntime._non_fast_role_css("client", profile=profile, generation_mode=GenerationMode.QUALITY).lower()
+    fast = WorkspaceCodeAgentRuntime._fast_role_css().lower()
+
+    assert "visual-profile:" in balanced
+    assert "--role-accent" in balanced
+    assert "visual-profile:fast-modern" not in balanced
+    assert balanced != fast
+    assert ".toolbar" in quality
+    assert ".success" in quality
+    assert len(quality) > len(balanced)
+
+
+def test_profiled_role_css_is_not_treated_as_generic_template(tmp_path: Path) -> None:
+    profile = WorkspaceCodeAgentRuntime._visual_design_profile(
+        prompt_analysis={"resource_hint": "сервис ремонта"},
+        resource_label="ремонт",
+        generation_mode=GenerationMode.BALANCED,
+    )
+    css_path = tmp_path / "styles.css"
+    css_path.write_text(
+        WorkspaceCodeAgentRuntime._non_fast_role_css("manager", profile=profile, generation_mode=GenerationMode.BALANCED),
+        encoding="utf-8",
+    )
+
+    assert WorkspaceCodeAgentRuntime._role_css_is_generic_template(css_path) is False
+
+
+def test_design_gate_blocks_old_generic_balanced_css() -> None:
+    css = """:root { color: #172033; background: #f6f7fb; }
+.hero { display: grid; gap: 8px; padding: 18px; border-radius: 8px; background: #1f2937; color: #ffffff; }
+.panel { display: grid; gap: 12px; background: #ffffff; }
+.item-card { display: grid; gap: 10px; background: #eff6ff; }
+"""
+    issue = CheckRunner._role_design_depth_issue("client", css, "", GenerationMode.BALANCED)
+
+    assert issue is not None
+    assert issue.code == "platform.generic_mode_design_template"
+
+
+def test_balanced_mode_requirements_are_not_fast_scaffold_contract() -> None:
+    requirements = WorkspaceCodeAgentRuntime._mode_generation_requirements(GenerationMode.BALANCED)
+    text = " ".join(requirements["rules"])
+
+    assert requirements["tier"] == "balanced"
+    assert "not a FAST-style generic request scaffold" in text
+    assert "domain-specific API route names" in text
+    assert "generated Python and JS app tests" in text
+
+
+def test_balanced_quality_do_not_use_deterministic_non_fast_completer_by_default(monkeypatch) -> None:
+    monkeypatch.delenv("WORKSPACE_AGENT_ALLOW_NON_FAST_TEMPLATE_COMPLETION", raising=False)
+
+    assert WorkspaceCodeAgentRuntime._allow_deterministic_non_fast_completion(GenerationMode.BALANCED) is False
+    assert WorkspaceCodeAgentRuntime._allow_deterministic_non_fast_completion(GenerationMode.QUALITY) is False
+
+    monkeypatch.setenv("WORKSPACE_AGENT_ALLOW_NON_FAST_TEMPLATE_COMPLETION", "1")
+
+    assert WorkspaceCodeAgentRuntime._allow_deterministic_non_fast_completion(GenerationMode.BALANCED) is True
+
+
+def test_quality_mode_requirements_are_deeper_than_balanced() -> None:
+    balanced = WorkspaceCodeAgentRuntime._mode_generation_requirements(GenerationMode.BALANCED)
+    quality = WorkspaceCodeAgentRuntime._mode_generation_requirements(GenerationMode.QUALITY)
+    quality_text = " ".join(quality["rules"])
+
+    assert quality["tier"] == "quality"
+    assert quality["file_depth"] == "deep"
+    assert balanced["file_depth"] == "moderate"
+    assert "richer than Balanced" in quality_text
+    assert "Do not intentionally use FAST scaffold in Quality" in quality_text
+
+
+def test_token_usage_merge_preserves_fallback_metadata() -> None:
+    merged = WorkspaceCodeAgentRuntime._merge_run_token_usage(
+        {"fallback_kind": "emergency_scaffold", "fallback_from_mode": "balanced", "total_tokens": 10},
+        {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5},
+    )
+
+    assert merged["fallback_kind"] == "emergency_scaffold"
+    assert merged["fallback_from_mode"] == "balanced"
+    assert merged["total_tokens"] == 15
 
 
 def test_lsp_tool_service_reports_jumpable_changed_file_diagnostics(tmp_path: Path) -> None:
@@ -1855,6 +1981,457 @@ def test_fast_scaffold_blueprint_fills_sparse_contract_without_blocking() -> Non
     assert "missing_sections" not in blueprint
 
 
+def test_product_runtime_detection_rejects_preview_bridge_only_app(tmp_path: Path) -> None:
+    source = tmp_path
+    routes = source / "miniapp/app/routes"
+    static = source / "miniapp/app/static"
+    routes.mkdir(parents=True)
+    (routes / "orders.py").write_text("from fastapi import APIRouter\nrouter = APIRouter()\n", encoding="utf-8")
+    for role in ("client", "specialist", "manager"):
+        role_dir = static / role
+        role_dir.mkdir(parents=True)
+        (role_dir / "index.html").write_text("<main id=\"app\"></main>", encoding="utf-8")
+        (role_dir / "app.js").write_text(f"const role = {role!r};\nwindow.setupPreviewBridge?.(role);\n", encoding="utf-8")
+        (role_dir / "styles.css").write_text(".page-shell { display: grid; }\n", encoding="utf-8")
+
+    assert WorkspaceCodeAgentRuntime._draft_has_product_runtime_source(source) is False
+
+
+def test_product_runtime_detection_accepts_role_logic(tmp_path: Path) -> None:
+    source = tmp_path
+    routes = source / "miniapp/app/routes"
+    static = source / "miniapp/app/static"
+    routes.mkdir(parents=True)
+    (routes / "orders.py").write_text("from fastapi import APIRouter\nrouter = APIRouter()\n", encoding="utf-8")
+    app_js = """
+const app = document.querySelector("#app");
+async function loadOrders() {
+  const data = await window.MiniApp.json("/api/orders");
+  app.replaceChildren();
+  app.insertAdjacentHTML("beforeend", `<button data-action="save">${data.items.length}</button>`);
+}
+document.addEventListener("click", (event) => {
+  if (event.target.closest("[data-action]")) fetch("/api/orders", { method: "POST" });
+});
+loadOrders();
+"""
+    for role in ("client", "specialist", "manager"):
+        role_dir = static / role
+        role_dir.mkdir(parents=True)
+        (role_dir / "index.html").write_text("<main id=\"app\"></main>", encoding="utf-8")
+        (role_dir / "app.js").write_text(app_js, encoding="utf-8")
+        (role_dir / "styles.css").write_text(".page-shell { display: grid; }\n", encoding="utf-8")
+
+    assert WorkspaceCodeAgentRuntime._draft_has_product_runtime_source(source) is True
+
+
+def test_balanced_does_not_degrade_to_fast_scaffold_after_loop_exhaustion(tmp_path: Path) -> None:
+    job = JobRecord(
+        job_id="job_balanced",
+        workspace_id="ws_balanced",
+        prompt="Build a booking app",
+        target_platform="telegram_mini_app",
+        preview_profile="telegram_mock",
+        status="blocked",
+        generation_mode=GenerationMode.BALANCED,
+        failure_class="generation.repeated_no_progress",
+    )
+    request = SimpleNamespace(mode="generate")
+
+    assert WorkspaceCodeAgentRuntime._should_use_local_product_fallback(
+        job,
+        request=request,  # type: ignore[arg-type]
+        generation_mode=GenerationMode.BALANCED,
+        draft_source=tmp_path,
+    ) is False
+
+    assert WorkspaceCodeAgentRuntime._should_use_local_product_fallback(
+        job,
+        request=request,  # type: ignore[arg-type]
+        generation_mode=GenerationMode.QUALITY,
+        draft_source=tmp_path,
+    ) is False
+
+
+def test_emergency_scaffold_does_not_replace_usable_balanced_runtime(tmp_path: Path) -> None:
+    test_product_runtime_detection_accepts_role_logic(tmp_path)
+    job = JobRecord(
+        job_id="job_balanced",
+        workspace_id="ws_balanced",
+        prompt="Build a booking app",
+        target_platform="telegram_mini_app",
+        preview_profile="telegram_mock",
+        status="blocked",
+        generation_mode=GenerationMode.BALANCED,
+        failure_class="generation.repeated_no_progress",
+    )
+    request = SimpleNamespace(mode="generate")
+
+    assert WorkspaceCodeAgentRuntime._should_use_local_product_fallback(
+        job,
+        request=request,  # type: ignore[arg-type]
+        generation_mode=GenerationMode.BALANCED,
+        draft_source=tmp_path,
+    ) is False
+
+
+def test_non_fast_create_sanitizes_fast_scaffold_leftovers(tmp_path: Path) -> None:
+    template = tmp_path / "template"
+    draft = tmp_path / "draft"
+    for root in (template, draft):
+        (root / "miniapp/app/generated").mkdir(parents=True)
+        (root / "miniapp/app/routes/__pycache__").mkdir(parents=True)
+        for role in ("client", "specialist", "manager"):
+            role_dir = root / "miniapp/app/static" / role
+            role_dir.mkdir(parents=True)
+            (role_dir / "index.html").write_text(f"<main>{role} template</main>", encoding="utf-8")
+            (role_dir / "app.js").write_text(f'const role = "{role}";\nwindow.setupPreviewBridge?.(role);\n', encoding="utf-8")
+            (role_dir / "styles.css").write_text("", encoding="utf-8")
+    (template / "miniapp/app/generated/route_manifest.json").write_text('{"roles": {}, "shared": {}}', encoding="utf-8")
+    (draft / "miniapp/app/generated/route_manifest.json").write_text('{"roles": {"client": ["/client"]}}', encoding="utf-8")
+    (draft / "miniapp/app/generated/fast_requests.json").write_text("[]", encoding="utf-8")
+    (draft / "miniapp/app/routes/fast_requests.py").write_text("router = object()\n", encoding="utf-8")
+    (draft / "miniapp/app/routes/__pycache__/fast_requests.cpython-312.pyc").write_bytes(b"pyc")
+    (draft / "miniapp/app/static/client/app.js").write_text('const apiPath = "/api/fast-requests";\n', encoding="utf-8")
+
+    runtime = WorkspaceCodeAgentRuntime.__new__(WorkspaceCodeAgentRuntime)
+    runtime.workspace_service = SimpleNamespace(settings=SimpleNamespace(template_dir=template))
+
+    changed = WorkspaceCodeAgentRuntime._sanitize_non_fast_create_draft(
+        runtime,
+        workspace_id="ws_1",
+        run_id="run_1",
+        draft_source=draft,
+        generation_mode=GenerationMode.BALANCED,
+    )
+
+    assert "miniapp/app/routes/fast_requests.py" in changed
+    assert not (draft / "miniapp/app/routes/fast_requests.py").exists()
+    assert not (draft / "miniapp/app/generated/fast_requests.json").exists()
+    assert not list((draft / "miniapp/app/routes/__pycache__").glob("fast_requests*.pyc"))
+    assert "/api/fast-requests" not in (draft / "miniapp/app/static/client/app.js").read_text(encoding="utf-8")
+    assert (draft / "miniapp/app/generated/route_manifest.json").read_text(encoding="utf-8") == '{"roles": {}, "shared": {}}'
+
+
+def test_non_fast_contract_route_overrides_resource_label(tmp_path: Path) -> None:
+    generated = tmp_path / "miniapp/app/generated"
+    generated.mkdir(parents=True)
+    (generated / "contract_validator.json").write_text(
+        json.dumps(
+            {
+                "contract_routes": [
+                    {"method": "GET", "path": "/api/zapis", "endpoint_id": "zapis.list"},
+                    {"method": "POST", "path": "/api/zapis", "endpoint_id": "zapis.create"},
+                    {"method": "PATCH", "path": "/api/zapis/{item_id}", "endpoint_id": "zapis.update"},
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    assert WorkspaceCodeAgentRuntime._contract_declared_api_route(tmp_path) == ("/api/zapis", "zapis")
+
+
+def test_non_fast_prompt_analysis_prefers_contract_copy(tmp_path: Path) -> None:
+    generated = tmp_path / "miniapp/app/generated"
+    generated.mkdir(parents=True)
+    (generated / "miniapp_contract.json").write_text(
+        json.dumps(
+            {
+                "acceptance_summary": {
+                    "api_contract": {
+                        "resource_hint": "запись",
+                        "field_hints": ["услуга", "мастер", "дата", "время", "имя", "телефон"],
+                    }
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    analysis = WorkspaceCodeAgentRuntime._non_fast_prompt_analysis(tmp_path, "Создай запись в барбершоп")
+
+    assert analysis["resource_hint"] == "запись"
+    assert analysis["field_hints"][:2] == ["услуга", "мастер"]
+    assert WorkspaceCodeAgentRuntime._non_fast_resource_label("Создай запись", prompt_analysis=analysis) == "запись"
+
+
+def test_non_fast_role_js_posts_schema_keys_not_display_labels() -> None:
+    js = WorkspaceCodeAgentRuntime._non_fast_role_js(
+        "client",
+        api_path="/api/zapis",
+        resource_label="запись",
+        fields=["имя", "телефон", "услуга"],
+        statuses=["new", "in_progress", "completed"],
+    )
+
+    assert 'const API_PATH = "/api/zapis";' in js
+    assert '"key": "imya"' in js
+    assert '"label": "имя"' in js
+    assert 'formData.get(field.key)' in js
+    assert '[field.key, formData.get(field.key)' in js
+    assert 'formData.get(field.label)' not in js
+    assert "updated_at" in js
+    assert "updated_by" in js
+    assert "innerHTML" not in js
+    assert "insertAdjacentHTML" not in js
+    assert "Создать запись" in js
+    assert "Сохранить" in js
+
+
+def test_non_fast_client_template_prioritizes_records_and_separate_create_screen() -> None:
+    js = WorkspaceCodeAgentRuntime._non_fast_role_js(
+        "client",
+        api_path="/api/zapis",
+        resource_label="запись",
+        fields=["услуга", "мастер", "время"],
+        statuses=["new", "in_progress", "completed"],
+    )
+
+    assert "function renderClientListShell(items)" in js
+    assert "function renderClientCreateShell()" in js
+    assert "history.pushState(null, \"\", \"/client/new\")" in js
+    assert "root.replaceChildren(hero(LIST_HEADING" in js
+    assert "field-grid" in js
+    assert "card-actions" in js
+    assert "buildCreateForm()" in js
+    assert 'return window.location.pathname.split("/").filter(Boolean).pop() || document.body.dataset.view || "root";' in js
+    assert "function openItem(id)" in js
+    assert "function bindItemActions()" in js
+    assert 'button.dataset.action = ROLE === "client" ? "open" : "status";' in js
+    assert 'currentView() === "review"' in js
+
+
+def test_fast_client_cards_have_active_open_detail_handler() -> None:
+    ui_copy = WorkspaceCodeAgentRuntime._fast_ui_copy("Client creates an order.", "order")
+    js = WorkspaceCodeAgentRuntime._fast_role_js(
+        "client",
+        "Client creates an order.",
+        "order",
+        ["Product", "Address"],
+        ["new", "in progress", "completed"],
+        ui_copy,
+    )
+
+    assert 'data-action="open"' in js
+    assert "async function openDetail(id)" in js
+    assert 'button.dataset.action === "open"' in js
+    assert 'button.dataset.action === "back"' in js
+
+
+def test_non_fast_role_page_exposes_js_dom_anchors(tmp_path: Path) -> None:
+    draft = tmp_path
+    root = draft / "miniapp/app/static/specialist"
+    root.mkdir(parents=True)
+    (root / "index.html").write_text(
+        '<main id="app" class="page-shell"></main><script src="/static/specialist/app.js" defer></script>',
+        encoding="utf-8",
+    )
+
+    changes = WorkspaceCodeAgentRuntime._non_fast_role_page_changes(draft)
+    specialist_root = next(change for change in changes if change.file_path == "miniapp/app/static/specialist/index.html")
+    js = WorkspaceCodeAgentRuntime._non_fast_role_js(
+        "specialist",
+        api_path="/api/zapis",
+        resource_label="запись",
+        fields=["имя", "телефон", "услуга"],
+        statuses=["new", "in_progress", "completed"],
+    )
+    import re
+
+    html_ids = set(re.findall(r"""id=["']([A-Za-z0-9_-]+)["']""", specialist_root.content))
+    js_ids = set(re.findall(r"""querySelector(?:All)?\(\s*["']#([A-Za-z0-9_-]+)""", js))
+
+    assert {"app", "items", "create-form"}.issubset(html_ids)
+    assert js_ids.issubset(html_ids)
+
+
+def test_non_fast_role_page_plan_has_prompt_scale_routes(tmp_path: Path) -> None:
+    changes = WorkspaceCodeAgentRuntime._non_fast_role_page_changes(tmp_path)
+    paths = {change.file_path for change in changes}
+
+    for role in ("client", "specialist", "manager"):
+        role_pages = [path for path in paths if path.startswith(f"miniapp/app/static/{role}/") and path.endswith("/index.html")]
+        assert f"miniapp/app/static/{role}/index.html" in paths
+        assert len(role_pages) >= 5
+
+
+def test_non_fast_role_app_completion_requires_update_visibility(tmp_path: Path) -> None:
+    app_js = tmp_path / "app.js"
+    app_js.write_text(
+        """
+const root = document.querySelector("#app");
+fetch("/api/zapis", { method: "POST", body: JSON.stringify({ status: item.status }) });
+document.addEventListener("click", () => root.textContent = item.status);
+""",
+        encoding="utf-8",
+    )
+
+    assert WorkspaceCodeAgentRuntime._role_app_has_product_logic(app_js) is True
+    assert WorkspaceCodeAgentRuntime._role_app_needs_completion(app_js) is True
+
+
+def test_product_readiness_allows_contract_metadata_and_smoke_store_diff() -> None:
+    passed_results = [
+        RunCheckResult(name="changed_files_static", status="passed", details="ok"),
+        RunCheckResult(
+            name="platform_invariants",
+            status="passed",
+            details="ok",
+            diagnostics={
+                "role_coverage": {
+                    "client": {"status": "present", "route_count": 2},
+                    "specialist": {"status": "present", "route_count": 2},
+                    "manager": {"status": "present", "route_count": 2},
+                }
+            },
+        ),
+        RunCheckResult(name="frontend_interaction_static_smoke", status="passed", details="ok"),
+        RunCheckResult(
+            name="api_workflow_smoke",
+            status="passed",
+            details="ok",
+            diagnostics={"created_state_marker": "browser-flow-proof", "api_paths": ["/api/zapis"]},
+        ),
+        RunCheckResult(name="generated_app_python_tests", status="passed", details="ok"),
+        RunCheckResult(name="generated_app_js_tests", status="passed", details="ok"),
+        RunCheckResult(name="preview_boot_smoke", status="passed", details="ok"),
+        RunCheckResult(name="preview_connectivity_smoke", status="passed", details="ok"),
+        RunCheckResult(
+            name="browser_flow_smoke",
+            status="passed",
+            details="ok",
+            diagnostics={
+                "roles_checked": ["client", "specialist", "manager"],
+                "ui_steps": [{"action": "client_create"}],
+                "created_state_marker": "browser-flow-proof",
+                "updated_state_marker": "browser-flow-updated",
+                "mobile_layout": {"status": "passed"},
+            },
+        ),
+    ]
+    diff_text = "\n".join(
+        [
+            "diff --git a/source/miniapp/app/routes/zapis.py b/source/miniapp/app/routes/zapis.py",
+            "diff --git a/source/miniapp/app/static/client/app.js b/source/miniapp/app/static/client/app.js",
+            "diff --git a/source/miniapp/app/generated/miniapp_contract.json b/source/miniapp/app/generated/miniapp_contract.json",
+            "diff --git a/source/miniapp/app/generated/contract_validator.json b/source/miniapp/app/generated/contract_validator.json",
+            "diff --git a/source/miniapp/app/generated/route_manifest.json b/source/miniapp/app/generated/route_manifest.json",
+            "diff --git a/source/miniapp/app/generated/zapis_store.json b/source/miniapp/app/generated/zapis_store.json",
+        ]
+    )
+
+    result = ProductReadinessContract.evaluate(
+        run_mode="generate",
+        generation_mode="balanced",
+        intent="create",
+        acceptance_contract={
+            "required": True,
+            "roles": ["client", "specialist", "manager"],
+            "features": {"workflow_update": True},
+        },
+        implementation_plan={},
+        results=passed_results,
+        diff_text=diff_text,
+        require_diff=True,
+        require_product_source_change=True,
+        require_apply=False,
+    )
+
+    assert result.status == "passed"
+    assert not [
+        issue
+        for issue in result.blocking_reasons
+        if (issue.model_dump(mode="json") if hasattr(issue, "model_dump") else issue).get("kind") == "diff_scope"
+    ]
+
+
+def test_run_task_ledger_completes_planned_tasks_when_proof_passes() -> None:
+    ledger = RunTaskLedger.build(
+        run_id="run_1",
+        workspace_id="ws_1",
+        implementation_plan={
+            "runtime_task_ledger": [
+                {
+                    "id": "client.role_surface",
+                    "status": "planned",
+                    "proof_checks": ["platform_invariants", "browser_flow_smoke"],
+                }
+            ]
+        },
+        run_status="completed",
+        current_stage="completion_gate",
+        results=[
+            RunCheckResult(name="platform_invariants", status="passed", details="ok"),
+            RunCheckResult(name="browser_flow_smoke", status="passed", details="ok"),
+        ],
+    )
+
+    assert ledger["counts"]["completed"] == 1
+    assert ledger["items"][0]["status"] == "completed"
+    assert not RunTaskLedger.blocking_issues(
+        run_id="run_1",
+        workspace_id="ws_1",
+        implementation_plan={
+            "runtime_task_ledger": [
+                {
+                    "id": "client.role_surface",
+                    "status": "planned",
+                    "proof_checks": ["platform_invariants", "browser_flow_smoke"],
+                }
+            ]
+        },
+        run_status="completed",
+        current_stage="completion_gate",
+        results=[
+            RunCheckResult(name="platform_invariants", status="passed", details="ok"),
+            RunCheckResult(name="browser_flow_smoke", status="passed", details="ok"),
+        ],
+    )
+
+
+def test_guardian_bypass_only_applies_to_fast_or_tagged_emergency_scaffold() -> None:
+    service = RunService.__new__(RunService)
+    called = {"gate": 0}
+
+    def run_gate(**kwargs):
+        called["gate"] += 1
+        return SimpleNamespace(
+            guardian_gate_ref="guardian:test",
+            apply_decision="allow",
+            status="passed",
+            model_dump=lambda **_: {"status": "passed", "findings": []},
+        )
+
+    service.guardian_gate_service = SimpleNamespace(run_gate=run_gate)
+    service.store = SimpleNamespace(upsert=lambda *args, **kwargs: None)
+    service._save_run = lambda run: None
+    balanced = RunRecord(
+        run_id="run_balanced",
+        workspace_id="ws_balanced",
+        prompt="Build app",
+        mode="generate",
+        intent="create",
+        generation_mode=GenerationMode.BALANCED,
+        touched_files=["miniapp/app/routes/fast_requests.py"],
+    )
+
+    allowed, _report = RunService.enforce_guardian_before_apply(service, balanced, source="pre_apply_guardian")
+
+    assert allowed is True
+    assert called["gate"] == 1
+
+    called["gate"] = 0
+    balanced.token_usage = {"fallback_kind": "emergency_scaffold", "fallback_from_mode": "balanced"}
+    allowed, report = RunService.enforce_guardian_before_apply(service, balanced, source="pre_apply_guardian")
+
+    assert allowed is True
+    assert called["gate"] == 0
+    assert report["reason"] == "local_scaffold_fast_gate"
+
+
 def test_terminal_job_snapshot_preserves_fast_scaffold_changed_files() -> None:
     service = RunService.__new__(RunService)
     run = RunRecord(
@@ -1895,13 +2472,53 @@ def test_terminal_job_snapshot_preserves_fast_scaffold_changed_files() -> None:
     assert snapshot.fix_targets == job.fix_targets
 
 
+def test_terminal_job_snapshot_does_not_treat_draft_patch_as_source_apply() -> None:
+    service = RunService.__new__(RunService)
+    run = RunRecord(
+        run_id="run_balanced",
+        workspace_id="ws_balanced",
+        prompt="Build app",
+        intent="create",
+        generation_mode=GenerationMode.BALANCED,
+        apply_status="pending",
+        status="running",
+    )
+    job = JobRecord(
+        job_id="job_balanced",
+        workspace_id="ws_balanced",
+        linked_run_id="run_balanced",
+        prompt="Build app",
+        target_platform="telegram_mini_app",
+        preview_profile="telegram_mock",
+        status="completed",
+        outcome_kind="applied",
+        apply_result={"status": "applied", "revision_id": None, "changed_files": ["miniapp/app/static/client/app.js"]},
+    )
+
+    assert RunService._terminal_run_snapshot_from_job(service, run, job) is None
+
+
+def test_guardian_prefers_green_job_checks_over_stale_artifact_checks() -> None:
+    stale = [
+        {"name": "lsp_static_diagnostics", "status": "failed"},
+        {"name": "api_workflow_smoke", "status": "skipped"},
+    ]
+    fresh = [
+        {"name": "lsp_static_diagnostics", "status": "passed"},
+        {"name": "api_workflow_smoke", "status": "passed"},
+        {"name": "browser_flow_smoke", "status": "passed"},
+    ]
+
+    assert RunService._prefer_green_check_payload(stale, fresh) == fresh
+
+
 def test_apply_completed_draft_keeps_product_touched_files_when_revision_only_has_preview_logs() -> None:
     service = RunService.__new__(RunService)
     service.workspace_service = SimpleNamespace(
         approve_draft=lambda workspace_id, run_id, message: SimpleNamespace(revision_id="rev_result"),
         discard_draft=lambda workspace_id, run_id: None,
     )
-    service.enforce_guardian_before_apply = lambda run, source: (True, {})
+    service.enforce_guardian_before_apply = lambda run, source, changed_files=None: (True, {})
     service._save_run = lambda run: None
     service._append_job_event = lambda *args, **kwargs: None
     service._record_before_apply_checkpoint = lambda *args, **kwargs: None
@@ -1909,6 +2526,7 @@ def test_apply_completed_draft_keeps_product_touched_files_when_revision_only_ha
         ".sandbox/preview/stdout.log",
         ".sandbox/preview/stderr.log",
     ]
+    service.workspace_service.draft_changed_paths = lambda workspace_id, run_id: []
     run = RunRecord(
         run_id="run_fast",
         workspace_id="ws_fast",
@@ -1927,6 +2545,7 @@ def test_apply_completed_draft_keeps_product_touched_files_when_revision_only_ha
     assert run.status == "completed"
     assert run.apply_status == "applied"
     assert run.touched_files == ["miniapp/app/routes/fast_requests.py", "miniapp/app/static/client/app.js"]
+    assert run.apply_result["revision_id"] == "rev_result"
 
 
 def test_apply_completed_draft_falls_back_to_fix_targets_for_idempotent_fast_apply() -> None:
@@ -1935,11 +2554,12 @@ def test_apply_completed_draft_falls_back_to_fix_targets_for_idempotent_fast_app
         approve_draft=lambda workspace_id, run_id, message: SimpleNamespace(revision_id="rev_result"),
         discard_draft=lambda workspace_id, run_id: None,
     )
-    service.enforce_guardian_before_apply = lambda run, source: (True, {})
+    service.enforce_guardian_before_apply = lambda run, source, changed_files=None: (True, {})
     service._save_run = lambda run: None
     service._append_job_event = lambda *args, **kwargs: None
     service._record_before_apply_checkpoint = lambda *args, **kwargs: None
     service._meaningful_paths_between_revisions = lambda **kwargs: [".sandbox/preview/stdout.log"]
+    service.workspace_service.draft_changed_paths = lambda workspace_id, run_id: []
     run = RunRecord(
         run_id="run_fast",
         workspace_id="ws_fast",
@@ -1960,6 +2580,51 @@ def test_apply_completed_draft_falls_back_to_fix_targets_for_idempotent_fast_app
 
     assert applied is True
     assert run.touched_files == ["miniapp/app/routes/fast_requests.py", "miniapp/app/static/client/app.js"]
+
+
+def test_pre_apply_guardian_syncs_mobile_proof_from_artifacts() -> None:
+    service = RunService.__new__(RunService)
+    saved: list[RunRecord] = []
+    service.store = SimpleNamespace(
+        get=lambda table, key: {
+            "check_results": [
+                {
+                    "name": "browser_flow_smoke",
+                    "status": "passed",
+                    "diagnostics": {
+                        "roles_checked": ["client", "specialist", "manager"],
+                        "mobile_layout": {"status": "passed", "viewports": ["390x844"]},
+                    },
+                }
+            ]
+        },
+        upsert=lambda *args, **kwargs: None,
+    )
+    service.get_run_artifacts = lambda run_id: service.store.get("reports", f"run_artifacts:{run_id}")
+    service._save_run = lambda run: saved.append(run.model_copy(deep=True))
+    service.guardian_gate_service = SimpleNamespace(
+        run_gate=lambda **kwargs: SimpleNamespace(
+            status="passed",
+            apply_decision="allow",
+            guardian_gate_ref="guardian_gate:ws:run",
+            model_dump=lambda **_: {"status": "passed", "apply_decision": "allow", "findings": []},
+        )
+    )
+    run = RunRecord(
+        run_id="run_balanced",
+        workspace_id="ws_balanced",
+        prompt="Build app",
+        mode="generate",
+        intent="create",
+        generation_mode=GenerationMode.BALANCED,
+    )
+
+    allowed, _ = RunService.enforce_guardian_before_apply(service, run, source="pre_apply_guardian")
+
+    assert allowed is True
+    assert run.mobile_layout_report == {"status": "passed", "viewports": ["390x844"]}
+    assert run.browser_flow_proof["mobile_layout"]["status"] == "passed"
+    assert saved
 
 
 def test_tool_router_spills_large_result_to_output_artifact_writer(tmp_path: Path, monkeypatch) -> None:
@@ -2370,13 +3035,37 @@ def test_role_surface_issues_accepts_generation_mode(tmp_path: Path) -> None:
             f"<main><section class='dashboard'><h1>{role} workflow app</h1><button class='button'>Save</button></section></main>",
             encoding="utf-8",
         )
-        (role_dir / "app.js").write_text("document.body.dataset.ready = 'true';\n", encoding="utf-8")
+        (role_dir / "app.js").write_text(
+            "const root = document.querySelector('main');\n"
+            "root.replaceChildren(document.createElement('section'));\n"
+            "document.addEventListener('click', () => fetch('/api/workflow', { method: 'POST' }));\n",
+            encoding="utf-8",
+        )
         (role_dir / "styles.css").write_text(css, encoding="utf-8")
 
     issues, coverage, _neutral = CheckRunner._role_surface_issues(tmp_path, generation_mode=GenerationMode.BALANCED)
 
     assert isinstance(issues, list)
     assert set(coverage) == {"client", "specialist", "manager"}
+
+
+def test_role_surface_issues_rejects_preview_bridge_only_js(tmp_path: Path) -> None:
+    css = "\n".join(f".rule{i} {{ display: block; }}" for i in range(8))
+    for role in ("client", "specialist", "manager"):
+        role_dir = tmp_path / "miniapp" / "app" / "static" / role
+        role_dir.mkdir(parents=True)
+        (role_dir / "index.html").write_text(f"<main><h1>{role} app</h1></main>", encoding="utf-8")
+        (role_dir / "app.js").write_text(f'const role = "{role}";\nwindow.setupPreviewBridge?.(role);\n', encoding="utf-8")
+        (role_dir / "styles.css").write_text(css, encoding="utf-8")
+
+    issues, coverage, _neutral = CheckRunner._role_surface_issues(tmp_path, generation_mode=GenerationMode.BALANCED)
+
+    codes = [issue.code for issue in issues]
+    assert "platform.placeholder_role_js" in codes
+    assert coverage["client"]["status"] == "placeholder_js"  # type: ignore[index]
+    js_issue = next(issue for issue in issues if issue.code == "platform.placeholder_role_js")
+    assert js_issue.repair_recipe
+    assert js_issue.repair_recipe["target_files"] == ["miniapp/app/static/client/app.js"]
 
 
 def test_prompt_scale_requires_routeable_role_pages(tmp_path: Path) -> None:
@@ -2572,7 +3261,7 @@ def test_agent_transcript_tracks_pending_tool_results_and_reduced_graph() -> Non
         response_id="resp_1",
         assistant_message="Read files.",
         tool_calls=[{"tool_use_id": "call_1", "tool": "read_files", "targets": ["miniapp/app/main.py"]}],
-        model="gpt-5.4-mini",
+        model="gpt-5.2-codex",
     )
     transcript.append_tool_results("run_1", [{"tool_use_id": "call_1", "tool": "read_files", "files": []}])
 
@@ -2609,7 +3298,7 @@ def test_agent_transcript_drops_partial_tool_outputs_before_responses_resume() -
             {"tool_use_id": "call_1", "tool": "read_files"},
             {"tool_use_id": "call_2", "tool": "search_files"},
         ],
-        model="gpt-5.4-mini",
+        model="gpt-5.2-codex",
     )
     transcript.append_tool_results("run_1", [{"tool_use_id": "call_1", "tool": "read_files", "files": []}])
 
@@ -2633,7 +3322,7 @@ def test_agent_transcript_persists_and_restores_pending_tool_results() -> None:
         response_id="resp_1",
         assistant_message="Search files.",
         tool_calls=[{"tool_use_id": "call_1", "tool": "search_files"}],
-        model="gpt-5.4-mini",
+        model="gpt-5.2-codex",
     )
     transcript.append_tool_results("run_1", [{"tool_use_id": "call_1", "tool": "search_files", "matches": []}])
 
@@ -2655,7 +3344,7 @@ def test_agent_transcript_normalizes_history_versions_and_extra_tool_results() -
         response_id="resp_1",
         assistant_message="Read one file.",
         tool_calls=[{"tool_use_id": "call_1", "tool": "read_files"}],
-        model="gpt-5.4-mini",
+        model="gpt-5.2-codex",
     )
     transcript.append_tool_results(
         "run_1",
@@ -4243,6 +4932,9 @@ def test_worker_task_planner_builds_self_contained_owner_prompts() -> None:
     assert by_id["backend_api_worker"]["product_task_ledger_slice"][0]["id"] == "shared_state.persistence_api"
     assert "miniapp/app/generated/miniapp_contract.json" in by_id["client_surface_worker"]["prompt"]
     assert "keep them consistent across backend, JS payloads, renderers, and tests" in by_id["client_surface_worker"]["prompt"]
+    assert "createElement" in by_id["client_surface_worker"]["prompt"]
+    assert "do not use innerHTML" in by_id["client_surface_worker"]["prompt"]
+    assert "insertAdjacentHTML" in by_id["client_surface_worker"]["prompt"]
     assert by_id["client_surface_worker"]["mode_contract"]["depth"] == "deep"
     assert "mobile layout works" in by_id["client_surface_worker"]["self_check"][3]
 
@@ -4290,6 +4982,72 @@ def test_worker_runtime_prepares_isolated_drafts_and_merge_reports(tmp_path: Pat
 
     assert branch_results[0]["agent_loop"] == "branch_scoped"
     assert branch_results[0]["self_check"]["owned_paths_only"] is True  # type: ignore[index]
+
+
+def test_worker_branch_validation_rejects_unsafe_role_dom() -> None:
+    loop = AgentWorkerBranchLoop(
+        openai_client=SimpleNamespace(),
+        workspace_service=SimpleNamespace(),
+    )
+    unsafe = DraftAction(
+        file_path="miniapp/app/static/client/app.js",
+        operation="replace",
+        content='const app = document.querySelector("#app");\napp.innerHTML = "<section>Order</section>";\n',
+        reason="client ui",
+    )
+
+    with pytest.raises(ValueError) as exc:
+        loop._validate_worker_changes([unsafe], worker_id="client_surface_worker")
+
+    assert "unsafe_dom_api" in str(exc.value)
+    assert "createElement/textContent/replaceChildren" in str(exc.value)
+    next_action = loop._worker_validation_next_action(str(exc.value))
+    assert "safe DOM construction" in next_action
+    assert "do not use innerHTML" in next_action
+
+
+def test_guardian_allows_escaped_inner_html_templates_but_blocks_raw_interpolation() -> None:
+    safe = DraftAction(
+        file_path="miniapp/app/static/client/app.js",
+        operation="replace",
+        content="""
+function esc(value) {
+  return String(value ?? "").replace(/[&<>"']/g, "");
+}
+const msg = `Ошибка ${res.status}`;
+const cardsHtml = items.map((item) => `<article>${esc(item.name)}</article>`).join("");
+document.querySelector("#app").innerHTML = `<section>${cardsHtml}</section>`;
+""",
+        reason="safe escaped role template",
+    )
+    raw = DraftAction(
+        file_path="miniapp/app/static/client/app.js",
+        operation="replace",
+        content="""
+function esc(value) {
+  return String(value ?? "").replace(/[&<>"']/g, "");
+}
+document.querySelector("#app").innerHTML = `<section>${item.name}</section>`;
+""",
+        reason="unsafe raw role template",
+    )
+
+    safe_report = GuardianReview.review_risky_action(
+        workspace_id="ws_1",
+        run_id="run_1",
+        draft_source=None,
+        file_changes=[safe],
+    )
+    raw_report = GuardianReview.review_risky_action(
+        workspace_id="ws_1",
+        run_id="run_1",
+        draft_source=None,
+        file_changes=[raw],
+    )
+
+    assert safe_report.status == "passed"
+    assert raw_report.status == "failed"
+    assert raw_report.findings[0].code == "guardian.security_privacy.unsafe_inner_html"
 
 
 def test_worker_merge_decisions_emit_repair_worker_packets() -> None:

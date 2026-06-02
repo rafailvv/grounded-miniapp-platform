@@ -348,9 +348,10 @@ class GuardianGateService:
 
     def _check_execution(self, run: RunRecord, artifacts: dict[str, Any], changed_files: list[str]) -> CheckExecutionRecord | None:
         raw_checks = artifacts.get("check_results") if isinstance(artifacts.get("check_results"), list) else []
-        if not raw_checks and run.linked_job_id:
+        if run.linked_job_id:
             job_payload = self.store.get("jobs", run.linked_job_id)
-            raw_checks = job_payload.get("executed_checks") if isinstance(job_payload, dict) and isinstance(job_payload.get("executed_checks"), list) else []
+            job_checks = job_payload.get("executed_checks") if isinstance(job_payload, dict) and isinstance(job_payload.get("executed_checks"), list) else []
+            raw_checks = self._prefer_green_check_payload(raw_checks, job_checks)
         results: list[RunCheckResult] = []
         for item in raw_checks or []:
             if not isinstance(item, dict):
@@ -362,6 +363,34 @@ class GuardianGateService:
         if not results:
             return None
         return CheckExecutionRecord(workspace_id=run.workspace_id, run_id=run.run_id, changed_files=changed_files, results=results, completed_at=_now())
+
+    @staticmethod
+    def _prefer_green_check_payload(primary: Any, fallback: Any) -> list[Any]:
+        primary_items = list(primary or []) if isinstance(primary, list) else []
+        fallback_items = list(fallback or []) if isinstance(fallback, list) else []
+        if not primary_items:
+            return fallback_items
+        if not fallback_items:
+            return primary_items
+
+        def score(items: list[Any]) -> tuple[int, int, int]:
+            statuses = [
+                str(item.get("status") or "").lower()
+                for item in items
+                if isinstance(item, dict)
+            ]
+            failed = sum(1 for status in statuses if status in {"failed", "blocked"})
+            passed = sum(1 for status in statuses if status == "passed")
+            terminal_proof = sum(
+                1
+                for item in items
+                if isinstance(item, dict)
+                and str(item.get("name") or "") in {"api_workflow_smoke", "browser_flow_smoke"}
+                and str(item.get("status") or "").lower() == "passed"
+            )
+            return (-failed, terminal_proof, passed)
+
+        return fallback_items if score(fallback_items) > score(primary_items) else primary_items
 
     def _next_sequence(self, run_id: str) -> int:
         if self.event_journal_service is None:

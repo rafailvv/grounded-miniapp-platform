@@ -23,7 +23,7 @@ MOCK_DATA_PATTERNS: tuple[tuple[str, str], ...] = (
 SECURITY_PRIVACY_PATTERNS: tuple[tuple[str, str, str], ...] = (
     (r"(?i)\b(?:api[_-]?key|secret|access[_-]?token|auth[_-]?token|password|private[_-]?key)\b\s*[:=]\s*['\"]([^'\"]{12,})['\"]", "hardcoded_secret", "Changed source appears to contain a hard-coded secret or credential."),
     (r"\b(?:eval|Function)\s*\(", "dynamic_code_execution", "Changed source uses dynamic code execution."),
-    (r"\.innerHTML\s*=", "unsafe_inner_html", "Changed source writes raw HTML and may expose injection risk."),
+    (r"\.innerHTML\s*=", "unsafe_inner_html", "Changed source writes unescaped raw HTML and may expose injection risk."),
     (r"\bdocument\.cookie\s*=", "cookie_write", "Changed source writes browser cookies directly."),
     (r"(?i)\blocalStorage\.setItem\s*\(\s*['\"][^'\"]*(?:token|password|secret|email|phone|address)", "sensitive_local_storage", "Changed source stores sensitive data in localStorage."),
 )
@@ -431,6 +431,8 @@ class GuardianReview:
                     continue
                 if reason == "hardcoded_secret" and cls._placeholder_secret(match.group(1)):
                     continue
+                if reason == "unsafe_inner_html" and cls._inner_html_usage_looks_escaped(text):
+                    continue
                 line = text.count("\n", 0, match.start()) + 1
                 findings.append(
                     cls._finding(
@@ -498,6 +500,8 @@ class GuardianReview:
                     continue
                 if reason == "hardcoded_secret" and cls._placeholder_secret(match.group(1)):
                     continue
+                if reason == "unsafe_inner_html" and cls._inner_html_usage_looks_escaped(payload):
+                    continue
                 findings.append(
                     cls._finding(
                         code=f"guardian.security_privacy.{reason}",
@@ -511,6 +515,51 @@ class GuardianReview:
                 )
                 break
         return findings
+
+    @classmethod
+    def _inner_html_usage_looks_escaped(cls, text: str) -> bool:
+        """Allow common generated UI templates when user data is visibly escaped.
+
+        Guardian should block raw user-controlled interpolation, not every
+        template-string render. Mini-app agents commonly render cards with
+        innerHTML plus an escape helper; treating that as categorically unsafe
+        makes ordinary frontend generation unrecoverable.
+        """
+        source = str(text or "")
+        if ".innerHTML" not in source:
+            return True
+        has_escape_helper = bool(
+            re.search(r"\bfunction\s+(?:esc|escapeHtml)\s*\(", source)
+            or re.search(r"\bconst\s+(?:esc|escapeHtml)\s*=", source)
+        )
+        if not has_escape_helper:
+            return False
+        html_sinks = cls._inner_html_sink_snippets(source)
+        if not html_sinks:
+            return True
+        raw_property_interpolation = re.compile(
+            r"\$\{\s*(?!esc\s*\(|escapeHtml\s*\(|String\s*\()\s*"
+            r"(?:[A-Za-z_$][\w$]*\.)+[A-Za-z_$][\w$]*(?:\s*[|?:},)]|$)"
+        )
+        raw_form_interpolation = re.compile(
+            r"\$\{\s*(?!esc\s*\(|escapeHtml\s*\(|String\s*\()\s*"
+            r"(?:formData\.get|input\.value|textarea\.value|event\.target\.value)"
+        )
+        for snippet in html_sinks:
+            if raw_property_interpolation.search(snippet) or raw_form_interpolation.search(snippet):
+                return False
+        return True
+
+    @staticmethod
+    def _inner_html_sink_snippets(source: str) -> list[str]:
+        snippets: list[str] = []
+        for match in re.finditer(r"\.innerHTML\s*=", source):
+            start = match.end()
+            end = source.find(";", start)
+            if end == -1 or end - start > 4000:
+                end = min(len(source), start + 4000)
+            snippets.append(source[start:end])
+        return snippets
 
     @classmethod
     def _rejection_circuit_findings(

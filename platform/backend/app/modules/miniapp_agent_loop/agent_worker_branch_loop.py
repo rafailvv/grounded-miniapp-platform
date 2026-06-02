@@ -281,7 +281,7 @@ class AgentWorkerBranchLoop:
                                 "status": "failed",
                                 "error": str(exc),
                                 "file_path": str(item.get("file_path") or ""),
-                                "next_action": "repair the same owned slice with a smaller valid patch",
+                                "next_action": self._worker_validation_next_action(str(exc)),
                             }
                             for index, item in enumerate(mutating_trace)
                         ] or [
@@ -290,7 +290,7 @@ class AgentWorkerBranchLoop:
                                 "tool_use_id": f"{worker_id}_edit_repair_{step + 1}",
                                 "status": "failed",
                                 "error": str(exc),
-                                "next_action": "repair the same owned slice with a smaller valid patch",
+                                "next_action": self._worker_validation_next_action(str(exc)),
                             }
                         ]
                         tool_results.extend(repair_results)
@@ -613,7 +613,45 @@ class AgentWorkerBranchLoop:
         ]
         if role_isolation_errors:
             raise ValueError(" ".join(role_isolation_errors[:3]))
+        unsafe_dom_errors = [
+            message
+            for item in file_changes
+            for message in self._unsafe_dom_errors(item)
+        ]
+        if unsafe_dom_errors:
+            raise ValueError(" ".join(unsafe_dom_errors[:3]))
         return file_changes
+
+    @staticmethod
+    def _worker_validation_next_action(error: str) -> str:
+        lowered = str(error or "").lower()
+        if "unsafe_dom_api" in lowered:
+            return (
+                "rewrite the same role app.js with safe DOM construction only: "
+                "createElement, textContent, append/replaceChildren, dataset, and addEventListener; "
+                "do not use innerHTML, outerHTML, insertAdjacentHTML, or string-built HTML templates"
+            )
+        return "repair the same owned slice with a smaller valid patch"
+
+    @staticmethod
+    def _unsafe_dom_errors(item: DraftAction) -> list[str]:
+        normalized = str(item.file_path or "").replace("\\", "/")
+        if not re.match(r"^miniapp/app/static/(client|specialist|manager)/app\.js$", normalized):
+            return []
+        body = item.content if item.operation in {"create", "replace"} else item.diff
+        text = str(body or "")
+        banned = [
+            marker
+            for marker in (".innerHTML", ".outerHTML", "insertAdjacentHTML")
+            if marker in text
+        ]
+        if not banned:
+            return []
+        return [
+            "unsafe_dom_api: role app.js draft uses "
+            + ", ".join(dict.fromkeys(banned))
+            + "; build UI with createElement/textContent/replaceChildren instead."
+        ]
 
     @staticmethod
     def _role_surface_isolation_errors(worker_id: str, item: DraftAction) -> list[str]:
@@ -758,6 +796,8 @@ class AgentWorkerBranchLoop:
                 "Prompt analysis decides the role split through shared_prefix.implementation_plan.role_state_contract; do not force a fixed client/specialist/manager workflow split. If the user's prompt assigns shared-state creation to manager or specialist, that role must own that creation flow and client must consume the persisted state without duplicate source controls.",
                 "Split role workflows into routeable mobile pages according to shared_prefix.implementation_plan.product_scale_contract.min_role_routes and the routeable screen plan; avoid one long dashboard-only page. Child pages must live under static/<role>/<page>/index.html and be reachable through route_manifest.json or filesystem role routing.",
                 "Use shared_prefix.implementation_plan.routeable_screen_plan for screen intent guidance; concrete route names are still owned by this worker and must come from the prompt/product vocabulary.",
+                "Balanced and Quality branches must not recreate the FAST generic request scaffold. Use prompt/domain vocabulary for route names, payload keys, labels, status names, and page concepts.",
+                "For Quality, add richer visible states and logic where relevant: empty, loading, validation error, success, update/status/history, observer state after reload, generated tests, and mobile/visual proof readiness.",
                 "If you work on UI or generated tests, read the current backend route/schema files first and use their actual endpoint paths and field names exactly.",
                 "If shared_prefix.backend_contract is present, treat it as the active API contract and do not invent a different /api route or field casing.",
                 "In async JavaScript form handlers, store DOM references before awaited calls, e.g. `const form = event.currentTarget`; do not read `event.currentTarget` after await.",

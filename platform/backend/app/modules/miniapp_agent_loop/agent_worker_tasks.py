@@ -16,7 +16,7 @@ class AgentWorkerTaskPlanner:
             return {
                 "depth": "compact",
                 "passes": ["green_workflow"],
-                "design_bar": "clean mobile UI, minimal but usable, with one consistent light neutral visual system across roles",
+                "design_bar": "modern compact mobile UI with bright header, clear CTAs, state badges, focus styling, and no old grey FAST/default shell",
                 "workflow_bar": "one complete prompt-derived flow across all roles, preserving all explicit role actions/resources from the prompt",
                 "page_bar": "at least the product_scale_contract minimum prompt-derived role pages; split broad mobile workflows instead of stacking a long dashboard",
             }
@@ -24,16 +24,16 @@ class AgentWorkerTaskPlanner:
             return {
                 "depth": "deep",
                 "passes": ["green_workflow", "role_consistency", "mobile_design_polish", "test_verifier_worker"],
-                "design_bar": "modern mobile product UI with polished spacing, states, responsive cards/forms/lists, no horizontal overflow, and consistent light theme across role apps unless explicitly requested otherwise",
-                "workflow_bar": "multiple prompt-derived role actions where useful, with persisted write/read/update proof only when the prompt implies it",
-                "page_bar": "well-organized prompt-derived role pages with no long dashboard-only scrolls",
+                "design_bar": "premium prompt-specific mobile product UI with a visible domain palette, role-specific visual language, polished spacing, empty/loading/error/success states, responsive cards/forms/lists, focus states, visual snapshot readiness, and a consistent light theme unless explicitly requested otherwise",
+                "workflow_bar": "multiple prompt-derived role actions where useful, richer validation/status/history logic, and persisted write/read/update proof only when the prompt implies it",
+                "page_bar": "multiple well-organized prompt-derived role pages; split broad workflows into child pages and avoid one long dashboard-only scroll",
             }
         return {
             "depth": "balanced",
             "passes": ["green_workflow", "role_consistency"],
-            "design_bar": "noticeably polished mobile UI without excessive pages or token-heavy decoration, using a consistent light role system",
-            "workflow_bar": "one primary flow plus one related prompt-derived update/summary flow",
-            "page_bar": "enough prompt-derived role pages to keep each mobile workflow focused",
+            "design_bar": "noticeably polished prompt-specific mobile UI with domain palette, role accents, modern cards/forms/lists, state styling, and no FAST-style generic request scaffold or panel/card-only shell",
+            "workflow_bar": "one primary flow plus one related prompt-derived update/summary flow with generated tests and browser proof",
+            "page_bar": "2-4 prompt-derived role pages when the prompt has enough role actions/resources; keep each mobile workflow focused",
         }
 
     @classmethod
@@ -143,6 +143,10 @@ class AgentWorkerTaskPlanner:
             f"Use the implementation plan ({plan_summary}) and the user's prompt-derived entities/actions as source of truth. "
             f"Product task ledger slice for this worker: {ledger_slice or 'none'}. Complete these ledger items with product source and proof before reporting done. "
             f"Mode depth is {mode_contract.get('depth')}: {mode_contract.get('workflow_bar')}; page organization: {mode_contract.get('page_bar')}; design bar: {mode_contract.get('design_bar')}. "
+            "Do not use generic fast_requests/request scaffold naming for Balanced or Quality work unless the prompt itself is literally a generic request tracker. "
+            "For Balanced or Quality, update the owned styles.css with prompt-specific visual-profile, palette variables, role accent styling, responsive/focus states, and visible empty/loading/error/success styling unless the file already has those markers. "
+            "Do not finish with only a generic .hero/.panel/.card/.item-card shell; each owned role must feel like the user's domain, not the default platform template. "
+            "Quality work must include richer visible states, validation and update/history/status handling, generated tests, and mobile/visual proof readiness. "
             "Use implementation_plan.product_scale_contract.min_role_routes and implementation_plan.routeable_screen_plan for screen intent guidance; choose concrete route names from the prompt and satisfy the prompt-derived minimum routeable pages. "
             "miniapp/app/generated/miniapp_contract.json is prompt-analysis metadata only; do not treat it as a fixed product schema, route template, or API scaffold. "
             "Choose field keys and API routes from the prompt and keep them consistent across backend, JS payloads, renderers, and tests. "
@@ -153,6 +157,7 @@ class AgentWorkerTaskPlanner:
             "If the prompt assigns shared-state creation to manager or specialist, that role must own the creation form and the client role must load or use that persisted state without duplicate source controls. "
             "Role UI workers must split long workflows into routeable child pages under their owned static/<role>/ directory rather than stacking every section on index.html. "
             "When a role has child pages, its shared app.js must be view-aware: detect body[data-view] or route, guard optional DOM from other pages, and bind every visible form/button/control on root and child pages. "
+            "Role UI workers must build DOM with createElement, textContent, append/replaceChildren, dataset, and addEventListener; do not use innerHTML, outerHTML, insertAdjacentHTML, or string-built HTML templates because Guardian blocks those unsafe draft actions. "
             "Do not expose raw API paths, HTTP methods, route slugs, role slugs, or enum codes in normal user-facing UI; use readable labels and keep label/value pairs visually separated."
         )
 
