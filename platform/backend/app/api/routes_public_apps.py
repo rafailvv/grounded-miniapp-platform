@@ -78,7 +78,6 @@ async def proxy_public_app(
     if _should_rewrite(content_type):
         rewritten = _rewrite_public_paths(content.decode(upstream.encoding or "utf-8", errors="replace"), f"/apps/{workspace_id}")
         content = rewritten.encode("utf-8")
-        response_headers["Content-Length"] = str(len(content))
     return Response(content=content, status_code=upstream.status_code, headers=response_headers, media_type=content_type or None)
 
 
@@ -119,7 +118,7 @@ def _response_headers(headers) -> dict[str, str]:
     returned: dict[str, str] = {}
     for key, value in headers.items():
         lowered = key.lower()
-        if lowered in HOP_BY_HOP_HEADERS:
+        if lowered in HOP_BY_HOP_HEADERS or lowered == "content-length":
             continue
         returned[key] = value
     return returned

@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import hashlib
 from urllib.error import URLError
 from urllib.request import urlopen
 from datetime import datetime, timezone
@@ -36,13 +37,14 @@ class PreviewRuntimeManager:
         miniapp_dir = source_dir / "miniapp"
         if not miniapp_dir.exists():
             raise RuntimeError(f"Miniapp directory is missing: {miniapp_dir}")
-        env = os.environ.copy()
-        env.update(self._compose_env(proxy_port))
-        env["PYTHONPATH"] = str(miniapp_dir)
         log_dir = source_dir / ".sandbox" / "preview"
         log_dir.mkdir(parents=True, exist_ok=True)
         stdout_log = log_dir / "stdout.log"
         stderr_log = log_dir / "stderr.log"
+        env = os.environ.copy()
+        env.update(self._compose_env(proxy_port))
+        env["PYTHONPATH"] = str(miniapp_dir)
+        dependency_logs = self._ensure_local_preview_dependencies(miniapp_dir, log_dir, env)
         command = [
             sys.executable,
             "-m",
@@ -88,11 +90,50 @@ class PreviewRuntimeManager:
             raise
         logs = [
             f"[runtime] starting local uvicorn preview for workspace {workspace_id} on port {proxy_port}",
+            *dependency_logs,
             f"[runtime] command: {' '.join(command)}",
             *wait_logs,
             f"[runtime] local preview started in {int((time.perf_counter() - started_at) * 1000)}ms",
         ]
         return project_name, logs
+
+    def _ensure_local_preview_dependencies(self, miniapp_dir: Path, log_dir: Path, env: dict[str, str]) -> list[str]:
+        requirements = miniapp_dir / "requirements.txt"
+        if not requirements.exists():
+            return ["[runtime] no miniapp requirements.txt found; using platform environment"]
+        digest = hashlib.sha256(requirements.read_bytes()).hexdigest()
+        marker = log_dir / "requirements.sha256"
+        if marker.exists() and marker.read_text(encoding="utf-8").strip() == digest:
+            return ["[runtime] miniapp Python dependencies already installed"]
+
+        install_log = log_dir / "requirements-install.log"
+        command = [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--no-cache-dir",
+            "-r",
+            str(requirements),
+        ]
+        started_at = time.perf_counter()
+        result = subprocess.run(
+            command,
+            cwd=miniapp_dir,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        install_log.write_text((result.stdout or "") + ("\n" if result.stdout and result.stderr else "") + (result.stderr or ""), encoding="utf-8")
+        if result.returncode != 0:
+            tail = "\n".join(install_log.read_text(encoding="utf-8", errors="replace").splitlines()[-40:])
+            raise RuntimeError(f"Miniapp dependency install failed: {' '.join(command)}\n{tail}")
+        marker.write_text(digest, encoding="utf-8")
+        return [
+            f"[runtime] installed miniapp Python dependencies from {requirements.name} in {int((time.perf_counter() - started_at) * 1000)}ms",
+            f"[runtime] dependency install log: {install_log}",
+        ]
 
     def rebuild_local(self, workspace_id: str, source_dir: Path, proxy_port: int) -> list[str]:
         project_name, logs = self.start_local(workspace_id, source_dir, proxy_port)
