@@ -1,79 +1,204 @@
 # Grounded Mini-App Platform
 
-This repository runs mini-app generation through one universal workspace code agent.
+Grounded Mini-App Platform is a local workbench for generating, repairing, validating, and previewing Telegram-style mini-apps from natural-language product prompts.
 
-The active path is:
+The active runtime is a workspace code agent, not a loose chat-to-code demo:
 
-`user prompt -> workspace code agent -> draft patch -> platform checks -> apply -> preview`
+```text
+prompt -> workspace code agent -> draft patch -> checks and gates -> apply -> live preview
+```
 
-The agent reads the workspace, edits files through draft operations, runs checks, inspects failures, and repeats until the draft is safe to apply. Product semantics come only from the user prompt. The base template is technical shell context, not a product model.
+The agent works inside a cloned mini-app workspace, edits files through draft/apply operations, runs platform checks, inspects failures, and repeats until the draft is safe to apply. Product semantics come from the user prompt and generated contract, while the base template stays a technical shell.
 
-## Active Runtime
+## Current Architecture
 
 - Backend API: `platform/backend/app/api/`
+- Backend services: `platform/backend/app/services/`
+- Workspace storage, preview, draft/apply: `platform/backend/app/services/workspace/`
 - Agent runtime: `platform/backend/app/modules/workspace_code_agent_runtime/`
-- Agent loop primitives: `platform/backend/app/modules/miniapp_agent_loop/`
-- Workspace storage and draft/apply: `platform/backend/app/services/workspace/`
-- Platform checks: `platform/backend/app/services/check_runner.py`
-- Validators: `platform/backend/app/validators/`
-- Frontend: `platform/frontend/`
+- Agent loop, tools, workers, repair packets: `platform/backend/app/modules/miniapp_agent_loop/`
+- Generated-app validation: `platform/backend/app/services/check_runner.py`
+- Static validators: `platform/backend/app/validators/`
+- Platform UI: `platform/frontend/`
 - Base mini-app template: `runtime/templates/base-miniapp/`
+- Runtime config, checks, models, mode SLAs: `runtime/platform.config.json`
+- Runtime skills and prompt guidance: `runtime/skills/*/SKILL.md`
+- Execution policy: `runtime/policies/agent_exec_policy.codexpolicy`
 
-## Generation Enhancement Layer
+The mini-app target is a single FastAPI app serving role-specific mobile pages:
 
-The platform now exposes reusable generation-quality primitives inspired by mature coding-agent workflows:
+- `/client`
+- `/specialist`
+- `/manager`
 
-- Product config contract: `runtime/platform.config.json` defines generation modes, required checks, model profiles, skill activation, browser proof, and SLA policy. Its generated schema is `platform/backend/app/schemas/platform.config.schema.json`.
-- Project instructions: `AGENTS.md` and template `AGENTS.md` are loaded into context summaries.
-- Runtime skill packs: `runtime/skills/*/SKILL.md` provide focused guidance for Telegram product generation, FastAPI persistence, mobile polish, repair, browser proof, and existing-app edits.
-- Persistent workspace memory: `/workspaces/{id}/memory` stores preferences, decisions, known failures, and stale-reference checks.
-- Slash commands: `/slash-commands` lists Workbench command contracts such as `/generate`, `/fix`, `/polish`, `/review`, `/acceptance`, `/visual-qa`, and `/docs`.
-- Acceptance scenarios: `/runs/{id}/acceptance-scenarios` derives proof scenarios from the run contract.
-- Visual QA: `/runs/{id}/visual-qa` combines static mobile checks with browser mobile diagnostics.
-- Trace reducer: `/runs/{id}/trace-reducer` summarizes phases, blockers, quality signals, changed files, and next action.
-- Magic Docs: `/workspaces/{id}/magic-docs/product-architecture` previews or writes the current product architecture doc.
-- Worker roles: `/system/worker-roles` formalizes planner, backend, role UI, tests, and verifier ownership.
+Each role owns static HTML/CSS/JS under `miniapp/app/static/{role}/`, with shared backend routes and shared persistent state.
 
-## Generation Contract
+## Generation Modes
 
-Generation, edit, fix, visual change, retry, and failed-check apply all use `WorkspaceCodeAgentRuntime`.
+Generation behavior is driven by `runtime/platform.config.json`.
 
-Fresh successful runs must reach:
+- `basic`: minimal scaffold/sanity path.
+- `fast`: compact happy-path generation with real API/browser proof.
+- `balanced`: role coverage, persistence, generated tests, and mobile usability.
+- `quality`: deeper browser proof, visual checks, edge states, and worker branch depth.
+- `production`: release-style gate with security, export, docs, regression, and audit evidence.
 
-`running -> agent_turn -> checks -> applying -> complete`
+The default mode in the frontend is Balanced.
 
-Terminal success requires:
+### Model Routing
+
+Current OpenAI routing separates coding from lightweight support tasks:
+
+- Code-writing roles (`agent_turn`, `code_edit`, `repair`): `gpt-5.2-codex`
+- Summary/support roles (`summarize`, `cheap_task`): `gpt-4.1-mini`
+- Embeddings: `text-embedding-3-large`
+
+Environment overrides are supported through:
+
+- `OPENAI_CODE_FAST_MODEL`
+- `OPENAI_CODE_BALANCED_MODEL`
+- `OPENAI_CODE_QUALITY_MODEL`
+- `OPENAI_CODE_REPAIR_MODEL`
+- `OPENAI_CODE_SUMMARY_MODEL`
+- `OPENAI_CODE_MINI_MODEL`
+- `OPENAI_CODE_MAX_MODEL`
+
+## Generation Quality Layer
+
+The platform includes generation primitives that make runs inspectable and repairable:
+
+- Prompt contracts and mini-app route manifests.
+- Product task ledgers for required role/backend/test work.
+- Repair cases with evidence, likely files, focused checks, and retry policy.
+- Worker roles for planner, backend, role UI, tests, verifier, and mobile polish.
+- Guardian and readiness gates before apply.
+- Context pressure and compaction reports.
+- Browser proof and replayable acceptance artifacts.
+- Visual QA and mobile overflow checks.
+- Trace bundles, rollout trace, final reports, and run state diagnostics.
+
+Successful fresh runs must reach:
+
+```text
+running -> agent/workers -> checks -> applying -> completed
+```
+
+Terminal success means:
 
 - `status=completed`
 - `apply_status=applied`
-- platform invariant checks passed
-- contract smoke passed
-- draft diff applied to the source workspace
+- required checks passed for the selected mode
+- draft diff was applied to source workspace
+- preview can load the generated app
 
-## Workspace Creation
+## Workspaces
 
-`POST /workspaces` is the cold-create path. It creates workspace storage, clones the base template, indexes files, and starts preview once. The frontend opens existing workspaces with `GET /workspaces/{id}`.
+`POST /workspaces` creates a workspace by cloning `runtime/templates/base-miniapp`, initializing git, indexing files, and starting preview state.
 
-## Public Run APIs
+Workspace data is stored under `data/workspaces/{workspace_id}`. The repo also includes a Bloom starter/demo workspace path used by the platform when starter bootstrap is enabled.
 
-- `POST /workspaces/{id}/runs`
-- `POST /workspaces/{id}/generate`
-- `GET /jobs/{id}`
-- `POST /jobs/{id}/retry`
-- `GET /runs/{id}/artifacts`
-- `GET /runs/{id}/iterations`
-- `GET /runs/{id}/checks`
-- `GET /runs/{id}/patch`
+Core workspace APIs:
 
-Run artifacts are agent-native: `run`, `job`, `iterations`, `checks`, `patch`, `diff`, `trace`, and `preview`.
+- `GET /workspaces`
+- `POST /workspaces`
+- `GET /workspaces/{workspace_id}`
+- `DELETE /workspaces/{workspace_id}`
+- `GET /workspaces/{workspace_id}/files/tree`
+- `GET /workspaces/{workspace_id}/files/content`
+- `POST /workspaces/{workspace_id}/files/save`
+- `GET /workspaces/{workspace_id}/git/status`
+
+## Runs
+
+Runs are the main generation/edit/fix lifecycle objects.
+
+Core run APIs:
+
+- `POST /workspaces/{workspace_id}/runs`
+- `POST /workspaces/{workspace_id}/generate`
+- `GET /workspaces/{workspace_id}/runs`
+- `GET /runs/{run_id}`
+- `POST /runs/{run_id}/stop`
+- `POST /runs/{run_id}/resume`
+- `GET /runs/{run_id}/checks`
+- `GET /runs/{run_id}/patch`
+- `GET /runs/{run_id}/diff`
+- `GET /runs/{run_id}/artifacts`
+- `GET /runs/{run_id}/iterations`
+- `GET /runs/{run_id}/tasks`
+- `GET /runs/{run_id}/repair-cases`
+- `GET /runs/{run_id}/context-pressure`
+- `GET /runs/{run_id}/final-report`
+
+Runs are intentionally draft-first: generated changes are validated in an isolated draft before being applied to the source workspace.
+
+## Preview
+
+Preview is managed per workspace and can run locally or through Docker depending on `PREVIEW_RUNTIME_MODE`.
+
+For local development, use:
+
+```env
+PREVIEW_RUNTIME_MODE=local
+PREVIEW_PORT_BASE=16000
+```
+
+Preview APIs:
+
+- `POST /workspaces/{workspace_id}/preview/start`
+- `POST /workspaces/{workspace_id}/preview/rebuild`
+- `POST /workspaces/{workspace_id}/preview/reset`
+- `GET /workspaces/{workspace_id}/preview/url`
+- `GET /workspaces/{workspace_id}/preview/logs`
+- `GET /workspaces/{workspace_id}/preview/runtime-boundary`
+
+The frontend renders role URLs side by side so client, specialist, and manager flows can be inspected together.
+
+## Local Development
+
+Backend:
+
+```bash
+PYTHONPATH=platform/backend PREVIEW_RUNTIME_MODE=local \
+  python3 -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+Frontend:
+
+```bash
+cd platform/frontend
+npm install
+npm run dev -- --host 127.0.0.1 --port 5174
+```
+
+Platform URL:
+
+```text
+http://127.0.0.1:5174
+```
 
 ## Checks
 
-Backend:
+Backend checks:
 
 ```bash
 PYTHONPATH=platform/backend python3 -m compileall -q platform/backend/app
 PYTHONPATH=platform/backend pytest -q platform/backend/tests
 ```
 
-Static cleanup is covered by the backend test suite.
+Frontend checks:
+
+```bash
+cd platform/frontend
+npm run build
+```
+
+Generated mini-app checks are mode-dependent and orchestrated by `CheckRunner`; typical proof includes API persistence, browser flow smoke, generated Python tests, generated JS tests, and optional visual regression.
+
+## Notes For Contributors
+
+- Keep generated product behavior prompt-derived; avoid hardcoding a specific business domain into platform stabilizers.
+- Do not replace a usable generated app with a scaffold unless an explicit emergency fallback policy allows it.
+- Prefer focused repair based on failing evidence over broad rewrites.
+- Keep role JS, backend API, generated tests, and browser proof aligned; most failures are contract mismatches across those surfaces.
+- Treat `data/` as runtime state, not source code, unless a specific fixture/starter workspace is intentionally versioned.
