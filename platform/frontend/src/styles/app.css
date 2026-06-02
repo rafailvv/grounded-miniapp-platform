@@ -879,11 +879,23 @@ button:disabled {
   border: 0;
   background: transparent;
   color: var(--ink);
-  padding: 10px 12px;
+  padding: 9px 12px;
   text-align: left;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 7px;
+  cursor: pointer;
+  border-radius: 10px;
+  transition: background 140ms ease, color 140ms ease;
+}
+
+.tree-row:hover {
+  background: rgba(79, 93, 246, 0.08);
+}
+
+.tree-row:focus-visible {
+  outline: 2px solid rgba(79, 93, 246, 0.42);
+  outline-offset: -2px;
 }
 
 .tree-row.is-selected {
@@ -891,16 +903,77 @@ button:disabled {
   color: var(--accent-strong);
 }
 
+.tree-chevron {
+  width: 14px;
+  height: 14px;
+  color: var(--muted);
+  opacity: 0;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transform: rotate(0deg);
+  transition: transform 140ms ease, opacity 140ms ease;
+}
+
+.tree-chevron.is-visible {
+  opacity: 0.78;
+}
+
+.tree-chevron.is-expanded {
+  transform: rotate(90deg);
+}
+
+.tree-chevron svg {
+  width: 14px;
+  height: 14px;
+}
+
 .tree-icon {
   width: 18px;
-  color: var(--muted);
+  height: 18px;
   flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.tree-icon-svg {
+  width: 18px;
+  height: 18px;
+  fill: currentColor;
+}
+
+.tree-icon-folder {
+  color: #5267e8;
+}
+
+.tree-icon-python {
+  color: #2d7dd2;
+}
+
+.tree-icon-json {
+  color: #d97706;
+}
+
+.tree-icon-image {
+  color: #db4f7a;
+}
+
+.tree-icon-file {
+  color: #7b849b;
+}
+
+.tree-row.is-selected .tree-chevron,
+.tree-row.is-selected .tree-icon-svg {
+  color: currentColor;
 }
 
 .tree-label {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .editor {

@@ -955,6 +955,53 @@ type FileTreeProps = {
   depth?: number;
 };
 
+function FileTreeIcon({ node, expanded }: { node: FileTreeNode; expanded: boolean }) {
+  if (node.type === "directory") {
+    return (
+      <svg className="tree-icon-svg tree-icon-folder" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <path d="M3.75 6.75A2.25 2.25 0 0 1 6 4.5h4.1c.64 0 1.24.27 1.66.74l1.15 1.26H18a2.25 2.25 0 0 1 2.25 2.25v1.1H3.75v-3.1Z" />
+        <path d="M3.75 9.25h16.5v7.5A2.25 2.25 0 0 1 18 19H6a2.25 2.25 0 0 1-2.25-2.25v-7.5Z" opacity={expanded ? 0.82 : 0.64} />
+      </svg>
+    );
+  }
+  const extension = node.name.split(".").pop()?.toLowerCase() ?? "";
+  if (["jpg", "jpeg", "png", "gif", "webp", "svg"].includes(extension)) {
+    return (
+      <svg className="tree-icon-svg tree-icon-image" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <path d="M6 4.75h12A2.25 2.25 0 0 1 20.25 7v10A2.25 2.25 0 0 1 18 19.25H6A2.25 2.25 0 0 1 3.75 17V7A2.25 2.25 0 0 1 6 4.75Z" />
+        <path d="m5.6 16.6 3.15-3.15a1.15 1.15 0 0 1 1.62 0l1.18 1.18 2.35-2.35a1.15 1.15 0 0 1 1.62 0l2.88 2.88v1.7H5.6v-1.26Z" opacity="0.72" />
+        <circle cx="8.65" cy="8.75" r="1.35" fill="currentColor" opacity="0.72" />
+      </svg>
+    );
+  }
+  if (extension === "py") {
+    return (
+      <svg className="tree-icon-svg tree-icon-python" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <path d="M8 4.25h5.4A3.35 3.35 0 0 1 16.75 7.6v2.15H9.6A2.85 2.85 0 0 0 6.75 12.6V14H5.9A2.65 2.65 0 0 1 3.25 11.35V9.5A5.25 5.25 0 0 1 8.5 4.25H8Z" />
+        <path d="M16 19.75h-5.4A3.35 3.35 0 0 1 7.25 16.4v-2.15h7.15a2.85 2.85 0 0 0 2.85-2.85V10h.85a2.65 2.65 0 0 1 2.65 2.65v1.85a5.25 5.25 0 0 1-5.25 5.25H16Z" opacity="0.72" />
+        <circle cx="9" cy="7.6" r=".85" fill="currentColor" opacity="0.82" />
+        <circle cx="15" cy="16.4" r=".85" fill="currentColor" opacity="0.82" />
+      </svg>
+    );
+  }
+  if (extension === "json") {
+    return (
+      <svg className="tree-icon-svg tree-icon-json" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <path d="M7 3.75h7.25L19.25 9v8A2.25 2.25 0 0 1 17 19.25H7A2.25 2.25 0 0 1 4.75 17V6A2.25 2.25 0 0 1 7 3.75Z" />
+        <path d="M14 3.9V8a1 1 0 0 0 1 1h4" opacity="0.62" />
+        <path d="M9.5 12.2 8.2 13.5l1.3 1.3M14.5 12.2l1.3 1.3-1.3 1.3" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    );
+  }
+  return (
+    <svg className="tree-icon-svg tree-icon-file" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path d="M7 3.75h7.25L19.25 9v8A2.25 2.25 0 0 1 17 19.25H7A2.25 2.25 0 0 1 4.75 17V6A2.25 2.25 0 0 1 7 3.75Z" />
+      <path d="M14 3.9V8a1 1 0 0 0 1 1h4" opacity="0.62" />
+      <path d="M8.25 12.25h7.5M8.25 15.25h5" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" opacity="0.7" />
+    </svg>
+  );
+}
+
 function FileTree({
   nodes,
   expandedPaths,
@@ -977,7 +1024,14 @@ function FileTree({
               style={{ paddingLeft: `${12 + depth * 16}px` }}
               onClick={() => (isDirectory ? onToggleDirectory(node.path) : onSelectFile(node.path))}
             >
-              <span className="tree-icon">{isDirectory ? (isExpanded ? "▾" : "▸") : "•"}</span>
+              <span className={`tree-chevron ${isDirectory ? "is-visible" : ""} ${isExpanded ? "is-expanded" : ""}`} aria-hidden="true">
+                <svg viewBox="0 0 16 16" focusable="false">
+                  <path d="M5.75 3.75 10.25 8l-4.5 4.25" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+              </span>
+              <span className="tree-icon">
+                <FileTreeIcon node={node} expanded={isExpanded} />
+              </span>
               <span className="tree-label">{node.name}</span>
             </button>
             {isDirectory && isExpanded ? (
